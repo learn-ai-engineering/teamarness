@@ -24,6 +24,8 @@ use crate::body::{BodyError, DocumentBody};
 use crate::domain::{DomainError, DomainRecord, MAX_UPDATE};
 use crate::store::{DocumentStore, ImportClassifier, IngestResult, Ingested, StoreError};
 
+#[path = "guide.rs"]
+mod guide;
 #[path = "ports.rs"]
 mod ports;
 
@@ -1537,6 +1539,12 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         },
     )
     .port_request(
+        ports::CONTRACT, "runtime.guide", "query",
+        |_context: Context<DocumentsActive>, _actor: PortActor, _: Empty| async move {
+            Ok(guide::response())
+        },
+    )
+    .port_request(
         ports::CONTRACT, "document.list", "query",
         |context: Context<DocumentsActive>, _actor: PortActor, request: ports::ListRequest| async move {
             ports::list(&context, request).await
@@ -1546,6 +1554,13 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         ports::CONTRACT, "document.markdown", "query",
         |context: Context<DocumentsActive>, _actor: PortActor, request: ports::MarkdownRequest| async move {
             ports::read_markdown(&context, request).await
+        },
+    )
+    .port_request(
+        ports::CONTRACT, "document.create", "command",
+        |context: Context<DocumentsActive>, actor: PortActor, request: ports::CreateRequest| async move {
+            let signer = ports::authorize_actor(&context, actor)?;
+            ports::create(&context, signer, request).await
         },
     )
     .port_request(
@@ -2004,14 +2019,30 @@ async fn append(
     context: &Context<DocumentsActive>,
     record: DomainRecord,
 ) -> Result<JsonValue, BackendError> {
+    append_as(context, record, None).await
+}
+
+/// [`append`], signed by this Installation or by the bound Agent whose Principal ID `principal`
+/// names. The record must name that Agent's key as its author.
+async fn append_as(
+    context: &Context<DocumentsActive>,
+    record: DomainRecord,
+    principal: Option<&str>,
+) -> Result<JsonValue, BackendError> {
     let purpose = record.kind();
     let canonical = record.encode();
     let appended = context
         .state()
         .log
-        .append(purpose, &canonical)
+        .append_with_principal(purpose, &canonical, principal)
         .await
-        .map_err(|cause| capability_error(purpose, cause))?;
+        .map_err(|cause| {
+            // Core refuses before committing anything: it does not sign as that Agent now.
+            if cause.code() == "principal_not_bound" {
+                return error("documents.principal_not_bound", false);
+            }
+            capability_error(purpose, cause)
+        })?;
     let state = context.state().clone();
     let id = appended.record_id.as_str().to_owned();
     let ingested = context
@@ -7258,7 +7289,7 @@ mod tests {
         assert_eq!(contract.contracts.len(), 1);
         let provided = &contract.contracts[0];
         assert_eq!(provided.identity, ports::CONTRACT);
-        assert_eq!((provided.major, provided.minor), (1, 1));
+        assert_eq!((provided.major, provided.minor), (1, 2));
         let names: Vec<_> = provided
             .ports
             .iter()
@@ -7267,11 +7298,38 @@ mod tests {
         assert_eq!(
             names,
             [
+                ("runtime.guide", json!("query")),
                 ("document.list", json!("query")),
                 ("document.markdown", json!("query")),
+                ("document.create", json!("command")),
                 ("document.revise", json!("command")),
                 ("documents.changed", json!("event")),
             ]
+        );
+        assert!(contract.has_guide(ports::CONTRACT));
+        let create = provided
+            .ports
+            .iter()
+            .find(|port| port.name == "document.create")
+            .unwrap();
+        assert!(
+            create
+                .description
+                .contains("must not be retried automatically")
+        );
+        // Every code the provider's create returns is named for the Consumer.
+        for code in [
+            "documents.unknown_collection",
+            "documents.collection_archived",
+            "documents.invalid_title",
+            "documents.actor_unauthorized",
+            "documents.principal_not_bound",
+        ] {
+            assert!(create.description.contains(code), "{code}");
+        }
+        assert_eq!(
+            create.request.as_ref().unwrap()["properties"]["title"]["maxLength"],
+            crate::domain::MAX_TITLE
         );
         let revise = provided
             .ports
@@ -7329,6 +7387,32 @@ mod tests {
         ] {
             assert!(!valid("document.revise", "request", invalid));
         }
+        assert!(valid(
+            "document.create",
+            "request",
+            json!({"collectionId":id,"title":"Q4"})
+        ));
+        for invalid in [
+            json!({"collectionId":id}),
+            json!({"collectionId":id,"title":""}),
+            json!({"collectionId":id,"title":"x".repeat(257)}),
+            json!({"collectionId":id,"title":"Q4","markdown":"x"}),
+            json!({"collectionId":id,"title":"Q4","actor":"forged"}),
+        ] {
+            assert!(!valid("document.create", "request", invalid));
+        }
+        assert!(valid(
+            "document.create",
+            "response",
+            json!({"documentId":id,"version":version})
+        ));
+        assert!(!valid(
+            "document.create",
+            "response",
+            json!({"documentId":id})
+        ));
+        assert!(valid("runtime.guide", "request", json!({})));
+        assert!(!valid("runtime.guide", "request", json!({"verbose":true})));
         assert!(valid("documents.changed", "event", json!({})));
         assert!(valid(
             "documents.changed",
@@ -7705,19 +7789,27 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
-    // Verifies: TEAM.SYS.DOCS-R12, TEAM.SYS.PKG-R12 — 1.1 keeps every 1.0 Port, kind and schema.
-    #[test]
-    fn port_contract_1_1_is_additive_over_the_shipped_1_0_document() {
+    /// Asserts that `new` is an additive minor over `old`: every earlier Port keeps its kind and
+    /// schemas, and `added` Ports are new.
+    fn assert_additive(old: &[u8], new: &[u8], minors: (u16, u16), added: usize) {
         use teamarness_package_contract::port_contract::{
             check_additive_minor_documents, compile_port_contracts,
         };
-        let old =
-            compile_port_contracts(include_bytes!("../tests/fixtures/ports-1.0.json")).unwrap();
-        let new = compile_port_contracts(include_bytes!("../../ports.json")).unwrap();
-        assert_eq!((old.contracts[0].major, old.contracts[0].minor), (1, 0));
-        assert_eq!((new.contracts[0].major, new.contracts[0].minor), (1, 1));
+        let old = compile_port_contracts(old).unwrap();
+        let new = compile_port_contracts(new).unwrap();
+        assert_eq!(
+            (old.contracts[0].major, old.contracts[0].minor),
+            (1, minors.0)
+        );
+        assert_eq!(
+            (new.contracts[0].major, new.contracts[0].minor),
+            (1, minors.1)
+        );
         check_additive_minor_documents(&old, &new, ports::CONTRACT).unwrap();
-        assert_eq!(old.contracts[0].ports.len(), new.contracts[0].ports.len());
+        assert_eq!(
+            old.contracts[0].ports.len() + added,
+            new.contracts[0].ports.len()
+        );
         for before in &old.contracts[0].ports {
             let after = new.contracts[0]
                 .ports
@@ -7729,6 +7821,24 @@ mod tests {
             assert_eq!(before.response, after.response);
             assert_eq!(before.event, after.event);
         }
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12, TEAM.SYS.PKG-R12 — 1.2 keeps every 1.1 Port, kind and schema,
+    // and adds runtime.guide and document.create; 1.1 still keeps every 1.0 Port.
+    #[test]
+    fn port_contract_1_2_is_additive_over_1_1_and_1_1_over_1_0() {
+        assert_additive(
+            include_bytes!("../tests/fixtures/ports-1.1.json"),
+            include_bytes!("../../ports.json"),
+            (1, 2),
+            2,
+        );
+        assert_additive(
+            include_bytes!("../tests/fixtures/ports-1.0.json"),
+            include_bytes!("../tests/fixtures/ports-1.1.json"),
+            (0, 1),
+            0,
+        );
     }
 
     fn agent() -> JsonValue {
@@ -8004,6 +8114,317 @@ mod tests {
             appends(&session),
             before + 3,
             "no refused write is retried in the background"
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    async fn create_as(
+        harness: &mut Harness,
+        actor: JsonValue,
+        collection: &str,
+        title: &str,
+    ) -> Result<JsonValue, BackendError> {
+        port_as(
+            harness,
+            "command",
+            "document.create",
+            actor,
+            json!({"collectionId":collection,"title":title}),
+        )
+        .await
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12 — the Installation Person and a bound Agent each create a
+    // Document as one record that names its signer (1.2). The Agent's is appended with its
+    // Principal ID, and the returned version is the base for a first revise.
+    #[tokio::test]
+    async fn person_and_agent_create_documents_and_revise_from_the_returned_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (collection, _) = ported_document(&mut session).await;
+        let before = appends(&session);
+        let minutes = create_as(&mut session.harness, alice(), &collection, "Minutes")
+            .await
+            .unwrap();
+        assert_eq!(appends(&session), before + 1, "one create is one record");
+        let calls = append_calls(&session);
+        let call = calls.last().unwrap();
+        assert!(call.payload.get("principal").is_none());
+        assert_eq!(call.payload["purpose"], DomainRecord::CREATE_KIND);
+        assert_eq!(appended_record(call).author(), ALICE);
+
+        let notes = create_as(&mut session.harness, agent(), &collection, "Agent notes")
+            .await
+            .unwrap();
+        assert_eq!(appends(&session), before + 2);
+        let calls = append_calls(&session);
+        let call = calls.last().unwrap();
+        assert_eq!(call.payload["principal"], AGENT_PRINCIPAL);
+        assert_eq!(call.payload["purpose"], DomainRecord::CREATE_KIND);
+        let DomainRecord::DocumentCreate {
+            author,
+            collection: parent,
+            title,
+            ..
+        } = appended_record(call)
+        else {
+            panic!("a create record");
+        };
+        assert_eq!(author, AGENT_KEY, "the record names the Agent's key");
+        assert_eq!(parent, collection);
+        assert_eq!(title, "Agent notes");
+        let document = notes["documentId"].as_str().unwrap().to_owned();
+        assert_ne!(document, minutes["documentId"]);
+
+        // The new Document is listed, empty, and at the returned version.
+        let page = query(
+            &mut session.harness,
+            "document.list",
+            json!({"collectionId":collection}),
+        )
+        .await
+        .unwrap();
+        let listed = page["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == document.as_str())
+            .unwrap()
+            .clone();
+        assert_eq!(listed["title"], "Agent notes");
+        assert_eq!(listed["body"], "available");
+        assert_eq!(listed["version"], notes["version"]);
+        let read = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read, json!({"markdown":"","version":notes["version"]}));
+
+        // Create then revise against the returned version, as the guide teaches.
+        let revised = port_as(
+            &mut session.harness,
+            "command",
+            "document.revise",
+            agent(),
+            json!({"documentId":document,"baseVersion":notes["version"],"markdown":"Drafted by an agent\n"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(revised["changed"], true);
+        let calls = append_calls(&session);
+        let call = calls.last().unwrap();
+        assert_eq!(call.payload["principal"], AGENT_PRINCIPAL);
+        assert_eq!(appended_record(call).author(), AGENT_KEY);
+        let read = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read["markdown"], "Drafted by an agent\n");
+        let agenda = revise(
+            &mut session.harness,
+            minutes["documentId"].as_str().unwrap(),
+            &minutes["version"],
+            "Agenda\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(agenda["changed"], true);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12 — a create refused before its append, or by Core for an Agent it
+    // does not sign for, is certain and creates nothing (ADR 0038).
+    #[tokio::test]
+    async fn create_refusals_are_certain_and_create_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (collection, _) = ported_document(&mut session).await;
+        let archived = session
+            .harness
+            .request("documents.collection.create", json!({ "name": "Old" }))
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .harness
+            .request(
+                "documents.collection.archive",
+                json!({ "collectionId": archived }),
+            )
+            .await
+            .unwrap();
+        let before = appends(&session);
+        let bob = json!({"kind":"person","identity":"bob"});
+        for (actor, target, title, code) in [
+            (
+                alice(),
+                hex(64, 0xc0ffee),
+                "Q1",
+                "documents.unknown_collection",
+            ),
+            (
+                agent(),
+                archived.clone(),
+                "Q1",
+                "documents.collection_archived",
+            ),
+            (
+                alice(),
+                collection.clone(),
+                " Padded",
+                "documents.invalid_title",
+            ),
+            (
+                agent(),
+                collection.clone(),
+                "Bell\u{7}",
+                "documents.invalid_title",
+            ),
+            (
+                bob,
+                collection.clone(),
+                "Q1",
+                "documents.actor_unauthorized",
+            ),
+        ] {
+            let refused = create_as(&mut session.harness, actor, &target, title)
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code(), code);
+            assert!(!refused.retryable(), "{code}");
+            assert!(!refused.outcome_uncertain(), "{code}");
+        }
+        assert_eq!(appends(&session), before, "no refused create is appended");
+        let stale = json!({"kind":"agent","principal":hex(64, 0x57a1e),"identity":AGENT_KEY});
+        let refused = create_as(&mut session.harness, stale, &collection, "Q1")
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), "documents.principal_not_bound");
+        assert!(!refused.retryable());
+        assert!(!refused.outcome_uncertain(), "Core committed nothing");
+        assert_eq!(appends(&session), before + 1, "Core was asked once");
+        let page = query(&mut session.harness, "document.list", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(page["documents"].as_array().unwrap().len(), 1);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12 — a create whose append may have committed is uncertain, so a
+    // Consumer does not repeat it and duplicate the Document.
+    #[tokio::test]
+    async fn create_failing_after_its_append_request_is_uncertain() {
+        let fail = Arc::new(AtomicBool::new(false));
+        let failing = fail.clone();
+        let next = Arc::new(std::sync::atomic::AtomicU64::new(100));
+        let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => Ok(json!({"results":payload["sealedRecords"].as_array().unwrap().iter()
+                .map(|_| json!({"status":"waiting_for_history_access"})).collect::<Vec<_>>()})),
+            "append" if failing.load(Ordering::SeqCst) => Err(error("unavailable", true)),
+            "append" => {
+                let seed = next.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"recordId":hex(64, seed),"orderKey":hex(82, seed),
+                    "author":ALICE,"signature":"c2ln","sealedRecord":"c2VhbGVk","durability":"committed"}))
+            }
+            _ => Err(error("unavailable", false)),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted).await;
+        let (collection, _) = ported_document(&mut session).await;
+        fail.store(true, Ordering::SeqCst);
+        let uncertain = create_as(&mut session.harness, alice(), &collection, "Q1")
+            .await
+            .unwrap_err();
+        assert_eq!(uncertain.code(), "documents.capability_unavailable");
+        assert!(uncertain.outcome_uncertain());
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12, TEAM.SYS.PKG-R12 — the actual router serves a runtime.guide
+    // that is a valid guide under the contract, fits 32 KiB with its envelope, states the
+    // enforced limits, and refuses a non-empty request.
+    #[tokio::test]
+    async fn runtime_guide_is_schema_valid_bounded_and_explains_create_and_revise() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let response = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                port_envelope("runtime.guide", agent(), json!({})),
+            )
+            .await
+            .expect("the actual public Port router serves runtime.guide");
+        let guide = &response["$teamarnessPortValue"];
+        let contract = teamarness_package_contract::port_contract::compile_port_contracts(
+            include_bytes!("../../ports.json"),
+        )
+        .unwrap();
+        assert!(contract.has_guide(ports::CONTRACT));
+        assert!(
+            contract
+                .validate(ports::CONTRACT, "runtime.guide", "response", guide)
+                .is_ok()
+        );
+        assert!(serde_json::to_vec(guide).unwrap().len() <= 32 * 1024);
+        // Include the process envelope in the size qualification, not just the Markdown.
+        assert!(serde_json::to_vec(&response).unwrap().len() <= 32 * 1024);
+        let markdown = guide["markdown"].as_str().unwrap();
+        for heading in [
+            "## Discover and read",
+            "## Create",
+            "## Revise against a version",
+            "## Host-derived authorship",
+            "## Errors and repeatability",
+        ] {
+            assert!(markdown.contains(heading), "missing section: {heading}");
+        }
+        for advice in [
+            format!("at most {} entries per page", ports::MAX_PAGE),
+            format!("1 to {} characters", crate::domain::MAX_TITLE),
+            format!("{} KiB of changes", crate::domain::MAX_UPDATE / 1024),
+            format!("{} KiB of text", crate::body::MAX_TEXT_BYTES / 1024),
+            format!("{} KiB Port value bound", ports::PORT_PAYLOAD_BYTES / 1024),
+            format!("more than {} IDs", ports::MAX_VERSION_IDS),
+            "baseVersion set to the returned version".into(),
+            "documents.collection_archived".into(),
+            "documents.principal_not_bound".into(),
+            "Host-derived actor".into(),
+            "provider_error".into(),
+            "details.provider.code".into(),
+            "outcomeUncertain".into(),
+            "Never automatically retry an uncertain command".into(),
+            "a retry duplicates it".into(),
+            "List and reconcile first".into(),
+        ] {
+            assert!(markdown.contains(&advice), "missing guidance: {advice}");
+        }
+        let refused = session
+            .harness
+            .request(
+                "teamarness.port.query.v1",
+                port_envelope("runtime.guide", alice(), json!({"verbose":true})),
+            )
+            .await
+            .unwrap_err();
+        assert!(!refused.retryable());
+        assert!(
+            contract
+                .validate(
+                    ports::CONTRACT,
+                    "runtime.guide",
+                    "request",
+                    &json!({"verbose":true})
+                )
+                .is_err()
         );
         session.harness.shutdown().await.unwrap();
     }

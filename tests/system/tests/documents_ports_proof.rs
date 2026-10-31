@@ -1,7 +1,8 @@
 //! Documents Port Contract through the Host broker: a real SDK consumer Package lists, reads,
 //! revises and observes the real Documents Backend, and every row of the shared merge scenario
 //! table runs through `document.revise`. A 1.0 Consumer revises as the Installation Person; a
-//! 1.1 Consumer bound to a Workspace Agent revises as that Agent.
+//! 1.2 Consumer bound to a Workspace Agent enables Documents, reads its guide, and creates and
+//! revises as that Agent.
 #![cfg(unix)]
 #[allow(dead_code)] // Shared qualification helpers are used by different integration targets.
 mod support;
@@ -31,6 +32,8 @@ const DOCUMENTS: &str = "dev.teamarness.documents";
 const CONSUMER: &str = "dev.teamarness.documents-port-proof";
 /// A canonical token for `(peer 12345, counter 0)`, which no Document here has seen.
 const UNKNOWN_BASE: &str = "AAAAAAAAMDkAAAAA";
+/// A Record ID no Collection here has.
+const UNKNOWN_COLLECTION: &str = "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff";
 
 fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -63,6 +66,16 @@ fn stage_consumer(application: &Path, min_minor: u16, max_minor: u16) {
     let contract = br#"{"schemaVersion":1,"$defs":{},"requests":{},"subscriptions":{}}"#;
     fs::write(root.join("ui/index.js"), ui).unwrap();
     fs::write(root.join("ui-contract.json"), contract).unwrap();
+    let mut ports = vec![
+        json!({"name":"document.list","kind":"query"}),
+        json!({"name":"document.markdown","kind":"query"}),
+        json!({"name":"document.revise","kind":"command"}),
+        json!({"name":"documents.changed","kind":"event"}),
+    ];
+    if min_minor >= 2 {
+        ports.push(json!({"name":"runtime.guide","kind":"query"}));
+        ports.push(json!({"name":"document.create","kind":"command"}));
+    }
     let manifest = json!({
         "schemaVersion":1,"identity":CONSUMER,"version":"1.0.0",
         "presentation":{"displayName":"Documents port proof"},
@@ -71,9 +84,7 @@ fn stage_consumer(application: &Path, min_minor: u16, max_minor: u16) {
         "ui":{"entrypoint":{"path":"ui/index.js","size":ui.len(),"sha256":digest(ui)},"assets":[],
             "contract":{"path":"ui-contract.json","sha256":digest(contract)}},
         "capabilities":[{"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0}],
-        "consumedPorts":[{"identity":DOCUMENTS,"major":1,"minMinor":min_minor,"maxMinor":max_minor,"ports":[
-            {"name":"document.list","kind":"query"},{"name":"document.markdown","kind":"query"},
-            {"name":"document.revise","kind":"command"},{"name":"documents.changed","kind":"event"}]}]
+        "consumedPorts":[{"identity":DOCUMENTS,"major":1,"minMinor":min_minor,"maxMinor":max_minor,"ports":ports}]
     });
     fs::write(
         root.join("teamarness.package.json"),
@@ -301,7 +312,7 @@ fn unique_text(bytes: usize) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
     let application = harness::StagedApplication::with(&documents_stage());
-    // A 1.0 Consumer keeps working against the 1.1 Provider.
+    // A 1.0 Consumer keeps working against the 1.2 Provider.
     stage_consumer(&application.application_path, 0, 0);
     let root = application.root.path();
     let core = open_core(Addressing::Loopback, &root.join("alice-core")).await;
@@ -320,8 +331,10 @@ async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
     let provided = serde_json::to_value(&provider.provided).unwrap();
     assert_eq!(provided[0]["identity"], DOCUMENTS);
     let ports = provided[0]["ports"].as_array().unwrap();
-    assert_eq!(ports.len(), 4);
+    assert_eq!(ports.len(), 6);
     for (name, kind) in [
+        ("runtime.guide", "query"),
+        ("document.create", "command"),
         ("document.list", "query"),
         ("document.markdown", "query"),
         ("document.revise", "command"),
@@ -536,13 +549,15 @@ async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
     core.shutdown().await.unwrap();
 }
 
-/// Verifies: TEAM.SYS.DOCS-R12 — a Consumer bound to a Workspace Agent revises a Document as
-/// that Agent (1.1): the body and Markdown reflect it, `documents.changed` fires, and Core holds
-/// the record signed with the Agent's key.
+/// Verifies: TEAM.SYS.DOCS-R12 — a Consumer bound to a Workspace Agent enables Documents, reads
+/// its guide (1.2), and revises a Document as that Agent (1.1): the body and Markdown reflect it,
+/// and `documents.changed` fires. It then creates a Document as the Agent (1.2) and revises it
+/// from the returned version, and Core holds the create and both edits signed with the Agent's
+/// key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn agent_bound_consumer_revises_a_document_as_the_agent() {
+async fn agent_bound_consumer_creates_and_revises_documents_as_the_agent() {
     let application = harness::StagedApplication::with(&documents_stage());
-    stage_consumer(&application.application_path, 1, 1);
+    stage_consumer(&application.application_path, 2, 2);
     let root = application.root.path();
     let core = open_core(Addressing::Loopback, &root.join("alice-core")).await;
     let workspace = core.create_workspace("Documents agent proof").unwrap();
@@ -609,9 +624,17 @@ async fn agent_bound_consumer_revises_a_document_as_the_agent() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // The Host reads the binding at each dispatch: from now on the Consumer is the Agent.
+    // The Host reads the binding at each dispatch: from now on the Consumer is the Agent. Documents
+    // has a guide, so the bound Agent uses it only once its harness has enabled it.
     core.bind_agent_package(workspace_id, agent, CONSUMER)
         .unwrap();
+    let refused = consumer.call("query", "runtime.guide", json!({})).await;
+    assert_eq!(refused["code"], "port_not_enabled", "{refused}");
+    consumer.value("enable", "", json!({})).await;
+    let guide = consumer.value("query", "runtime.guide", json!({})).await;
+    let guide = guide["markdown"].as_str().unwrap();
+    assert!(guide.contains("## Create"), "{guide}");
+    assert!(guide.contains("baseVersion set to the returned version"));
     let revised = consumer
         .revise(&document, &read["version"], "Drafted by the Scribe\n")
         .await;
@@ -634,19 +657,55 @@ async fn agent_bound_consumer_revises_a_document_as_the_agent() {
     assert_eq!(read["markdown"], "Drafted by the Scribe\n");
     assert_eq!(read["version"], revised["value"]["version"]);
 
-    // Core holds exactly one body edit, signed with the Agent's key.
+    // The Agent creates a Document and gives it content from the returned version.
+    let created = consumer
+        .value(
+            "command",
+            "document.create",
+            json!({"collectionId":collection,"title":"Scribe notes"}),
+        )
+        .await;
+    let notes = created["documentId"].as_str().unwrap().to_owned();
+    let revised = consumer
+        .revise(&notes, &created["version"], "Notes by the Scribe\n")
+        .await;
+    assert_eq!(revised["ok"], true, "{revised}");
+    assert_eq!(revised["value"]["changed"], true);
+    let read = consumer.markdown(&notes).await;
+    assert_eq!(read["markdown"], "Notes by the Scribe\n");
+    let unknown = consumer
+        .call(
+            "command",
+            "document.create",
+            json!({"collectionId":UNKNOWN_COLLECTION,"title":"Lost"}),
+        )
+        .await;
+    assert_eq!(provider_code(&unknown), "documents.unknown_collection");
+    assert_eq!(unknown["uncertain"], false);
+
+    // Core holds the Person's create, the Agent's create, and two body edits, each Agent record
+    // signed with the Agent's key.
     let mut records = core
         .subscribe_records(workspace_id, DOCUMENTS, None)
         .unwrap();
-    let edits: Vec<String> = records
-        .next_page(256)
-        .unwrap()
-        .events
-        .iter()
-        .filter(|event| event.purpose() == "document.edit")
-        .map(|event| event.author().to_string())
-        .collect();
-    assert_eq!(edits, vec![agent_key], "the revise is the Agent's record");
+    let page = records.next_page(256).unwrap();
+    let authors = |purpose: &str| -> Vec<String> {
+        page.events
+            .iter()
+            .filter(|event| event.purpose() == purpose)
+            .map(|event| event.author().to_string())
+            .collect()
+    };
+    assert_eq!(
+        authors("document.create"),
+        vec![core.public_identity().to_string(), agent_key.clone()],
+        "the Person created Q4 and the Agent created its notes"
+    );
+    assert_eq!(
+        authors("document.edit"),
+        vec![agent_key.clone(), agent_key],
+        "both revises are the Agent's records"
+    );
 
     consumer
         .value("close", "documents.changed", json!({}))

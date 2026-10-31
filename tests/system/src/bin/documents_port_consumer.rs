@@ -72,6 +72,8 @@ async fn answer(
         "query" => client.query(teamarness_package_sdk::ports::PortAccess::Declared, CONTRACT, 1, port, body).await,
         "command" => client.command(teamarness_package_sdk::ports::PortAccess::Declared, CONTRACT, 1, port, body).await,
         "available" => client.available(teamarness_package_sdk::ports::PortAccess::Declared, None).await,
+        // A bound harness selects Documents, which has a guide (1.2), before acting as its Agent.
+        "enable" => client.enable(CONTRACT, 1).await.map(|()| json!({})),
         // A call that forges its own actor, which the Host must refuse.
         "forged" => {
             raw.call(

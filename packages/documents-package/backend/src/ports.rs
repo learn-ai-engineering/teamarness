@@ -1,11 +1,13 @@
-//! Documents Port Contract 1.1 (`dev.teamarness.documents`, `ports.json`): another Package lists
-//! Documents, reads one as Canonical Markdown with a version token, revises it against a base
-//! version as the Host-derived actor, and observes changes. This is the agent surface.
+//! Documents Port Contract 1.2 (`dev.teamarness.documents`, `ports.json`): another Package lists
+//! Documents, reads one as Canonical Markdown with a version token, creates one (1.2) and
+//! revises it against a base version as the Host-derived actor, observes changes, and reads the
+//! `runtime.guide` (1.2). This is the agent surface.
 //!
 //! A revise is one Markdown merge from a fresh peer and exactly one `document.edit` record,
 //! through the same validation as an editor session's update. The local Installation Person's
 //! revise takes the editor's write path; a bound Agent's (1.1) is appended with its Principal ID
-//! before the body adopts it (ADR 0030, ADR 0033).
+//! before the body adopts it (ADR 0030, ADR 0033). A create is one `document.create` record with
+//! an empty body, signed the same way (ADR 0038).
 
 use std::collections::BTreeSet;
 
@@ -18,10 +20,11 @@ use teamarness_package_sdk::{BackendError, Context, EventSubscription, event_cha
 use tokio::sync::broadcast;
 
 use super::{
-    BodyEvent, BodyHub, DocumentsActive, LocalWrite, append_identified_edit, drain_local_writes,
-    error, reopen_unopened_edits, require_collection, require_document, stage_local_write,
-    storage_failed,
+    BodyEvent, BodyHub, DocumentsActive, LocalWrite, append_as, append_identified_edit,
+    domain_error, drain_local_writes, error, reopen_unopened_edits, require_collection,
+    require_document, stage_local_write, storage_failed,
 };
+use crate::domain::DomainRecord;
 use crate::markdown;
 
 pub(super) const CONTRACT: &str = "dev.teamarness.documents";
@@ -32,7 +35,7 @@ pub(crate) const MAX_VERSION_IDS: usize = 64;
 const ID_BYTES: usize = 12;
 /// The most entries one `document.list` page holds, and the most Document IDs one
 /// `documents.changed` event names.
-const MAX_PAGE: usize = 64;
+pub(crate) const MAX_PAGE: usize = 64;
 /// The Host's bound on one Port value, `MAX_UI_PAYLOAD_BYTES` in the Package contract crate,
 /// which a test pins this to. A Package depends only on the SDK and the protocol (ARC-10), so
 /// the bound is restated here rather than imported.
@@ -298,15 +301,15 @@ pub(super) struct ReviseRequest {
     markdown: String,
 }
 
-/// Who a revise is written as: the signing key its record names as author and, for an Agent,
-/// the Principal ID Core signs for.
+/// Who a revise or create is written as: the signing key its record names as author and, for an
+/// Agent, the Principal ID Core signs for.
 pub(super) struct Signer {
     identity: String,
     /// `None` for the Installation Person, whom Core signs for by default.
     principal: Option<String>,
 }
 
-/// Turns the Host-authored actor into the signer a revise is written as.
+/// Turns the Host-authored actor into the signer a revise or create is written as.
 ///
 /// A Person must be this Installation. An Agent actor is Host-derived from the calling Package
 /// Instance's Agent Binding (ADR 0030), so it is accepted as given: the record names the Agent's
@@ -417,6 +420,66 @@ pub(super) async fn revise(
         value["version"] = json!(version);
     }
     Ok(value)
+}
+
+// ---------------------------------------------------------------- document.create
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct CreateRequest {
+    collection_id: String,
+    title: String,
+}
+
+/// Creates an empty Document as exactly one `document.create` record signed as `signer`, and
+/// answers with its ID and the version of its genesis, the base for a first revise.
+///
+/// Refusals before the append are certain. Core's `principal_not_bound` is too, because Core
+/// commits nothing; any other failure once the append is requested may have created the
+/// Document, so it is uncertain, and a retry would create a second one.
+pub(super) async fn create(
+    context: &Context<DocumentsActive>,
+    signer: Signer,
+    request: CreateRequest,
+) -> Result<JsonValue, BackendError> {
+    let state = context.state().clone();
+    let collection = request.collection_id.clone();
+    let archived = context
+        .blocking(move |_| {
+            Ok(state
+                .store
+                .collections()
+                .map_err(|_| storage_failed())?
+                .into_iter()
+                .find(|known| known.id == collection)
+                .map(|known| known.archived))
+        })
+        .await?;
+    match archived {
+        None => return Err(error("documents.unknown_collection", false)),
+        Some(true) => return Err(error("documents.collection_archived", false)),
+        Some(false) => {}
+    }
+    let genesis = crate::body::genesis();
+    let version = encode_version(&crate::body::genesis_frontiers(&genesis))
+        .expect("a genesis has one frontier");
+    let record = DomainRecord::document_create(
+        &signer.identity,
+        &request.collection_id,
+        &request.title,
+        genesis,
+    )
+    .map_err(domain_error)?;
+    let created = append_as(context, record, signer.principal.as_deref())
+        .await
+        .map_err(|cause| {
+            if cause.code() == "documents.principal_not_bound" {
+                cause
+            } else {
+                cause.with_outcome_uncertain(true)
+            }
+        })?;
+    Ok(json!({ "documentId": created["id"], "version": version }))
 }
 
 // ---------------------------------------------------------------- documents.changed
