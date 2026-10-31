@@ -428,8 +428,7 @@ pub(crate) fn admit_live_personal(
         .iter()
         .map(|(identity, entry)| (identity.clone(), entry))
         .collect();
-    let mut healthy: BTreeSet<_> = view.keys().cloned().collect();
-    settle_required(&view, providers, &mut healthy);
+    let healthy = healthy(&view, providers);
     let graph = FixedGraph {
         admitted: view
             .into_iter()
@@ -477,16 +476,30 @@ pub(crate) fn admit_live_personal(
     })
 }
 
-/// Resolves `consumed` against `providers`, where every Package in `admitted` is running.
+/// The running Packages whose every required Port resolves, transitively.
+///
+/// A Package whose required Port has become unavailable keeps running but is
+/// not offered as a Provider, exactly as [`admit_live_personal`] treats it.
+pub(crate) fn healthy(
+    running: &View<'_>,
+    providers: &BTreeMap<String, PackageIdentity>,
+) -> BTreeSet<PackageIdentity> {
+    let mut healthy: BTreeSet<_> = running.keys().cloned().collect();
+    settle_required(running, providers, &mut healthy);
+    healthy
+}
+
+/// Resolves `consumed` against `providers`, offering only the `healthy`
+/// Packages of `running` as Providers.
 pub(crate) fn resolve_routes(
     consumed: &[teamarness_package_contract::manifest::ConsumedContract],
     providers: &BTreeMap<String, PackageIdentity>,
-    admitted: &View<'_>,
+    running: &View<'_>,
+    healthy: &BTreeSet<PackageIdentity>,
 ) -> Vec<PortAvailability> {
-    let remaining: BTreeSet<_> = admitted.keys().cloned().collect();
     consumed
         .iter()
-        .map(|request| resolve(request, providers, admitted, &remaining))
+        .map(|request| resolve(request, providers, running, healthy))
         .collect()
 }
 

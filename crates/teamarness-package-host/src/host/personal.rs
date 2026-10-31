@@ -770,6 +770,7 @@ impl PackageHost {
     async fn publish_personal(&self, except: Option<&PackageIdentity>) -> Vec<PackageIdentity> {
         let changed: Vec<(PackageIdentity, Vec<PackageErrorCode>)> = {
             let mut entries = self.inner.personal.write();
+            let healthy;
             let resolved: Vec<_> = {
                 let mut running: View<'_> = self
                     .inner
@@ -786,13 +787,17 @@ impl PackageHost {
                 );
                 let mut providers = self.inner.team.providers.clone();
                 providers.extend(entries.providers.clone());
+                // The same required-Provider health filter as live admission (CR-002):
+                // a Provider that lost a required Port serves no consumer, old or new.
+                healthy = admission::healthy(&running, &providers);
                 entries
                     .packages
                     .iter()
                     .filter(|(identity, _)| Some(*identity) != except)
                     .filter_map(|(identity, package)| {
                         let consumed = &package.admitted.1.manifest.consumed_ports;
-                        let routes = admission::resolve_routes(consumed, &providers, &running);
+                        let routes =
+                            admission::resolve_routes(consumed, &providers, &running, &healthy);
                         (routes != package.routes).then(|| {
                             let missing = consumed
                                 .iter()
@@ -831,11 +836,13 @@ impl PackageHost {
                 })
                 .collect();
             let broker = &self.inner.port_broker;
-            broker.publish(
-                broker
-                    .snapshot()
-                    .with_personal(personal, entries.providers.clone()),
-            );
+            let offered = entries
+                .providers
+                .iter()
+                .filter(|(_, provider)| healthy.contains(*provider))
+                .map(|(contract, provider)| (contract.clone(), provider.clone()))
+                .collect();
+            broker.publish(broker.snapshot().with_personal(personal, offered));
             changed
         };
         let mut data = self.inner.data.lock().await;

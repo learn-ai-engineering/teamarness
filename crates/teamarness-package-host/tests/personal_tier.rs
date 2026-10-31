@@ -1338,3 +1338,113 @@ async fn in_flight_call_keeps_provider_resolved_before_swap() {
     live.assert_team_undisturbed().await;
     live.shutdown().await;
 }
+
+const UPSTREAM: &str = "com.example.upstream";
+
+/// Rewrites one Package Directory's manifest in place.
+fn edit_manifest(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let manifest_path = path.join("teamarness.package.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    edit(&mut manifest);
+    fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+}
+
+/// Makes a Package provide one contract with `ports`, replacing any it had.
+fn provide(path: &Path, contract: &str, ports: serde_json::Value) {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion":1,"$defs":{},"contracts":[{
+            "identity":contract,"major":1,"minor":0,"description":"Fixture contract","ports":ports
+        }]
+    }))
+    .unwrap();
+    fs::write(path.join("ports.json"), &bytes).unwrap();
+    edit_manifest(path, |manifest| {
+        manifest["portContract"] =
+            serde_json::json!({"path":"ports.json","sha256":common::digest(&bytes)});
+    });
+}
+
+/// The consumed-Port routes the authoring catalog shows for `identity`.
+fn catalog_routes(
+    host: &PackageHost,
+    identity: &str,
+) -> Vec<teamarness_package_host::PortAvailability> {
+    host.authoring_catalog()
+        .into_iter()
+        .find(|entry| entry.package.identity.as_str() == identity)
+        .unwrap()
+        .availability
+}
+
+/// Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn provider_losing_required_dependency_is_unavailable_to_existing_and_new_consumers() {
+    let live = Live::open().await;
+    let upstream = live.package("upstream", UPSTREAM, Ports::None);
+    provide(
+        &upstream,
+        UPSTREAM,
+        serde_json::json!([{"name":"value.read","kind":"query","description":"Read",
+            "request":true,"response":true}]),
+    );
+    // The middle Provider requires the upstream contract.
+    let middle = live.package("middle", "com.example.middle", Ports::Provides);
+    edit_manifest(&middle, |manifest| {
+        manifest["consumedPorts"] = serde_json::json!([{
+            "identity":UPSTREAM,"major":1,"minMinor":0,"maxMinor":0,"required":true,
+            "ports":[{"name":"value.read","kind":"query"}]
+        }]);
+    });
+    let consumer = live.package("consumer", "com.example.consumer", Ports::Requires);
+    let late = live.package("late", "com.example.late", Ports::Requires);
+    for (path, identity) in [
+        (&upstream, UPSTREAM),
+        (&middle, "com.example.middle"),
+        (&consumer, "com.example.consumer"),
+    ] {
+        live.install(path, identity).await.unwrap();
+    }
+    let routed = catalog_routes(&live.host, "com.example.consumer");
+    assert_eq!(
+        routed[0].provider.as_ref().map(PackageIdentity::as_str),
+        Some("com.example.middle")
+    );
+
+    live.remove(UPSTREAM).await.unwrap();
+
+    // The middle Provider keeps running, but serves neither the existing consumer...
+    assert_active(&instances(&live.host, "com.example.middle").await, 2);
+    let existing = catalog_routes(&live.host, "com.example.consumer");
+    assert_eq!(existing[0].provider, None, "{existing:?}");
+    assert_eq!(
+        existing[0].unavailable,
+        Some(PackageErrorCode::PortContractMissing)
+    );
+    let consumers = instances(&live.host, "com.example.consumer").await;
+    assert_active(&consumers, 2);
+    let unrouted = mount(&live.host, consumers[0].key.clone()).await;
+    let refused = post(&live.host, &unrouted, "hello").await.unwrap();
+    assert_eq!(refused["error"], "port_unavailable", "{refused}");
+    // ...nor a consumer installed now: both see the same availability.
+    let late_refused = live.install(&late, "com.example.late").await.unwrap_err();
+    assert_eq!(late_refused.code, existing[0].unavailable.unwrap());
+    assert!(instances(&live.host, "com.example.late").await.is_empty());
+
+    live.install(&upstream, UPSTREAM).await.unwrap();
+
+    let restored = catalog_routes(&live.host, "com.example.consumer");
+    assert_eq!(
+        restored[0].provider.as_ref().map(PackageIdentity::as_str),
+        Some("com.example.middle"),
+        "{restored:?}"
+    );
+    let consumers = instances(&live.host, "com.example.consumer").await;
+    let rerouted = mount(&live.host, consumers[0].key.clone()).await;
+    let posted = post(&live.host, &rerouted, "again").await.unwrap();
+    assert_eq!(posted["result"]["accepted"], true, "{posted}");
+    live.install(&late, "com.example.late").await.unwrap();
+    assert_active(&instances(&live.host, "com.example.late").await, 2);
+    live.assert_team_undisturbed().await;
+    live.shutdown().await;
+}
