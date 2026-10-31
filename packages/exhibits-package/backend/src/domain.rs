@@ -39,6 +39,11 @@ pub const READ_PAGE: usize = 500;
 /// or backslash that doubles when written as JSON, the request stays under the 256 KiB Port
 /// payload bound. It is below [`CHUNK_BYTES`], so a written file is always one chunk.
 pub const MAX_WRITE_BYTES: usize = 98_304;
+/// The default `file.text` page, in UTF-8 bytes. Even quote-heavy HTML stays under 16384
+/// characters as JSON, which fits a model's tool result.
+pub const TEXT_PAGE_BYTES: usize = 8_192;
+/// The smallest `file.text` page: one UTF-8 character of any width always fits.
+pub const MIN_TEXT_PAGE_BYTES: usize = 4;
 /// The most `file.put` calls a Consumer should have in flight at once.
 pub const MAX_CONCURRENT_PUTS: usize = 4;
 /// How long a partial upload, or a complete file no Draft references, is kept (24 hours).
@@ -76,6 +81,8 @@ pub enum ExhibitsError {
     /// The assembled file's size or SHA-256 differs from the declared one; nothing was kept.
     ContentMismatch,
     NotFound,
+    /// `file.text` names a file, or an offset, that is not UTF-8 text.
+    NotText,
     InvalidRequest,
     ActorUnauthorized,
     Storage,
@@ -98,6 +105,7 @@ impl ExhibitsError {
             Self::InvalidChunk { .. } => "exhibits.invalid_chunk",
             Self::ContentMismatch => "exhibits.content_mismatch",
             Self::NotFound => "exhibits.not_found",
+            Self::NotText => "exhibits.not_text",
             Self::InvalidRequest => "exhibits.invalid_request",
             Self::ActorUnauthorized => "exhibits.actor_unauthorized",
             Self::Storage => "exhibits.storage_failed",

@@ -444,6 +444,34 @@ impl ExhibitStore {
         Ok((bytes, count))
     }
 
+    /// Reads at most `length` bytes of a complete file from `offset`, and the file's size.
+    ///
+    /// # Errors
+    /// `exhibits.invalid_request` for a malformed hash or an offset past the end,
+    /// `exhibits.not_found` for a file the store does not hold completely, or
+    /// `exhibits.storage_failed`.
+    pub fn read_range(
+        &self,
+        sha256: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Vec<u8>, u64), ExhibitsError> {
+        if !is_sha256(sha256) {
+            return Err(ExhibitsError::InvalidRequest);
+        }
+        let _connection = self.lock();
+        let size = self.complete_size(sha256)?.ok_or(ExhibitsError::NotFound)?;
+        if offset > size {
+            return Err(ExhibitsError::InvalidRequest);
+        }
+        let mut file = fs::File::open(self.complete_path(sha256)).map_err(fault("open_content"))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(fault("seek_content"))?;
+        let mut bytes = vec![0; usize::try_from(length.min(size - offset)).unwrap_or_default()];
+        file.read_exact(&mut bytes).map_err(fault("read_content"))?;
+        Ok((bytes, size))
+    }
+
     /// Creates a Draft, or atomically replaces its title, entry and file list, and returns the
     /// new revision.
     ///

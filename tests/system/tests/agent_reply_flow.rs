@@ -2461,7 +2461,6 @@ fn written(text: &str) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "requires a freshly built external Agent and TEAMARNESS_AGENT_PACKAGE_DIR"]
 async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
     let (endpoint, mut requests, _) = controlled_model().await;
     let app = stage_authoring_application();
     let core = open_core(Addressing::Loopback, &app.root.path().join("core")).await;
@@ -2531,7 +2530,7 @@ async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
     assert_eq!(plan["id"], "plan");
     assert_eq!(plan["revision"], 1);
 
-    // A revision replaces the entry page; reading the stored page back returns its bytes.
+    // A revision replaces the entry page; reading the stored page back returns its text.
     let results = scripted_turn(
         &agent,
         &mut requests,
@@ -2544,8 +2543,8 @@ async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
             ),
             ("exhibits__exhibit_list", json!({})),
             (
-                "exhibits__file_read",
-                json!({"sha256":written(page2)["sha256"],"chunkIndex":0}),
+                "exhibits__file_text",
+                json!({"sha256":written(page2)["sha256"]}),
             ),
         ],
         "revised",
@@ -2562,12 +2561,11 @@ async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
         "{}",
         results[2]
     );
-    assert_eq!(results[3]["chunkCount"], 1, "{}", results[3]);
     assert_eq!(
-        STANDARD
-            .decode(results[3]["data"].as_str().unwrap())
-            .unwrap(),
-        page2.as_bytes()
+        results[3],
+        json!({"text":page2,"size":page2.len()}),
+        "{}",
+        results[3]
     );
 
     // The Exhibits UI sees the Agent's Draft at its new revision.
@@ -2606,7 +2604,7 @@ async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
         "{activity}"
     );
     println!(
-        "agent exhibits timeline: enable -> write x2 -> draft r1 -> list by title -> write -> draft r2 -> read back"
+        "agent exhibits timeline: enable -> write x2 -> draft r1 -> list by title -> write -> draft r2 -> read back as text"
     );
     shutdown(host).await;
     core.shutdown().await.unwrap();

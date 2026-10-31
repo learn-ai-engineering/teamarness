@@ -38,8 +38,8 @@
       } }
   },
   "contracts": [{
-    "identity": "dev.teamarness.exhibits", "major": 1, "minor": 1,
-    "description": "Author Exhibits: static multi-page websites (HTML, CSS, JavaScript, images, media, WebAssembly) that a Person views inside Teamarness. Store each file (file.write for text, file.put for binary), then create or replace a Draft that names them. Call runtime.guide first.",
+    "identity": "dev.teamarness.exhibits", "major": 1, "minor": 2,
+    "description": "Author Exhibits: static multi-page websites (HTML, CSS, JavaScript, images, media, WebAssembly) that a Person views inside Teamarness. Store each file (file.write for text, file.put for binary), then create or replace a Draft that names them; read text back with file.text. Call runtime.guide first.",
     "ports": [
       { "name": "runtime.guide", "kind": "query", "description": "Read this first. Returns how to author an Exhibit as Markdown, plus the enforced limits, the allowed extensions with their media types (lowercase extensions only) and the Exhibit ID pattern. Exhibits bundle every file: no CDN or network, relative links only, one entry page, no workers or nested frames.",
         "request": { "type": "object", "additionalProperties": false },
@@ -93,7 +93,7 @@
           "nextBefore": { "type": "string", "minLength": 1, "maxLength": 128 }
         } }
       },
-      { "name": "exhibit.read", "kind": "query", "description": "Read a Draft's title, entry page, revision, who last updated it (person or agent) and files (path, sha256, size, mediaType), sorted by path, 500 files per page; pass nextOffset back as offset for the next page. Fetch file bytes with file.read. Unknown IDs fail with exhibits.not_found.",
+      { "name": "exhibit.read", "kind": "query", "description": "Read a Draft's title, entry page, revision, who last updated it (person or agent) and files (path, sha256, size, mediaType), sorted by path, 500 files per page; pass nextOffset back as offset for the next page. Read a text file's content with file.text, and binary bytes with file.read. Unknown IDs fail with exhibits.not_found.",
         "request": { "type": "object", "additionalProperties": false, "required": ["exhibitId"], "properties": {
           "exhibitId": { "$ref": "#/$defs/exhibitId" }, "offset": { "type": "integer", "minimum": 0, "maximum": 1000 }
         } },
@@ -106,12 +106,23 @@
           "nextOffset": { "type": "integer", "minimum": 1, "maximum": 1000 }
         } }
       },
-      { "name": "file.read", "kind": "query", "description": "Read one 131072-byte chunk of a stored file as standard base64, with the file's chunkCount, so you can read back or revise content you did not keep. Files not stored completely fail with exhibits.not_found.",
+      { "name": "file.read", "kind": "query", "description": "Read one 131072-byte chunk of a stored file as standard base64, with the file's chunkCount, for binary files or a program that decodes base64. Read text files with file.text instead. Files not stored completely fail with exhibits.not_found.",
         "request": { "type": "object", "additionalProperties": false, "required": ["sha256", "chunkIndex"], "properties": {
           "sha256": { "$ref": "#/$defs/sha256" }, "chunkIndex": { "type": "integer", "minimum": 0, "maximum": 127 }
         } },
         "response": { "type": "object", "additionalProperties": false, "required": ["data", "chunkCount"], "properties": {
           "data": { "type": "string", "maxLength": 174764 }, "chunkCount": { "type": "integer", "minimum": 1, "maximum": 128 }
+        } }
+      },
+      { "name": "file.text", "kind": "query", "description": "Read a stored text file (HTML, CSS, JavaScript, SVG, JSON, Markdown) as plain UTF-8 text, so you can revise content you did not keep. Returns at most maxBytes bytes (default 8192, at most 98304) from offset (default 0), ending on a character boundary, with the file's size; nextOffset is present while more text remains: pass it back as offset. Take each file's sha256 from exhibit.read. Binary files fail with exhibits.not_text (use file.read); files not stored completely fail with exhibits.not_found.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["sha256"], "properties": {
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "offset": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+          "maxBytes": { "type": "integer", "minimum": 4, "maximum": 98304 }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["text", "size"], "properties": {
+          "text": { "type": "string", "maxLength": 98304 }, "size": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+          "nextOffset": { "type": "integer", "minimum": 1, "maximum": 16777216 }
         } }
       },
       { "name": "draft.delete", "kind": "command", "description": "Delete a Draft; deleted is false when it did not exist, so a repeat is safe. Pass expectedRevision to refuse deleting an update you have not seen (exhibits.revision_conflict). Its files stay stored for 24 hours, so recreating it soon needs no upload.",

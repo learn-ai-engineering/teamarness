@@ -7,7 +7,7 @@ use teamarness_package_contract::media_types::MEDIA_TYPES;
 use crate::domain::{
     CHUNK_BYTES, ID_PATTERN, LIST_PAGE, MAX_CONCURRENT_PUTS, MAX_FILE_BYTES, MAX_FILES,
     MAX_ID_CHARS, MAX_MISSING_QUERY, MAX_PATH_BYTES, MAX_TITLE_CHARS, MAX_TOTAL_BYTES,
-    MAX_WRITE_BYTES, READ_PAGE,
+    MAX_WRITE_BYTES, READ_PAGE, TEXT_PAGE_BYTES,
 };
 
 /// The enforced limits, as `runtime.guide` publishes them.
@@ -113,15 +113,27 @@ not form the file and were discarded: upload the whole file again. After an unce
 `file.write`, call it again with the same text. After an uncertain \
 `draft.update`, call `exhibit.read` and compare the revision and files before trying again.
 
-## Reading back
+## Reading back and revising
 
 - `exhibit.list` returns Exhibits newest first, {LIST_PAGE} per page; pass `nextBefore` back \
 as `before` for the next page.
 - `exhibit.read` returns the Draft's entry, title, revision and files, {READ_PAGE} files per \
 page; pass `nextOffset` back as `offset`.
-- `file.read` returns one chunk of a stored file, so you can revise content you did not keep.
+- **Text files:** `file.text` returns a stored file as plain text, {TEXT_PAGE_BYTES} bytes per \
+page by default (`maxBytes` up to {MAX_WRITE_BYTES}). While `nextOffset` is present, pass it \
+back as `offset` for the rest. If you are a model, always read text this way.
+- **Binary files:** `file.read` returns one {CHUNK_BYTES}-byte chunk as base64, for a program \
+that decodes it. `file.text` refuses binary files with `exhibits.not_text`.
 - `draft.delete` removes a Draft. Its files are kept for 24 hours, so recreating it soon \
 needs no upload.
+
+To revise an Exhibit you did not just write:
+
+1. Call `exhibit.read` for its revision and files.
+2. Read only the files you will change with `file.text`.
+3. Write each changed file again with `file.write`. Unchanged files keep their `sha256`.
+4. Call `draft.update` with **every** file, changed or not, and the revision from step 1 as \
+`expectedRevision`. A file you leave out is removed from the Exhibit.
 ",
         max_file = mib(MAX_FILE_BYTES),
         max_total = mib(MAX_TOTAL_BYTES),
@@ -192,6 +204,11 @@ mod tests {
             "never compute a SHA-256 or base64 yourself",
             "at most 98304 bytes of UTF-8",
             "Binary files",
+            "`file.text` returns a stored file as plain text",
+            "8192 bytes per page",
+            "always read text this way",
+            "`exhibits.not_text`",
+            "with **every** file",
             "at most 4 `file.put` calls",
             "files.missing",
             "outcome_unknown",
