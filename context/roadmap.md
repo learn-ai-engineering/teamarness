@@ -70,6 +70,19 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### Agent Doc Exhibit (in progress)
+
+Started on 2026-10-31 on branch `don-smith/agent_doc_exhibit` in the Host and the standalone Agent Package, workstream `agent-doc-exhibit`. A Steward's Agent works with Documents and Exhibits in chat, and the Agent's Configuration moves to its Package page.
+
+- ADR 0038 (accepted 2026-10-31) amends ADR 0033 §1. Documents Port Contract 1.2 adds `document.create`, which a bound Agent may call, and a `runtime.guide`, so Documents is an agent-facing contract under ADR 0035. A create is title-only and returns the version for a first revise. An archived Collection is refused with `documents.collection_archived`.
+- The Agent creates and revises Documents as itself, including Documents a Person created.
+- The Agent stops withholding the Exhibits `file.put` and `file.read` Ports, and publishes small multi-page Exhibits. Before it sends a tool call, it refuses one whose arguments would exceed the turn's remaining message budget, with `agent.tool_arguments_too_large`.
+- The Agent's main view shows Chat only, and its Configuration is the Package's settings view.
+
+**Outcome:** In chat, an Agent creates and revises a Document and publishes an Exhibit that the Steward opens by name, all attributed to the Agent.
+
+**Follow-ups:** a shared, human-curated Exhibit library catalog; larger Exhibits and an archive format; per-Agent turn bounds; and staging the Agent harness for the Host's integration tests.
+
 ### Packagement (complete, verified locally)
 
 Implemented on 2026-10-25 on branch `don-smith/packagement`, workstream `packagement`. ADR 0036 (accepted 2026-10-25) splits Package Admission into a Team tier, fixed at Host open, and a Personal tier that changes while the Host runs. A Team Package never routes to a Personal Provider.
@@ -315,7 +328,7 @@ Start a separate Scope if sustained name-delivery or membership churn becomes an
 
 ### Documents Agent tools and Comments (follow-up)
 
-Identified on 2026-10-25 when rendered Document editing closed. Documents Port Contract 1.1 already lets a bound Workspace Agent list, read, observe and revise Documents (ADR 0033). The Agent Package now supports generic tools, but Documents has no `runtime.guide` and is not yet eligible for Agent discovery. The generic guidance direction is delivered by [ADR 0035](.decisions/0035-agent-controlled-port-discovery.md) and the completed alignment workstream above. [TEAM-DQ10](open-questions.md) retains these Documents follow-ups:
+Identified on 2026-10-25 when rendered Document editing closed. Documents Port Contract 1.1 already lets a bound Workspace Agent list, read, observe and revise Documents (ADR 0033). The Agent Package now supports generic tools. Documents 1.2 adds `runtime.guide` and `document.create` (ADR 0038), so it is eligible for Agent discovery; see **Agent Doc Exhibit** under **Current work**. The generic guidance direction is delivered by [ADR 0035](.decisions/0035-agent-controlled-port-discovery.md) and the completed alignment workstream above. [TEAM-DQ10](open-questions.md) retains these Documents follow-ups:
 
 - Documents guidance and generic Agent tools can follow the ordinary `runtime.guide` convention; no Documents-specific Host adapter is planned.
 - Agent document tools in the standalone Agent Package, built on that guidance. A tool reads before every revise and revises against the version it read (R12).
