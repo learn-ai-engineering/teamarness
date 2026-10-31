@@ -367,7 +367,8 @@ describe("Package page messages", () => {
     await test.act("restart-app");
     const html = test.html();
     expect(html).not.toContain("This Package cannot do that");
-    expect(between(html, "status-message-slot", "role=\"tabpanel\"")).toContain('role="alert" aria-live="assertive"><p>');
+    // The slot shows exactly the restart refusal, not some other error.
+    expect(between(html, "status-message-slot", "role=\"tabpanel\"")).toContain('role="alert" aria-live="assertive"><p>Teamarness refused this Package (restart_failed).</p>');
   });
 });
 
@@ -552,6 +553,9 @@ describe("Package page", () => {
     await test.act("remove");
     expect(test.html()).toContain("Cancel the override? It has not applied yet, so the Team Package Tutorial keeps running. Data is kept.");
     expect(test.html()).not.toContain("after Teamarness restarts. Data is kept.");
+    expect(test.html()).toContain('aria-label="Keep override Tutorial"');
+    expect(test.html()).toContain(">Keep override</button>");
+    expect(test.html()).not.toContain("Keep it");
     await test.act("confirm-remove");
     expect(test.calls).toContain(`remove:${TUTORIAL}`);
     expect(test.management.registrationState(TUTORIAL).feedback?.message)

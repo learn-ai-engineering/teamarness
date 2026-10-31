@@ -475,7 +475,9 @@ describe("persistent Shell frame", () => {
 
     screen.recover.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(screen.innerHTML).toContain("Could not recover Private One.");
+    // The result shows in the section's message area, not in the Package's row.
+    expect(screen.innerHTML).toContain('<div class="status-message status-message--error" role="alert" aria-live="assertive"><p>Private One: Could not recover.</p><button type="button" data-package-failure-action="recover">Retry Recover Backend</button>');
+    expect(screen.innerHTML).not.toContain("package-lifecycle-feedback");
     expect(screen.innerHTML).not.toContain("out of date");
 
     screen.retryLifecycle.click();
@@ -487,9 +489,52 @@ describe("persistent Shell frame", () => {
     expect(test.calls).not.toContain(`recover:${packageKey.packageIdentity}`);
   });
 
+  it("shows Recover and Dispose results in the message area, and the next action clears the last one", async () => {
+    const screen = new SettingsRegion();
+    const test = harness(screen as unknown as HTMLElement, {
+      lifecycle: async (action) => ({ snapshot: packages, failure: action === "dispose" ? "operation" : null }),
+    });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+
+    screen.dispose.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.innerHTML).toContain("<p>Private One: Could not dispose.</p>");
+    expect(screen.innerHTML).toContain(">Retry Dispose</button>");
+
+    // An error stays until the next action, which replaces it with its own result.
+    screen.recover.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.innerHTML).not.toContain("Could not dispose");
+    expect(screen.innerHTML).not.toContain("data-package-failure-action");
+    expect(screen.innerHTML).toContain('<div class="status-message status-message--success" role="status" aria-live="polite"><p>Private One: Recovered.</p></div>');
+
+    test.timers.advance(5_000);
+    expect(screen.innerHTML).not.toContain("Private One: Recovered.");
+  });
+
+  it("replaces a refresh failure message with the result once Package information refreshes", async () => {
+    const screen = new SettingsRegion();
+    const test = harness(screen as unknown as HTMLElement, {
+      lifecycle: async () => ({ snapshot: null, failure: "operation-and-refresh" }),
+    });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(packages);
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+
+    screen.recover.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.innerHTML).toContain("Private One: Could not recover, and Package information could not be refreshed.");
+
+    test.shell.updatePackages({ ...packages, revision: 2 });
+    expect(screen.innerHTML).toContain("<p>Private One: Could not recover.</p>");
+    expect(screen.innerHTML).toContain(">Retry Recover Backend</button>");
+  });
+
   it.each([
-    ["refresh", "Recovered Private One, but Package information could not be refreshed."],
-    ["operation-and-refresh", "Could not recover Private One, and Package information could not be refreshed."],
+    ["refresh", "Private One: Recovered, but Package information could not be refreshed."],
+    ["operation-and-refresh", "Private One: Could not recover, and Package information could not be refreshed."],
   ] as const)("preserves and marks the latest snapshot when lifecycle result is %s", async (failure, wording) => {
     const screen = new SettingsRegion();
     const test = harness(screen as unknown as HTMLElement, {
@@ -1047,7 +1092,14 @@ describe("Package page Configuration tab", () => {
     await test.shell.navigate(configuration);
 
     failing = true;
-    await expect(test.shell.navigate(page)).resolves.toBeUndefined();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(test.shell.navigate(page)).resolves.toBeUndefined();
+      // The failure is not swallowed silently: its reason is logged, without a payload.
+      expect(warn).toHaveBeenCalledWith("Package UI unmount cleanup failed", { reason: "unmount was not acknowledged" });
+    } finally {
+      warn.mockRestore();
+    }
     expect(test.shell.route()).toEqual(page);
     expect(test.frame.packageMount.hidden).toBe(true);
     expect(test.frame.shellScreen.hidden).toBe(false);

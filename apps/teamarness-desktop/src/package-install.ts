@@ -31,6 +31,8 @@ export type RegistrationFeedback = Readonly<{
   message: string;
   failed: boolean;
   restart: boolean;
+  /** A Workspace page Recover or Dispose that failed and can run again from the message. */
+  retry?: "recover" | "dispose";
 }>;
 
 /** The registration actions' state for one identity. */
@@ -210,7 +212,9 @@ export class PackageManagementController {
     if (!feedback || (pending && !feedback.failed)) return renderStatusMessageSlot(null, MESSAGE_DISMISS);
     const restart = feedback.restart && !pending
       ? '<button type="button" data-package-change-restart>Restart Teamarness</button>'
-      : "";
+      : feedback.retry
+        ? `<button type="button" data-package-failure-action="${feedback.retry}">Retry ${feedback.retry === "recover" ? "Recover Backend" : "Dispose"}</button>`
+        : "";
     return renderStatusMessageSlot(
       { message: `${feedback.name}: ${feedback.message}`, failed: feedback.failed },
       MESSAGE_DISMISS,
@@ -254,6 +258,20 @@ export class PackageManagementController {
   public clearMessage(): void {
     if (this.workingRegistration) return;
     this.feedback.clear();
+  }
+
+  /** The message the slot shows now, if any. */
+  public currentMessage(): RegistrationFeedback | null {
+    return this.feedback.current();
+  }
+
+  /**
+   * Shows another Workspace page result, such as Recover or Dispose, in the
+   * same message area. The caller renders again.
+   */
+  public showMessage(feedback: RegistrationFeedback): void {
+    if (this.workingRegistration) return;
+    this.feedback.set(feedback);
   }
 
   /** Dismisses the shown message, for the person's dismiss control. */
@@ -479,6 +497,11 @@ export function registrationRemoveLabel(registration: PackageRegistration, teamR
   return teamRuns ? "Cancel override" : "Remove override";
 }
 
+/** The label that dismisses a removal confirmation: **Keep override** for an override, so it never reads as the opposite of **Cancel override**. */
+export function registrationKeepLabel(registration: PackageRegistration | null): string {
+  return registration?.override ? "Keep override" : "Keep it";
+}
+
 export const OVERRIDE_CANCELLED_COPY = "The override is cancelled. The Team Package keeps running.";
 export const TEAM_ENTRY_REMOVED_COPY = "Removed from this device. The Team Package keeps running.";
 
@@ -600,7 +623,7 @@ function renderRegistration(
   const controls = state.confirming && pending !== "removed"
     ? `<div class="package-remove-confirmation" role="group" aria-label="${escape(`Confirm removing ${name}`)}"><p>${escape(team
       ? teamEntryRemoveQuestion(registration, name, teamRuns)
-      : `Remove ${name} from this device? ${REMOVE_KEEPS_DATA_COPY}`)}</p><div class="package-instance-actions">${action("confirm-remove", removeLabel)}${action("cancel-remove", "Keep it", true)}</div></div>`
+      : `Remove ${name} from this device? ${REMOVE_KEEPS_DATA_COPY}`)}</p><div class="package-instance-actions">${action("confirm-remove", removeLabel)}${action("cancel-remove", registrationKeepLabel(registration), true)}</div></div>`
     : `<div class="package-instance-actions">${buttons}</div>`;
   return `<article class="package-instance" aria-labelledby="package-registration-name-${index}"><div><h4 id="package-registration-name-${index}"><button type="button" class="package-instance-link" data-package-registration-page="${index}" aria-label="${escape(`About ${name}`)}">${escape(name)}</button></h4>${summary}${refused}${pendingNote}</div>${working}${controls}</article>`;
 }

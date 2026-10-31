@@ -443,6 +443,10 @@ describe("registrations that need attention", () => {
     // The Team Package still runs, so cancelling the override needs no restart.
     expect(html).toContain("Cancel the override? It has not applied yet, so the Team Package Tutorial keeps running. Data is kept.");
     expect(html).not.toContain("after Teamarness restarts. Data is kept.");
+    // The pair reads Cancel override / Keep override, never Keep it.
+    expect(html).toContain('aria-label="Keep override Tutorial"');
+    expect(html).toContain(">Keep override</button>");
+    expect(html).not.toContain("Keep it");
     test.controller.dismissFeedback();
     const idle = test.controller.renderRegistrations(pending);
     expect(idle).toContain('data-package-registration-action="restart"');

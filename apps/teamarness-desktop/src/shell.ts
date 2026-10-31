@@ -1,5 +1,5 @@
 import type { PackageHostSnapshot, PackageInstanceKey, PackageManagementBridge, PackageUiView } from "./package-contracts";
-import { PackageManagementController } from "./package-install";
+import { PackageManagementController, type RegistrationFeedback } from "./package-install";
 import { buildPackagePagePresentation, PackagePageController, type PackagePageTab } from "./package-page";
 import type { PackageLifecycleFailure, PackageLifecycleResult } from "./package-shell";
 import type { InstallationPackageVisibility } from "./package-visibility";
@@ -47,7 +47,9 @@ type PackageLifecycleAction = "recover" | "dispose";
 type PackageLifecycleFeedback = Readonly<{
   action: PackageLifecycleAction;
   instance: PackageInstanceKey;
-  failure: PackageLifecycleFailure;
+  /** The Package's name when the action ran. */
+  name: string;
+  failure: PackageLifecycleFailure | null;
 }>;
 
 type WorkspaceActions = Readonly<{
@@ -82,7 +84,10 @@ export class Shell {
   private workspacePresentation: ShellPresentation | null = null;
   private packageSnapshot: PackageHostSnapshot | null = null;
   private packageSnapshotFailed = false;
+  /** The last failed Recover or Dispose, for Retry and for a later successful refresh. */
   private packageLifecycleFeedback: PackageLifecycleFeedback | null = null;
+  /** The message that result put in the Workspace page's message area. */
+  private packageLifecycleMessage: RegistrationFeedback | null = null;
   private observedActiveWorkspaceId: string | null = null;
   private packageActionTargets: readonly PackageInstanceKey[] = [];
   private packagePresentation: PackageNavigationPresentation = { teamPackages: [], privatePackages: [] };
@@ -152,10 +157,12 @@ export class Shell {
     this.packageSnapshot = snapshot;
     this.packageSnapshotFailed = false;
     this.packagePage.snapshotChanged(snapshot);
-    if (this.packageLifecycleFeedback?.failure === "refresh") {
-      this.packageLifecycleFeedback = null;
-    } else if (this.packageLifecycleFeedback?.failure === "operation-and-refresh") {
-      this.packageLifecycleFeedback = { ...this.packageLifecycleFeedback, failure: "operation" };
+    const lifecycle = this.packageLifecycleFeedback;
+    if (lifecycle && (lifecycle.failure === "refresh" || lifecycle.failure === "operation-and-refresh")) {
+      // The refresh worked after all, so only the operation's own result is left to show.
+      this.showPackageLifecycleFeedback(lifecycle.failure === "refresh"
+        ? { ...lifecycle, failure: null }
+        : { ...lifecycle, failure: "operation" });
     }
     this.renderPackageConsumers();
   }
@@ -193,8 +200,9 @@ export class Shell {
       return;
     }
 
-    // A failed unmount still leaves the Shell screen; the Package Shell already reported it.
-    await this.options.packageShell.hide().catch(() => undefined);
+    // A failed unmount still leaves the Shell screen. Only an unacknowledged unmount is
+    // recorded as a UI fault; other cleanup failures are logged here.
+    await this.options.packageShell.hide().catch(warnUnmountFailure);
     if (navigation !== this.navigation) return;
     placePackageMount(this.shellFrame.packageMount, "pane");
     this.shellFrame.packageMount.hidden = true;
@@ -344,7 +352,7 @@ export class Shell {
 
   private deactivatePackage(): void {
     if (this.selectedRoute.kind === "package-instance" || isPackageConfiguration(this.selectedRoute)) {
-      void this.options.packageShell.hide().catch(() => undefined);
+      void this.options.packageShell.hide().catch(warnUnmountFailure);
     }
     placePackageMount(this.shellFrame.packageMount, "pane");
     this.shellFrame.packageMount.hidden = true;
@@ -374,7 +382,6 @@ export class Shell {
       ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packageManagement.renderMessage(this.packageSnapshot)}${this.packageManagement.renderPanel(this.packageSnapshot)}${renderPackageInstanceSettings(
         this.packagePresentation,
         this.packageActionTargets,
-        this.packageLifecycleFeedback,
         this.options.packageVisibility,
       )}${this.packageManagement.renderRegistrations(this.packageSnapshot)}`
       : undefined;
@@ -556,6 +563,8 @@ export class Shell {
         const index = Number(button.dataset.packageVisibilityIndex);
         const instance = this.packageActionTargets[index];
         if (!instance) return;
+        // Toggling is the next action, so an earlier result no longer applies.
+        this.packageManagement.clearMessage();
         this.options.packageVisibility.setHidden(instance, !this.options.packageVisibility.isHidden(instance));
         this.renderPackageConsumers();
         // Re-rendering replaces the buttons, so return keyboard focus to the toggled one.
@@ -603,6 +612,11 @@ export class Shell {
     action: PackageLifecycleAction,
     instance: PackageInstanceKey,
   ): Promise<void> {
+    // A new action replaces the previous result in the message area.
+    this.packageManagement.clearMessage();
+    this.packageLifecycleFeedback = null;
+    this.packageLifecycleMessage = null;
+    const name = this.packageInstanceName(instance);
     const result = action === "recover"
       ? await this.options.packageShell.recoverBackend(instance)
       : await this.options.packageShell.disposeBackend(instance);
@@ -613,10 +627,31 @@ export class Shell {
     if (result.failure === "refresh" || result.failure === "operation-and-refresh") {
       this.packageSnapshotFailed = true;
     }
-    this.packageLifecycleFeedback = result.failure
-      ? { action, instance, failure: result.failure }
-      : null;
+    this.showPackageLifecycleFeedback({ action, instance, name, failure: result.failure });
     this.renderPackageConsumers();
+  }
+
+  /**
+   * Shows a Recover or Dispose result in the Workspace page's message area.
+   * A failed operation keeps what Retry needs; anything else forgets it.
+   */
+  private showPackageLifecycleFeedback(feedback: PackageLifecycleFeedback): void {
+    // A result the person dismissed, or a later action replaced, is not shown again.
+    if (this.packageLifecycleFeedback && this.packageManagement.currentMessage() !== this.packageLifecycleMessage) {
+      this.packageLifecycleFeedback = null;
+      this.packageLifecycleMessage = null;
+      return;
+    }
+    const message = packageLifecycleMessage(feedback);
+    this.packageManagement.showMessage(message);
+    this.packageLifecycleFeedback = feedback.failure === null ? null : feedback;
+    this.packageLifecycleMessage = message;
+  }
+
+  private packageInstanceName(instance: PackageInstanceKey): string {
+    const index = this.packageActionTargets.findIndex((target) => samePackageInstance(target, instance));
+    return packageRows(this.packagePresentation).find(({ actionIndex }) => actionIndex === index)?.name
+      ?? instance.packageIdentity;
   }
 }
 
@@ -713,7 +748,6 @@ function packageButton(
 function renderPackageInstanceSettings(
   presentation: PackageNavigationPresentation,
   packageActionTargets: readonly PackageInstanceKey[],
-  feedback: PackageLifecycleFeedback | null,
   visibility: InstallationPackageVisibility,
 ): string {
   const rows = packageRows(presentation);
@@ -724,12 +758,9 @@ function renderPackageInstanceSettings(
       : "";
     const sourceMarker = `<span class="package-source" aria-label="Package source: ${row.sourceLabel}">${row.sourceLabel}</span>`;
     const instance = packageActionTargets[row.actionIndex];
-    const rowFeedback = instance && feedback && samePackageInstance(instance, feedback.instance)
-      ? renderPackageLifecycleFeedback(row, feedback)
-      : "";
     const visibilityToggle = instance ? packageVisibilityButton(row, visibility.isHidden(instance)) : "";
     return `<article class="package-instance" aria-labelledby="package-instance-name-${row.actionIndex}"><div class="package-instance-summary"><div><h3 id="package-instance-name-${row.actionIndex}"><button type="button" class="package-instance-link" data-package-page-index="${row.actionIndex}" aria-label="${escape(`About ${row.name}`)}">${escape(row.name)}</button></h3><p>${escape(row.availability)}</p>${sourceMarker}${localMarker}</div>${visibilityToggle}</div>
-      ${rowFeedback}${renderPackageInstanceActions(row)}</article>`;
+      ${renderPackageInstanceActions(row)}</article>`;
   }).join("")}</div>`;
 }
 
@@ -738,21 +769,25 @@ function packageVisibilityButton(row: PackageInstancePresentation, hidden: boole
   return `<button type="button" class="package-visibility-toggle" data-package-visibility-index="${row.actionIndex}" aria-pressed="${hidden ? "false" : "true"}" aria-label="${escape(label)}" title="${escape(label)}">${hidden ? EYE_CLOSED_ICON : EYE_OPEN_ICON}</button>`;
 }
 
-function renderPackageLifecycleFeedback(
-  row: PackageInstancePresentation,
-  feedback: PackageLifecycleFeedback,
-): string {
-  const verb = feedback.action === "recover" ? "recover" : "dispose of";
-  const past = feedback.action === "recover" ? "Recovered" : "Disposed of";
+/** The message area's copy for a Recover or Dispose result; the slot names the Package. */
+function packageLifecycleMessage(feedback: PackageLifecycleFeedback): RegistrationFeedback {
+  const verb = feedback.action === "recover" ? "recover" : "dispose";
+  const past = feedback.action === "recover" ? "Recovered" : "Disposed";
   const refreshFailed = feedback.failure === "refresh" || feedback.failure === "operation-and-refresh";
   const operationFailed = feedback.failure === "operation" || feedback.failure === "operation-and-refresh";
   const message = operationFailed
-    ? `Could not ${verb} ${row.name}${refreshFailed ? ", and Package information could not be refreshed" : ""}.`
-    : `${past} ${row.name}, but Package information could not be refreshed.`;
-  const retry = operationFailed
-    ? `<button type="button" data-package-failure-action="${feedback.action}">Retry ${escape(lifecycleActionLabel(feedback.action))}</button>`
-    : "";
-  return `<div class="package-lifecycle-feedback" role="alert"><p>${escape(message)}</p>${retry}</div>`;
+    ? `Could not ${verb}${refreshFailed ? ", and Package information could not be refreshed" : ""}.`
+    : refreshFailed
+      ? `${past}, but Package information could not be refreshed.`
+      : `${past}.`;
+  return {
+    identity: feedback.instance.packageIdentity,
+    name: feedback.name,
+    message,
+    failed: feedback.failure !== null,
+    restart: false,
+    ...(operationFailed ? { retry: feedback.action } : {}),
+  };
 }
 
 function renderPackageSnapshotFailure(failed: boolean, hasSnapshot: boolean): string {
@@ -785,12 +820,19 @@ function lifecycleActionAllowed(row: PackageInstancePresentation, action: string
   return row.canRecover && (action === "recover" || (action === "dispose" && row.canDispose));
 }
 
-function isLifecycleAction(action: string | undefined): action is PackageLifecycleAction {
-  return action === "recover" || action === "dispose";
+/**
+ * Logs a failed Package UI unmount for diagnosis; the person sees no change.
+ * It logs an Error's message or a bridge error's code, never a payload.
+ */
+function warnUnmountFailure(error: unknown): void {
+  const code = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+    ? error.code
+    : null;
+  console.warn("Package UI unmount cleanup failed", { reason: error instanceof Error ? error.message : code ?? typeof error });
 }
 
-function lifecycleActionLabel(action: PackageLifecycleAction): string {
-  return action === "recover" ? "Recover Backend" : "Dispose";
+function isLifecycleAction(action: string | undefined): action is PackageLifecycleAction {
+  return action === "recover" || action === "dispose";
 }
 
 function samePackageInstance(left: PackageInstanceKey, right: PackageInstanceKey): boolean {

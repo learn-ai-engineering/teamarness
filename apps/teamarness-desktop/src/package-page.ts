@@ -9,6 +9,7 @@ import {
   packageRefusalMessage,
   pendingRestartChange,
   pendingRestartCopy,
+  registrationKeepLabel,
   registrationRemoveLabel,
   REMOVE_KEEPS_DATA_COPY,
   teamEntryRemoveQuestion,
@@ -68,6 +69,8 @@ export type PackagePagePresentation = Readonly<{
   personal: boolean;
   /** The label of Remove: **Cancel override** for an override that has not applied yet. */
   removeLabel: string;
+  /** The label that dismisses the removal confirmation: **Keep override** for an override. */
+  keepLabel: string;
   /** The question before removing this Team Package identity's file entry, when it has one to remove. */
   teamEntryRemoveQuestion: string | null;
   /** What waits for a restart, when the registration file changed while Teamarness ran. */
@@ -367,6 +370,7 @@ export function buildPackagePagePresentation(
     trustLabel: entry ? TRUST_LABELS[entry.trust] : null,
     personal,
     removeLabel: registration ? registrationRemoveLabel(registration, teamRuns) : "Remove",
+    keepLabel: registrationKeepLabel(registration ?? null),
     teamEntryRemoveQuestion: teamEntry && pending !== "removed" ? teamEntryRemoveQuestion(registration, name, teamRuns) : null,
     pending: pending ? pendingRestartCopy(pending, name) : null,
     directory: personal ? registration.directory : null,
@@ -510,7 +514,7 @@ function renderManage(presentation: PackagePagePresentation, state: RenderState,
   if (registration.confirming && controls.includes("remove")) {
     const question = presentation.teamEntryRemoveQuestion
       ?? `Remove ${presentation.name} from this device? It stops in all your Workspaces. ${REMOVE_KEEPS_DATA_COPY}`;
-    return manage(`<div class="package-remove-confirmation" role="group" aria-label="${escape(`Confirm removing ${presentation.name}`)}"><p>${escape(question)}</p><div class="package-instance-actions">${button("confirm-remove", false, removeLabel)}${button("cancel-remove", true)}</div></div>`);
+    return manage(`<div class="package-remove-confirmation" role="group" aria-label="${escape(`Confirm removing ${presentation.name}`)}"><p>${escape(question)}</p><div class="package-instance-actions">${button("confirm-remove", false, removeLabel)}${button("cancel-remove", true, presentation.keepLabel)}</div></div>`);
   }
   const buttons = controls.map((action) =>
     action === "remove" ? button("remove", true, removeLabel) : button(action, action === "dispose")).join("");
