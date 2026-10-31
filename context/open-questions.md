@@ -104,12 +104,12 @@ A Member chooses a Unicode Workspace Person Name at create/join and may rename o
 
 ## TEAM-DQ10 - How Packages offer agent-facing guidance for their Ports
 
-**Status:** guidance resolved by ADR 0035 (2026-10-25); Documents tools and Comments remain follow-ups.
+**Status:** guidance resolved by ADR 0035 (2026-10-25); Comments delivered by Documents 1.3 (2026-11-01); Documents tools remain a follow-up.
 
 **Decision:** Packages publish an ordinary bounded `runtime.guide` query, versioned with their Port Contract. Admission classifies its closed empty request and bounded Markdown response without executing a Provider. The generic harness retrieves complete schemas through package-ports 2.0 metadata. The Steward selects contracts in the Agent Package UI; the Host owns self-scoped, default-empty enablement and enforces it even on declared bound-Agent access. No Provider-specific Host adapter or Package-owned Agent-management screen is required.
 
 **Current milestone:** locally verified complete on 2026-10-30, with Host `6073dd0` and paired standalone Agent `7cf7358`. Complete metadata, runtime discovery, Host-owned selections, both access views, lifecycle revocation and Conversations guidance pass automated integration, independent review and provenance audit. Don reports successful rebuilt-Agent guidance, enable/disable, binding/unbinding and restart retention with his real model. He accepts automated Provider stop/recover evidence in place of a desktop check unavailable in the current UI. Per-Agent restart with unresolved commands remains a Packagement integration check. Exhibits already supplies a conforming guide; file tooling remains excluded.
 
-**Still open:** standalone Agent tools for Documents, Agent mentions, and Comment Ports. Documents 1.1 permits Agent revise, but has no Comment operations. The read-before-revise and live-editor check remain separate follow-ups, not delivered here.
+**Still open:** standalone Agent tools for Documents. Agent mentions and Comment Ports are delivered by Documents 1.3 (better-doc-agent, 2026-11-01). The read-before-revise and live-editor check remain separate follow-ups, not delivered here.
 
 **Owner:** agent-port-discovery for the generic interface; later Scope for Documents tools and Comments.

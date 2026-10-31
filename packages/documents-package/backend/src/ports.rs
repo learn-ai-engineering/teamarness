@@ -1,7 +1,8 @@
 //! Documents Port Contract 1.3 (`dev.teamarness.documents`, `ports.json`): another Package lists
 //! Documents, reads one as Canonical Markdown with a version token, creates one (1.2) and
 //! revises it against a base version as the Host-derived actor, observes changes, and reads the
-//! `runtime.guide` (1.2). This is the agent surface.
+//! `runtime.guide` (1.2). It also reads the Workspace-wide Comment feed and a Comment's thread,
+//! and adds a Comment as the Host-derived actor (1.3). This is the agent surface.
 //!
 //! A revise is one Markdown merge from a fresh peer and exactly one `document.edit` record,
 //! through the same validation as an editor session's update. The local Installation Person's

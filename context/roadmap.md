@@ -70,6 +70,21 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### Better Doc Agent (complete, verified locally)
+
+Implemented on 2026-11-01 on branch `don-smith/better_doc_agent` in the Host and on `main` in the standalone Agent Package, workstream `better-doc-agent`. A Person asks a Workspace Agent for changes from inside a Document by @mentioning it in a Comment.
+
+- Documents Port Contract 1.3 (additive) adds Comment Ports. `comments.changed` is a live event without a payload. `comment.changes` is a Workspace-wide Comment feed with an epoch and a cursor. `comment.thread` returns a Comment's thread together with its Document. `comment.add` adds a Comment as the Host-derived actor, so an Agent's Comment is signed with the Agent's key (`TEAM.SYS.DOCS-R07`, `R12`).
+- The Agent harness follows Comment mentions with the same rules as Conversations mentions. Only a Person's Comment that mentions the Agent triggers it, and each trigger is acted on once. The Agent posts one reply under the triggering Comment and never resolves it. The model reads and revises the Document with its ordinary Documents tools. `comment.add` is withheld from the model.
+- Documents highlights only the open Document, and Conversations highlights the selected Channel, both in the Shell's nav style. Documents restores the open Document and its scroll position after a Package switch. Conversations keeps a draft for each Channel, and Agent chat keeps its draft. This state is held in each Package Backend's memory while the app runs.
+- Agent chat renders Markdown with a copy of the Conversations renderer. Both copies now render tables.
+
+Manual checks AC1–AC14 passed with a real model on 2026-11-01. Verify passed on 2026-11-01 with no P0 or P1 findings. The production-relay test `three_profiles_converge_after_late_admission` fails in this environment with and without the change. Accepted tech debt is recorded in DELTA-020.
+
+**Outcome:** A Person @mentions an Agent in a Document Comment. The Agent revises the Document and replies in the thread, even while another Package is selected.
+
+**Follow-ups:** Agent-to-Agent mentions, with skill-guided loop limits; the items in DELTA-020.
+
 ### Agent Doc Exhibit (complete, verified locally)
 
 Started on 2026-10-31 on branch `don-smith/agent_doc_exhibit` in the Host and the standalone Agent Package, workstream `agent-doc-exhibit`. A Steward's Agent works with Documents and Exhibits in chat, and the Agent's Configuration moves to its Package page.
@@ -337,7 +352,7 @@ Identified on 2026-10-25 when rendered Document editing closed. Documents Port C
 
 - Documents guidance and generic Agent tools can follow the ordinary `runtime.guide` convention; no Documents-specific Host adapter is planned.
 - Agent document tools in the standalone Agent Package, built on that guidance. A tool reads before every revise and revises against the version it read (R12).
-- Agent mentions and Comment Ports for Documents. The Documents Port Contract has no Comment operations today.
+- Agent mentions and Comment Ports for Documents: delivered by Documents 1.3 (see **Better Doc Agent** under **Current work**).
 - A developer check once tools exist: an Agent revises a Document that a Member has open, and the change appears live.
 
 ### Documents editor maintenance (unscheduled)

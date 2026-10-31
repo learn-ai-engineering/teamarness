@@ -74,7 +74,6 @@ These are not delivered:
 - folder mapping;
 - formatting beyond the baseline body schema (R13), such as tables, images, task lists or underline;
 - exact text-range Comment anchors (Comments quote excerpts, R07);
-- agent-signed revisions;
 - document-level permissions beyond Canonical Membership;
 - log compaction;
 - a Core document capability family.
