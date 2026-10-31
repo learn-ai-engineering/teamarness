@@ -1,8 +1,9 @@
 import { describePackageError, isAbortError, isPackageRequestError, packageErrorCode } from "@teamarness/package-ui-sdk";
 import type { TypedPackageClient } from "@teamarness/package-ui-sdk";
 import type {
-  BacklogContract, Epic, Names, Principal, Priority, Snapshot, Status, Ticket, TicketSummary,
+  BacklogContract, Draft, Epic, Names, Principal, Priority, RememberedState, Snapshot, Status, Ticket, TicketSummary,
 } from "./contract.generated";
+import { MAX_DRAFTS, draftOf, hasChanges, restoreEdit } from "./remembered";
 
 export type Filters = Readonly<{ priority: Priority | null; status: Status | null }>;
 
@@ -37,6 +38,14 @@ export type DetailState = Readonly<{
 export type NamesState = Readonly<{ available: boolean; cursor: string; principals: readonly Principal[] }>;
 
 export type AssigneeOption = Readonly<{ value: string; label: string }>;
+
+/** Where the controller reports changes to what it remembers across a Package switch. */
+export type RememberSink = {
+  /** Something remembered changed; the sink reads `rememberedState()` when it sends. */
+  changed(): void;
+  /** A Ticket's draft was saved or cancelled and must be forgotten at once. */
+  clear(key: string): void;
+};
 
 /** The value the assignee dropdown uses for "Unassigned". */
 export const UNASSIGNED = "";
@@ -150,10 +159,56 @@ export class BacklogController {
   private loadSequence = 0;
   /** The listed version the newest `backlog.ticket.get` was sent for. */
   private requestedVersion: string | null = null;
+  /** Drafts of Tickets not open in the pane (or not loaded yet), oldest first, by Ticket ID. */
+  private readonly drafts = new Map<string, Draft>();
+  /** Set once remembered expansion is restored, so the first listing does not open every Epic. */
+  private expansionRestored = false;
+  private readonly remember: RememberSink | undefined;
 
-  constructor(client: TypedPackageClient<BacklogContract>, announce: () => void) {
+  constructor(client: TypedPackageClient<BacklogContract>, announce: () => void, remember?: RememberSink) {
     this.client = client;
     this.announce = announce;
+    this.remember = remember;
+  }
+
+  /**
+   * Restores remembered state: filters, show-archived, expansion, the drafts, and the selection.
+   * The selected Ticket's draft reopens in edit mode once the Ticket is read.
+   */
+  restore(state: RememberedState): void {
+    if (this.disposed) return;
+    this.drafts.clear();
+    for (const [key, draft] of Object.entries(state.drafts)) {
+      if (!key.startsWith("new:")) this.drafts.set(key, draft);
+    }
+    this.expansionRestored = true;
+    this.update({
+      showArchived: state.showArchived,
+      filters: { priority: state.filters.priority, status: state.filters.status },
+      expandedEpicIds: new Set(state.expandedEpicIds),
+    });
+    this.selectTicket(state.selectedTicketId ?? null);
+  }
+
+  /**
+   * The state to remember, and the draft key that must survive trimming (the open Ticket's). The
+   * open edit is remembered even without changes, so edit mode survives; other drafts only exist
+   * when they hold changes.
+   */
+  rememberedState(): { state: RememberedState; keep: string | null } {
+    const { detail, filters, showArchived, expandedEpicIds, selectedTicketId } = this._state;
+    const drafts: Record<string, Draft> = Object.fromEntries(this.drafts);
+    const edit = detail?.edit ?? null;
+    if (detail !== null && edit !== null) drafts[detail.ticketId] = draftOf(edit);
+    const state: RememberedState = {
+      ...(selectedTicketId === null ? {} : { selectedTicketId }),
+      editing: edit !== null,
+      filters: { priority: filters.priority, status: filters.status },
+      showArchived,
+      expandedEpicIds: [...expandedEpicIds],
+      drafts,
+    };
+    return { state, keep: selectedTicketId };
   }
 
   get state(): ControllerState {
@@ -187,8 +242,8 @@ export class BacklogController {
   applySnapshot(snapshot: Snapshot): void {
     if (this.disposed) return;
     const expanded = new Set(this._state.expandedEpicIds);
-    // The first listing opens every Epic so Ticket titles show at once.
-    if (!this._state.loaded) for (const epic of snapshot.epics) expanded.add(epic.epicId);
+    // The first listing opens every Epic so Ticket titles show at once, unless expansion was remembered.
+    if (!this._state.loaded && !this.expansionRestored) for (const epic of snapshot.epics) expanded.add(epic.epicId);
     if (this.pendingEpicId !== null && snapshot.epics.some((epic) => epic.epicId === this.pendingEpicId)) {
       expanded.add(this.pendingEpicId);
       this.pendingEpicId = null;
@@ -299,12 +354,16 @@ export class BacklogController {
     this.update({ expandedEpicIds: new Set([...this._state.expandedEpicIds, epicId]) });
   }
 
-  /** Selects a Ticket and reads it in full. Choosing another Ticket discards an unsaved edit. */
+  /**
+   * Selects a Ticket and reads it in full. An unsaved edit with changes on the Ticket left behind
+   * is kept as its draft and reopens when that Ticket is selected again.
+   */
   selectTicket(ticketId: string | null): void {
     if (ticketId === this._state.selectedTicketId && (ticketId === null || this._state.detail !== null)) {
       this.update({ error: null });
       return;
     }
+    this.stashEdit();
     this.loadSequence++;
     this.requestedVersion = null;
     this.update({
@@ -330,10 +389,11 @@ export class BacklogController {
     this.update({ detail: { ...detail, edit: { ...detail.edit, draft: { ...detail.edit.draft, ...changes } } } });
   }
 
-  /** Discards the draft. */
+  /** Discards the draft, here and in the remembered state. */
   cancelEdit(): void {
     const detail = this._state.detail;
     if (detail?.edit == null) return;
+    this.forgetDraft(detail.ticketId);
     this.update({ detail: { ...detail, edit: null }, error: null });
   }
 
@@ -380,6 +440,7 @@ export class BacklogController {
       }
       return false;
     }
+    this.forgetDraft(ticketId);
     const current = this._state.detail;
     if (current?.ticketId === ticketId) {
       // `base` now holds the saved values; read the Ticket again for its attribution.
@@ -481,7 +542,9 @@ export class BacklogController {
       if (sequence !== this.loadSequence || detail?.ticketId !== ticketId) return;
       // An answer older than what the pane already shows (a save just landed) changes nothing.
       if (detail.ticket !== null && detail.ticket.version > ticket.version) return;
-      this.update({ detail: { ...detail, ticket } });
+      const stored = detail.edit === null ? this.drafts.get(ticketId) : undefined;
+      if (stored !== undefined) this.drafts.delete(ticketId);
+      this.update({ detail: { ...detail, ticket, edit: stored === undefined ? detail.edit : restoreEdit(stored, ticket) } });
     } catch (error) {
       if (isAbortError(error) || this.disposed || sequence !== this.loadSequence) return;
       this.requestedVersion = null;
@@ -504,6 +567,26 @@ export class BacklogController {
     }
   }
 
+  /** Keeps the open edit, when it changes anything, as the draft of the Ticket being left. */
+  private stashEdit(): void {
+    const detail = this._state.detail;
+    if (detail?.edit == null) return;
+    const draft = draftOf(detail.edit);
+    if (!hasChanges(draft)) return;
+    this.drafts.delete(detail.ticketId);
+    this.drafts.set(detail.ticketId, draft);
+    // The newest drafts win; the open Ticket's own draft is added on top when remembered.
+    for (const key of this.drafts.keys()) {
+      if (this.drafts.size < MAX_DRAFTS) break;
+      this.drafts.delete(key);
+    }
+  }
+
+  private forgetDraft(ticketId: string): void {
+    this.drafts.delete(ticketId);
+    this.remember?.clear(ticketId);
+  }
+
   private ticket(ticketId: string): TicketSummary | null {
     return this._state.snapshot.tickets.find((ticket) => ticket.ticketId === ticketId) ?? null;
   }
@@ -524,7 +607,12 @@ export class BacklogController {
 
   private update(changes: Partial<ControllerState>): void {
     if (this.disposed) return;
-    this._state = { ...this._state, ...changes };
+    const before = this._state;
+    this._state = { ...before, ...changes };
+    const after = this._state;
+    if (before.showArchived !== after.showArchived || before.filters !== after.filters
+      || before.expandedEpicIds !== after.expandedEpicIds || before.selectedTicketId !== after.selectedTicketId
+      || before.detail?.edit !== after.detail?.edit) this.remember?.changed();
     this.announce();
   }
 }

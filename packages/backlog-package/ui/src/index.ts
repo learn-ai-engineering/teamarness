@@ -5,11 +5,15 @@ import "./styles.css";
 import type { PackageMountContext, PackageUnmount } from "@teamarness/package-ui-sdk";
 import type { BacklogContract } from "./contract.generated";
 import { BacklogController } from "./controller";
+import { RememberedStateSync, loadRemembered } from "./remembered";
 import { BacklogView } from "./view";
 
 export type { BacklogContract };
 
-/** Mounts the Backlog: the Epic tree with its filters, and the selected Ticket with its attribution. */
+/**
+ * Mounts the Backlog: the Epic tree with its filters, and the selected Ticket with its attribution.
+ * Selection, filters, expansion and drafts are restored from the Backend's remembered state.
+ */
 export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
   const client = typedPackageClient<BacklogContract>(context.client);
   const cleanupKit = installPackageUiKit(context.root);
@@ -25,12 +29,16 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   let nameSubscription: Awaited<ReturnType<typeof client.subscribe>> | null = null;
   let nameRetryDelay = 1000;
   let view: BacklogView | undefined;
-  const controller = new BacklogController(client, () => {
+  // The sync reads the controller only when it sends, after the controller exists.
+  const remembered: RememberedStateSync = new RememberedStateSync(client, () => controller.rememberedState());
+  const controller: BacklogController = new BacklogController(client, () => {
     if (!disposed) view?.render();
-  });
+  }, remembered);
   try {
     view = new BacklogView(context.root, controller, context.package.displayName);
     view.render();
+    const state = await loadRemembered(client);
+    if (state !== null && !disposed) controller.restore(state);
     // The Backend sends the current snapshot at once, then a new one after every change.
     const subscription = await client.subscribe("backlog.changes", {}, (snapshot) => {
       if (!disposed) controller.applySnapshot(snapshot);
@@ -72,6 +80,8 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
       if (disposed) return;
       disposed = true;
       if (nameRetry) clearTimeout(nameRetry);
+      // Send a pending change before the controller stops, so a Package switch keeps the draft.
+      await remembered.close();
       controller.dispose();
       view?.dispose();
       try {
@@ -88,6 +98,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   } catch (error) {
     disposed = true;
     if (nameRetry) clearTimeout(nameRetry);
+    void remembered.close();
     controller.dispose();
     view?.dispose();
     cleanupStyles();
