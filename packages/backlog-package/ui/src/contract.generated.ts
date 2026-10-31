@@ -40,6 +40,7 @@ export type Names = {
 
 export type Principal = {
   readonly "fingerprint": string;
+  readonly "identity": string;
   readonly "kind": "person" | "agent";
   readonly "name": string | null;
   readonly "principalId": PrincipalId;

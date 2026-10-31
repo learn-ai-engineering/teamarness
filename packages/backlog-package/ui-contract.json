@@ -252,6 +252,7 @@
       "additionalProperties": false,
       "required": [
         "principalId",
+        "identity",
         "kind",
         "name",
         "fingerprint"
@@ -259,6 +260,10 @@
       "properties": {
         "principalId": {
           "$ref": "#/$defs/principalId"
+        },
+        "identity": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         },
         "kind": {
           "type": "string",

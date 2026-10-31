@@ -4,6 +4,7 @@
 pub(crate) mod migration;
 pub mod projection;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -81,6 +82,38 @@ pub struct TicketView {
     pub create_at: u64,
     pub last_editor: String,
     pub last_at: u64,
+}
+
+/// One stored sealed record that projects state: applied or waiting for its target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedRow {
+    pub record_id: String,
+    pub order_key: String,
+    pub author: String,
+    pub purpose: String,
+    pub signature: String,
+    pub sealed: Vec<u8>,
+}
+
+/// One async lock per Ticket, so a stale check and the append it guards are never interleaved
+/// with another local change to the same Ticket.
+#[derive(Debug, Clone, Default)]
+pub struct TicketLocks {
+    locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl TicketLocks {
+    /// Waits for and holds the lock of `ticket` until the guard drops.
+    pub async fn lock(&self, ticket: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(ticket.to_owned())
+            .or_default()
+            .clone();
+        lock.lock_owned().await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +240,100 @@ impl BacklogStore {
             .map(|ticket| ticket_view(projection, id, ticket)))
     }
 
+    /// Clears the delivery cursor, after the host reported it invalid; the next session
+    /// replays from the beginning, which record identity deduplicates.
+    ///
+    /// # Errors
+    ///
+    /// Storage failure.
+    pub fn reset_cursor(&self) -> Result<(), StoreError> {
+        self.lock()?
+            .conn
+            .execute("UPDATE metadata SET cursor=NULL WHERE singleton=1", [])
+            .map(|_| ())
+            .map_err(rerr)
+    }
+
+    /// Whether any stored record was quarantined rather than applied or waiting.
+    ///
+    /// # Errors
+    ///
+    /// Storage failure.
+    pub fn has_projection_warnings(&self) -> Result<bool, StoreError> {
+        self.lock()?
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM records WHERE quarantine_code IS NOT NULL AND quarantine_code<>?1)",
+                [WAITING],
+                |row| row.get(0),
+            )
+            .map_err(rerr)
+    }
+
+    /// Every stored record that is applied or waiting, in ingestion order: the records to open
+    /// again after a restart to rebuild titles, bodies and the waiting set.
+    ///
+    /// # Errors
+    ///
+    /// Storage failure.
+    pub fn sealed_rows(&self) -> Result<Vec<SealedRow>, StoreError> {
+        let inner = self.lock()?;
+        let mut statement = inner
+            .conn
+            .prepare(
+                "SELECT record_id,order_key,author,purpose,signature,sealed_record FROM records WHERE quarantine_code IS NULL OR quarantine_code=?1 ORDER BY ingestion_ordinal",
+            )
+            .map_err(rerr)?;
+        let rows = statement
+            .query_map([WAITING], |row| {
+                Ok(SealedRow {
+                    record_id: row.get(0)?,
+                    order_key: row.get(1)?,
+                    author: row.get(2)?,
+                    purpose: row.get(3)?,
+                    signature: row.get(4)?,
+                    sealed: row.get(5)?,
+                })
+            })
+            .map_err(rerr)?;
+        rows.collect::<Result<_, _>>().map_err(rerr)
+    }
+
+    /// Applies an opened stored record again. Its persisted effect is unchanged, since applying
+    /// a record twice changes nothing; its title or body returns to memory, and a record still
+    /// waiting for its target waits in memory again, so the target's arrival releases it.
+    ///
+    /// Returns `false` when the canonical bytes do not decode to the row's kind.
+    ///
+    /// # Errors
+    ///
+    /// Storage failure; nothing was committed and the in-memory projection is reloaded.
+    pub fn reapply(&self, row: &SealedRow, canonical: &[u8]) -> Result<bool, StoreError> {
+        let record = match DomainRecord::decode(canonical) {
+            Ok(record) if record.kind() == row.purpose => record,
+            _ => return Ok(false),
+        };
+        let mut guard = self.lock()?;
+        let inner = &mut *guard;
+        let outcome = inner
+            .projection
+            .apply(&row.record_id, &row.order_key, &row.author, &record);
+        let result = (|| {
+            let tx = inner.conn.transaction().map_err(rerr)?;
+            commit_outcome(&tx, &inner.projection, &row.record_id, outcome)?;
+            tx.commit().map_err(|_| StoreError::UncertainOutcome)
+        })();
+        if result.is_err() {
+            let texts = inner.projection.texts().clone();
+            let mut reloaded = Projection::default();
+            if load(&inner.conn, &mut reloaded).is_ok() {
+                *reloaded.texts_mut() = texts;
+                inner.projection = reloaded;
+            }
+        }
+        result.map(|()| true)
+    }
+
     /// Record ids waiting for a target, with that target, from SQLite.
     ///
     /// # Errors
@@ -303,40 +430,15 @@ fn ingest_in(
         Ok(record) if record.kind() != incoming.purpose => {
             quarantine(&tx, incoming.record_id, "purpose_mismatch")?
         }
-        Ok(record) => match projection.apply(
-            incoming.record_id,
-            incoming.order_key,
-            incoming.author,
-            &record,
-        ) {
-            Outcome::Quarantined(code) => quarantine(&tx, incoming.record_id, code)?,
-            Outcome::Waiting { target } => {
-                wait(&tx, incoming.record_id, &target)?;
-                IngestResult::Waiting(target)
-            }
-            Outcome::Applied {
-                touched,
-                released,
-                rewaiting,
-            } => {
-                for entity in &touched {
-                    persist(&tx, projection, entity).map_err(rerr)?;
-                }
-                for id in &released {
-                    tx.execute("DELETE FROM waiting_for_target WHERE record_id=?1", [id])
-                        .map_err(rerr)?;
-                    tx.execute(
-                        "UPDATE records SET quarantine_code=NULL WHERE record_id=?1",
-                        [id],
-                    )
-                    .map_err(rerr)?;
-                }
-                for (id, target) in &rewaiting {
-                    wait(&tx, id, target)?;
-                }
-                IngestResult::Applied
-            }
-        },
+        Ok(record) => {
+            let outcome = projection.apply(
+                incoming.record_id,
+                incoming.order_key,
+                incoming.author,
+                &record,
+            );
+            commit_outcome(&tx, projection, incoming.record_id, outcome)?
+        }
     };
     tx.execute(
         "UPDATE metadata SET cursor=COALESCE(?1,cursor),next_ingestion_ordinal=?2 WHERE singleton=1",
@@ -345,6 +447,44 @@ fn ingest_in(
     .map_err(rerr)?;
     tx.commit().map_err(|_| StoreError::UncertainOutcome)?;
     Ok(result)
+}
+
+/// Persists what one projection apply did: touched entities, released and rewaiting records.
+fn commit_outcome(
+    tx: &Transaction<'_>,
+    projection: &Projection,
+    record_id: &str,
+    outcome: Outcome,
+) -> Result<IngestResult, StoreError> {
+    Ok(match outcome {
+        Outcome::Quarantined(code) => quarantine(tx, record_id, code)?,
+        Outcome::Waiting { target } => {
+            wait(tx, record_id, &target)?;
+            IngestResult::Waiting(target)
+        }
+        Outcome::Applied {
+            touched,
+            released,
+            rewaiting,
+        } => {
+            for entity in &touched {
+                persist(tx, projection, entity).map_err(rerr)?;
+            }
+            for id in &released {
+                tx.execute("DELETE FROM waiting_for_target WHERE record_id=?1", [id])
+                    .map_err(rerr)?;
+                tx.execute(
+                    "UPDATE records SET quarantine_code=NULL WHERE record_id=?1",
+                    [id],
+                )
+                .map_err(rerr)?;
+            }
+            for (id, target) in &rewaiting {
+                wait(tx, id, target)?;
+            }
+            IngestResult::Applied
+        }
+    })
 }
 
 fn quarantine(tx: &Transaction<'_>, id: &str, code: &str) -> Result<IngestResult, StoreError> {
@@ -850,6 +990,143 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Reopens the store at `path` and applies every stored record again from `opened`, the
+    /// canonical bytes a record log `open` returns for each record id.
+    fn reopen_and_rehydrate(
+        path: &std::path::Path,
+        opened: &std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> BacklogStore {
+        let store = BacklogStore::open(path).unwrap();
+        for row in store.sealed_rows().unwrap() {
+            assert!(store.reapply(&row, &opened[&row.record_id]).unwrap());
+        }
+        store
+    }
+
+    // Verifies: TEAM.SYS.BACKLOG-R10 — titles and bodies come back from sealed rows after a
+    // restart, and only the newest title wins whatever order the rows are reopened in.
+    #[test]
+    fn rehydration_rebuilds_titles_and_bodies_from_sealed_rows() {
+        let fixture = fixture();
+        create_epic_and_ticket(&fixture.store);
+        let rename = DomainRecord::epic_rename(ALICE, 30, &id(1), "Launch v2").unwrap();
+        let retitle = DomainRecord::ticket_update(
+            BOB,
+            40,
+            &id(2),
+            TicketChanges {
+                title: Some("Renamed ticket".into()),
+                ..TicketChanges::default()
+            },
+        )
+        .unwrap();
+        ingest(&fixture.store, 3, ALICE, &rename);
+        ingest(&fixture.store, 4, BOB, &retitle);
+        let before = fixture.store.ticket(&id(2)).unwrap().unwrap();
+        drop(fixture.store);
+
+        let mut opened = std::collections::BTreeMap::new();
+        opened.insert(
+            id(1),
+            DomainRecord::epic_create(ALICE, 10, "Launch")
+                .unwrap()
+                .encode(),
+        );
+        opened.insert(
+            id(2),
+            DomainRecord::ticket_create(
+                ALICE,
+                20,
+                &id(1),
+                SECRET_TITLE,
+                SECRET_BODY,
+                Status::Ready,
+                Priority::High,
+            )
+            .unwrap()
+            .encode(),
+        );
+        opened.insert(id(3), rename.encode());
+        opened.insert(id(4), retitle.encode());
+        let store = reopen_and_rehydrate(&fixture.path, &opened);
+        assert_eq!(store.ticket(&id(2)).unwrap().unwrap(), before);
+        assert_eq!(
+            store.ticket(&id(2)).unwrap().unwrap().title.as_deref(),
+            Some("Renamed ticket")
+        );
+        assert_eq!(
+            store.ticket(&id(2)).unwrap().unwrap().body.as_deref(),
+            Some(SECRET_BODY)
+        );
+        assert_eq!(
+            store.epics().unwrap()[0].title.as_deref(),
+            Some("Launch v2")
+        );
+        assert!(!store.has_projection_warnings().unwrap());
+    }
+
+    // Verifies: TEAM.SYS.BACKLOG-R03 — a record still waiting when the store closed applies
+    // when its target arrives after the restart.
+    #[test]
+    fn a_waiting_record_applies_after_a_restart_when_its_target_arrives() {
+        let fixture = fixture();
+        let update = DomainRecord::ticket_update(
+            BOB,
+            40,
+            &id(2),
+            TicketChanges {
+                status: Some(Status::Done),
+                body: Some("Waiting body".into()),
+                ..TicketChanges::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ingest(&fixture.store, 4, BOB, &update),
+            IngestResult::Waiting(id(2))
+        );
+        drop(fixture.store);
+        let mut opened = std::collections::BTreeMap::new();
+        opened.insert(id(4), update.encode());
+        let store = reopen_and_rehydrate(&fixture.path, &opened);
+        assert_eq!(store.waiting().unwrap(), vec![(id(4), id(2))]);
+        create_epic_and_ticket(&store);
+        assert!(store.waiting().unwrap().is_empty());
+        let ticket = store.ticket(&id(2)).unwrap().unwrap();
+        assert_eq!(ticket.status, Status::Done);
+        assert_eq!(ticket.body.as_deref(), Some("Waiting body"));
+        assert_eq!(ticket.version, order(4));
+    }
+
+    #[test]
+    fn quarantined_records_raise_a_warning_and_the_cursor_resets() {
+        let fixture = fixture();
+        create_epic_and_ticket(&fixture.store);
+        assert!(!fixture.store.has_projection_warnings().unwrap());
+        let forged = DomainRecord::ticket_archive(ALICE, 30, &id(2)).unwrap();
+        ingest(&fixture.store, 3, BOB, &forged);
+        assert!(fixture.store.has_projection_warnings().unwrap());
+        assert_eq!(fixture.store.sealed_rows().unwrap().len(), 2);
+        fixture.store.reset_cursor().unwrap();
+        assert_eq!(fixture.store.cursor().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_ticket_lock_is_held_until_its_guard_drops() {
+        let locks = TicketLocks::default();
+        let guard = locks.lock("a").await;
+        let other = locks.lock("b").await;
+        drop(other);
+        let waiting = {
+            let locks = locks.clone();
+            tokio::spawn(async move { drop(locks.lock("a").await) })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(guard);
+        waiting.await.unwrap();
     }
 
     #[test]
