@@ -35,12 +35,15 @@ pub const LIST_PAGE: usize = 64;
 /// The most files one `exhibit.read` page returns. A full page at the path bound stays well
 /// under the 256 KiB Port payload bound.
 pub const READ_PAGE: usize = 500;
-/// The largest `file.write` text, in UTF-8 bytes (96 KiB). Even when every character is a quote
-/// or backslash that doubles when written as JSON, the request stays under the 256 KiB Port
-/// payload bound. It is below [`CHUNK_BYTES`], so a written file is always one chunk.
+/// The largest `file.write` text, in UTF-8 bytes (96 KiB). Text holds no C0 control character
+/// but tab, line feed, form feed and carriage return ([`is_text`]), so even when every character is a
+/// quote or backslash that doubles when written as JSON, a request or `file.text` page stays under
+/// the 256 KiB Port payload bound. It is below [`CHUNK_BYTES`], so a written file is always one
+/// chunk.
 pub const MAX_WRITE_BYTES: usize = 98_304;
-/// The default `file.text` page, in UTF-8 bytes. Even quote-heavy HTML stays under 16384
-/// characters as JSON, which fits a model's tool result.
+/// The default `file.text` page, in UTF-8 bytes. Ordinary HTML, CSS and JavaScript stay well
+/// under 16384 characters as JSON, which fits a model's tool result; only text made almost
+/// entirely of quotes or backslashes doubles to the cap.
 pub const TEXT_PAGE_BYTES: usize = 8_192;
 /// The smallest `file.text` page: one UTF-8 character of any width always fits.
 pub const MIN_TEXT_PAGE_BYTES: usize = 4;
@@ -53,6 +56,15 @@ pub const GC_GRACE_MS: i64 = 24 * 60 * 60 * 1000;
 pub const MAX_MISSING_IN_ERROR: usize = 32;
 /// The Exhibit ID pattern, as published in `runtime.guide` and `ports.json`.
 pub const ID_PATTERN: &str = "^[a-z0-9]+(-[a-z0-9]+)*$";
+
+/// Whether `text` is Exhibit text: no C0 control character but tab, line feed, form feed and
+/// carriage return, so JSON writes each character in at most two bytes per UTF-8 byte.
+#[must_use]
+pub fn is_text(text: &str) -> bool {
+    !text
+        .chars()
+        .any(|c| c.is_ascii_control() && !matches!(c, '\t' | '\n' | '\x0c' | '\r' | '\x7f'))
+}
 
 /// Why a request was refused, as an `exhibits.*` code with bounded details.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +93,8 @@ pub enum ExhibitsError {
     /// The assembled file's size or SHA-256 differs from the declared one; nothing was kept.
     ContentMismatch,
     NotFound,
-    /// `file.text` names a file, or an offset, that is not UTF-8 text.
+    /// `file.write` text, or the file or offset `file.text` names, is not text: not UTF-8, or it
+    /// holds a C0 control character other than tab, line feed, form feed or carriage return.
     NotText,
     InvalidRequest,
     ActorUnauthorized,

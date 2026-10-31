@@ -15,8 +15,8 @@ use teamarness_package_sdk::{
 use tokio::sync::broadcast;
 
 use crate::domain::{
-    ExhibitsError, LIST_PAGE, MAX_WRITE_BYTES, MIN_TEXT_PAGE_BYTES, TEXT_PAGE_BYTES, rfc3339,
-    validate_chunk_header,
+    ExhibitsError, LIST_PAGE, MAX_WRITE_BYTES, MIN_TEXT_PAGE_BYTES, TEXT_PAGE_BYTES, is_text,
+    rfc3339, validate_chunk_header,
 };
 use crate::guide;
 use crate::store::{
@@ -347,6 +347,9 @@ async fn file_write(
     if request.text.len() > MAX_WRITE_BYTES {
         return Err(ExhibitsError::TooLarge { limit: "text" }.into());
     }
+    if !is_text(&request.text) {
+        return Err(ExhibitsError::NotText.into());
+    }
     let size = request.text.len();
     let sha256 = on_store(&context, move |store| {
         store.write_whole(request.text.as_bytes())
@@ -516,6 +519,9 @@ async fn file_text(
         }
         Err(_) => return Err(ExhibitsError::NotText.into()),
     };
+    if !is_text(&text) {
+        return Err(ExhibitsError::NotText.into());
+    }
     let next = offset + text.len() as u64;
     let mut answer = json!({ "text": text, "size": size });
     if next < size {

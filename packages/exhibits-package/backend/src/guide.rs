@@ -79,7 +79,9 @@ Write text files with `file.write`. Send binary files with `file.put`.
 with the whole file as `text`. It returns the file's `sha256` and `size`; use that `sha256` \
 in `draft.update`. If you are a model, always use `file.write` for text: never compute a \
 SHA-256 or base64 yourself. `text` is at most {MAX_WRITE_BYTES} bytes of UTF-8 \
-(`exhibits.too_large` otherwise), so split larger code or data into several files. Writing \
+(`exhibits.too_large` otherwise), so split larger code or data into several files. Control \
+characters other than tab, line feed, form feed and carriage return are refused with \
+`exhibits.not_text`. Writing \
 the same text again is safe and returns the same `sha256`.
 - **Binary files** (images, fonts, media, WebAssembly), or any file a program uploads:
    1. Compute its SHA-256 (lowercase hex) and size.

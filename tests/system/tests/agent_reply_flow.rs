@@ -2241,7 +2241,8 @@ async fn documents_ui(client: &ConversationClient<'_>, operation: &str, payload:
     .unwrap()
 }
 
-/// Verifies AC2–AC4 end to end: a bound Agent, scripted only at the model, enables Documents,
+/// Verifies: TEAM.SYS.DOCS-R12
+/// Workstream AC2–AC4, end to end: a bound Agent, scripted only at the model, enables Documents,
 /// reads its guide, creates and revises a Document, and revises a Document the Person created.
 /// Core signs the Agent's create and both edits with the Agent's key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -2455,7 +2456,8 @@ fn written(text: &str) -> Value {
     json!({"sha256": sha256_hex(text.as_bytes()), "size": text.len()})
 }
 
-/// Verifies AC5–AC6 end to end: a bound Agent, scripted only at the model, enables Exhibits,
+/// Verifies: TEAM.SYS.PKG-R18
+/// Workstream AC5–AC6, end to end: a bound Agent, scripted only at the model, enables Exhibits,
 /// writes two linked pages as plain text with `file.write` (Exhibits 1.1), creates a Draft from
 /// the returned hashes, finds it by title, revises it, and reads a stored page back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -2610,7 +2612,8 @@ async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
     core.shutdown().await.unwrap();
 }
 
-/// Verifies AC7 end to end: a `file.put` whose arguments exceed the turn's budget is refused
+/// Verifies: TEAM.SYS.PKG-R18
+/// Workstream AC7, end to end: a `file.put` whose arguments exceed the turn's budget is refused
 /// before dispatch, nothing is stored, the stored history carries a placeholder, and the turn
 /// continues to its reply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]

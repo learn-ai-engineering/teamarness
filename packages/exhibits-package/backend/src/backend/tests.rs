@@ -839,7 +839,8 @@ fn port_contract_1_1_is_additive_over_1_0() {
 }
 
 // Verifies: TEAM.SYS.PKG-R18 — 1.2 keeps every 1.1 Port, kind and schema and adds file.text;
-// only exhibit.read and file.read change their description, to point text reads at file.text.
+// only exhibit.read and file.read change their description, to point text reads at file.text,
+// and file.write's names the control characters it refuses.
 #[test]
 fn port_contract_1_2_is_additive_over_1_1() {
     assert_additive(
@@ -847,7 +848,7 @@ fn port_contract_1_2_is_additive_over_1_1() {
         include_bytes!("../../../ports.json"),
         (1, 2),
         1,
-        &["exhibit.read", "file.read"],
+        &["exhibit.read", "file.read", "file.write"],
     );
 }
 
@@ -940,6 +941,10 @@ async fn file_text_refuses_binary_unknown_and_strangers() {
     let binary = session
         .upload(&agent(), &[0x89, b'P', b'N', b'G', 0xff, 0xfe])
         .await;
+    // Valid UTF-8, but a file of zeros is not text: JSON would write each byte as six.
+    let nul = session.upload(&agent(), &[0; 64]).await;
+    // An offset inside a character starts no text.
+    let accented = session.upload(&agent(), "é".as_bytes()).await;
     let text = session
         .port("file.write", &agent(), json!({"text":"abc"}))
         .await
@@ -952,6 +957,8 @@ async fn file_text_refuses_binary_unknown_and_strangers() {
             json!({"sha256":text,"offset":4}),
             "exhibits.invalid_request",
         ),
+        (json!({"sha256":nul}), "exhibits.not_text"),
+        (json!({"sha256":accented,"offset":1}), "exhibits.not_text"),
     ] {
         assert_eq!(
             code(session.port("file.text", &agent(), request).await),
@@ -1075,7 +1082,7 @@ async fn file_write_stores_text_as_an_uploaded_file() {
 }
 
 // Verifies: TEAM.SYS.PKG-R18 — text over the bound is refused with exhibits.too_large and
-// nothing is stored; another Installation's Person is refused as for file.put.
+// nothing is stored; control characters are refused with exhibits.not_text; another Installation's Person is refused as for file.put.
 #[tokio::test]
 async fn file_write_refuses_oversized_text_and_strangers() {
     let mut session = start().await;
@@ -1087,6 +1094,22 @@ async fn file_write_refuses_oversized_text_and_strangers() {
         .unwrap_err();
     assert_eq!(error.code(), "exhibits.too_large");
     assert_eq!(error.details()["limit"], "text");
+    // Control characters other than tab, line feed, form feed and carriage return are not
+    // text; those four are.
+    for (text, expected) in [
+        ("a\u{0}b", Some("exhibits.not_text")),
+        ("\u{1b}[0m", Some("exhibits.not_text")),
+        ("a\tb\r\n\u{c}", None),
+    ] {
+        let answer = session
+            .port("file.write", &agent(), json!({"text":text}))
+            .await;
+        assert_eq!(
+            answer.err().map(|error| error.code().to_owned()).as_deref(),
+            expected,
+            "{text:?}"
+        );
+    }
     assert_eq!(
         session
             .port(

@@ -58,7 +58,7 @@
         } },
         "response": { "type": "object", "additionalProperties": false, "required": ["complete"], "properties": { "complete": { "type": "boolean" } } }
       },
-      { "name": "file.write", "kind": "command", "description": "Store one whole text file (HTML, CSS, JavaScript, SVG, JSON, Markdown) by sending its content as text, at most 98304 bytes of UTF-8 (exhibits.too_large otherwise; split larger files). Returns its sha256 and size: pass that sha256 with the file's path to draft.update. Never compute hashes or base64 yourself. Repeating the same text is safe and returns the same sha256. Use file.put only for binary files or when a program computes the hash.",
+      { "name": "file.write", "kind": "command", "description": "Store one whole text file (HTML, CSS, JavaScript, SVG, JSON, Markdown) by sending its content as text, at most 98304 bytes of UTF-8 (exhibits.too_large otherwise; split larger files). Control characters other than tab and line breaks fail with exhibits.not_text. Returns its sha256 and size: pass that sha256 with the file's path to draft.update. Never compute hashes or base64 yourself. Repeating the same text is safe. Use file.put only for binary files or when a program computes the hash.",
         "request": { "type": "object", "additionalProperties": false, "required": ["text"], "properties": {
           "text": { "type": "string", "maxLength": 98304 }
         } },
@@ -114,7 +114,7 @@
           "data": { "type": "string", "maxLength": 174764 }, "chunkCount": { "type": "integer", "minimum": 1, "maximum": 128 }
         } }
       },
-      { "name": "file.text", "kind": "query", "description": "Read a stored text file (HTML, CSS, JavaScript, SVG, JSON, Markdown) as plain UTF-8 text, so you can revise content you did not keep. Returns at most maxBytes bytes (default 8192, at most 98304) from offset (default 0), ending on a character boundary, with the file's size; nextOffset is present while more text remains: pass it back as offset. Take each file's sha256 from exhibit.read. Binary files fail with exhibits.not_text (use file.read); files not stored completely fail with exhibits.not_found.",
+      { "name": "file.text", "kind": "query", "description": "Read a stored text file (HTML, CSS, JavaScript, SVG, JSON, Markdown) as plain UTF-8 text, so you can revise content you did not keep. Returns at most maxBytes bytes (default 8192, at most 98304) from offset (default 0), ending on a character boundary, with the file's size; nextOffset is present while more text remains: pass it back as offset. Take each file's sha256 from exhibit.read. Binary content fails with exhibits.not_text (use file.read); files not stored completely fail with exhibits.not_found.",
         "request": { "type": "object", "additionalProperties": false, "required": ["sha256"], "properties": {
           "sha256": { "$ref": "#/$defs/sha256" },
           "offset": { "type": "integer", "minimum": 0, "maximum": 16777216 },
