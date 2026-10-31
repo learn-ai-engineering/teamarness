@@ -1,0 +1,108 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "recordId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "principalId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "identity": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "version": { "type": "string", "pattern": "^[0-9a-f]{82}$" },
+    "cursor": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "time": { "type": "integer", "minimum": 0, "maximum": 253402300799999 },
+    "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "body": { "type": "string", "maxLength": 65536 },
+    "status": { "type": "string", "enum": ["not_ready", "ready", "in_progress", "done"] },
+    "priority": { "type": "string", "enum": ["high", "medium", "low"] },
+    "assignee": { "anyOf": [{ "$ref": "#/$defs/principalId" }, { "type": "null" }] },
+    "epic": { "type": "object", "additionalProperties": false, "required": ["epicId", "title", "archived"], "properties": {
+      "epicId": { "$ref": "#/$defs/recordId" },
+      "title": { "$ref": "#/$defs/title" },
+      "archived": { "type": "boolean" }
+    } },
+    "ticketSummary": { "type": "object", "additionalProperties": false, "required": ["ticketId", "epicId", "title", "status", "priority", "assignee", "archived", "version"], "properties": {
+      "ticketId": { "$ref": "#/$defs/recordId" },
+      "epicId": { "$ref": "#/$defs/recordId" },
+      "title": { "$ref": "#/$defs/title" },
+      "status": { "$ref": "#/$defs/status" },
+      "priority": { "$ref": "#/$defs/priority" },
+      "assignee": { "$ref": "#/$defs/assignee" },
+      "archived": { "type": "boolean" },
+      "version": { "$ref": "#/$defs/version" }
+    } },
+    "ticket": { "type": "object", "additionalProperties": false, "required": ["ticketId", "epicId", "title", "body", "status", "priority", "assignee", "archived", "version", "creator", "createdAt", "lastEditor", "lastAt"], "properties": {
+      "ticketId": { "$ref": "#/$defs/recordId" },
+      "epicId": { "$ref": "#/$defs/recordId" },
+      "title": { "$ref": "#/$defs/title" },
+      "body": { "$ref": "#/$defs/body" },
+      "status": { "$ref": "#/$defs/status" },
+      "priority": { "$ref": "#/$defs/priority" },
+      "assignee": { "$ref": "#/$defs/assignee" },
+      "archived": { "type": "boolean" },
+      "version": { "$ref": "#/$defs/version" },
+      "creator": { "$ref": "#/$defs/identity" },
+      "createdAt": { "$ref": "#/$defs/time" },
+      "lastEditor": { "$ref": "#/$defs/identity" },
+      "lastAt": { "$ref": "#/$defs/time" }
+    } },
+    "versionResult": { "type": "object", "additionalProperties": false, "required": ["version"], "properties": {
+      "version": { "$ref": "#/$defs/version" }
+    } }
+  },
+  "contracts": [{
+    "identity": "dev.teamarness.backlog", "major": 1, "minor": 0,
+    "description": "The Workspace Backlog of Epics and Tickets. Agents and the local Person list Epics and Tickets, read a Ticket, create a Ticket in an existing Epic, and change a Ticket's title, body, status or priority against its version.",
+    "ports": [
+      { "name": "runtime.guide", "kind": "query", "description": "Read the Backlog guide: what Epics and Tickets are, the statuses and priorities, what you can and cannot change, how to save against a version, and the limits.",
+        "request": { "type": "object", "additionalProperties": false },
+        "response": { "type": "object", "additionalProperties": false, "required": ["markdown"], "properties": {
+          "markdown": { "type": "string", "maxLength": 32768 }
+        } }
+      },
+      { "name": "ticket.list", "kind": "query", "description": "List the Backlog's Epics and Ticket summaries without bodies, Epics first, in creation order. Filter by epicId, status or priority; archived items are omitted unless includeArchived is true. Pass nextCursor as cursor for the next page. Errors: backlog.not_found, backlog.invalid_cursor.",
+        "request": { "type": "object", "additionalProperties": false, "properties": {
+          "epicId": { "$ref": "#/$defs/recordId" },
+          "status": { "$ref": "#/$defs/status" },
+          "priority": { "$ref": "#/$defs/priority" },
+          "includeArchived": { "type": "boolean" },
+          "cursor": { "$ref": "#/$defs/cursor" }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["epics", "tickets"], "properties": {
+          "epics": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/epic" } },
+          "tickets": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/ticketSummary" } },
+          "nextCursor": { "$ref": "#/$defs/cursor" }
+        } }
+      },
+      { "name": "ticket.get", "kind": "query", "description": "Read one Ticket in full: title, Markdown body, status, priority, assignee, archived, version, and who created and last changed it. Pass its version as baseVersion to ticket.update. Errors: backlog.not_found.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["ticketId"], "properties": {
+          "ticketId": { "$ref": "#/$defs/recordId" }
+        } },
+        "response": { "$ref": "#/$defs/ticket" }
+      },
+      { "name": "ticket.create", "kind": "command", "description": "Create a Ticket in an existing, non-archived Epic, signed by the caller's bound Agent or the local Person. status defaults to not_ready and priority to medium. Errors: backlog.not_found, backlog.epic_archived, backlog.invalid, backlog.too_large. Every accepted create makes a new Ticket: never retry an uncertain create without listing first.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["epicId", "title"], "properties": {
+          "epicId": { "$ref": "#/$defs/recordId" },
+          "title": { "$ref": "#/$defs/title" },
+          "body": { "$ref": "#/$defs/body" },
+          "status": { "$ref": "#/$defs/status" },
+          "priority": { "$ref": "#/$defs/priority" }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["ticketId", "version"], "properties": {
+          "ticketId": { "$ref": "#/$defs/recordId" },
+          "version": { "$ref": "#/$defs/version" }
+        } }
+      },
+      { "name": "ticket.update", "kind": "command", "description": "Change a Ticket's title, body, status or priority, sending only the changed fields and the version you read as baseVersion. A base older than the current version is refused with backlog.stale_version, whose details hold the current Ticket. Other errors: backlog.not_found, backlog.invalid, backlog.too_large.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["ticketId", "baseVersion"], "properties": {
+          "ticketId": { "$ref": "#/$defs/recordId" },
+          "baseVersion": { "$ref": "#/$defs/version" },
+          "title": { "$ref": "#/$defs/title" },
+          "body": { "$ref": "#/$defs/body" },
+          "status": { "$ref": "#/$defs/status" },
+          "priority": { "$ref": "#/$defs/priority" }
+        } },
+        "response": { "$ref": "#/$defs/versionResult" }
+      },
+      { "name": "backlog.changed", "kind": "event", "description": "Notice that the Backlog may have changed: an empty, live-only event that may coalesce, with no initial event or replay. List or read again on receipt and after reconnecting.",
+        "event": { "type": "object", "additionalProperties": false }
+      }
+    ]
+  }]
+}

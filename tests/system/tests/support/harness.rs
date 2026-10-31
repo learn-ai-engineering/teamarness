@@ -654,6 +654,54 @@ pub fn stage_package_with(root: &Path, stage: &PackageStage) -> PathBuf {
     application
 }
 
+/// Stages the real Backlog manifest, UI contract, Port contract and Backend, with a placeholder
+/// UI, as the application's only Package, and returns the application directory.
+#[allow(dead_code)] // Only the Backlog targets use it.
+pub fn stage_backlog(root: &Path) -> PathBuf {
+    const BACKLOG: &str = "dev.teamarness.backlog";
+    let application = root.join("application");
+    let source = workspace_root().join("packages/backlog-package");
+    let package = application.join(BACKLOG);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(source.join("teamarness.package.json")).unwrap()).unwrap();
+    let backend = fs::read(env!("CARGO_BIN_EXE_backlog-backend-under-test")).unwrap();
+    let backend_path = package.join(manifest["backends"][0]["path"].as_str().unwrap());
+    fs::create_dir_all(backend_path.parent().unwrap()).unwrap();
+    fs::write(&backend_path, &backend).unwrap();
+    fs::set_permissions(&backend_path, fs::Permissions::from_mode(0o700)).unwrap();
+    manifest["backends"][0]["size"] = serde_json::json!(backend.len());
+    manifest["backends"][0]["sha256"] = serde_json::json!(digest(&backend));
+    let ui = b"export function mount() { return async () => {}; }";
+    let css = b"";
+    fs::create_dir_all(package.join("ui")).unwrap();
+    fs::write(package.join("ui/index.js"), ui).unwrap();
+    fs::write(package.join("ui/style.css"), css).unwrap();
+    manifest["ui"]["entrypoint"]["size"] = serde_json::json!(ui.len());
+    manifest["ui"]["entrypoint"]["sha256"] = serde_json::json!(digest(ui));
+    manifest["ui"]["assets"][0]["size"] = serde_json::json!(css.len());
+    manifest["ui"]["assets"][0]["sha256"] = serde_json::json!(digest(css));
+    let contract = fs::read(source.join("ui-contract.json")).unwrap();
+    fs::write(package.join("ui-contract.json"), &contract).unwrap();
+    manifest["ui"]["contract"]["sha256"] = serde_json::json!(digest(&contract));
+    let ports = fs::read(source.join("ports.json")).unwrap();
+    fs::write(package.join("ports.json"), &ports).unwrap();
+    manifest["portContract"]["sha256"] = serde_json::json!(digest(&ports));
+    fs::write(
+        package.join("teamarness.package.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        application.join("application-packages.v1.json"),
+        serde_json::to_vec(
+            &serde_json::json!({ "schemaVersion": 1, "packages": [{ "directory": BACKLOG }] }),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    application
+}
+
 /// Stages the real Exhibits manifest, contracts and Backend into `application`, with a
 /// placeholder UI. The caller registers it.
 #[allow(dead_code)] // Only the Exhibits and Agent qualification targets use it.

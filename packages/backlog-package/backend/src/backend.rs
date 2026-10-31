@@ -18,6 +18,7 @@ use teamarness_package_sdk::capabilities::record_log::{
     Availability, Cursor, OpenResult, RecordEvent, RecordLog, RecordLogSink, SessionOptions,
     SyncState, SyncWarning, run_session,
 };
+use teamarness_package_sdk::ports::PortActor;
 use teamarness_package_sdk::{
     BackendError, CancellationToken, Context, Empty, Router, event_channel,
 };
@@ -30,6 +31,11 @@ use crate::domain::{
 use crate::store::{
     BacklogStore, Incoming, IngestResult, SealedRow, StoreError, TicketLocks, TicketView,
 };
+
+#[path = "guide.rs"]
+mod guide;
+#[path = "ports.rs"]
+mod ports;
 
 /// How many distinct synchronization warning codes are remembered at a time.
 const MAX_WARNINGS: usize = 8;
@@ -363,7 +369,8 @@ fn parse_priority(value: Option<&str>) -> Result<Option<Priority>, BackendError>
 }
 
 /// Who a record is written as: the signing key the record names and, for an Agent, the
-/// Principal Core signs for. UI requests are always the Installation.
+/// Principal Core signs for. UI requests are always the Installation; Port commands are the
+/// Host-derived actor (`ports::authorize_actor`).
 pub(crate) struct Author {
     identity: String,
     principal: Option<String>,
@@ -697,6 +704,45 @@ pub fn router() -> Router<BacklogActive> {
                 }
             });
             Ok(subscription)
+        },
+    )
+    .port_request(
+        ports::CONTRACT, "runtime.guide", "query",
+        |_context: Context<BacklogActive>, _actor: PortActor, _: Empty| async move {
+            Ok(guide::response())
+        },
+    )
+    .port_request(
+        ports::CONTRACT, "ticket.list", "query",
+        |context: Context<BacklogActive>, _actor: PortActor, request: ports::ListRequest| async move {
+            ports::list(&context, request).await
+        },
+    )
+    .port_request(
+        ports::CONTRACT, "ticket.get", "query",
+        |context: Context<BacklogActive>, _actor: PortActor, request: TicketRequest| async move {
+            let ticket = read_ticket(&context, &request.ticket_id).await?;
+            Ok(ticket_value(&ticket))
+        },
+    )
+    .port_request(
+        ports::CONTRACT, "ticket.create", "command",
+        |context: Context<BacklogActive>, actor: PortActor, request: TicketCreateRequest| async move {
+            let author = ports::authorize_actor(&context, actor)?;
+            create_ticket(&context, &author, request).await
+        },
+    )
+    .port_request(
+        ports::CONTRACT, "ticket.update", "command",
+        |context: Context<BacklogActive>, actor: PortActor, request: TicketUpdateRequest| async move {
+            let author = ports::authorize_actor(&context, actor)?;
+            update_ticket(&context, &author, request).await
+        },
+    )
+    .port_event(
+        ports::CONTRACT, "backlog.changed",
+        |context: Context<BacklogActive>, _actor: PortActor| async move {
+            ports::changed(&context)
         },
     )
 }
@@ -1140,29 +1186,36 @@ mod tests {
     use super::*;
 
     const RECORD_LOG: &str = "teamarness.synchronization.immutable-record-log";
-    const ALICE: &str = "alice";
+    pub(super) const ALICE: &str = "alice";
     const BOB: &str = "bob";
     const SENTINEL: &str = "backlog-plaintext-sentinel";
 
-    fn hex(length: usize, seed: u64) -> String {
+    pub(super) fn hex(length: usize, seed: u64) -> String {
         format!("{seed:0length$x}")
     }
 
-    fn person() -> String {
+    pub(super) fn person() -> String {
         "c".repeat(64)
     }
 
-    fn agent() -> String {
+    pub(super) fn agent() -> String {
         "e".repeat(64)
     }
 
     /// What a scripted record log has appended, by sealed bytes, so `open` can answer it.
     #[derive(Clone, Default)]
-    struct Ledger {
+    pub(super) struct Ledger {
         opened: Arc<Mutex<BTreeMap<String, JsonValue>>>,
         next: Arc<AtomicU64>,
     }
 
+    /// The signing key of the Agent [`agent`] names, as the roster lists it.
+    pub(super) fn agent_key() -> String {
+        "b".repeat(64)
+    }
+
+    /// A record log that signs as this Installation, or as the Agent when an append names the
+    /// Agent's Principal, as Core does.
     fn scripted_log(ledger: &Ledger) -> ScriptedCapability {
         let ledger = ledger.clone();
         ledger.next.fetch_max(100, Ordering::SeqCst);
@@ -1170,14 +1223,21 @@ mod tests {
             "append" => {
                 let seed = ledger.next.fetch_add(1, Ordering::SeqCst);
                 let sealed = URL_SAFE_NO_PAD.encode(format!("sealed-{seed}"));
+                let author = match payload.get("principal").and_then(JsonValue::as_str) {
+                    Some(principal) if principal == agent() => agent_key(),
+                    Some(_) => {
+                        return Err(BackendError::new("principal_not_bound", false, json!({})));
+                    }
+                    None => ALICE.to_owned(),
+                };
                 let opened = json!({
                     "status": "ready", "recordId": hex(64, seed), "orderKey": hex(82, seed),
-                    "author": ALICE, "purpose": payload["purpose"], "signature": "c2ln",
+                    "author": author, "purpose": payload["purpose"], "signature": "c2ln",
                     "canonical": payload["canonical"],
                 });
                 ledger.opened.lock().unwrap().insert(sealed.clone(), opened);
                 Ok(json!({
-                    "recordId": hex(64, seed), "orderKey": hex(82, seed), "author": ALICE,
+                    "recordId": hex(64, seed), "orderKey": hex(82, seed), "author": author,
                     "signature": "c2ln", "sealedRecord": sealed, "durability": "committed",
                 }))
             }
@@ -1222,12 +1282,12 @@ mod tests {
         })
     }
 
-    struct Session {
-        harness: Harness,
-        log: ScriptedCapability,
+    pub(super) struct Session {
+        pub(super) harness: Harness,
+        pub(super) log: ScriptedCapability,
     }
 
-    async fn start(directory: &std::path::Path, ledger: &Ledger) -> Session {
+    pub(super) async fn start(directory: &std::path::Path, ledger: &Ledger) -> Session {
         let log = scripted_log(ledger);
         let mut harness = HarnessBuilder::new(router().into_backend())
             .package_identity("dev.teamarness.backlog")
@@ -1241,7 +1301,11 @@ mod tests {
         Session { harness, log }
     }
 
-    async fn request(session: &mut Session, operation: &str, payload: JsonValue) -> JsonValue {
+    pub(super) async fn request(
+        session: &mut Session,
+        operation: &str,
+        payload: JsonValue,
+    ) -> JsonValue {
         session
             .harness
             .request(operation, payload)
@@ -1249,7 +1313,11 @@ mod tests {
             .unwrap_or_else(|failure| panic!("{operation}: {}", failure.code()))
     }
 
-    async fn refusal(session: &mut Session, operation: &str, payload: JsonValue) -> BackendError {
+    pub(super) async fn refusal(
+        session: &mut Session,
+        operation: &str,
+        payload: JsonValue,
+    ) -> BackendError {
         session
             .harness
             .request(operation, payload)
@@ -1257,7 +1325,7 @@ mod tests {
             .expect_err(operation)
     }
 
-    async fn snapshot(session: &mut Session) -> JsonValue {
+    pub(super) async fn snapshot(session: &mut Session) -> JsonValue {
         let mut changes = session
             .harness
             .subscribe("backlog.changes", json!({}))
@@ -1268,14 +1336,18 @@ mod tests {
         first
     }
 
-    async fn epic(session: &mut Session, title: &str) -> String {
+    pub(super) async fn epic(session: &mut Session, title: &str) -> String {
         request(session, "backlog.epic.create", json!({ "title": title })).await["epicId"]
             .as_str()
             .unwrap()
             .to_owned()
     }
 
-    async fn ticket(session: &mut Session, epic_id: &str, title: &str) -> (String, String) {
+    pub(super) async fn ticket(
+        session: &mut Session,
+        epic_id: &str,
+        title: &str,
+    ) -> (String, String) {
         let created = request(
             session,
             "backlog.ticket.create",
@@ -1288,7 +1360,7 @@ mod tests {
         )
     }
 
-    async fn get(session: &mut Session, ticket_id: &str) -> JsonValue {
+    pub(super) async fn get(session: &mut Session, ticket_id: &str) -> JsonValue {
         request(
             session,
             "backlog.ticket.get",
@@ -1774,7 +1846,7 @@ mod tests {
         })
     }
 
-    async fn next_snapshot(
+    pub(super) async fn next_snapshot(
         changes: &mut teamarness_package_sdk::testing::HarnessSubscription,
         ready: impl Fn(&JsonValue) -> bool,
     ) -> JsonValue {

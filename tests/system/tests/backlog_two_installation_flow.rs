@@ -10,18 +10,15 @@
 #[allow(dead_code)] // Shared qualification helpers are used by different integration targets.
 mod support;
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use support::harness::{
     Addressing, ConversationClient, assert_no_plaintext_sentinel, create_invitation, introduce,
-    open_core, open_host, open_mount, poll_until, shutdown, workspace_root,
+    open_core, open_host, open_mount, poll_until, shutdown, stage_backlog,
 };
 use teamarness_core::CoreRuntime;
 use teamarness_package_host::{
@@ -32,54 +29,6 @@ use teamarness_package_host::{
 
 const BACKLOG: &str = "dev.teamarness.backlog";
 const CONVERGENCE: Duration = Duration::from_secs(30);
-
-fn digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-/// Stages the real Backlog manifest, UI contract and Backend, with a placeholder UI, as the
-/// application's only Package. Backlog has no Port contract yet.
-fn stage_backlog(root: &Path) -> PathBuf {
-    let application = root.join("application");
-    let source = workspace_root().join("packages/backlog-package");
-    let package = application.join(BACKLOG);
-    let mut manifest: Value =
-        serde_json::from_slice(&fs::read(source.join("teamarness.package.json")).unwrap()).unwrap();
-    let backend = fs::read(env!("CARGO_BIN_EXE_backlog-backend-under-test")).unwrap();
-    let backend_path = package.join(manifest["backends"][0]["path"].as_str().unwrap());
-    fs::create_dir_all(backend_path.parent().unwrap()).unwrap();
-    fs::write(&backend_path, &backend).unwrap();
-    fs::set_permissions(&backend_path, fs::Permissions::from_mode(0o700)).unwrap();
-    manifest["backends"][0]["size"] = json!(backend.len());
-    manifest["backends"][0]["sha256"] = json!(digest(&backend));
-    let ui = b"export function mount() { return async () => {}; }";
-    let css = b"";
-    fs::create_dir_all(package.join("ui")).unwrap();
-    fs::write(package.join("ui/index.js"), ui).unwrap();
-    fs::write(package.join("ui/style.css"), css).unwrap();
-    manifest["ui"]["entrypoint"]["size"] = json!(ui.len());
-    manifest["ui"]["entrypoint"]["sha256"] = json!(digest(ui));
-    manifest["ui"]["assets"][0]["size"] = json!(css.len());
-    manifest["ui"]["assets"][0]["sha256"] = json!(digest(css));
-    let contract = fs::read(source.join("ui-contract.json")).unwrap();
-    fs::write(package.join("ui-contract.json"), &contract).unwrap();
-    manifest["ui"]["contract"]["sha256"] = json!(digest(&contract));
-    fs::write(
-        package.join("teamarness.package.json"),
-        serde_json::to_vec(&manifest).unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        application.join("application-packages.v1.json"),
-        serde_json::to_vec(&json!({ "schemaVersion": 1, "packages": [{ "directory": BACKLOG }] }))
-            .unwrap(),
-    )
-    .unwrap();
-    application
-}
 
 /// One Installation's private paths, so it can be stopped and reopened.
 struct Paths {

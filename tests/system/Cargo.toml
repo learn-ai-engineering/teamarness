@@ -47,6 +47,10 @@ name = "backlog-backend-under-test"
 path = "../../packages/backlog-package/backend/src/main.rs"
 
 [[bin]]
+name = "backlog-port-consumer-under-test"
+path = "src/bin/backlog_port_consumer.rs"
+
+[[bin]]
 name = "generic-port-consumer-under-test"
 path = "src/bin/generic_port_consumer.rs"
 
