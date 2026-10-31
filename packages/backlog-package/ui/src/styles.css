@@ -1,8 +1,76 @@
 /* The Frame host has min-height, not a definite height; size this Package to its viewport. */
 :host { display: block; height: 100vh; height: 100dvh; color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
 * { box-sizing: border-box; }
-.backlog-page.teamarness-page { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 0; }
+button, input, textarea { font: inherit; }
+.backlog-page.teamarness-page { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 0; container-type: inline-size; }
 .backlog-page.teamarness-page > * + * { margin-top: 0; }
-.backlog-page .teamarness-page-header { flex: none; border-bottom: 1px solid var(--teamarness-color-border); padding: .85rem 1.4rem; }
+.backlog-page .teamarness-page-header { display: flex; flex: none; align-items: center; gap: .6rem; border-bottom: 1px solid var(--teamarness-color-border); padding: .85rem 1.4rem; }
 .backlog-page .teamarness-page-title { margin: 0; font-size: 1.4rem; }
-.backlog-placeholder { margin: 0; padding: 1rem 1.4rem; color: var(--teamarness-color-text-muted); }
+.availability { margin: 0; color: var(--teamarness-color-text-muted); font-size: .8rem; }
+.backlog-warnings:empty, .backlog-page [hidden] { display: none; }
+.backlog-warnings .teamarness-notice, .backlog-page .teamarness-notice--danger { margin: .6rem 1.4rem 0; }
+.backlog-shell { display: flex; flex: 1; min-height: 0; min-width: 0; position: relative; }
+
+/* Left rail */
+.epic-rail { flex: none; width: min(320px, 40%); display: flex; flex-direction: column; min-height: 0; min-width: 0; border-right: 1px solid var(--teamarness-color-border); background: color-mix(in srgb, var(--teamarness-color-panel) 80%, var(--teamarness-color-background)); }
+.epic-rail-header { display: flex; align-items: center; gap: .25rem; flex: none; border-bottom: 1px solid var(--teamarness-color-border); padding: .55rem; }
+.epic-rail h2 { flex: 1; margin: 0 0 0 .3rem; color: var(--teamarness-color-text-muted); font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; }
+.backlog-icon { display: inline-grid; flex: none; place-items: center; width: 2rem; height: 2rem; border: 1px solid transparent; border-radius: var(--teamarness-radius-control, 6px); background: transparent; color: var(--teamarness-color-text-muted); cursor: pointer; padding: .3rem; }
+.backlog-icon:hover, .backlog-icon[aria-expanded="true"], .backlog-icon[aria-pressed="true"] { color: var(--teamarness-color-text); background: var(--teamarness-color-background); border-color: var(--teamarness-color-border); }
+.backlog-icon svg, .epic-button svg { width: 1.15rem; height: 1.15rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.backlog-tooltip-control { position: relative; }
+.control-tooltip { position: absolute; z-index: 8; top: 100%; right: 0; width: max-content; max-width: min(22rem, 80vw); padding: .3rem .5rem; border-radius: var(--teamarness-radius-control, 6px); background: var(--teamarness-color-text); color: var(--teamarness-color-background); font-size: .75rem; font-weight: 400; white-space: normal; overflow-wrap: anywhere; visibility: hidden; pointer-events: none; }
+.backlog-tooltip-control:hover .control-tooltip, .backlog-tooltip-control:focus-visible .control-tooltip { visibility: visible; }
+.backlog-page button:focus-visible, .backlog-page input:focus-visible, .backlog-page textarea:focus-visible { outline: 2px solid var(--teamarness-color-accent); outline-offset: -2px; }
+
+/* Filters */
+.backlog-filters { display: flex; flex: none; flex-wrap: wrap; gap: .4rem; padding: .5rem .55rem; border-bottom: 1px solid var(--teamarness-color-border); }
+.backlog-filter { display: flex; flex: 1 1 8rem; align-items: center; gap: .15rem; min-width: 0; }
+.backlog-filter .backlog-listbox { flex: 1; min-width: 0; }
+
+/* Tree */
+.epic-list, .ticket-list { list-style: none; margin: 0; }
+.epic-list { flex: 1; min-height: 0; overflow: auto; padding: .5rem; }
+.epic-group { position: relative; }
+.tree-row, .ticket-row { position: relative; display: flex; align-items: center; min-width: 0; border-radius: var(--teamarness-radius-control, 6px); }
+.tree-row:hover, .ticket-row:hover { background: var(--teamarness-color-background); }
+.epic-button, .ticket-title { display: flex; flex: 1; align-items: center; gap: .3rem; min-width: 0; text-align: left; border: 0; border-radius: var(--teamarness-radius-control, 6px); background: transparent; color: var(--teamarness-color-text); cursor: pointer; padding: .55rem .25rem; }
+.epic-button { font-weight: 700; }
+.epic-button svg { flex: none; width: 1rem; height: 1rem; color: var(--teamarness-color-text-muted); transition: transform .12s; }
+.epic-button[aria-expanded="true"] svg { transform: rotate(90deg); }
+.epic-title, .ticket-title-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ticket-title { font-size: .92rem; }
+.ticket-meta { flex: none; color: var(--teamarness-color-text-muted); font-size: .75rem; }
+.ticket-meta.priority-high { color: var(--teamarness-color-danger, var(--teamarness-color-text)); }
+.ticket-title[aria-current="true"] { background: color-mix(in srgb, var(--teamarness-color-accent) 14%, var(--teamarness-color-panel)); box-shadow: inset 3px 0 var(--teamarness-color-accent); font-weight: 700; }
+.is-archived .epic-title, .is-archived .ticket-title-text { color: var(--teamarness-color-text-muted); text-decoration: line-through; }
+.ticket-list { padding: 0 0 0 1.4rem; }
+.backlog-empty { padding: .5rem; color: var(--teamarness-color-text-muted); font-size: .85rem; }
+.epic-create, .ticket-create, .epic-rename { display: flex; gap: .25rem; align-items: center; margin: .3rem 0; }
+.epic-create .teamarness-input, .ticket-create .teamarness-input, .epic-rename .teamarness-input { flex: 1; min-width: 0; }
+.action-menu { position: absolute; z-index: 5; right: .4rem; top: 100%; display: flex; flex-direction: column; align-items: stretch; gap: .2rem; width: min(14rem, 90%); padding: .3rem; border: 1px solid var(--teamarness-color-border); border-radius: var(--teamarness-radius-control, 6px); background: var(--teamarness-color-panel); box-shadow: 0 8px 20px #0005; }
+.action-menu button { text-align: left; }
+
+/* Custom dropdown (select-only combobox) */
+.backlog-listbox { position: relative; }
+.backlog-listbox-button { display: flex; align-items: center; gap: .4rem; width: 100%; min-width: 0; text-align: left; cursor: pointer; }
+.backlog-listbox-button:disabled { cursor: default; opacity: .6; }
+.backlog-listbox-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.backlog-listbox-value.is-placeholder { color: var(--teamarness-color-text-muted); }
+.backlog-listbox-chevron { flex: none; width: 1rem; height: 1rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; color: var(--teamarness-color-text-muted); }
+.backlog-listbox-button[aria-expanded="true"] .backlog-listbox-chevron { transform: rotate(180deg); }
+.backlog-listbox-popup { position: absolute; z-index: 9; top: calc(100% + 2px); left: 0; min-width: 100%; max-height: 16rem; overflow-y: auto; list-style: none; margin: 0; padding: .25rem; border: 1px solid var(--teamarness-color-border); border-radius: var(--teamarness-radius-control, 6px); background: var(--teamarness-color-panel); box-shadow: 0 8px 20px #0005; }
+.backlog-listbox-option { padding: .4rem .6rem; border-radius: var(--teamarness-radius-control, 6px); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.backlog-listbox-option[aria-selected="true"] { font-weight: 700; }
+.backlog-listbox-option.is-active { background: color-mix(in srgb, var(--teamarness-color-accent) 18%, var(--teamarness-color-panel)); outline: 1px solid var(--teamarness-color-accent); outline-offset: -1px; }
+
+/* Detail pane (placeholder until the Ticket detail lands) */
+.ticket-detail { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; padding: 1rem 1.4rem; }
+.ticket-detail-title { margin: 0 0 .4rem; font-size: 1.15rem; }
+.ticket-detail-placeholder { margin: 0; color: var(--teamarness-color-text-muted); }
+
+@container (max-width: 640px) {
+  .backlog-page .teamarness-page-header { padding: .5rem; }
+  .backlog-shell { flex-direction: column; }
+  .epic-rail { width: 100%; max-height: 60%; border-right: 0; border-bottom: 1px solid var(--teamarness-color-border); }
+}
