@@ -10,6 +10,7 @@ node_modules/
 /packages/agent-package/ui/dist/
 /packages/documents-package/ui/dist/
 /packages/exhibits-package/ui/dist/
+/packages/backlog-package/ui/dist/
 /apps/teamarness-desktop/src-tauri/gen/
 /.teamarness-dev/
 # Temporary typecheck trees the contract-types generator test builds

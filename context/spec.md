@@ -17,6 +17,7 @@ Branch table for the Teamarness product VRS. Every requirement, spec clause, dec
 | `TEAM.SYS.SHELL` | `02-system/07-shell/` | Tauri shell, package frame mounting, workspace controls, theming |
 | `TEAM.SYS.OBS` | `02-system/08-observability/` | Logging, metrics, error reporting, diagnostics |
 | `TEAM.SYS.DOCS` | `02-system/09-documents/` | The Documents Package: Collections, Documents with a collaborative rendered body and Canonical Markdown interchange, Comments, record validation and projections, Documents Port Contract 1.1, and its UI. Consumes the immutable-record Synchronization Capability (ADRs 0027, 0032 and 0033) |
+| `TEAM.SYS.BACKLOG` | `02-system/10-backlog/` | The Backlog Package: Epics, Tickets, per-field convergence and Ticket Versions, record validation and projections, the Backlog Port Contract, and its UI. Consumes the immutable-record Synchronization Capability (ADRs 0027 and 0039) |
 | `TEAM.DEL` | `03-delivery/` | Build, release, CI/CD, update distribution, code signing |
 | `TEAM.CONTRIB` | `04-contributing/` | Development setup, contribution workflow, code standards |
 
