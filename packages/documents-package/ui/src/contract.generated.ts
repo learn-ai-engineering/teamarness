@@ -77,6 +77,12 @@ export type PersonName = {
   readonly "personId": string;
 };
 
+export type Place = {
+  readonly "collectionId"?: RecordId;
+  readonly "documentId"?: RecordId;
+  readonly "scrollTop"?: number;
+};
+
 export type RecordId = string;
 
 export type RequestId = string;
@@ -196,6 +202,8 @@ export type DocumentsContract = {
       }; readonly response: {
         readonly "requestId": RequestId;
       } };
+    readonly "documents.place.get": { readonly request: Record<string, never>; readonly response: Place };
+    readonly "documents.place.set": { readonly request: Place; readonly response: Record<string, never> };
     readonly "documents.snapshot": { readonly request: Record<string, never>; readonly response: Snapshot };
   };
   readonly subscriptions: {

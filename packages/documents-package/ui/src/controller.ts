@@ -20,6 +20,15 @@ export type ControllerState = Readonly<{
 
 const EMPTY: Snapshot = { collections: [], documents: [], availability: "catching_up", warnings: [] };
 
+type Place = DocumentsContract["requests"]["documents.place.get"]["response"];
+
+/**
+ * How long the remembered place waits for more changes before it is saved. The Frame has no
+ * unmount hook to save on, so each change is saved soon after it settles.
+ */
+export const PLACE_SAVE_DELAY_MS = 150;
+const MAX_SCROLL_TOP = 1_000_000_000;
+
 /**
  * Holds the listing the Backend publishes and the UI's own selection, and turns user actions
  * into Package requests. Rendering is the view's job; the controller only announces changes.
@@ -47,6 +56,12 @@ export class DocumentsController {
   private openSequence = 0;
   private commentsSequence = 0;
   private pendingNames: { cursor: string; parts: number; nextPart: number; persons: Names["persons"] } | null = null;
+  /** The open Document's scroll offset, as last reported or restored. */
+  private scrollTop: number | undefined;
+  /** A remembered scroll offset still to apply once its Document's body is shown. */
+  private restoredScroll: { documentId: string; scrollTop: number } | null = null;
+  private placeTimer: ReturnType<typeof setTimeout> | undefined;
+  private lastSavedPlace: string | null = null;
 
   constructor(client: TypedPackageClient<DocumentsContract>, announce: () => void) {
     this.client = client;
@@ -103,7 +118,83 @@ export class DocumentsController {
   }
 
   async initialize(): Promise<void> {
-    this.applySnapshot(await this.client.request("documents.snapshot", {}));
+    const snapshot = await this.client.request("documents.snapshot", {});
+    const place = await this.readPlace();
+    const restored = this.restorable(snapshot, place);
+    if (restored.collectionId !== null) {
+      // Chosen before the first listing is shown, so the first selection is the remembered one.
+      this._state = { ...this._state, selectedCollectionId: restored.collectionId };
+    }
+    this.lastSavedPlace = JSON.stringify(placeOf(restored.collectionId, restored.documentId, restored.scrollTop));
+    this.applySnapshot(snapshot);
+    if (restored.documentId !== null) {
+      if (restored.scrollTop !== undefined) {
+        this.restoredScroll = { documentId: restored.documentId, scrollTop: restored.scrollTop };
+      }
+      void this.openDocumentById(restored.documentId);
+    }
+  }
+
+  /** The remembered place, or none when the Backend has none or cannot say. */
+  private async readPlace(): Promise<Place> {
+    try {
+      return await this.client.request("documents.place.get", {});
+    } catch {
+      return {};
+    }
+  }
+
+  /** What of a remembered place still exists and is shown in `snapshot`. */
+  private restorable(snapshot: Snapshot, place: Place): {
+    collectionId: string | null; documentId: string | null; scrollTop: number | undefined;
+  } {
+    const visible = (id: string | undefined) => id !== undefined
+      && snapshot.collections.some((c) => c.id === id && (this._state.showArchived || !c.archived));
+    const document_ = snapshot.documents.find((d) => d.id === place.documentId
+      && (this._state.showArchived || !d.archived) && visible(d.collectionId));
+    if (document_ !== undefined) {
+      return { collectionId: document_.collectionId, documentId: document_.id, scrollTop: place.scrollTop };
+    }
+    return { collectionId: visible(place.collectionId) ? place.collectionId ?? null : null, documentId: null, scrollTop: undefined };
+  }
+
+  /**
+   * The remembered scroll offset of `documentId`, once: the view applies it when that Document's
+   * body is first shown.
+   */
+  takeRestoredScroll(documentId: string): number | undefined {
+    const restored = this.restoredScroll;
+    if (restored === null || restored.documentId !== documentId) return undefined;
+    this.restoredScroll = null;
+    return restored.scrollTop;
+  }
+
+  /** Records the open Document's scroll offset, saved with the place soon after it settles. */
+  rememberScroll(scrollTop: number): void {
+    if (this.disposed || this._state.openDocumentId === null) return;
+    const top = Math.min(MAX_SCROLL_TOP, Math.max(0, Math.round(scrollTop)));
+    if (top === this.scrollTop) return;
+    this.scrollTop = top;
+    this.schedulePlaceSave();
+  }
+
+  private schedulePlaceSave(): void {
+    if (this.placeTimer !== undefined) clearTimeout(this.placeTimer);
+    this.placeTimer = setTimeout(() => this.savePlace(), PLACE_SAVE_DELAY_MS);
+  }
+
+  /** Saves the current place to the Backend's memory, unless it is already saved. */
+  private savePlace(): void {
+    if (this.placeTimer !== undefined) clearTimeout(this.placeTimer);
+    this.placeTimer = undefined;
+    const place = placeOf(this._state.selectedCollectionId, this._state.openDocumentId, this.scrollTop);
+    const key = JSON.stringify(place);
+    if (key === this.lastSavedPlace) return;
+    this.lastSavedPlace = key;
+    // Remembering is a convenience: a refused save changes nothing the Member can see.
+    this.client.request("documents.place.set", place).catch(() => {
+      if (this.lastSavedPlace === key) this.lastSavedPlace = null;
+    });
   }
 
   applySnapshot(snapshot: Snapshot): void {
@@ -319,6 +410,7 @@ export class DocumentsController {
 
   dispose(): void {
     this.disposed = true;
+    if (this.placeTimer !== undefined) this.savePlace();
     void this.closeDocument();
   }
 
@@ -338,7 +430,15 @@ export class DocumentsController {
 
   private update(changes: Partial<ControllerState>): void {
     if (this.disposed) return;
+    const before = this._state;
     this._state = { ...this._state, ...changes };
+    if (before.openDocumentId !== this._state.openDocumentId) {
+      const opened = this._state.openDocumentId;
+      if (this.restoredScroll !== null && this.restoredScroll.documentId !== opened) this.restoredScroll = null;
+      this.scrollTop = this.restoredScroll?.documentId === opened ? this.restoredScroll?.scrollTop : undefined;
+    }
+    if (before.openDocumentId !== this._state.openDocumentId
+      || before.selectedCollectionId !== this._state.selectedCollectionId) this.schedulePlaceSave();
     this.announce();
   }
 }
@@ -375,6 +475,14 @@ async function digestMatches(text: string, digest: string): Promise<boolean> {
   if (subtle === undefined) return true;
   const hash = new Uint8Array(await subtle.digest("SHA-256", new TextEncoder().encode(text)));
   return [...hash].map((byte) => byte.toString(16).padStart(2, "0")).join("") === digest;
+}
+
+function placeOf(collectionId: string | null, documentId: string | null, scrollTop: number | undefined): Place {
+  return {
+    ...(collectionId !== null ? { collectionId } : {}),
+    ...(documentId !== null ? { documentId } : {}),
+    ...(documentId !== null && scrollTop !== undefined ? { scrollTop } : {}),
+  };
 }
 
 const CLOSED_LOST_MESSAGE = "Your last changes to the Document you closed could not be confirmed as saved.";

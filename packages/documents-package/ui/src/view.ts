@@ -360,6 +360,7 @@ export class DocumentsView {
     );
     this.copyPanel.append(copyHint, this.copyText, copyActions);
     this.editorPane.append(editorHeader, this.copyPanel, this.editorPlaceholder, this.editor.element);
+    this.editor.scroller.addEventListener("scroll", () => controller.rememberScroll(this.editor.scroller.scrollTop), { passive: true });
 
     // --- comments (built once; the list is rebuilt per render, the composer persists) ---
     this.commentsPanel = document.createElement("section");
@@ -586,6 +587,10 @@ export class DocumentsView {
     this.editor.bind(shown ? loro : null, shown && session.editable);
     this.editor.element.hidden = !shown;
     this.editorPlaceholder.hidden = open === null || shown;
+    if (shown) {
+      const restored = this.controller.takeRestoredScroll(open.id);
+      if (restored !== undefined) this.editor.scroller.scrollTop = restored;
+    }
     if (open === null) {
       this.editorTitle.textContent = "Choose a Document";
       this.editorStatus.textContent = "";
@@ -838,7 +843,8 @@ export class DocumentsView {
       });
       select.setAttribute("aria-expanded", String(expanded));
       select.dataset.treeFocus = `collection:select:${collection.id}`;
-      if (collection.id === selected) select.setAttribute("aria-current", "page");
+      // Selection targets new Documents and expansion only; only the open Document is current.
+      if (collection.id === selected) select.dataset.selected = "true";
       const add = icon("plus", `Add Document to ${collection.name}`, () => {
         this.controller.selectCollection(collection.id);
         this.expanded.add(collection.id);

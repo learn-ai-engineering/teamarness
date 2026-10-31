@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use loro::Frontiers;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use teamarness_package_sdk::capabilities::principals::{PrincipalSnapshot, Principals};
@@ -723,6 +723,21 @@ pub struct DocumentsActive {
     session: Mutex<Option<Session>>,
     hub: BodyHub,
     flusher: Mutex<Option<Session>>,
+    /// Where the UI last was: held in memory only, so it lasts while the Backend runs.
+    place: Mutex<Place>,
+}
+
+/// The UI's remembered place: the selected Collection, the open Document and its scroll offset.
+/// It survives a Package switch but never a Backend restart.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Place {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    collection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    document_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scroll_top: Option<u64>,
 }
 
 /// What one activation built, for a test that must look inside.
@@ -1175,6 +1190,7 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 session: Mutex::new(Some(session)),
                 hub,
                 flusher: Mutex::new(Some(flusher)),
+                place: Mutex::new(Place::default()),
             })
         }
     })
@@ -1224,6 +1240,20 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         |context: Context<DocumentsActive>, _: Empty| async move {
             let state = context.state().clone();
             context.blocking(move |_| state.snapshot_value()).await
+        },
+    )
+    .request(
+        "documents.place.get",
+        |context: Context<DocumentsActive>, _: Empty| async move {
+            let place = recover(&context.state().place).clone();
+            serde_json::to_value(place).map_err(|_| storage_failed())
+        },
+    )
+    .request(
+        "documents.place.set",
+        |context: Context<DocumentsActive>, place: Place| async move {
+            *recover(&context.state().place) = place;
+            Ok(json!({}))
         },
     )
     .request(
@@ -3627,6 +3657,67 @@ mod tests {
             "qualified initial replay",
         )
         .await;
+    }
+
+    // Verifies: AC10 (better-doc-agent) — the UI's remembered place round-trips through the
+    // Backend's memory and is never written to disk.
+    #[tokio::test]
+    async fn remembered_place_round_trips_in_memory_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let contract = ui_contract();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let empty = session
+            .harness
+            .request("documents.place.get", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(empty, json!({}));
+        let place = json!({
+            "collectionId": hex(64, 1), "documentId": hex(64, 2), "scrollTop": 480,
+        });
+        let set = session
+            .harness
+            .request("documents.place.set", place.clone())
+            .await
+            .unwrap();
+        contract
+            .validate_response("documents.place.set", &set)
+            .unwrap();
+        let read = session
+            .harness
+            .request("documents.place.get", json!({}))
+            .await
+            .unwrap();
+        contract
+            .validate_response("documents.place.get", &read)
+            .unwrap();
+        assert_eq!(read, place);
+        // A set replaces the whole place: what it leaves out is forgotten.
+        session
+            .harness
+            .request("documents.place.set", json!({ "collectionId": hex(64, 3) }))
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .harness
+                .request("documents.place.get", json!({}))
+                .await
+                .unwrap(),
+            json!({ "collectionId": hex(64, 3) })
+        );
+        session.harness.shutdown().await.unwrap();
+        // A new Backend start remembers nothing.
+        let mut restarted = start(directory.path(), scripted_log()).await;
+        assert_eq!(
+            restarted
+                .harness
+                .request("documents.place.get", json!({}))
+                .await
+                .unwrap(),
+            json!({})
+        );
+        restarted.harness.shutdown().await.unwrap();
     }
 
     // Verifies: AC1, AC4 — a local create is appended, projected, and answered with its identity.
