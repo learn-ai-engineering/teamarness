@@ -1117,6 +1117,47 @@ mod tests {
             .unwrap();
     }
 
+    /// The restart result seam (SM-011, SF-102): the actor itself says whether it started a
+    /// new generation, decided under its lifecycle gate. A result that reported success for an
+    /// Instance it left alone would let `RestartPersonal` claim a restart that never happened.
+    ///
+    /// Verifies: TEAM.SYS.PKG-R09
+    #[tokio::test]
+    async fn actor_restart_reports_not_running_for_a_suspended_instance() {
+        let fixture = host_fixture::Fixture::node(&[("team", "com.example.team")]).await;
+        let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+            .await
+            .unwrap();
+        let key = host.snapshot().await.instances[0].key.clone();
+        let actor = host.actor(&key).await.unwrap();
+        assert_eq!(actor.generation().await, 1);
+
+        assert_eq!(
+            actor.restart().await.unwrap(),
+            instance::RestartOutcome::Restarted
+        );
+        assert_eq!(actor.generation().await, 2, "a running Instance restarts");
+
+        host.execute(PackageHostCommand::Suspend(crate::SuspendPackage {
+            instance: key.clone(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            actor.restart().await.unwrap(),
+            instance::RestartOutcome::NotRunning,
+            "a suspended Instance is left alone and says so"
+        );
+        assert_eq!(actor.generation().await, 2);
+        assert_eq!(
+            actor.snapshot().await.lifecycle,
+            crate::LifecycleState::Suspended
+        );
+        host.execute(PackageHostCommand::Shutdown(ShutdownHost))
+            .await
+            .unwrap();
+    }
+
     /// Verifies: TEAM.SYS.PKG-R09
     #[tokio::test]
     async fn an_override_write_waits_for_a_live_install_and_keeps_both_entries() {
