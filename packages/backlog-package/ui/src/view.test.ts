@@ -320,3 +320,47 @@ describe("Backlog actions", () => {
     expect(root.querySelector(".backlog-page")).toBeNull();
   });
 });
+
+describe("Typing in inline forms", () => {
+  /** Types at the caret one key at a time, then delivers a remote snapshot, checking focus throughout. */
+  async function typeThroughRemoteChange(root: ShadowRoot, backlog: FakeBacklog, input: HTMLInputElement, expected: string) {
+    input.setSelectionRange(1, 1);
+    const ticket = [...backlog.tickets.values()].find((t) => t.title === "Low ready")!;
+    for (const [index, key] of [..."xyz"].entries()) {
+      const at = input.selectionStart!;
+      input.value = input.value.slice(0, at) + key + input.value.slice(at);
+      input.setSelectionRange(at + 1, at + 1);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      if (index === 1) {
+        backlog.remoteChange(ticket.ticketId, { status: "done" });
+        await backlog.publish();
+        await tick();
+      }
+      expect(root.activeElement).toBe(input);
+      expect([input.selectionStart, input.selectionEnd]).toEqual([at + 1, at + 1]);
+    }
+    expect(input.isConnected).toBe(true);
+    expect(input.value).toBe(expected);
+  }
+
+  it("keep focus, text and caret in New Epic, Add Ticket and Rename", async () => {
+    const { root, q, labelled, backlog } = await mounted();
+    labelled("New Epic").click();
+    const epicInput = q<HTMLInputElement>(".epic-create input");
+    expect(root.activeElement).toBe(epicInput);
+    epicInput.value = "ab";
+    await typeThroughRemoteChange(root, backlog, epicInput, "axyzb");
+
+    labelled("Add Ticket to beta").click();
+    const ticketInput = q<HTMLInputElement>(".ticket-create input");
+    expect(root.activeElement).toBe(ticketInput);
+    ticketInput.value = "ab";
+    await typeThroughRemoteChange(root, backlog, ticketInput, "axyzb");
+
+    labelled("Actions for beta").click();
+    [...q(".epic-actions").querySelectorAll("button")].find((b) => b.textContent === "Rename")!.click();
+    const renameInput = q<HTMLInputElement>(".epic-rename input");
+    expect(root.activeElement).toBe(renameInput);
+    await typeThroughRemoteChange(root, backlog, renameInput, "bxyzeta");
+  });
+});

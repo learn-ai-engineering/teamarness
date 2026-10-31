@@ -279,3 +279,70 @@ describe("Stale saves", () => {
     expect(notice.querySelector(".ticket-stale-body")?.textContent).toBe("Theirs");
   });
 });
+
+/**
+ * Types `text` one character at a time at the caret, as a browser does: insert, move the caret,
+ * then fire `input`. After each key, checks focus, value and caret, and that no blur happened.
+ */
+function typeKeys(root: ShadowRoot, element: HTMLInputElement | HTMLTextAreaElement, text: string): void {
+  let blurs = 0;
+  const onBlur = () => { blurs += 1; };
+  element.addEventListener("blur", onBlur);
+  try {
+    for (const key of text) {
+      const at = element.selectionStart ?? element.value.length;
+      const expected = element.value.slice(0, at) + key + element.value.slice(element.selectionEnd ?? at);
+      element.value = expected;
+      element.setSelectionRange(at + 1, at + 1);
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+      expect(root.activeElement).toBe(element);
+      expect(blurs).toBe(0);
+      expect(element.isConnected).toBe(true);
+      expect(element.value).toBe(expected);
+      expect([element.selectionStart, element.selectionEnd]).toEqual([at + 1, at + 1]);
+    }
+  } finally {
+    element.removeEventListener("blur", onBlur);
+  }
+}
+
+describe("Typing in edit mode", () => {
+  it("keeps focus, text and caret in the body text area on every key", async () => {
+    const { root, q, button, ticket } = await opened("Write the guide");
+    button("Edit")!.click();
+    const area = q<HTMLTextAreaElement>("textarea.ticket-body-input");
+    expect(root.activeElement).toBe(area);
+    // Type in the middle of the body, so a moved caret would show.
+    area.setSelectionRange(2, 2);
+    typeKeys(root, area, "abc");
+    expect(area.value).toBe(`${ticket.body.slice(0, 2)}abc${ticket.body.slice(2)}`);
+  });
+
+  it("keeps focus, text and caret in the title input on every key", async () => {
+    const { root, labelled, button } = await opened("Write the guide");
+    button("Edit")!.click();
+    const title = labelled<HTMLInputElement>("Ticket title");
+    title.focus();
+    title.setSelectionRange(5, 5);
+    typeKeys(root, title, "xyz");
+    expect(title.value).toBe("Writexyz the guide");
+  });
+
+  it("keeps focus, text and caret when a remote change arrives mid-typing", async () => {
+    const { root, q, button, backlog, ticket } = await opened("Write the guide");
+    button("Edit")!.click();
+    const area = q<HTMLTextAreaElement>("textarea.ticket-body-input");
+    area.setSelectionRange(0, 0);
+    typeKeys(root, area, "ab");
+    let blurs = 0;
+    area.addEventListener("blur", () => { blurs += 1; });
+    backlog.remoteChange(ticket.ticketId, { priority: "low" });
+    await backlog.publish();
+    await settle();
+    expect(root.activeElement).toBe(area);
+    expect(blurs).toBe(0);
+    expect([area.selectionStart, area.selectionEnd]).toEqual([2, 2]);
+    typeKeys(root, area, "c");
+    expect(area.value).toBe(`abc${ticket.body}`);
+  });
+});

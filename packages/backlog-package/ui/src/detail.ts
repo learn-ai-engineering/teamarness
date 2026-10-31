@@ -36,6 +36,15 @@ function attribution(line: HTMLElement, lead: string, who: string, at: number): 
   line.replaceChildren(`${lead} ${who} · `, time);
 }
 
+/**
+ * Makes `node` the only child of `slot`. Leaves the slot alone when it already is: replacing a node
+ * with itself detaches it, and a detached control loses focus and caret.
+ */
+function show(slot: HTMLElement, node: HTMLElement): void {
+  if (slot.childNodes.length === 1 && slot.firstChild === node) return;
+  slot.replaceChildren(node);
+}
+
 function field(label: string, control: HTMLElement): HTMLElement {
   const wrapper = element("div", `${KIT.field} ticket-field`);
   wrapper.append(element("span", "ticket-field-label", label), control);
@@ -165,7 +174,7 @@ export class TicketDetailView {
     const editing = edit !== null;
 
     this.heading.textContent = ticket?.title ?? summary?.title ?? "";
-    this.titleSlot.replaceChildren(editing ? this.titleInput : this.heading);
+    show(this.titleSlot, editing ? this.titleInput : this.heading);
     if (editing && this.titleInput.value !== edit.draft.title) this.titleInput.value = edit.draft.title;
     this.titleInput.readOnly = busy;
     this.editButton.hidden = editing;
@@ -188,7 +197,7 @@ export class TicketDetailView {
 
     this.renderStale(edit?.stale ?? null);
 
-    this.bodySlot.replaceChildren(editing ? this.bodyInput : this.body);
+    show(this.bodySlot, editing ? this.bodyInput : this.body);
     if (editing && this.bodyInput.value !== edit.draft.body) this.bodyInput.value = edit.draft.body;
     this.bodyInput.readOnly = busy;
     if (!editing) this.renderBody(ticket);
