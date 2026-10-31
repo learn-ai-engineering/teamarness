@@ -5,5 +5,6 @@
 //! UI requests.
 
 pub(crate) mod lifecycle;
+pub(crate) mod personal;
 pub(crate) mod ui_mounts;
 pub(crate) mod ui_requests;

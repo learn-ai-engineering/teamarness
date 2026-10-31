@@ -1,0 +1,61 @@
+{
+  "description": "Declared metadata fixture; exact compact UTF-8 bytes are represented by describeResult.data. Agent handlers are implemented and covered by scripted repository tests. Independent Verify and external harness/UI/model qualification remain separate.",
+  "document": {
+    "schemaVersion": 1,
+    "$defs": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "contracts": [
+      {
+        "identity": "dev.example.metadata",
+        "major": 1,
+        "minor": 2,
+        "description": "Metadata",
+        "ports": [
+          {
+            "name": "value.read",
+            "kind": "query",
+            "description": "Read",
+            "request": true,
+            "response": {
+              "$ref": "#/$defs/text"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "availableCall": {
+    "method": "available",
+    "access": "declared"
+  },
+  "availableResult": {
+    "contracts": [
+      {
+        "contract": "dev.example.metadata",
+        "major": 1,
+        "minor": 2,
+        "description": "Metadata",
+        "available": true,
+        "enabled": false,
+        "enabledMajor": null,
+        "metadataSha256": "0de9112f997e9a8350b7bef09d9331815451382033e418f3954c614a42fdbbc7"
+      }
+    ]
+  },
+  "describeCall": {
+    "method": "describe",
+    "access": "declared",
+    "contract": "dev.example.metadata",
+    "metadataSha256": "0de9112f997e9a8350b7bef09d9331815451382033e418f3954c614a42fdbbc7",
+    "offset": 0
+  },
+  "describeResult": {
+    "metadataSha256": "0de9112f997e9a8350b7bef09d9331815451382033e418f3954c614a42fdbbc7",
+    "totalBytes": 267,
+    "offset": 0,
+    "data": "eyJzY2hlbWFWZXJzaW9uIjoxLCIkZGVmcyI6eyJ0ZXh0Ijp7InR5cGUiOiJzdHJpbmcifX0sImNvbnRyYWN0cyI6W3siaWRlbnRpdHkiOiJkZXYuZXhhbXBsZS5tZXRhZGF0YSIsIm1ham9yIjoxLCJtaW5vciI6MiwiZGVzY3JpcHRpb24iOiJNZXRhZGF0YSIsInBvcnRzIjpbeyJuYW1lIjoidmFsdWUucmVhZCIsImtpbmQiOiJxdWVyeSIsImRlc2NyaXB0aW9uIjoiUmVhZCIsInJlcXVlc3QiOnRydWUsInJlc3BvbnNlIjp7IiRyZWYiOiIjLyRkZWZzL3RleHQifX1dfV19"
+  }
+}

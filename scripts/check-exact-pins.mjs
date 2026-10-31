@@ -98,9 +98,45 @@ export async function findLoosePins(root = repositoryRoot) {
   return problems;
 }
 
+// The Documents body is one Loro document that the Rust Backend (`loro`) and the UI frame
+// (`loro-crdt`) both edit, so the two must be the same release. The lockfiles are what a build
+// resolves, so they are what is compared.
+const LORO_PARITY = { cargo: "loro", npm: "loro-crdt" };
+
+/** The version `Cargo.lock` resolves for `name`, or `null`. */
+export function cargoLockVersion(text, name) {
+  const lines = text.split("\n");
+  for (let index = 0; index < lines.length - 1; index += 1) {
+    if (lines[index].trim() === `name = "${name}"`) {
+      return /^version = "([^"]*)"$/.exec(lines[index + 1].trim())?.[1] ?? null;
+    }
+  }
+  return null;
+}
+
+/** The version `package-lock.json` resolves for the hoisted package `name`, or `null`. */
+export function packageLockVersion(text, name) {
+  return JSON.parse(text).packages?.[`node_modules/${name}`]?.version ?? null;
+}
+
+/** A problem when the two lockfiles resolve different Loro releases, else `null`. */
+export function findLoroParityProblem(cargoLock, packageLock) {
+  const cargo = cargoLockVersion(cargoLock, LORO_PARITY.cargo);
+  const npm = packageLockVersion(packageLock, LORO_PARITY.npm);
+  if (cargo !== null && cargo === npm) return null;
+  return `Cargo.lock resolves ${LORO_PARITY.cargo} ${cargo ?? "(none)"} but package-lock.json resolves ${LORO_PARITY.npm} ${npm ?? "(none)"}; pin both to one version.`;
+}
+
+export async function findLoroParity(root = repositoryRoot) {
+  return findLoroParityProblem(
+    await readFile(join(root, "Cargo.lock"), "utf8"),
+    await readFile(join(root, "package-lock.json"), "utf8"),
+  );
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === scriptPath) {
-  findLoosePins()
-    .then((problems) => {
+  Promise.all([findLoosePins(), findLoroParity()])
+    .then(([problems, parity]) => {
       if (problems.length > 0) {
         console.error(
           `${problems.join("\n")}\nEvery Cargo dependency version must start with \`=\`. Pin the exact version the lockfile resolves.`,
@@ -108,6 +144,12 @@ if (process.argv[1] && resolve(process.argv[1]) === scriptPath) {
         process.exitCode = 1;
       } else {
         console.log("Every Cargo dependency is pinned to an exact version.");
+      }
+      if (parity !== null) {
+        console.error(parity);
+        process.exitCode = 1;
+      } else {
+        console.log("Rust loro and npm loro-crdt resolve the same version.");
       }
     })
     .catch((error) => {

@@ -273,6 +273,8 @@ const escape = (value: string): string => value
 
 export type ShellRendererInput = Readonly<{
   packageSettings?: string;
+  /** The rendered Package page, for the `package-page` route. */
+  packagePage?: string;
 }>;
 
 export function renderShell(
@@ -305,6 +307,10 @@ export function renderShell(
       <textarea id="invitation-value" required maxlength="8192" autocapitalize="off" autocorrect="off" spellcheck="false" writingsuggestions="false"></textarea><label for="join-person-name">Your name in this Workspace</label><input id="join-person-name" required maxlength="256" autocomplete="name"><button ${presentation.loading ? "disabled" : ""}>Join</button></form></section></section>`;
   }
 
+  if (route.kind === "package-page") {
+    return `${feedback}${input.packagePage ?? '<section class="shell-screen"><p class="empty-state">Package information is loading.</p></section>'}`;
+  }
+
   const workspace = presentation.workspace;
   if (!workspace) return `${feedback}<section class="shell-screen"><h1>Workspace unavailable</h1><p>Choose another Workspace or retry.</p></section>`;
 
@@ -321,7 +327,8 @@ export function renderShell(
     <section class="screen-section" aria-labelledby="invitations-heading"><h2 id="invitations-heading">Workspace Invitations</h2><p>Create a one-use Workspace Invitation.</p>
     <button type="button" id="copy-invitation" ${presentation.loading ? "disabled" : ""}>Copy Workspace Invitation</button>
     <p class="sensitive">Workspace Invitations are sensitive bearer admission material. Share them privately.</p></section>
-    <section class="screen-section settings-panel" aria-labelledby="package-instances-heading"><h2 id="package-instances-heading">Package Instances</h2>${input.packageSettings ?? '<p class="empty-state">Package information is loading.</p>'}</section></section>`;
+    <section class="screen-section settings-panel" aria-labelledby="package-instances-heading"><div class="section-heading"><h2 id="package-instances-heading">Package Instances</h2>
+      <button type="button" class="package-add" data-package-install-action="open" aria-label="Add Personal Package" title="Add Personal Package">+</button></div>${input.packageSettings ?? '<p class="empty-state">Package information is loading.</p>'}</section></section>`;
 }
 
 function routeWorkspaceId(route: ShellRoute): string | null {

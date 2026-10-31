@@ -189,6 +189,55 @@ impl From<UiResourceToken> for String {
     }
 }
 
+/// The opaque token of one content view: 128 random bits as lowercase hexadecimal.
+///
+/// It is the `<view>` segment of `teamarness-content://localhost/<view>/<path>`, and holding it
+/// is what lets the Shell read the view's files, so its `Debug` form is redacted.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ContentViewToken(String);
+
+impl ContentViewToken {
+    /// Validates exactly 32 lowercase hexadecimal characters.
+    pub fn new(value: impl Into<String>) -> Result<Self, ValueParseError> {
+        let value = value.into();
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ValueParseError::new("content view token"));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the opaque token text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ContentViewToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ContentViewToken([redacted])")
+    }
+}
+
+impl TryFrom<String> for ContentViewToken {
+    type Error = ValueParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ContentViewToken> for String {
+    fn from(value: ContentViewToken) -> Self {
+        value.0
+    }
+}
+
 /// One Package Identity and Workspace pair inside the opened Installation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -394,9 +443,32 @@ pub struct PackageCatalogEntry {
     pub identity: PackageIdentity,
     pub version: String,
     pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
     pub source: PackageSourceKind,
     pub trust: PackageTrustKind,
     pub ui_contract_digest: String,
+    /// The optional UI views the manifest declares beside `main`, in declaration order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<PackageUiView>,
+}
+
+/// A Package UI view a mount shows.
+///
+/// Every Package UI has `main`. `settings` exists only when the manifest declares it in
+/// `ui.views`, and a catalog entry lists it in `views`.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageUiView {
+    #[default]
+    Main,
+    Settings,
 }
 
 /// Public state for one Package Instance.
@@ -429,4 +501,125 @@ pub struct PackageHostSnapshot {
     pub packages: Vec<PackageCatalogEntry>,
     pub instances: Vec<PackageInstanceSnapshot>,
     pub diagnostics: Vec<PackageErrorEnvelope>,
+    /// Every installation registration the Host read, with its tier and admission result.
+    pub registrations: Vec<InstallationRegistrationSnapshot>,
+}
+
+/// The admission tier a Package belongs to (ADR 0036).
+///
+/// The Team tier is the bundled Packages plus installation registrations with
+/// `overrideApplication`. It is fixed when the Host opens. The Personal tier is
+/// every other installation registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageTier {
+    Team,
+    Personal,
+}
+
+/// Whether one installation registration was admitted, or how it changed
+/// since the Host opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RegistrationStatus {
+    Admitted,
+    Refused {
+        code: crate::errors::PackageErrorCode,
+    },
+    /// The file entry for a Team Package identity was written or removed while
+    /// the Host ran. The running Host is unchanged; the change applies at the
+    /// next open.
+    PendingRestart {
+        change: PendingRegistrationChange,
+    },
+}
+
+/// The file change a [`RegistrationStatus::PendingRestart`] entry waits to apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingRegistrationChange {
+    /// An override was written. It replaces the bundled Package at the next open.
+    Written,
+    /// The entry was removed. The bundled Package returns at the next open.
+    Removed,
+}
+
+/// One entry of the installation registration file, as the Host last admitted it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationRegistrationSnapshot {
+    /// The registered Package Directory, canonical when it could be resolved.
+    pub directory: String,
+    /// The Package Identity the registration expects, exactly as written.
+    pub expected_identity: String,
+    /// Whether the registration replaces a bundled Package.
+    #[serde(rename = "override")]
+    pub override_application: bool,
+    pub tier: PackageTier,
+    pub status: RegistrationStatus,
+}
+
+/// What registering an inspected Package Directory would do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectedPackageKind {
+    /// No registration or bundled Package has this identity.
+    New,
+    /// The identity is already registered at this directory.
+    Reload,
+    /// The identity is already registered at a different directory.
+    ReplacesRegistration,
+    /// A bundled Package has this identity, so registering it needs an override.
+    OverridesTeam,
+}
+
+/// The display metadata of an inspected Package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectedPresentation {
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+}
+
+/// One Semantic Capability an inspected Package requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectedCapability {
+    pub identity: String,
+    pub major: u16,
+    pub min_minor: u16,
+    pub max_minor: u16,
+}
+
+/// A Package Directory read for a preview. Inspecting never runs Package code.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectedPackage {
+    /// The canonical Package Directory.
+    pub directory: PathBuf,
+    pub identity: PackageIdentity,
+    pub version: String,
+    pub presentation: InspectedPresentation,
+    pub capabilities: Vec<InspectedCapability>,
+    pub provided: Vec<teamarness_package_contract::port_contract::ProvidedContract>,
+    pub consumed: Vec<teamarness_package_contract::manifest::ConsumedContract>,
+    pub kind: InspectedPackageKind,
+}
+
+/// A request to register a Package Directory in the installation registration file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationRequest {
+    /// An absolute path to the Package Directory.
+    pub directory: PathBuf,
+    /// The identity the person saw in the preview.
+    pub expected_identity: PackageIdentity,
+    /// The `trusted_native_code_v1` risks the person accepted.
+    pub accepted_risks: Vec<String>,
+    /// Whether the person confirmed replacing a bundled Package.
+    pub override_application: bool,
 }

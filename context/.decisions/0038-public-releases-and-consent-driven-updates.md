@@ -1,4 +1,4 @@
-# 0031 — Public same-repository releases and consent-driven application updates
+# 0038 — Public same-repository releases and consent-driven application updates
 
 **Status:** accepted (2026-10-24)
 

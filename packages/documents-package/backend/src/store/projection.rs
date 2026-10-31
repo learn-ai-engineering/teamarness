@@ -152,6 +152,7 @@ pub(crate) fn project_domain(
             author,
             collection,
             title,
+            genesis,
         } => {
             if !collection_exists(tx, collection)? {
                 return ProjectionOutcome::deferred(tx, record_id, domain);
@@ -161,9 +162,18 @@ pub(crate) fn project_domain(
                 params![record_id, author, order_key, collection],
             )?;
             clear(tx, record_id)?;
+            // The genesis is the body's first update, imported before any edit can apply:
+            // an edit of a Document that does not exist yet is deferred until this record.
+            // A Document already known to be conflicted imports nothing, not even its genesis.
+            let conflicted: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM document_identity_conflicts WHERE document_id=?1)",
+                [record_id],
+                |row| row.get(0),
+            )?;
             Ok(ProjectionOutcome {
                 text: Some((record_id.into(), order_key.into(), title.clone())),
                 created: Some(record_id.into()),
+                edit: (!conflicted).then(|| (record_id.into(), genesis.clone())),
                 ..ProjectionOutcome::applied()
             })
         }
@@ -207,10 +217,7 @@ pub(crate) fn project_domain(
             clear(tx, record_id)?;
             Ok(ProjectionOutcome::applied())
         }
-        DomainRecord::DocumentEdit {
-            document, update, ..
-        }
-        | DomainRecord::IdentifiedDocumentEdit {
+        DomainRecord::IdentifiedDocumentEdit {
             document, update, ..
         } => {
             tx.execute(

@@ -103,7 +103,58 @@ impl HostStore {
         connection
             .execute_batch(include_str!("../migrations/0002_port_providers.sql"))
             .map_err(fault!(storage_failure()))?;
+        connection
+            .execute_batch(include_str!("../migrations/0003_agent_port_selections.sql"))
+            .map_err(fault!(storage_failure()))?;
         Ok(Self { connection })
+    }
+
+    pub(crate) fn port_selections(
+        &self,
+        installation: &str,
+        workspace: &str,
+        package: &str,
+    ) -> Result<std::collections::BTreeMap<String, u16>, HostStoreFailure> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT contract_identity, major FROM agent_port_selections
+                 WHERE installation_identity = ?1 AND workspace_id = ?2 AND package_identity = ?3
+                 ORDER BY contract_identity",
+            )
+            .map_err(fault!(storage_failure()))?;
+        statement
+            .query_map(params![installation, workspace, package], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(fault!(storage_failure()))?
+            .collect::<Result<_, _>>()
+            .map_err(fault!(storage_failure()))
+    }
+
+    pub(crate) fn select_port(
+        &self,
+        installation: &str,
+        workspace: &str,
+        package: &str,
+        contract: &str,
+        major: Option<u16>,
+    ) -> Result<(), HostStoreFailure> {
+        if let Some(major) = major {
+            self.connection.execute("INSERT INTO agent_port_selections(installation_identity, workspace_id,
+                    package_identity, contract_identity, major) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(installation_identity, workspace_id, package_identity, contract_identity)
+                 DO UPDATE SET major = excluded.major", params![installation, workspace, package, contract, major]).map_err(fault!(storage_failure()))?;
+        } else {
+            self.connection
+                .execute(
+                    "DELETE FROM agent_port_selections WHERE installation_identity = ?1
+                 AND workspace_id = ?2 AND package_identity = ?3 AND contract_identity = ?4",
+                    params![installation, workspace, package, contract],
+                )
+                .map_err(fault!(storage_failure()))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn data_directory_mapping(

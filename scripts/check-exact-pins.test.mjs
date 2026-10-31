@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { findLoosePins, findLoosePinsInManifest, repositoryRoot } from "./check-exact-pins.mjs";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+
+import {
+  findLoosePins,
+  findLoosePinsInManifest,
+  findLoroParity,
+  findLoroParityProblem,
+  repositoryRoot,
+} from "./check-exact-pins.mjs";
 
 const MANIFEST = `[package]
 name = "example"
@@ -65,4 +74,18 @@ test("platform, dev and [dependencies.name] tables are all scanned", () => {
 
 test("the fixture reports exactly the five loose pins", () => {
   assert.equal(findLoosePinsInManifest("Cargo.toml", MANIFEST).length, 5);
+});
+
+test("the real lockfiles resolve one Loro release for Rust and the UI", async () => {
+  assert.equal(await findLoroParity(repositoryRoot), null);
+});
+
+test("a Loro release mismatch between the lockfiles is reported", async () => {
+  const cargoLock = await readFile(join(repositoryRoot, "Cargo.lock"), "utf8");
+  const packageLock = JSON.parse(await readFile(join(repositoryRoot, "package-lock.json"), "utf8"));
+  packageLock.packages["node_modules/loro-crdt"].version = "1.16.3";
+  const problem = findLoroParityProblem(cargoLock, JSON.stringify(packageLock));
+  assert.match(problem ?? "", /loro 1\.16\.2 but package-lock\.json resolves loro-crdt 1\.16\.3/);
+  const missing = findLoroParityProblem(cargoLock.replace('name = "loro"', 'name = "loro-gone"'), JSON.stringify(packageLock));
+  assert.match(missing ?? "", /loro \(none\)/);
 });

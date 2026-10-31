@@ -49,6 +49,17 @@ test("prepares a local probe Package whose manifest sizes and digests match its 
     const entrypoint = await readFile(join(packageDirectory, "ui/index.js"), "utf8");
     assert.match(entrypoint, /export async function mount\(context\)/);
     assert.match(entrypoint, /ui-isolation-breach/);
+    for (const check of [
+      "wasm-instantiates",
+      "eval-blocked",
+      "function-constructor-blocked",
+      "ipc-fetch-blocked",
+      "parent-document-blocked",
+      "top-location-blocked",
+      "top-navigation-blocked",
+    ]) {
+      assert.match(entrypoint, new RegExp(`runCheck\\("${check}"`), `${check} probe check`);
+    }
 
     assert.equal((await stat(join(packageDirectory, "backend/package.mjs"))).mode & 0o777, 0o700);
     assert.equal((await stat(join(packageDirectory, "ui/index.js"))).mode & 0o777, 0o600);
@@ -93,7 +104,7 @@ test("probe attempts all four commands with missing/fake keys, generation 1 and 
     getComputedStyle: () => ({ getPropertyValue: () => "accent" }),
     fetch: async (url, options) => { fetches.push({ url, options }); throw new Error("denied"); },
     setTimeout: () => 1,
-  });
+  }, { contextCodeGeneration: { strings: false, wasm: true } });
   await mount({ root: element(), client: { request: async (operation) => { bridge.push(operation); throw { code: "ui_contract_violation" }; } } });
   for (const command of ["application_update_status", "application_update_check", "application_update_restart", "application_update_quit"]) {
     const attempts = posts.filter(({ cmd }) => cmd === command);
@@ -104,7 +115,8 @@ test("probe attempts all four commands with missing/fake keys, generation 1 and 
     assert.ok(forged.some(({ operation }) => operation === command));
     assert.ok(bridge.includes(command));
   }
-  assert.ok(text.some(({ textContent }) => textContent === "Isolation probe PASS"));
+  assert.ok(text.some(({ textContent }) => textContent === "Isolation probe PASS"),
+    JSON.stringify(text.map(({ textContent }) => textContent)));
   const smoke = await readFile(new URL("../smoke-packaged-app.mjs", import.meta.url), "utf8");
   assert.match(smoke, /handlerEntriesBeforeFrame/);
   assert.match(smoke, /requires the disposable verified Ready probe build, not default Disabled/);

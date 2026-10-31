@@ -10,13 +10,15 @@ mod authority;
 #[cfg(feature = "test-hooks")]
 mod test_hooks;
 #[cfg(feature = "test-hooks")]
-pub use test_hooks::AuthorityPause;
+pub use test_hooks::{AuthorityPause, PortSelectionPause, PortSnapshotProbe, TeamPortEntry};
 mod broker;
+mod port_access;
 mod port_observation;
 pub use port_observation::{PortObservation, PortObservations, PortStage};
 mod capability;
 mod catalog;
 mod commands;
+mod content_views;
 mod data_directory;
 mod diag;
 mod errors;
@@ -25,6 +27,7 @@ mod host_store;
 mod instance;
 mod manifest;
 mod protocol;
+mod registrations;
 mod subscriptions;
 mod supervisor;
 mod ui;
@@ -38,13 +41,17 @@ use tokio::sync::{Mutex, watch};
 pub use crate::admission::PortAvailability;
 pub use crate::commands::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
-    OpenUiMount, OpenUiSubscription, PackageHostCommand, PackageHostOutcome, ReadUiResource,
-    ReconcileWorkspaces, RecoverPackage, ReportUiFault, ShutdownHost, SuspendPackage,
-    UiLoaderDescriptor, UiPackageContext, UiRequest, UiWorkspaceContext,
+    InstallPersonal, OpenUiMount, OpenUiSubscription, PackageHostCommand, PackageHostOutcome,
+    ReadContent, ReadUiResource, ReconcileWorkspaces, RecoverPackage, ReloadPersonal,
+    RemoveOverride, RemovePersonal, ReportUiFault, RestartPersonal, ShutdownHost, SuspendPackage,
+    UiLoaderDescriptor, UiPackageContext, UiRequest, UiWorkspaceContext, WriteOverride,
 };
 pub use crate::errors::{
     MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH, PackageErrorCode,
     PackageErrorEnvelope, PackageErrorStage, PackageOwnedError, RecoveryAction,
+};
+pub use crate::registrations::{
+    inspect_package_directory, remove_registration, write_registration,
 };
 pub use crate::subscriptions::{
     HostStateNotification, PackageHostNotification, PackageHostSubscription,
@@ -52,10 +59,13 @@ pub use crate::subscriptions::{
 };
 pub use crate::ui::MAX_UI_SUBSCRIPTIONS_PER_MOUNT;
 pub use crate::values::{
-    DiagnosticId, HostRevision, InstallationPublicIdentity, LifecycleState, MountState,
-    PackageCatalogEntry, PackageHostConfig, PackageHostSnapshot, PackageHostState, PackageIdentity,
-    PackageInstanceKey, PackageInstanceSnapshot, PackageSourceKind, PackageTrustKind, PackageValue,
-    UiMountId, UiRequestId, UiResourceToken, UiSubscriptionId, ValueParseError, WorkspaceId,
+    ContentViewToken, DiagnosticId, HostRevision, InspectedCapability, InspectedPackage,
+    InspectedPackageKind, InspectedPresentation, InstallationPublicIdentity,
+    InstallationRegistrationSnapshot, LifecycleState, MountState, PackageCatalogEntry,
+    PackageHostConfig, PackageHostSnapshot, PackageHostState, PackageIdentity, PackageInstanceKey,
+    PackageInstanceSnapshot, PackageSourceKind, PackageTier, PackageTrustKind, PackageUiView,
+    PackageValue, PendingRegistrationChange, RegistrationRequest, RegistrationStatus, UiMountId,
+    UiRequestId, UiResourceToken, UiSubscriptionId, ValueParseError, WorkspaceId,
 };
 
 use crate::errors::host_error;
@@ -66,6 +76,8 @@ use crate::errors::host_error;
 #[serde(rename_all = "camelCase")]
 pub struct AuthoringCatalogEntry {
     pub package: PackageCatalogEntry,
+    /// The Semantic Capabilities the manifest declares.
+    pub capabilities: Vec<InspectedCapability>,
     pub provided: Vec<teamarness_package_contract::port_contract::ProvidedContract>,
     pub definitions: serde_json::Map<String, serde_json::Value>,
     pub consumed: Vec<teamarness_package_contract::manifest::ConsumedContract>,
@@ -88,15 +100,19 @@ struct PackageHostInner {
     revisions: watch::Sender<HostRevision>,
     config: PackageHostConfig,
     core: Arc<teamarness_core::CoreRuntime>,
+    // The Team tier, fixed at open and never changed while the Host runs (ADR 0036).
+    team: host::personal::TeamTier,
     templates: Vec<supervisor::ProcessTemplate>,
     admitted_ui: BTreeMap<PackageIdentity, Arc<ui::AdmittedUi>>,
     authoring_catalog: Vec<AuthoringCatalogEntry>,
     port_graph: BTreeMap<PackageIdentity, Vec<PortAvailability>>,
-    port_broker: Arc<broker::PortBroker>,
     port_contracts: BTreeMap<
         PackageIdentity,
         Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,
     >,
+    /// The live Personal tier: its lock and its per-identity entries.
+    personal: host::personal::PersonalTier,
+    port_broker: Arc<broker::PortBroker>,
     reconciliation: Mutex<()>,
     mount_management: Mutex<()>,
 }
@@ -106,6 +122,7 @@ struct HostData {
     revision: HostRevision,
     packages: Vec<PackageCatalogEntry>,
     diagnostics: Vec<PackageErrorEnvelope>,
+    registrations: Vec<InstallationRegistrationSnapshot>,
     instances: BTreeMap<PackageInstanceKey, Arc<instance::InstanceActor>>,
     mounts: BTreeMap<UiMountId, MountLease>,
     ui_routes: BTreeMap<(UiMountId, UiSubscriptionId), Option<protocol::UiEventReceiver>>,
@@ -123,13 +140,14 @@ struct MountLease {
 impl PackageHost {
     /// Returns the authoritative Package Host state.
     pub async fn snapshot(&self) -> PackageHostSnapshot {
-        let (state, revision, packages, diagnostics, instances) = {
+        let (state, revision, packages, diagnostics, registrations, instances) = {
             let data = self.inner.data.lock().await;
             (
                 data.state,
                 data.revision,
                 data.packages.clone(),
                 data.diagnostics.clone(),
+                data.registrations.clone(),
                 data.instances.values().cloned().collect::<Vec<_>>(),
             )
         };
@@ -143,6 +161,7 @@ impl PackageHost {
             packages,
             instances: snapshots,
             diagnostics,
+            registrations,
         }
     }
 
@@ -158,7 +177,31 @@ impl PackageHost {
                 entry.definitions = compiled.definitions.clone();
             }
         }
+        entries.extend(self.inner.personal.catalog());
+        entries.sort_by(|left, right| left.package.identity.cmp(&right.package.identity));
         entries
+    }
+
+    /// Reads a Package Directory for a preview, as [`inspect_package_directory`]
+    /// does for this Host's configuration. It runs no Package code and changes
+    /// nothing, so it does not wait for a Personal operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the codes [`inspect_package_directory`] returns.
+    pub async fn inspect_directory(
+        &self,
+        directory: std::path::PathBuf,
+    ) -> Result<InspectedPackage, PackageErrorEnvelope> {
+        let config = self.inner.config.clone();
+        tokio::task::spawn_blocking(move || inspect_package_directory(&config, &directory))
+            .await
+            .map_err(|_| {
+                host_error(
+                    PackageErrorCode::DataDirectoryUnavailable,
+                    PackageErrorStage::Storage,
+                )
+            })?
     }
 
     /// Opt in to bounded, process-local Port routing observations. A slow receiver reports lag.
@@ -231,6 +274,13 @@ impl PackageHost {
             }
             PackageHostCommand::ReportUiFault(input) => self.report_ui_fault(input).await,
             PackageHostCommand::ReadUiResource(input) => self.read_ui_resource(input).await,
+            PackageHostCommand::InstallPersonal(input) => self.install_personal(input).await,
+            PackageHostCommand::ReloadPersonal(input) => self.reload_personal(input).await,
+            PackageHostCommand::RemovePersonal(input) => self.remove_personal(input).await,
+            PackageHostCommand::RestartPersonal(input) => self.restart_personal(input).await,
+            PackageHostCommand::WriteOverride(input) => self.write_override(input).await,
+            PackageHostCommand::RemoveOverride(input) => self.remove_override(input).await,
+            PackageHostCommand::ReadContent(input) => self.read_content(input).await,
             PackageHostCommand::Shutdown(_) => self.shutdown_host().await,
         }
     }
@@ -274,9 +324,9 @@ mod tests {
         let instances = host.snapshot().await.instances;
         assert_eq!(instances.len(), 2, "both Packages activated");
         for instance in instances {
-            host.execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-                instance: instance.key,
-            }))
+            host.execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+                instance.key,
+            )))
             .await
             .unwrap();
         }

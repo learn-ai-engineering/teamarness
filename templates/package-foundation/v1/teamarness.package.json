@@ -2,7 +2,10 @@
   "schemaVersion": 1,
   "identity": "__PACKAGE_IDENTITY__",
   "version": "1.0.0",
-  "presentation": { "displayName": __PACKAGE_DISPLAY_NAME_JSON__ },
+  "presentation": {
+    "displayName": __PACKAGE_DISPLAY_NAME_JSON__,
+    "description": "Describe what this Package does for a Workspace."
+  },
   "protocol": { "major": 1, "minMinor": 0, "maxMinor": 0 },
   "backends": [{
     "target": "aarch64-apple-darwin",

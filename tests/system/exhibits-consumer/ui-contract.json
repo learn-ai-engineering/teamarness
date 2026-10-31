@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "exhibitId": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "minLength": 1, "maxLength": 48 },
+    "fixture": { "type": "string", "enum": ["revision-1", "revision-2", "media", "isolation-probe"] }
+  },
+  "requests": {
+    "fixture.publish": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["fixture"],
+        "properties": {
+          "fixture": { "$ref": "#/$defs/fixture" },
+          "exhibitId": { "$ref": "#/$defs/exhibitId" },
+          "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "delayMs": { "type": "integer", "minimum": 0, "maximum": 60000 }
+        }
+      },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["exhibitId"],
+        "properties": {
+          "exhibitId": { "$ref": "#/$defs/exhibitId" },
+          "revision": { "type": "integer", "minimum": 1 },
+          "chunksSent": { "type": "integer", "minimum": 0 },
+          "scheduledInMs": { "type": "integer", "minimum": 1, "maximum": 60000 }
+        }
+      }
+    },
+    "frame.probe": {
+      "request": { "type": "object", "additionalProperties": false },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["url"],
+        "properties": { "url": { "type": "string", "pattern": "^teamarness-content://localhost/[0-9a-f]{32}/index\\.html$" } }
+      }
+    },
+    "agent.bind": {
+      "request": { "type": "object", "additionalProperties": false },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["principalId", "identity"],
+        "properties": {
+          "principalId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "identity": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "agent.unbind": {
+      "request": { "type": "object", "additionalProperties": false },
+      "response": { "type": "object", "additionalProperties": false }
+    },
+    "proof.start": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["prefix"],
+        "properties": { "prefix": { "$ref": "#/$defs/exhibitId" } }
+      },
+      "response": { "type": "object", "additionalProperties": false, "required": ["started"], "properties": { "started": { "const": true } } }
+    },
+    "proof.result": {
+      "request": { "type": "object", "additionalProperties": false },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["state"],
+        "properties": {
+          "state": { "type": "string", "enum": ["idle", "running", "done"] },
+          "report": { "type": "object" }
+        }
+      }
+    }
+  },
+  "subscriptions": {}
+}

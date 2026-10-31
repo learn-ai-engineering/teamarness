@@ -24,6 +24,8 @@ export type PackageInstancePresentation = Readonly<{
   availability: string;
   actionIndex: number;
   installationLocal: boolean;
+  /** The admission tier, which picks the sidebar group. An override is `local` but in the Team tier. */
+  tier: "team" | "personal";
   sourceLabel: "Team" | "Personal";
   canRecover: boolean;
   canDispose: boolean;
@@ -76,26 +78,32 @@ export function buildPackageNavigationPresentation(
       if (!catalog) return [];
       const descriptor = lifecycleDescriptor(instance.lifecycle);
       const sourceLabel: PackageInstancePresentation["sourceLabel"] = catalog.source === "local" ? "Personal" : "Team";
+      const registration = snapshot.registrations.find(({ expectedIdentity }) => expectedIdentity === catalog.identity);
+      // An installation registration names its tier; a bundled Package has none and is in the Team tier.
+      const tier: PackageInstancePresentation["tier"] = registration?.tier
+        ?? (catalog.source === "local" ? "personal" : "team");
       return [{
         name: catalog.displayName,
         actionIndex,
         installationLocal: catalog.source === "local",
+        tier,
         sourceLabel,
         ...descriptor,
       }];
     });
   return {
-    teamPackages: rows.filter(({ installationLocal }) => !installationLocal),
-    privatePackages: rows.filter(({ installationLocal }) => installationLocal),
+    teamPackages: rows.filter(({ tier }) => tier === "team"),
+    privatePackages: rows.filter(({ tier }) => tier === "personal"),
   };
 }
 
-type LifecycleDescriptor = Pick<
+export type LifecycleDescriptor = Pick<
   PackageInstancePresentation,
   "availability" | "canRecover" | "canDispose"
 >;
 
-function lifecycleDescriptor(
+/** How one Package Instance lifecycle reads, and which recovery controls it allows. */
+export function lifecycleDescriptor(
   lifecycle: PackageHostSnapshot["instances"][number]["lifecycle"],
 ): LifecycleDescriptor {
   switch (lifecycle) {

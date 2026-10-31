@@ -12,6 +12,11 @@ use crate::values::{DiagnosticId, PackageIdentity, PackageInstanceKey};
 #[serde(rename_all = "snake_case")]
 pub enum PackageErrorCode {
     InvalidRegistration,
+    /// The installation registration file breaks its file policy or does not parse, so the Host
+    /// refuses to rewrite it.
+    RegistrationFileInvalid,
+    /// No installation registration has the requested Package Identity.
+    NotRegistered,
     SourceNotFound,
     ManifestMalformed,
     ManifestUnsupported,
@@ -32,6 +37,10 @@ pub enum PackageErrorCode {
     PrincipalNotBound,
     AgentNotStewarded,
     AgentNotFound,
+    UnsupportedMediaType,
+    ContentTooLarge,
+    InvalidContentPath,
+    ContentNotFound,
     SpawnFailed,
     HandshakeTimeout,
     HandshakeMismatch,
@@ -59,11 +68,17 @@ pub enum PackageErrorCode {
     PortVersionMismatch,
     PortDependencyCycle,
     PortUnavailable,
+    PortCatalogChanged,
+    PortNotEnabled,
+    AgentNotBound,
+    AgentBindingChanged,
     PortUngranted,
     PortRequestInvalid,
     PortResponseInvalid,
     PortEventInvalid,
     UiLoadFailed,
+    /// A mount asked for a UI view the Package's manifest does not declare.
+    UiViewNotDeclared,
     UiException,
     StaleMount,
     EventLagged,
@@ -175,7 +190,12 @@ pub(crate) fn host_error(code: PackageErrorCode, stage: PackageErrorStage) -> Pa
         | PackageErrorCode::UiContractViolation
         | PackageErrorCode::EventLagged
         | PackageErrorCode::UiLoadFailed => RecoveryAction::ReloadUi,
-        PackageErrorCode::ShuttingDown => RecoveryAction::None,
+        PackageErrorCode::ShuttingDown | PackageErrorCode::UiViewNotDeclared => {
+            RecoveryAction::None
+        }
+        PackageErrorCode::RegistrationFileInvalid | PackageErrorCode::NotRegistered => {
+            RecoveryAction::CorrectRegistration
+        }
         _ => RecoveryAction::CorrectPackageSource,
     };
     let mut random = [0_u8; 12];
@@ -219,6 +239,9 @@ pub(crate) fn activation_error(
             | PackageErrorCode::PrincipalNotBound
             | PackageErrorCode::AgentNotStewarded
             | PackageErrorCode::AgentNotFound
+            | PackageErrorCode::UnsupportedMediaType
+            | PackageErrorCode::ContentTooLarge
+            | PackageErrorCode::InvalidContentPath
     ) {
         PackageErrorStage::Capability
     } else {

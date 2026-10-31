@@ -7,6 +7,7 @@ import {
   type PackageMountContext,
   type PackageSubscription,
   type PackageUnmount,
+  type TypedPackageClient,
 } from "@teamarness/package-ui-sdk";
 import type { ReferenceContract, Snapshot } from "./contract.generated";
 import referenceAsset from "./probe.svg?no-inline";
@@ -40,6 +41,12 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   } catch (error) {
     cleanupKit();
     throw error;
+  }
+  if (context.view === "settings") {
+    return mountSettings(context, client, () => {
+      cleanupPackageStyles();
+      cleanupKit();
+    });
   }
   const article = document.createElement("article");
   article.className = "teamarness-page teamarness-page--readable";
@@ -144,5 +151,53 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     article.remove();
     cleanupPackageStyles();
     cleanupKit();
+  };
+}
+
+/**
+ * The settings view the manifest declares in `ui.views`. The Reference Package has nothing to
+ * configure; the view shows that a declared view mounts with the same client and Backend.
+ */
+async function mountSettings(
+  context: PackageMountContext,
+  client: TypedPackageClient<ReferenceContract>,
+  cleanupStyles: () => void,
+): Promise<PackageUnmount> {
+  const article = document.createElement("article");
+  article.className = "teamarness-page teamarness-page--readable";
+  const header = document.createElement("header");
+  header.className = "teamarness-page-header";
+  const heading = document.createElement("h1");
+  heading.className = "teamarness-page-title";
+  heading.textContent = `${context.package.displayName} settings`;
+  const subtitle = document.createElement("p");
+  subtitle.className = "teamarness-page-subtitle";
+  subtitle.textContent = "This Package declares a settings view. It has nothing to configure.";
+  header.append(heading, subtitle);
+  const section = document.createElement("section");
+  section.className = "teamarness-section teamarness-stack";
+  const details = document.createElement("dl");
+  details.className = "reference-details";
+  const term = document.createElement("dt");
+  term.textContent = "Counter";
+  const counter = document.createElement("dd");
+  counter.textContent = "Loading";
+  details.append(term, counter);
+  section.append(details);
+  article.append(header, section);
+  context.root.append(article);
+
+  try {
+    counter.textContent = String((await client.request("reference.read", {})).counter);
+  } catch (error) {
+    counter.textContent = `Package error: ${describePackageError(error)}`;
+  }
+
+  let unmounted = false;
+  return () => {
+    if (unmounted) return;
+    unmounted = true;
+    article.remove();
+    cleanupStyles();
   };
 }

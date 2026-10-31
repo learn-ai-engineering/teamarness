@@ -70,7 +70,7 @@ async fn membership_stream_resumes_after_credit_exhaustion_without_gaps() {
 
     let instance = host.snapshot().await.instances[0].key.clone();
     let mount = match host
-        .execute(PackageHostCommand::OpenUiMount(OpenUiMount { instance }))
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(instance)))
         .await
         .unwrap()
     {

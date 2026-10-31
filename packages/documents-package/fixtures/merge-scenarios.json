@@ -1,0 +1,121 @@
+{
+  "description": "Shared Markdown merge scenarios. Each row runs against markdown::merge (backend cargo test) and through document.revise (system test). Steps: (1) a new Document's genesis is revised to `initial` and that version is `initial`; (2) a person applies `concurrentHumanEdits` on their own replica, each inserting `text` at the start or end of the first text run of top-level block `block`, and the replicas sync; (3) the revision is merged against `base`: `initial` (the version the agent exported) or `current` (after the person's edits); (4) every replica exports `expectedMarkdown`, and when `expectedOps` is present the revision produced exactly that many Loro operations (0 means no change and no record).",
+  "scenarios": [
+    {
+      "name": "agent rewrites a sentence and adds a list item while a person types in two other places",
+      "initial": "# Q4 plan\n\nWe ship rendered editing first.\n\n## Goals\n\n- Members edit in **rendered** form\n- Agents edit through Markdown\n- Nothing is lost\n\n## Risks\n\nThe binding is pre-1.0.\n\nUndo is per person.\n",
+      "base": "initial",
+      "concurrentHumanEdits": [
+        {
+          "block": 1,
+          "at": "start",
+          "text": "Today "
+        },
+        {
+          "block": 6,
+          "at": "end",
+          "text": " Mostly."
+        }
+      ],
+      "revision": "# Q4 plan\n\nWe ship rendered editing first.\n\n## Goals\n\n- Members edit in **rendered** form\n- Agents edit through Markdown\n- Nothing is lost\n- Markdown round-trips\n\n## Risks\n\nThe binding is pre-1.0 and has one maintainer.\n\nUndo is per person.\n",
+      "expectedMarkdown": "# Q4 plan\n\nToday We ship rendered editing first.\n\n## Goals\n\n- Members edit in **rendered** form\n- Agents edit through Markdown\n- Nothing is lost\n- Markdown round-trips\n\n## Risks\n\nThe binding is pre-1.0 and has one maintainer.\n\nUndo is per person. Mostly.\n"
+    },
+    {
+      "name": "agent edits inside the paragraph a person is typing in",
+      "initial": "The quick brown fox jumps over the lazy dog.\n",
+      "base": "initial",
+      "concurrentHumanEdits": [
+        {
+          "block": 0,
+          "at": "start",
+          "text": "Look: "
+        }
+      ],
+      "revision": "The quick brown fox jumps over the *sleepy* dog.\n",
+      "expectedMarkdown": "Look: The quick brown fox jumps over the *sleepy* dog.\n"
+    },
+    {
+      "name": "formatting-only revision is one mark and no text operations",
+      "initial": "Ship it on Friday.\n",
+      "base": "initial",
+      "concurrentHumanEdits": [],
+      "revision": "Ship it on **Friday**.\n",
+      "expectedMarkdown": "Ship it on **Friday**.\n",
+      "expectedOps": 2
+    },
+    {
+      "name": "unchanged export is a no-op",
+      "initial": "# Q4 plan\n\nWe ship rendered editing first.\n\n## Goals\n\n- Members edit in **rendered** form\n- Agents edit through Markdown\n- Nothing is lost\n\n## Risks\n\nThe binding is pre-1.0.\n\nUndo is per person.\n",
+      "base": "initial",
+      "concurrentHumanEdits": [],
+      "revision": "# Q4 plan\n\nWe ship rendered editing first.\n\n## Goals\n\n- Members edit in **rendered** form\n- Agents edit through Markdown\n- Nothing is lost\n\n## Risks\n\nThe binding is pre-1.0.\n\nUndo is per person.\n",
+      "expectedMarkdown": "# Q4 plan\n\nWe ship rendered editing first.\n\n## Goals\n\n- Members edit in **rendered** form\n- Agents edit through Markdown\n- Nothing is lost\n\n## Risks\n\nThe binding is pre-1.0.\n\nUndo is per person.\n",
+      "expectedOps": 0
+    },
+    {
+      "name": "unchanged old export is a no-op and keeps the person's newer edits",
+      "initial": "# Q4 plan\n\nWe ship rendered editing first.\n\n## Goals\n\n- Members edit in **rendered** form\n- Agents edit through Markdown\n- Nothing is lost\n\n## Risks\n\nThe binding is pre-1.0.\n\nUndo is per person.\n",
+      "base": "initial",
+      "concurrentHumanEdits": [
+        {
+          "block": 5,
+          "at": "end",
+          "text": " Probably."
+        }
+      ],
+      "revision": "# Q4 plan\n\nWe ship rendered editing first.\n\n## Goals\n\n- Members edit in **rendered** form\n- Agents edit through Markdown\n- Nothing is lost\n\n## Risks\n\nThe binding is pre-1.0.\n\nUndo is per person.\n",
+      "expectedMarkdown": "# Q4 plan\n\nWe ship rendered editing first.\n\n## Goals\n\n- Members edit in **rendered** form\n- Agents edit through Markdown\n- Nothing is lost\n\n## Risks\n\nThe binding is pre-1.0. Probably.\n\nUndo is per person.\n",
+      "expectedOps": 0
+    },
+    {
+      "name": "agent appends a section while a person types at the top",
+      "initial": "# Notes\n\nFirst point.\n",
+      "base": "initial",
+      "concurrentHumanEdits": [
+        {
+          "block": 0,
+          "at": "end",
+          "text": " (draft)"
+        }
+      ],
+      "revision": "# Notes\n\nFirst point.\n\n## Next\n\n1. Review\n2. Ship\n",
+      "expectedMarkdown": "# Notes (draft)\n\nFirst point.\n\n## Next\n\n1. Review\n2. Ship\n"
+    },
+    {
+      "name": "a deleted block drops a concurrent edit inside it",
+      "initial": "keep\n\ndoomed\n",
+      "base": "initial",
+      "concurrentHumanEdits": [
+        {
+          "block": 1,
+          "at": "end",
+          "text": " edited"
+        }
+      ],
+      "revision": "keep\n",
+      "expectedMarkdown": "keep\n"
+    },
+    {
+      "name": "without the exported base the agent overwrites newer human text",
+      "initial": "alpha\n\nbeta\n",
+      "base": "current",
+      "concurrentHumanEdits": [
+        {
+          "block": 0,
+          "at": "end",
+          "text": " (human)"
+        }
+      ],
+      "revision": "alpha\n\nbeta (agent)\n",
+      "expectedMarkdown": "alpha\n\nbeta (agent)\n"
+    },
+    {
+      "name": "unsupported Markdown is kept as literal text",
+      "initial": "x\n",
+      "base": "initial",
+      "concurrentHumanEdits": [],
+      "revision": "| a | b |\n|---|---|\n| 1 | 2 |\n",
+      "expectedMarkdown": "| a | b | |---|---| | 1 | 2 |\n"
+    }
+  ]
+}

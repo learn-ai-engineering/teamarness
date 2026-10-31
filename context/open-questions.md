@@ -56,11 +56,11 @@ Design uncertainties that need resolution before or during implementation. Each 
 
 ## TEAM-DQ6 — Tauri version and tooling
 
-**Status:** Resolved (2026-10-24, ADR 0031).
+**Status:** Resolved (2026-10-24, ADR 0038).
 
 **Decision:** Use exact pins for `tauri` 2.12.5, `tauri-build` 2.7.4, `tauri-plugin-updater` 2.14.0, and npm `@tauri-apps/api` and `@tauri-apps/cli` 2.12.4. Keep vanilla TypeScript, Vite, Vitest, npm workspaces, and committed Rust and npm lockfiles. The desktop alone consumes the updater and direct `reqwest` 0.13.5 dependency.
 
-**Rationale:** [ADR 0031](.decisions/0031-public-releases-and-consent-driven-updates.md) selects the official version-bearing signer and mandatory signed-version verifier instead of custom trust machinery. Updater 2.14.0 requires the Tauri 2.12 stack. The offline `apps/teamarness-desktop/src-tauri/examples/qualify-update.rs` harness uses the pinned plugin's `restore_update` and `Update::verify`, with real signatures and independent expected versions for both macOS target keys. It rejects altered bytes, inflated announcements, unversioned signatures, and changed trusted comments. This upgrade requires renewed native packaged-app and WKWebView isolation qualification under ADR 0015. Successful compilation or fixtures do not replace that manual gate.
+**Rationale:** [ADR 0038](.decisions/0038-public-releases-and-consent-driven-updates.md) selects the official version-bearing signer and mandatory signed-version verifier instead of custom trust machinery. Updater 2.14.0 requires the Tauri 2.12 stack. The offline `apps/teamarness-desktop/src-tauri/examples/qualify-update.rs` harness uses the pinned plugin's `restore_update` and `Update::verify`, with real signatures and independent expected versions for both macOS target keys. It rejects altered bytes, inflated announcements, unversioned signatures, and changed trusted comments. This upgrade requires renewed native packaged-app and WKWebView isolation qualification under ADR 0015. Successful compilation or fixtures do not replace that manual gate.
 
 ---
 
@@ -103,4 +103,17 @@ A Member chooses a Unicode Workspace Person Name at create/join and may rename o
 
 ## Stable release operations (settled policy; deployment gates pending)
 
-ADR 0031 and `TEAM.DEL-R04`–`R06` settle one public source/Actions/releases repository, stable immutable publication, signed-version trust and explicit restart consent. The [release runbook](../docs/releasing.md) describes actual commands and failure behavior. Repository visibility/disclosure, protected main/tags/environment, production-key backup/custody, hosted permissions/anonymous access and real native A→B/isolation observations remain Don/maintainer-owned gates, not answered by fixtures. Lost/compromised keys can require manual reinstall; no automatic revocation, freeze protection or rollback is promised. This does not resolve other open questions.
+ADR 0038 and `TEAM.DEL-R04`–`R06` settle one public source/Actions/releases repository, stable immutable publication, signed-version trust and explicit restart consent. The [release runbook](../docs/releasing.md) describes actual commands and failure behavior. Repository visibility/disclosure, protected main/tags/environment, production-key backup/custody, hosted permissions/anonymous access and real native A→B/isolation observations remain Don/maintainer-owned gates, not answered by fixtures. Lost/compromised keys can require manual reinstall; no automatic revocation, freeze protection or rollback is promised. This does not resolve other open questions.
+---
+
+## TEAM-DQ10 - How Packages offer agent-facing guidance for their Ports
+
+**Status:** guidance resolved by ADR 0035 (2026-10-25); Documents tools and Comments remain follow-ups.
+
+**Decision:** Packages publish an ordinary bounded `runtime.guide` query, versioned with their Port Contract. Admission classifies its closed empty request and bounded Markdown response without executing a Provider. The generic harness retrieves complete schemas through package-ports 2.0 metadata. The Steward selects contracts in the Agent Package UI; the Host owns self-scoped, default-empty enablement and enforces it even on declared bound-Agent access. No Provider-specific Host adapter or Package-owned Agent-management screen is required.
+
+**Current milestone:** locally verified complete on 2026-10-30, with Host `6073dd0` and paired standalone Agent `7cf7358`. Complete metadata, runtime discovery, Host-owned selections, both access views, lifecycle revocation and Conversations guidance pass automated integration, independent review and provenance audit. Don reports successful rebuilt-Agent guidance, enable/disable, binding/unbinding and restart retention with his real model. He accepts automated Provider stop/recover evidence in place of a desktop check unavailable in the current UI. Per-Agent restart with unresolved commands remains a Packagement integration check. Exhibits already supplies a conforming guide; file tooling remains excluded.
+
+**Still open:** standalone Agent tools for Documents, Agent mentions, and Comment Ports. Documents 1.1 permits Agent revise, but has no Comment operations. The read-before-revise and live-editor check remain separate follow-ups, not delivered here.
+
+**Owner:** agent-port-discovery for the generic interface; later Scope for Documents tools and Comments.

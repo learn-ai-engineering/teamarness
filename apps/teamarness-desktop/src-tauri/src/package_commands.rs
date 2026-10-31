@@ -1,25 +1,29 @@
 #![allow(clippy::result_large_err)]
 
+use std::path::PathBuf;
 use std::str::FromStr;
 
-use tauri::{State, ipc::Channel};
+use tauri::{AppHandle, Manager, State, ipc::Channel};
+use tauri_plugin_dialog::DialogExt;
 use teamarness_package_host::{
     AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
-    HostRevision, OpenUiMount, OpenUiSubscription, PackageErrorCode, PackageErrorStage,
-    PackageHostCommand, PackageHostNotification, PackageHostOutcome,
-    PackageHostSubscriptionSelector, PackageIdentity, PackageInstanceKey, PackageValue,
-    RecoverPackage, ReportUiFault, SuspendPackage, UiMountId, UiRequest, UiRequestId,
-    UiSubscriptionId, WorkspaceId,
+    HostRevision, InstallPersonal, InstallationRegistrationSnapshot, OpenUiMount,
+    OpenUiSubscription, PackageErrorCode, PackageErrorStage, PackageHost, PackageHostCommand,
+    PackageHostNotification, PackageHostOutcome, PackageHostSubscriptionSelector, PackageIdentity,
+    PackageInstanceKey, PackageTier, PackageUiView, PackageValue, RecoverPackage,
+    RegistrationStatus, ReloadPersonal, RemoveOverride, RemovePersonal, ReportUiFault,
+    RestartPersonal, SuspendPackage, UiMountId, UiRequest, UiRequestId, UiSubscriptionId,
+    WorkspaceId, WriteOverride,
 };
 
 use crate::DesktopState;
 use crate::package_dto::{
-    HostStateNotificationDto, OpenUiMountDto, PackageHostSnapshotDto, PackageInstanceKeyDto,
-    UiStreamMessageDto,
+    HostStateNotificationDto, InspectedPackageDto, OpenUiMountDto, PackageAuthoringEntryDto,
+    PackageChangeDto, PackageHostSnapshotDto, PackageInstanceKeyDto, UiStreamMessageDto,
 };
 use crate::package_error::{PackageBridgeError, invalid_input};
 
-pub const COMMAND_NAMES: [&str; 13] = [
+pub const COMMAND_NAMES: [&str; 22] = [
     "package_catalog_snapshot",
     "package_subscribe_host_state",
     "package_open_mount",
@@ -33,6 +37,15 @@ pub const COMMAND_NAMES: [&str; 13] = [
     "package_recover",
     "package_dispose",
     "package_report_ui_fault",
+    "package_choose_directory",
+    "package_inspect_directory",
+    "package_install",
+    "package_reload",
+    "package_remove",
+    "package_write_override",
+    "package_authoring_catalog",
+    "package_restart",
+    "app_restart",
 ];
 
 #[tauri::command]
@@ -89,6 +102,7 @@ pub async fn package_subscribe_host_state(
 #[tauri::command]
 pub async fn package_open_mount(
     instance: PackageInstanceKeyDto,
+    view: Option<String>,
     state: State<'_, DesktopState>,
 ) -> Result<OpenUiMountDto, PackageBridgeError> {
     let state = state.inner().clone();
@@ -96,11 +110,13 @@ pub async fn package_open_mount(
     dispatch
         .dispatch(async move {
             let instance = parse_instance(instance)?;
+            let view = parse_view(view.as_deref())?;
             state.remove_instance_tokens(&instance).await;
             let outcome = state
                 .package_host()
                 .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
                     instance: instance.clone(),
+                    view,
                 }))
                 .await
                 .map_err(PackageBridgeError::from)?;
@@ -108,7 +124,12 @@ pub async fn package_open_mount(
                 unreachable!("OpenUiMount has one success outcome")
             };
             state
-                .register_protocol_mount(loader.token.as_str(), &mount, &instance)
+                .register_protocol_mount(
+                    loader.token.as_str(),
+                    &mount,
+                    &instance,
+                    loader.nested_content,
+                )
                 .await;
             Ok(OpenUiMountDto {
                 mount: mount.into(),
@@ -461,6 +482,331 @@ pub async fn package_report_ui_fault(
         })?
 }
 
+/// Replaces the process of one Personal Package Instance with a new generation.
+/// A Team Instance is refused with `override_required`.
+#[tauri::command]
+pub async fn package_restart(
+    instance: PackageInstanceKeyDto,
+    state: State<'_, DesktopState>,
+) -> Result<(), PackageBridgeError> {
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move { restart(&state.package_host(), parse_instance(instance)?).await })
+        .await
+        .map_err(|_| shutdown_error())?
+}
+
+async fn restart(
+    host: &PackageHost,
+    instance: PackageInstanceKey,
+) -> Result<(), PackageBridgeError> {
+    host.execute(PackageHostCommand::RestartPersonal(RestartPersonal {
+        instance,
+    }))
+    .await
+    .map_err(PackageBridgeError::from)?;
+    Ok(())
+}
+
+/// The declared Semantic Capabilities and Ports of every admitted Package, for
+/// the Package page. Reading it starts no Package.
+#[tauri::command]
+pub async fn package_authoring_catalog(
+    state: State<'_, DesktopState>,
+) -> Result<Vec<PackageAuthoringEntryDto>, PackageBridgeError> {
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move { Ok(authoring_catalog(&state.package_host())) })
+        .await
+        .map_err(|_| shutdown_error())?
+}
+
+fn authoring_catalog(host: &PackageHost) -> Vec<PackageAuthoringEntryDto> {
+    host.authoring_catalog()
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+/// Shows the native folder picker. Returns the chosen absolute path, or `None`
+/// when the person cancels.
+#[tauri::command]
+pub async fn package_choose_directory(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<Option<String>, PackageBridgeError> {
+    state
+        .dispatch(async move { choose_directory(app).await })
+        .await
+        .map_err(|_| shutdown_error())?
+}
+
+async fn choose_directory(app: AppHandle) -> Result<Option<String>, PackageBridgeError> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut picker = app.dialog().file().set_title("Choose a Package folder");
+    if let Some(window) = app.get_webview_window("main") {
+        picker = picker.set_parent(&window);
+    }
+    picker.pick_folder(move |chosen| {
+        let _ = sender.send(chosen);
+    });
+    let Some(chosen) = receiver.await.ok().flatten() else {
+        return Ok(None);
+    };
+    let path = chosen.into_path().map_err(|_| {
+        invalid_input(
+            PackageErrorCode::InvalidRegistration,
+            PackageErrorStage::Discovery,
+        )
+    })?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// Reads a Package Directory for the install preview. Runs no Package code.
+#[tauri::command]
+pub async fn package_inspect_directory(
+    directory: String,
+    state: State<'_, DesktopState>,
+) -> Result<InspectedPackageDto, PackageBridgeError> {
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move { inspect_directory(&state.package_host(), directory).await })
+        .await
+        .map_err(|_| shutdown_error())?
+}
+
+/// Registers and starts a Personal Package after the person accepted its risks.
+#[tauri::command]
+pub async fn package_install(
+    directory: String,
+    expected_identity: String,
+    accepted_risks: Vec<String>,
+    state: State<'_, DesktopState>,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            install(
+                &state.package_host(),
+                directory,
+                expected_identity,
+                accepted_risks,
+            )
+            .await
+        })
+        .await
+        .map_err(|_| shutdown_error())?
+}
+
+/// Re-admits a Personal Package from its directory after a rebuild.
+#[tauri::command]
+pub async fn package_reload(
+    identity: String,
+    state: State<'_, DesktopState>,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move { reload(&state.package_host(), identity).await })
+        .await
+        .map_err(|_| shutdown_error())?
+}
+
+/// Removes a Personal Package now, or the file entry of a Team Package identity
+/// (an override, or one written by hand without it) at the next start. Data is kept.
+#[tauri::command]
+pub async fn package_remove(
+    identity: String,
+    state: State<'_, DesktopState>,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move { remove(&state.package_host(), identity).await })
+        .await
+        .map_err(|_| shutdown_error())?
+}
+
+/// Writes an override of a Team Package. It applies at the next start.
+#[tauri::command]
+pub async fn package_write_override(
+    directory: String,
+    expected_identity: String,
+    accepted_risks: Vec<String>,
+    state: State<'_, DesktopState>,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            write_override(
+                &state.package_host(),
+                directory,
+                expected_identity,
+                accepted_risks,
+            )
+            .await
+        })
+        .await
+        .map_err(|_| shutdown_error())?
+}
+
+/// Stops the Package Host and Core the way quitting does, then starts Teamarness again.
+#[tauri::command]
+pub async fn app_restart(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<(), PackageBridgeError> {
+    let state = state.inner().clone();
+    state
+        .lifecycle
+        .restart(std::sync::Arc::new(crate::DesktopTerminal {
+            state: state.clone(),
+            handle: app,
+        }))
+        .map_err(|()| shutdown_error())
+}
+
+fn shutdown_error() -> PackageBridgeError {
+    invalid_input(PackageErrorCode::ShuttingDown, PackageErrorStage::Shutdown)
+}
+
+async fn inspect_directory(
+    host: &PackageHost,
+    directory: String,
+) -> Result<InspectedPackageDto, PackageBridgeError> {
+    Ok(host
+        .inspect_directory(PathBuf::from(directory))
+        .await
+        .map_err(PackageBridgeError::from)?
+        .into())
+}
+
+async fn install(
+    host: &PackageHost,
+    directory: String,
+    expected_identity: String,
+    accepted_risks: Vec<String>,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let outcome = host
+        .execute(PackageHostCommand::InstallPersonal(InstallPersonal {
+            directory: PathBuf::from(directory),
+            expected_identity: parse_identity(expected_identity)?,
+            accepted_risks,
+        }))
+        .await
+        .map_err(PackageBridgeError::from)?;
+    let PackageHostOutcome::PersonalInstalled { revision } = outcome else {
+        unreachable!("InstallPersonal has one success outcome")
+    };
+    Ok(PackageChangeDto::live(revision))
+}
+
+async fn reload(
+    host: &PackageHost,
+    identity: String,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let outcome = host
+        .execute(PackageHostCommand::ReloadPersonal(ReloadPersonal {
+            identity: parse_identity(identity)?,
+        }))
+        .await
+        .map_err(PackageBridgeError::from)?;
+    let PackageHostOutcome::PersonalReloaded { revision } = outcome else {
+        unreachable!("ReloadPersonal has one success outcome")
+    };
+    Ok(PackageChangeDto::live(revision))
+}
+
+async fn remove(
+    host: &PackageHost,
+    identity: String,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    let identity = parse_identity(identity)?;
+    // The snapshot registration says which tier the entry changes. An entry for
+    // a Team Package identity (an override, or one written by hand without it)
+    // is removed from the file and applies at the next start.
+    let team_entry = host
+        .snapshot()
+        .await
+        .registrations
+        .iter()
+        .any(|registration| {
+            registration.expected_identity == identity.as_str() && team_identity_entry(registration)
+        });
+    if team_entry {
+        let identity_text = identity.as_str().to_owned();
+        host.execute(PackageHostCommand::RemoveOverride(RemoveOverride {
+            identity,
+        }))
+        .await
+        .map_err(PackageBridgeError::from)?;
+        let snapshot = host.snapshot().await;
+        // An override removed before it applied leaves the bundled Package running as it is.
+        if !snapshot
+            .registrations
+            .iter()
+            .any(|registration| registration.expected_identity == identity_text)
+        {
+            return Ok(PackageChangeDto::live(snapshot.revision));
+        }
+        return Ok(PackageChangeDto::after_restart());
+    }
+    let outcome = host
+        .execute(PackageHostCommand::RemovePersonal(RemovePersonal {
+            identity,
+        }))
+        .await
+        .map_err(PackageBridgeError::from)?;
+    let PackageHostOutcome::PersonalRemoved { revision } = outcome else {
+        unreachable!("RemovePersonal has one success outcome")
+    };
+    Ok(PackageChangeDto::live(revision))
+}
+
+/// Whether a registration is a file entry for a Team Package identity, which
+/// changes only at the next start.
+fn team_identity_entry(registration: &InstallationRegistrationSnapshot) -> bool {
+    registration.override_application
+        || registration.tier == PackageTier::Team
+        || matches!(
+            registration.status,
+            RegistrationStatus::PendingRestart { .. }
+                | RegistrationStatus::Refused {
+                    code: PackageErrorCode::OverrideRequired
+                }
+        )
+}
+
+async fn write_override(
+    host: &PackageHost,
+    directory: String,
+    expected_identity: String,
+    accepted_risks: Vec<String>,
+) -> Result<PackageChangeDto, PackageBridgeError> {
+    host.execute(PackageHostCommand::WriteOverride(WriteOverride {
+        directory: PathBuf::from(directory),
+        expected_identity: parse_identity(expected_identity)?,
+        accepted_risks,
+    }))
+    .await
+    .map_err(PackageBridgeError::from)?;
+    Ok(PackageChangeDto::after_restart())
+}
+
+fn parse_identity(value: String) -> Result<PackageIdentity, PackageBridgeError> {
+    PackageIdentity::from_str(&value).map_err(|_| {
+        invalid_input(
+            PackageErrorCode::InvalidPackageIdentity,
+            PackageErrorStage::Discovery,
+        )
+    })
+}
+
 async fn forward_ui_events(
     lifecycle: &crate::lifecycle::Lifecycle,
     host: std::sync::Arc<teamarness_package_host::PackageHost>,
@@ -512,6 +858,19 @@ fn parse_instance(value: PackageInstanceKeyDto) -> Result<PackageInstanceKey, Pa
     Ok(PackageInstanceKey::new(package_identity, workspace_id))
 }
 
+/// An absent view is the main view. A name the mount contract does not define is refused like
+/// an undeclared view, since no Package can declare it.
+fn parse_view(value: Option<&str>) -> Result<PackageUiView, PackageBridgeError> {
+    match value {
+        None | Some("main") => Ok(PackageUiView::Main),
+        Some("settings") => Ok(PackageUiView::Settings),
+        Some(_) => Err(invalid_input(
+            PackageErrorCode::UiViewNotDeclared,
+            PackageErrorStage::Ui,
+        )),
+    }
+}
+
 fn parse_mount(value: String) -> Result<UiMountId, PackageBridgeError> {
     UiMountId::new(value).map_err(|_| ui_input_error())
 }
@@ -537,7 +896,7 @@ mod tests {
 
     #[test]
     fn command_registry_is_generic_and_exact() {
-        assert_eq!(COMMAND_NAMES.len(), 13);
+        assert_eq!(COMMAND_NAMES.len(), 22);
         let names = COMMAND_NAMES.join(" ");
         for forbidden in [
             "reference",
@@ -547,6 +906,21 @@ mod tests {
             "repository",
         ] {
             assert!(!names.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn an_absent_view_opens_main_and_an_unknown_view_is_refused() {
+        assert_eq!(parse_view(None).unwrap(), PackageUiView::Main);
+        assert_eq!(parse_view(Some("main")).unwrap(), PackageUiView::Main);
+        assert_eq!(
+            parse_view(Some("settings")).unwrap(),
+            PackageUiView::Settings
+        );
+        for unknown in ["", "Settings", "preferences"] {
+            let error = serde_json::to_value(parse_view(Some(unknown)).unwrap_err()).unwrap();
+            assert_eq!(error["code"], "ui_view_not_declared", "{unknown}");
+            assert_eq!(error["stage"], "ui", "{unknown}");
         }
     }
 
@@ -564,9 +938,9 @@ mod tests {
             let instance = initial.instances[0].key.clone();
             let generation = initial.instances[0].process_generation;
             let opened = host
-                .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-                    instance: instance.clone(),
-                }))
+                .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+                    instance.clone(),
+                )))
                 .await
                 .unwrap();
             let PackageHostOutcome::UiMountOpened { mount, .. } = opened else {
@@ -629,9 +1003,9 @@ mod tests {
             let (root, core, host) = fixture().await;
             let before = host.snapshot().await.instances[0].clone();
             let opened = host
-                .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-                    instance: before.key.clone(),
-                }))
+                .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+                    before.key.clone(),
+                )))
                 .await
                 .unwrap();
             let PackageHostOutcome::UiMountOpened { mount, .. } = opened else {
@@ -749,20 +1123,89 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let application = root.path().join("application");
         let private = root.path().join("private");
-        let package = application.join("fixture");
+        fs::create_dir_all(&private).unwrap();
+        write_package_with_processes(
+            &application.join("fixture"),
+            FIXTURE,
+            process_tree
+                .then(|| root.path().join("processes.json"))
+                .as_deref(),
+        );
+        let index = application.join("application-packages.v1.json");
+        fs::write(
+            &index,
+            br#"{"schemaVersion":1,"packages":[{"directory":"fixture"}]}"#,
+        )
+        .unwrap();
+        let core = Arc::new(
+            CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.path().join("core")))
+                .await
+                .unwrap(),
+        );
+        core.create_workspace("First Workspace").unwrap();
+        let host = Arc::new(
+            PackageHost::open(
+                PackageHostConfig::new(
+                    application,
+                    index,
+                    private,
+                    InstallationPublicIdentity::new(core.public_identity().to_string()).unwrap(),
+                ),
+                Arc::clone(&core),
+            )
+            .await
+            .unwrap(),
+        );
+        (root, core, host)
+    }
+
+    /// Shuts `host` down and opens a new Host over the same directories.
+    async fn reopen(
+        root: &tempfile::TempDir,
+        core: &Arc<CoreRuntime>,
+        host: Arc<PackageHost>,
+    ) -> Arc<PackageHost> {
+        host.execute(PackageHostCommand::Shutdown(ShutdownHost))
+            .await
+            .unwrap();
+        let application = root.path().join("application");
+        Arc::new(
+            PackageHost::open(
+                PackageHostConfig::new(
+                    application.clone(),
+                    application.join("application-packages.v1.json"),
+                    root.path().join("private"),
+                    InstallationPublicIdentity::new(core.public_identity().to_string()).unwrap(),
+                ),
+                Arc::clone(core),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    const FIXTURE: &str = "com.example.desktop-fixture";
+    const PERSONAL: &str = "com.example.desktop-personal";
+    const RISKS: [&str; 3] = ["filesystem", "network", "process"];
+
+    /// Writes a Package Directory with a Node Backend and a small UI contract.
+    fn write_package(package: &Path, identity: &str) {
+        write_package_with_processes(package, identity, None);
+    }
+
+    fn write_package_with_processes(package: &Path, identity: &str, process_file: Option<&Path>) {
         fs::create_dir_all(package.join("backend")).unwrap();
         fs::create_dir_all(package.join("ui")).unwrap();
-        fs::create_dir_all(&private).unwrap();
         let mut backend = fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../contracts/package-process/v1/fixtures/node-package-process.mjs"),
         )
         .unwrap();
-        if process_tree {
+        if let Some(process_file) = process_file {
             let source = String::from_utf8(backend).unwrap();
             let injected = format!(
                 "import {{ spawn as fixtureSpawn }} from 'node:child_process';\nimport {{ writeFileSync as fixtureWrite, existsSync as fixtureExists, readFileSync as fixtureRead }} from 'node:fs';\nconst fixturePidFile = {};\n",
-                serde_json::to_string(&root.path().join("processes.json")).unwrap()
+                serde_json::to_string(process_file).unwrap()
             );
             backend = source.replace("import { pathToFileURL }", &(injected + "import { pathToFileURL }"))
                 .replace("packageIdentity = frame.package.identity;", r#"
@@ -802,7 +1245,7 @@ mod tests {
             package.join("teamarness.package.json"),
             serde_json::to_vec(&serde_json::json!({
                 "schemaVersion": 1,
-                "identity": "com.example.desktop-fixture",
+                "identity": identity,
                 "version": "1.0.0",
                 "presentation": {"displayName": "Desktop fixture"},
                 "protocol": {"major": 1, "minMinor": 0, "maxMinor": 0},
@@ -825,32 +1268,306 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let index = application.join("application-packages.v1.json");
-        fs::write(
-            &index,
-            br#"{"schemaVersion":1,"packages":[{"directory":"fixture"}]}"#,
-        )
-        .unwrap();
-        let core = Arc::new(
-            CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.path().join("core")))
-                .await
-                .unwrap(),
-        );
-        core.create_workspace("First Workspace").unwrap();
-        let host = Arc::new(
-            PackageHost::open(
-                PackageHostConfig::new(
-                    application,
-                    index,
-                    private,
-                    InstallationPublicIdentity::new(core.public_identity().to_string()).unwrap(),
-                ),
-                Arc::clone(&core),
+    }
+
+    fn registration_file(root: &tempfile::TempDir) -> Option<Vec<u8>> {
+        fs::read(root.path().join("private/packages/registrations.v1.json")).ok()
+    }
+
+    fn code(error: PackageBridgeError) -> String {
+        serde_json::to_value(error).unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn identities(host: &PackageHost) -> Vec<String> {
+        host.snapshot()
+            .await
+            .instances
+            .into_iter()
+            .map(|instance| instance.key.package_identity.to_string())
+            .collect()
+    }
+
+    async fn close(root: tempfile::TempDir, core: Arc<CoreRuntime>, host: Arc<PackageHost>) {
+        host.execute(PackageHostCommand::Shutdown(ShutdownHost))
+            .await
+            .unwrap();
+        core.shutdown().await.unwrap();
+        drop(root);
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R09
+    #[test]
+    fn installing_a_valid_directory_adds_its_instance_and_remove_drops_it() {
+        tauri::async_runtime::block_on(async {
+            let (root, core, host) = fixture().await;
+            let directory = root.path().join("sources/personal");
+            write_package(&directory, PERSONAL);
+            let path = directory.to_string_lossy().into_owned();
+
+            let inspected =
+                serde_json::to_value(inspect_directory(&host, path.clone()).await.unwrap())
+                    .unwrap();
+            assert_eq!(inspected["identity"], PERSONAL);
+            assert_eq!(inspected["displayName"], "Desktop fixture");
+            assert_eq!(inspected["kind"], "new");
+            assert!(inspected.get("description").is_none());
+            assert_eq!(
+                inspected["capabilities"][0]["identity"],
+                "teamarness.workspace-context"
+            );
+
+            let installed = install(
+                &host,
+                path,
+                PERSONAL.into(),
+                RISKS.map(str::to_owned).to_vec(),
             )
             .await
-            .unwrap(),
-        );
-        (root, core, host)
+            .unwrap();
+            let installed = serde_json::to_value(installed).unwrap();
+            assert_eq!(installed["restartRequired"], false);
+            let snapshot = host.snapshot().await;
+            assert_eq!(installed["revision"], snapshot.revision.0);
+            assert!(identities(&host).await.contains(&PERSONAL.to_owned()));
+            assert!(registration_file(&root).is_some());
+
+            let removed =
+                serde_json::to_value(remove(&host, PERSONAL.into()).await.unwrap()).unwrap();
+            assert_eq!(removed["restartRequired"], false);
+            assert_eq!(identities(&host).await, vec![FIXTURE.to_owned()]);
+            close(root, core, host).await;
+        });
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R09
+    #[test]
+    fn an_invalid_directory_leaves_the_snapshot_and_file_unchanged() {
+        tauri::async_runtime::block_on(async {
+            let (root, core, host) = fixture().await;
+            let empty = root.path().join("sources/empty");
+            fs::create_dir_all(&empty).unwrap();
+            let tampered = root.path().join("sources/tampered");
+            write_package(&tampered, PERSONAL);
+            fs::write(tampered.join("backend/package.mjs"), b"// changed").unwrap();
+            let before = host.snapshot().await;
+
+            for (directory, expected) in [
+                (empty, "manifest_malformed"),
+                (tampered, "artifact_changed"),
+            ] {
+                let path = directory.to_string_lossy().into_owned();
+                let inspected = inspect_directory(&host, path.clone()).await.unwrap_err();
+                assert_eq!(code(inspected), expected);
+                let refused = install(
+                    &host,
+                    path,
+                    PERSONAL.into(),
+                    RISKS.map(str::to_owned).to_vec(),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(code(refused), expected);
+            }
+            let relative = install(
+                &host,
+                "sources/personal".into(),
+                PERSONAL.into(),
+                RISKS.map(str::to_owned).to_vec(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(code(relative), "invalid_registration");
+            let after = host.snapshot().await;
+            assert_eq!(after.revision, before.revision);
+            assert_eq!(identities(&host).await, vec![FIXTURE.to_owned()]);
+            assert_eq!(registration_file(&root), None);
+            close(root, core, host).await;
+        });
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R09
+    #[test]
+    fn an_override_is_written_for_a_restart_and_removed_the_same_way() {
+        tauri::async_runtime::block_on(async {
+            let (root, core, host) = fixture().await;
+            let directory = root.path().join("sources/team-build");
+            write_package(&directory, FIXTURE);
+            let path = directory.to_string_lossy().into_owned();
+            let inspected =
+                serde_json::to_value(inspect_directory(&host, path.clone()).await.unwrap())
+                    .unwrap();
+            assert_eq!(inspected["kind"], "overrides_team");
+            let refused = install(
+                &host,
+                path.clone(),
+                FIXTURE.into(),
+                RISKS.map(str::to_owned).to_vec(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(code(refused), "override_required");
+            let before = host.snapshot().await;
+
+            let written = write_override(
+                &host,
+                path,
+                FIXTURE.into(),
+                RISKS.map(str::to_owned).to_vec(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(written).unwrap(),
+                serde_json::json!({"revision": null, "restartRequired": true})
+            );
+            let file: serde_json::Value =
+                serde_json::from_slice(&registration_file(&root).unwrap()).unwrap();
+            assert_eq!(file["registrations"][0]["overrideApplication"], true);
+            // No Instance changes; the snapshot publishes the pending override.
+            let after = host.snapshot().await;
+            assert!(after.revision > before.revision);
+            assert_eq!(
+                after.instances[0].process_generation,
+                before.instances[0].process_generation
+            );
+            let pending = serde_json::to_value(PackageHostSnapshotDto::from(after)).unwrap();
+            assert_eq!(
+                pending["registrations"][0]["status"],
+                serde_json::json!({"kind": "pending_restart", "change": "written"})
+            );
+
+            // Removing the override before it applied leaves nothing to restart for.
+            let removed = remove(&host, FIXTURE.into()).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(removed).unwrap()["restartRequired"],
+                false
+            );
+            assert!(host.snapshot().await.registrations.is_empty());
+            let file: serde_json::Value =
+                serde_json::from_slice(&registration_file(&root).unwrap()).unwrap();
+            assert_eq!(file["registrations"], serde_json::json!([]));
+            assert_eq!(identities(&host).await, vec![FIXTURE.to_owned()]);
+            close(root, core, host).await;
+        });
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R09
+    #[test]
+    fn a_hand_written_entry_for_a_team_identity_is_removed_for_the_next_start() {
+        tauri::async_runtime::block_on(async {
+            let (root, core, host) = fixture().await;
+            let directory = root.path().join("sources/team-build");
+            write_package(&directory, FIXTURE);
+            write_override(
+                &host,
+                directory.to_string_lossy().into_owned(),
+                FIXTURE.into(),
+                RISKS.map(str::to_owned).to_vec(),
+            )
+            .await
+            .unwrap();
+            // A person drops `overrideApplication` by hand.
+            let path = root.path().join("private/packages/registrations.v1.json");
+            let mut file: serde_json::Value =
+                serde_json::from_slice(&registration_file(&root).unwrap()).unwrap();
+            file["registrations"][0]["overrideApplication"] = serde_json::json!(false);
+            fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+            let host = reopen(&root, &core, host).await;
+            assert_eq!(identities(&host).await, Vec::<String>::new());
+
+            let reloaded = reload(&host, FIXTURE.into()).await.unwrap_err();
+            assert_eq!(code(reloaded), "override_required");
+
+            let removed = remove(&host, FIXTURE.into()).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(removed).unwrap(),
+                serde_json::json!({"revision": null, "restartRequired": true})
+            );
+            let file: serde_json::Value =
+                serde_json::from_slice(&registration_file(&root).unwrap()).unwrap();
+            assert_eq!(file["registrations"], serde_json::json!([]));
+            let snapshot =
+                serde_json::to_value(PackageHostSnapshotDto::from(host.snapshot().await)).unwrap();
+            assert_eq!(
+                snapshot["registrations"][0]["status"],
+                serde_json::json!({"kind": "pending_restart", "change": "removed"})
+            );
+
+            let host = reopen(&root, &core, host).await;
+            assert_eq!(identities(&host).await, vec![FIXTURE.to_owned()]);
+            close(root, core, host).await;
+        });
+    }
+
+    /// Verifies: TEAM.SYS.PKG-R09
+    #[test]
+    fn the_authoring_catalog_lists_capabilities_and_restart_is_personal_only() {
+        tauri::async_runtime::block_on(async {
+            let (root, core, host) = fixture().await;
+            let directory = root.path().join("sources/personal");
+            write_package(&directory, PERSONAL);
+            install(
+                &host,
+                directory.to_string_lossy().into_owned(),
+                PERSONAL.into(),
+                RISKS.map(str::to_owned).to_vec(),
+            )
+            .await
+            .unwrap();
+
+            let catalog = serde_json::to_value(authoring_catalog(&host)).unwrap();
+            let entries = catalog.as_array().unwrap();
+            assert_eq!(entries.len(), 2, "Team and Personal Packages are listed");
+            let personal = entries
+                .iter()
+                .find(|entry| entry["identity"] == PERSONAL)
+                .unwrap();
+            assert_eq!(
+                personal["capabilities"],
+                serde_json::json!([{
+                    "identity": "teamarness.workspace-context",
+                    "major": 1, "minMinor": 0, "maxMinor": 0
+                }])
+            );
+            assert_eq!(personal["provided"], serde_json::json!([]));
+            assert_eq!(personal["consumed"], serde_json::json!([]));
+            assert!(
+                personal.get("definitions").is_none(),
+                "Port schemas stay out of the Shell"
+            );
+
+            let snapshot = host.snapshot().await;
+            let key = |identity: &str| {
+                snapshot
+                    .instances
+                    .iter()
+                    .find(|instance| instance.key.package_identity.as_str() == identity)
+                    .unwrap()
+                    .clone()
+            };
+            let (team, personal) = (key(FIXTURE), key(PERSONAL));
+            restart(&host, personal.key.clone()).await.unwrap();
+            let refused = restart(&host, team.key.clone()).await.unwrap_err();
+            assert_eq!(code(refused), "override_required");
+            let after = host.snapshot().await;
+            let generation = |identity: &str| {
+                after
+                    .instances
+                    .iter()
+                    .find(|instance| instance.key.package_identity.as_str() == identity)
+                    .unwrap()
+                    .process_generation
+            };
+            assert_eq!(
+                generation(PERSONAL),
+                personal.process_generation.map(|value| value + 1)
+            );
+            assert_eq!(generation(FIXTURE), team.process_generation);
+            close(root, core, host).await;
+        });
     }
 
     mod lifecycle_integration;

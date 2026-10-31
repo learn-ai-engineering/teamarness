@@ -90,6 +90,6 @@ pub fn membership_subscriptions_opened_for_tests(workspace: WorkspaceId) -> usiz
 
 pub use synchronization::{
     Cursor, ImmutableRecord, InitialReplayBoundary, OpenedRecord, OrderKey, RecordAvailability,
-    RecordEvent, RecordId, RecordPage, RecordSubscription, SyncAvailability, SyncWarning,
-    SynchronizationError,
+    RecordEvent, RecordId, RecordPage, RecordSubscription, RecordSubscriptionChanges,
+    SyncAvailability, SyncWarning, SynchronizationError,
 };

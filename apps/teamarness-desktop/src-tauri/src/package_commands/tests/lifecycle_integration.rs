@@ -75,7 +75,7 @@ fn actual_command_and_resource_adapters_reject_after_terminal_admission() {
                 .is_empty()
         );
         let key = state.packages.snapshot().await.instances[0].key.clone();
-        let mount = package_open_mount(PackageInstanceKeyDto::from(key), app.state())
+        let mount = package_open_mount(PackageInstanceKeyDto::from(key.clone()), None, app.state())
             .await
             .unwrap();
         let lease = state.lifecycle.admit().unwrap();
@@ -87,6 +87,28 @@ fn actual_command_and_resource_adapters_reject_after_terminal_admission() {
                 .is_err()
         );
         assert!(package_catalog_snapshot(app.state()).await.is_err());
+        let results = [
+            package_restart(key.into(), app.state()).await,
+            package_authoring_catalog(app.state()).await.map(|_| ()),
+            package_inspect_directory("unused".into(), app.state())
+                .await
+                .map(|_| ()),
+            package_install("unused".into(), "invalid".into(), vec![], app.state())
+                .await
+                .map(|_| ()),
+            package_reload("invalid".into(), app.state())
+                .await
+                .map(|_| ()),
+            package_remove("invalid".into(), app.state())
+                .await
+                .map(|_| ()),
+            package_write_override("unused".into(), "invalid".into(), vec![], app.state())
+                .await
+                .map(|_| ()),
+        ];
+        for result in results {
+            assert_eq!(code(result.unwrap_err()), "shutting_down");
+        }
         assert_eq!(state.lifecycle.status().phase, lifecycle::Phase::Stopping);
         let request = tauri::http::Request::builder()
             .uri(format!(
@@ -194,54 +216,76 @@ fn find_marker_optional(path: &Path) -> Option<std::path::PathBuf> {
 
 #[test]
 fn resource_response_lease_survives_dropped_waiter_through_responder() {
-    tauri::async_runtime::block_on(async {
-        let (_root, core, host) = fixture().await;
-        let state = DesktopState::new(core, host);
-        let key = state.packages.snapshot().await.instances[0].key.clone();
-        let PackageHostOutcome::UiMountOpened { mount, loader, .. } = state
-            .packages
-            .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
-                instance: key.clone(),
-            }))
-            .await
-            .unwrap()
-        else {
-            panic!()
-        };
-        state
-            .register_protocol_mount(loader.token.as_str(), &mount, &key)
-            .await;
-        let request = tauri::http::Request::builder()
-            .uri(format!(
-                "teamarness-package://localhost/{}/__teamarness/frame.html",
-                loader.token.as_str()
-            ))
-            .body(vec![])
-            .unwrap();
-        let (entered, received) = tokio::sync::oneshot::channel();
-        let (release, released) = std::sync::mpsc::channel();
-        let serving = state.clone();
-        let waiter = tauri::async_runtime::spawn(async move {
-            package_protocol::respond(serving, request, move |response| {
-                assert_eq!(response.status(), tauri::http::StatusCode::OK);
-                entered.send(()).unwrap();
-                released.recv().unwrap();
-            })
-            .await;
+    for content in [false, true] {
+        tauri::async_runtime::block_on(async {
+            let (_root, core, host) = fixture().await;
+            let state = DesktopState::new(core, host);
+            let key = state.packages.snapshot().await.instances[0].key.clone();
+            let PackageHostOutcome::UiMountOpened { mount, loader, .. } = state
+                .packages
+                .execute(PackageHostCommand::OpenUiMount(OpenUiMount {
+                    instance: key.clone(),
+                    view: PackageUiView::Main,
+                }))
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            state
+                .register_protocol_mount(loader.token.as_str(), &mount, &key, loader.nested_content)
+                .await;
+            let request = tauri::http::Request::builder()
+                .uri(format!(
+                    "teamarness-package://localhost/{}/__teamarness/frame.html",
+                    loader.token.as_str()
+                ))
+                .body(vec![])
+                .unwrap();
+            let request = if content {
+                tauri::http::Request::builder()
+                    .uri("teamarness-content://localhost/unknown/index.html")
+                    .body(vec![])
+                    .unwrap()
+            } else {
+                request
+            };
+            let (entered, received) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let serving = state.clone();
+            let waiter = tauri::async_runtime::spawn(async move {
+                let responder = move |response: tauri::http::Response<Vec<u8>>| {
+                    assert_eq!(
+                        response.status(),
+                        if content {
+                            tauri::http::StatusCode::NOT_FOUND
+                        } else {
+                            tauri::http::StatusCode::OK
+                        }
+                    );
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                };
+                if content {
+                    crate::content_protocol::respond(serving, request, responder).await;
+                } else {
+                    package_protocol::respond(serving, request, responder).await;
+                }
+            });
+            received.await.unwrap();
+            waiter.abort();
+            let terminal = adapter(state.clone());
+            state
+                .lifecycle
+                .apply("fixture", || Ok(Box::new(|| Ok(()))), terminal.clone())
+                .unwrap();
+            assert!(!terminal.installed.load(Ordering::SeqCst));
+            assert!(!state.protocol_mounts.lock().await.is_empty());
+            release.send(()).unwrap();
+            state.lifecycle.finished().await;
+            assert!(terminal.restarted.load(Ordering::SeqCst));
         });
-        received.await.unwrap();
-        waiter.abort();
-        let terminal = adapter(state.clone());
-        state
-            .lifecycle
-            .apply("fixture", || Ok(Box::new(|| Ok(()))), terminal.clone())
-            .unwrap();
-        assert!(!terminal.installed.load(Ordering::SeqCst));
-        assert!(!state.protocol_mounts.lock().await.is_empty());
-        release.send(()).unwrap();
-        state.lifecycle.finished().await;
-        assert!(terminal.restarted.load(Ordering::SeqCst));
-    });
+    }
 }
 
 #[test]
@@ -292,7 +336,9 @@ fn in_flight_ui_event_send_is_joined_but_idle_stream_does_not_deadlock_cleanup()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
         let key = state.packages.snapshot().await.instances[0].key.clone();
-        let mount = package_open_mount(key.into(), app.state()).await.unwrap();
+        let mount = package_open_mount(key.into(), None, app.state())
+            .await
+            .unwrap();
         let (entered, received) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
         let entered = StdMutex::new(Some(entered));

@@ -155,7 +155,8 @@ async function sendMount(mount: Mount): Promise<void> {
       processGeneration: "1",
     },
     workspace: { id: instance.workspaceId, name: "Workspace" },
-    uiHostVersion: 1,
+    view: "main",
+    uiHostVersion: 2,
     theme: themeSnapshot(),
   });
   await mount.host.mounted;

@@ -2,12 +2,13 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use teamarness_package_host::{
-    AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, DisposePackage,
-    HostRevision, LifecycleState, MountState, OpenUiMount, OpenUiSubscription, PackageErrorCode,
-    PackageErrorEnvelope, PackageErrorStage, PackageHostCommand, PackageHostConfig,
-    PackageHostOutcome, PackageHostSnapshot, PackageHostState, PackageIdentity, ReadUiResource,
-    ReconcileWorkspaces, RecoverPackage, RecoveryAction, ReportUiFault, ShutdownHost,
-    SuspendPackage, UiRequest, UiResourceToken,
+    AcknowledgeUiEvents, CancelUiRequest, CloseUiMount, CloseUiSubscription, ContentViewToken,
+    DisposePackage, HostRevision, InstallPersonal, LifecycleState, MountState, OpenUiMount,
+    OpenUiSubscription, PackageErrorCode, PackageErrorEnvelope, PackageErrorStage,
+    PackageHostCommand, PackageHostConfig, PackageHostOutcome, PackageHostSnapshot,
+    PackageHostState, PackageIdentity, ReadContent, ReadUiResource, ReconcileWorkspaces,
+    RecoverPackage, RecoveryAction, ReloadPersonal, RemoveOverride, RemovePersonal, ReportUiFault,
+    RestartPersonal, ShutdownHost, SuspendPackage, UiRequest, UiResourceToken, WriteOverride,
 };
 
 #[test]
@@ -51,9 +52,7 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
         PackageHostCommand::Dispose(DisposePackage {
             instance: instance.clone(),
         }),
-        PackageHostCommand::OpenUiMount(OpenUiMount {
-            instance: instance.clone(),
-        }),
+        PackageHostCommand::OpenUiMount(OpenUiMount::main(instance.clone())),
         PackageHostCommand::CloseUiMount(CloseUiMount {
             mount: mount.clone(),
         }),
@@ -91,9 +90,35 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             token: UiResourceToken::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
             relative_path: "ui/index.js".into(),
         }),
+        PackageHostCommand::InstallPersonal(InstallPersonal {
+            directory: PathBuf::from("/packages/reference"),
+            expected_identity: PackageIdentity::from_str("dev.example.reference").unwrap(),
+            accepted_risks: vec!["filesystem".into(), "network".into(), "process".into()],
+        }),
+        PackageHostCommand::ReloadPersonal(ReloadPersonal {
+            identity: PackageIdentity::from_str("dev.example.reference").unwrap(),
+        }),
+        PackageHostCommand::RemovePersonal(RemovePersonal {
+            identity: PackageIdentity::from_str("dev.example.reference").unwrap(),
+        }),
+        PackageHostCommand::RestartPersonal(RestartPersonal {
+            instance: instance.clone(),
+        }),
+        PackageHostCommand::WriteOverride(WriteOverride {
+            directory: PathBuf::from("/packages/tutorial"),
+            expected_identity: PackageIdentity::from_str("dev.teamarness.tutorial").unwrap(),
+            accepted_risks: vec!["filesystem".into(), "network".into(), "process".into()],
+        }),
+        PackageHostCommand::RemoveOverride(RemoveOverride {
+            identity: PackageIdentity::from_str("dev.teamarness.tutorial").unwrap(),
+        }),
+        PackageHostCommand::ReadContent(ReadContent {
+            token: ContentViewToken::new("0123456789abcdef0123456789abcdef").unwrap(),
+            path: "index.html".into(),
+        }),
         PackageHostCommand::Shutdown(ShutdownHost),
     ];
-    assert_eq!(commands.len(), 14);
+    assert_eq!(commands.len(), 21);
     for command in &commands {
         match command {
             PackageHostCommand::ReconcileWorkspaces(_)
@@ -109,6 +134,13 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             | PackageHostCommand::CloseUiSubscription(_)
             | PackageHostCommand::ReportUiFault(_)
             | PackageHostCommand::ReadUiResource(_)
+            | PackageHostCommand::InstallPersonal(_)
+            | PackageHostCommand::ReloadPersonal(_)
+            | PackageHostCommand::RemovePersonal(_)
+            | PackageHostCommand::RestartPersonal(_)
+            | PackageHostCommand::WriteOverride(_)
+            | PackageHostCommand::RemoveOverride(_)
+            | PackageHostCommand::ReadContent(_)
             | PackageHostCommand::Shutdown(_) => {}
         }
     }
@@ -131,7 +163,7 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             loader: teamarness_package_host::UiLoaderDescriptor {
                 token: UiResourceToken::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
                 entrypoint: "ui/index.js".into(),
-                ui_host_version: 1,
+                ui_host_version: 2,
                 contract_digest: "digest".into(),
                 package: teamarness_package_host::UiPackageContext {
                     identity: PackageIdentity::from_str("dev.teamarness.reference").unwrap(),
@@ -146,6 +178,8 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
                     id: teamarness_package_host::WorkspaceId::new("workspace").unwrap(),
                     name: "Workspace".into(),
                 },
+                view: teamarness_package_host::PackageUiView::Main,
+                nested_content: false,
             },
             revision: HostRevision::INITIAL,
         },
@@ -166,9 +200,27 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             bytes: vec![],
             media_type: "text/javascript".into(),
         },
+        PackageHostOutcome::PersonalInstalled {
+            revision: HostRevision::INITIAL,
+        },
+        PackageHostOutcome::PersonalReloaded {
+            revision: HostRevision::INITIAL,
+        },
+        PackageHostOutcome::PersonalRemoved {
+            revision: HostRevision::INITIAL,
+        },
+        PackageHostOutcome::PersonalRestarted {
+            revision: HostRevision::INITIAL,
+        },
+        PackageHostOutcome::OverrideWritten,
+        PackageHostOutcome::OverrideRemoved,
+        PackageHostOutcome::Content {
+            bytes: vec![],
+            media_type: "text/html; charset=utf-8".into(),
+        },
         PackageHostOutcome::Shutdown,
     ];
-    assert_eq!(outcomes.len(), 14);
+    assert_eq!(outcomes.len(), 21);
     for outcome in &outcomes {
         match outcome {
             PackageHostOutcome::Reconciled { .. }
@@ -184,6 +236,13 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             | PackageHostOutcome::UiSubscriptionClosed
             | PackageHostOutcome::UiFaultRecorded { .. }
             | PackageHostOutcome::UiResource { .. }
+            | PackageHostOutcome::PersonalInstalled { .. }
+            | PackageHostOutcome::PersonalReloaded { .. }
+            | PackageHostOutcome::PersonalRemoved { .. }
+            | PackageHostOutcome::PersonalRestarted { .. }
+            | PackageHostOutcome::OverrideWritten
+            | PackageHostOutcome::OverrideRemoved
+            | PackageHostOutcome::Content { .. }
             | PackageHostOutcome::Shutdown => {}
         }
     }
@@ -205,6 +264,7 @@ fn snapshots_and_errors_expose_only_host_values() {
         packages: vec![],
         instances: vec![],
         diagnostics: vec![],
+        registrations: vec![],
     };
     assert!(snapshot.packages.is_empty());
 
@@ -261,6 +321,8 @@ fn snapshots_and_errors_expose_only_host_values() {
 
     let codes = [
         PackageErrorCode::InvalidRegistration,
+        PackageErrorCode::RegistrationFileInvalid,
+        PackageErrorCode::NotRegistered,
         PackageErrorCode::SourceNotFound,
         PackageErrorCode::ManifestMalformed,
         PackageErrorCode::ManifestUnsupported,
@@ -281,6 +343,10 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::PrincipalNotBound,
         PackageErrorCode::AgentNotStewarded,
         PackageErrorCode::AgentNotFound,
+        PackageErrorCode::UnsupportedMediaType,
+        PackageErrorCode::ContentTooLarge,
+        PackageErrorCode::InvalidContentPath,
+        PackageErrorCode::ContentNotFound,
         PackageErrorCode::SpawnFailed,
         PackageErrorCode::HandshakeTimeout,
         PackageErrorCode::HandshakeMismatch,
@@ -308,19 +374,26 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::PortVersionMismatch,
         PackageErrorCode::PortDependencyCycle,
         PackageErrorCode::PortUnavailable,
+        PackageErrorCode::PortCatalogChanged,
+        PackageErrorCode::PortNotEnabled,
+        PackageErrorCode::AgentNotBound,
+        PackageErrorCode::AgentBindingChanged,
         PackageErrorCode::PortUngranted,
         PackageErrorCode::PortRequestInvalid,
         PackageErrorCode::PortResponseInvalid,
         PackageErrorCode::PortEventInvalid,
         PackageErrorCode::UiLoadFailed,
+        PackageErrorCode::UiViewNotDeclared,
         PackageErrorCode::UiException,
         PackageErrorCode::StaleMount,
         PackageErrorCode::EventLagged,
     ];
-    assert_eq!(codes.len(), 56);
+    assert_eq!(codes.len(), 67);
     for code in codes {
         match code {
             PackageErrorCode::InvalidRegistration
+            | PackageErrorCode::RegistrationFileInvalid
+            | PackageErrorCode::NotRegistered
             | PackageErrorCode::SourceNotFound
             | PackageErrorCode::ManifestMalformed
             | PackageErrorCode::ManifestUnsupported
@@ -341,6 +414,10 @@ fn snapshots_and_errors_expose_only_host_values() {
             | PackageErrorCode::PrincipalNotBound
             | PackageErrorCode::AgentNotStewarded
             | PackageErrorCode::AgentNotFound
+            | PackageErrorCode::UnsupportedMediaType
+            | PackageErrorCode::ContentTooLarge
+            | PackageErrorCode::InvalidContentPath
+            | PackageErrorCode::ContentNotFound
             | PackageErrorCode::SpawnFailed
             | PackageErrorCode::HandshakeTimeout
             | PackageErrorCode::HandshakeMismatch
@@ -367,12 +444,17 @@ fn snapshots_and_errors_expose_only_host_values() {
             | PackageErrorCode::PortMissing
             | PackageErrorCode::PortVersionMismatch
             | PackageErrorCode::PortDependencyCycle
+            | PackageErrorCode::PortCatalogChanged
+            | PackageErrorCode::PortNotEnabled
+            | PackageErrorCode::AgentNotBound
+            | PackageErrorCode::AgentBindingChanged
             | PackageErrorCode::PortUnavailable
             | PackageErrorCode::PortUngranted
             | PackageErrorCode::PortRequestInvalid
             | PackageErrorCode::PortResponseInvalid
             | PackageErrorCode::PortEventInvalid
             | PackageErrorCode::UiLoadFailed
+            | PackageErrorCode::UiViewNotDeclared
             | PackageErrorCode::UiException
             | PackageErrorCode::StaleMount
             | PackageErrorCode::EventLagged => {}
@@ -403,6 +485,68 @@ fn public_source_does_not_export_dependency_types() {
 
     let token = UiResourceToken::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
     assert_eq!(format!("{token:?}"), "UiResourceToken([redacted])");
+    let view = ContentViewToken::new("0123456789abcdef0123456789abcdef").unwrap();
+    assert_eq!(format!("{view:?}"), "ContentViewToken([redacted])");
+}
+
+#[test]
+fn content_view_tokens_are_exactly_128_bits_of_lowercase_hex() {
+    assert!(ContentViewToken::new("0123456789abcdef0123456789abcdef").is_ok());
+    for invalid in [
+        "",
+        "0123456789abcdef0123456789abcde",
+        "0123456789abcdef0123456789abcdef0",
+        "0123456789ABCDEF0123456789abcdef",
+        "0123456789abcdef0123456789abcdeg",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    ] {
+        assert!(ContentViewToken::new(invalid).is_err(), "{invalid}");
+    }
+}
+
+#[test]
+fn content_view_errors_serialize_with_stable_codes() {
+    for (code, expected) in [
+        (
+            PackageErrorCode::UnsupportedMediaType,
+            "unsupported_media_type",
+        ),
+        (PackageErrorCode::ContentTooLarge, "content_too_large"),
+        (PackageErrorCode::InvalidContentPath, "invalid_content_path"),
+        (PackageErrorCode::ContentNotFound, "content_not_found"),
+    ] {
+        let envelope = PackageErrorEnvelope::new(
+            code,
+            PackageErrorStage::Capability,
+            false,
+            RecoveryAction::CorrectPackageSource,
+            teamarness_package_host::DiagnosticId::new("diag-fixture").unwrap(),
+        );
+        assert_eq!(serde_json::to_value(envelope).unwrap()["code"], expected);
+    }
+}
+
+#[test]
+fn read_content_round_trips_as_a_host_command() {
+    let command = PackageHostCommand::ReadContent(ReadContent {
+        token: ContentViewToken::new("0123456789abcdef0123456789abcdef").unwrap(),
+        path: "pages/page2.html".into(),
+    });
+    let value = serde_json::to_value(&command).unwrap();
+    assert_eq!(value["kind"], "read_content");
+    assert_eq!(value["input"]["token"], "0123456789abcdef0123456789abcdef");
+    assert_eq!(value["input"]["path"], "pages/page2.html");
+    assert_eq!(
+        serde_json::from_value::<PackageHostCommand>(value).unwrap(),
+        command
+    );
+    let outcome = serde_json::to_value(PackageHostOutcome::Content {
+        bytes: vec![1, 2],
+        media_type: "image/png".into(),
+    })
+    .unwrap();
+    assert_eq!(outcome["kind"], "content");
+    assert_eq!(outcome["media_type"], "image/png");
 }
 
 #[test]
@@ -426,6 +570,10 @@ fn agent_binding_errors_keep_capability_stage_and_recovery() {
     for (code, expected) in [
         (PackageErrorCode::AgentNotStewarded, "agent_not_stewarded"),
         (PackageErrorCode::AgentNotFound, "agent_not_found"),
+        (
+            PackageErrorCode::AgentBindingChanged,
+            "agent_binding_changed",
+        ),
     ] {
         let envelope = PackageErrorEnvelope::new(
             code,

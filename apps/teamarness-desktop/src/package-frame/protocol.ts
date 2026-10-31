@@ -1,13 +1,17 @@
 import {
   TEAMARNESS_THEME_TOKENS,
   type PackagePresentation,
+  type PackageUiView,
   type PackageValue,
   type TeamarnessThemeToken,
   type WorkspacePresentation,
 } from "@teamarness/package-ui-sdk";
 
-/** The private Package UI bridge protocol. Both halves ship in one Shell build. */
-export const FRAME_BRIDGE_PROTOCOL = 2;
+/**
+ * The private Package UI bridge protocol. Both halves ship in one Shell build. Version 3 added
+ * `view` to the mount message.
+ */
+export const FRAME_BRIDGE_PROTOCOL = 3;
 export const CONNECT_KIND = "teamarness.bridge.connect";
 
 /** Matches the Package Host bound `MAX_UI_PAYLOAD_BYTES`. */
@@ -108,6 +112,7 @@ export type ShellToFrameMessage =
     entrypoint: string;
     package: PackagePresentation;
     workspace: WorkspacePresentation;
+    view: PackageUiView;
     uiHostVersion: number;
     theme: ThemeSnapshot;
   }>
@@ -319,9 +324,10 @@ export function parseShellMessage(data: unknown): ShellToFrameMessage | null {
   if (!isPlainObject(data) || typeof data.kind !== "string") return null;
   switch (data.kind) {
     case "mount": {
-      const keys = ["kind", "entrypoint", "package", "workspace", "uiHostVersion", "theme"];
+      const keys = ["kind", "entrypoint", "package", "workspace", "view", "uiHostVersion", "theme"];
       if (!hasExactKeys(data, keys)) return null;
       if (typeof data.entrypoint !== "string" || data.entrypoint.length === 0) return null;
+      if (data.view !== "main" && data.view !== "settings") return null;
       if (typeof data.uiHostVersion !== "number" || !Number.isSafeInteger(data.uiHostVersion)) return null;
       const presentation = parsePresentation(data.package);
       const workspace = parseWorkspace(data.workspace);
@@ -332,6 +338,7 @@ export function parseShellMessage(data: unknown): ShellToFrameMessage | null {
         entrypoint: data.entrypoint,
         package: presentation,
         workspace,
+        view: data.view,
         uiHostVersion: data.uiHostVersion,
         theme,
       });

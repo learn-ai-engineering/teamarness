@@ -67,6 +67,7 @@ pub(crate) trait TerminalAdapter: Send + Sync + 'static {
 #[derive(Clone)]
 enum Intent {
     Quit,
+    Restart,
     Apply(String),
 }
 struct Inner {
@@ -217,6 +218,20 @@ impl Lifecycle {
         self.start(&mut inner, Some(pending), adapter);
         Ok(())
     }
+    // Restart the current application for Package configuration, without update consent.
+    pub(crate) fn restart(&self, adapter: Arc<dyn TerminalAdapter>) -> Result<(), ()> {
+        let mut inner = self.0.inner.lock().unwrap();
+        if let Some(intent) = &inner.intent {
+            return if matches!(intent, Intent::Restart) && inner.status.phase != Phase::Failed {
+                Ok(())
+            } else {
+                Err(())
+            };
+        }
+        inner.intent = Some(Intent::Restart);
+        self.start(&mut inner, None, adapter);
+        Ok(())
+    }
     pub(crate) fn quit(&self, adapter: Arc<dyn TerminalAdapter>) {
         let mut inner = self.0.inner.lock().unwrap();
         if inner.intent.is_some() {
@@ -311,6 +326,9 @@ impl Lifecycle {
                 Ok(Err(error)) => self.fail(FailureCategory::Install, error.previous_app),
                 Err(_) => self.fail(FailureCategory::Uncertain, None),
             }
+        } else if matches!(&self.0.inner.lock().unwrap().intent, Some(Intent::Restart)) {
+            self.phase(Phase::Restarting);
+            adapter.restart();
         } else {
             self.phase(Phase::Stopped);
             self.0.inner.lock().unwrap().exit_allowed = true;

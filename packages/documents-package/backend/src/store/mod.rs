@@ -47,6 +47,8 @@ pub struct StoredRecord {
 pub struct CollectionView {
     pub id: String,
     pub creator: String,
+    /// The Order Key of the create record, which orders the listing.
+    pub order_key: String,
     pub archived: bool,
     /// `None` until the create or latest rename record has been opened.
     pub name: Option<String>,
@@ -56,6 +58,8 @@ pub struct CollectionView {
 pub struct DocumentView {
     pub id: String,
     pub creator: String,
+    /// The Order Key of the create record, which orders the listing.
+    pub order_key: String,
     pub collection_id: String,
     pub archived: bool,
     pub title: Option<String>,
@@ -444,7 +448,10 @@ impl DocumentStore {
         on_commit: &dyn Fn(),
         classify: &ImportClassifier<'_>,
     ) -> Result<Ingested, StoreError> {
-        let _ingest = self.ingest_gate.lock().map_err(|_| StoreError::Lock)?;
+        let _ingest = self
+            .ingest_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let parsed = DomainRecord::decode(canonical);
         let mut inner = lock(&self.inner)?;
         let transaction = inner.conn.transaction().map_err(rerr)?;
@@ -880,7 +887,10 @@ impl DocumentStore {
         on_commit: &dyn Fn(),
         classify: &ImportClassifier<'_>,
     ) -> Result<Ingested, StoreError> {
-        let _ingest = self.ingest_gate.lock().map_err(|_| StoreError::Lock)?;
+        let _ingest = self
+            .ingest_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Ok(domain) = DomainRecord::decode(canonical) else {
             return Ok(Ingested {
                 result: IngestResult::Quarantined("malformed_record".into()),
@@ -932,6 +942,36 @@ impl DocumentStore {
             Some(code) => IngestResult::Quarantined(code.to_owned()),
         };
         Ok(Ingested { result, edits })
+    }
+
+    /// Every applied record a body is built from, oldest first, optionally for one Document:
+    /// the `document.create` that carries its genesis, then its `document.edit` records.
+    /// [`StoredRecord::target`] is the Document for both.
+    pub fn body_records(&self, document: Option<&str>) -> Result<Vec<StoredRecord>, StoreError> {
+        let filter = match document {
+            Some(id) => {
+                validate_sql_identity(id)?;
+                format!(
+                    "((purpose='{create}' AND record_id='{id}') OR (purpose='{edit}' AND target='{id}'))",
+                    create = DomainRecord::CREATE_KIND,
+                    edit = DomainRecord::EDIT_KIND,
+                )
+            }
+            None => format!(
+                "purpose IN ('{}','{}')",
+                DomainRecord::CREATE_KIND,
+                DomainRecord::EDIT_KIND
+            ),
+        };
+        let mut rows = self.records_where(&format!(
+            "{filter} AND quarantine_code IS NULL AND NOT EXISTS (SELECT 1 FROM document_identity_conflicts WHERE document_id=COALESCE(target,record_id))"
+        ))?;
+        for row in &mut rows {
+            if row.purpose == DomainRecord::CREATE_KIND {
+                row.target = Some(row.record_id.clone());
+            }
+        }
+        Ok(rows)
     }
 
     /// Every applied body edit record, oldest first, optionally for one Document.
@@ -1043,7 +1083,7 @@ impl DocumentStore {
         let inner = lock(&self.inner)?;
         let mut statement = inner
             .conn
-            .prepare("SELECT collection_id,creator,archived FROM collections ORDER BY create_order,collection_id")
+            .prepare("SELECT collection_id,creator,archived,create_order FROM collections ORDER BY create_order,collection_id")
             .map_err(rerr)?;
         let rows = statement
             .query_map([], |row| {
@@ -1051,14 +1091,16 @@ impl DocumentStore {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .map_err(rerr)?;
         rows.map(|row| {
-            row.map(|(id, creator, archived)| CollectionView {
+            row.map(|(id, creator, archived, order_key)| CollectionView {
                 name: inner.texts.get(&id).map(|(_, text)| text.clone()),
                 id,
                 creator,
+                order_key,
                 archived,
             })
             .map_err(rerr)
@@ -1070,7 +1112,7 @@ impl DocumentStore {
         let inner = lock(&self.inner)?;
         let mut statement = inner
             .conn
-            .prepare("SELECT document_id,creator,collection_id,archived FROM documents ORDER BY create_order,document_id")
+            .prepare("SELECT document_id,creator,collection_id,archived,create_order FROM documents ORDER BY create_order,document_id")
             .map_err(rerr)?;
         let rows = statement
             .query_map([], |row| {
@@ -1079,17 +1121,21 @@ impl DocumentStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, bool>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })
             .map_err(rerr)?;
         rows.map(|row| {
-            row.map(|(id, creator, collection_id, archived)| DocumentView {
-                title: inner.texts.get(&id).map(|(_, text)| text.clone()),
-                id,
-                creator,
-                collection_id,
-                archived,
-            })
+            row.map(
+                |(id, creator, collection_id, archived, order_key)| DocumentView {
+                    title: inner.texts.get(&id).map(|(_, text)| text.clone()),
+                    id,
+                    creator,
+                    order_key,
+                    collection_id,
+                    archived,
+                },
+            )
             .map_err(rerr)
         })
         .collect()

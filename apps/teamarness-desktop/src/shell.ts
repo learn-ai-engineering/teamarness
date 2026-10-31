@@ -1,4 +1,6 @@
-import type { PackageHostSnapshot, PackageInstanceKey } from "./package-contracts";
+import type { PackageHostSnapshot, PackageInstanceKey, PackageManagementBridge, PackageUiView } from "./package-contracts";
+import { PackageManagementController, type RegistrationFeedback } from "./package-install";
+import { buildPackagePagePresentation, PackagePageController, type PackagePageTab } from "./package-page";
 import type { PackageLifecycleFailure, PackageLifecycleResult } from "./package-shell";
 import type { InstallationPackageVisibility } from "./package-visibility";
 import {
@@ -8,6 +10,7 @@ import {
   type PackageNavigationPresentation,
   type ShellPresentation,
 } from "./presentation";
+import type { StatusMessageTimers } from "./status-message";
 import type { InstallationThemeController, ThemePreference } from "./theme";
 import { THEME_OPTIONS } from "./theme-icons";
 import { renderShell, type ShellModel } from "./view";
@@ -15,7 +18,13 @@ import { renderShell, type ShellModel } from "./view";
 export type ShellRoute =
   | Readonly<{ kind: "workspace-chooser" }>
   | Readonly<{ kind: "workspace-settings"; workspaceId: string }>
-  | Readonly<{ kind: "package-instance"; instance: PackageInstanceKey }>;
+  /** The main view of an open Package UI. */
+  | Readonly<{ kind: "package-instance"; instance: PackageInstanceKey }>
+  /**
+   * A Package page. `tab` is About when absent. Configuration mounts the
+   * Package's settings view below the page header.
+   */
+  | Readonly<{ kind: "package-page"; workspaceId: string; packageIdentity: string; tab?: PackagePageTab }>;
 
 export type ShellFrame = Readonly<{
   workspaceRail: HTMLElement;
@@ -27,8 +36,9 @@ export type ShellFrame = Readonly<{
 type PackageRouter = Readonly<{
   setBlocked(blocked: boolean): void;
   refresh(): Promise<PackageHostSnapshot>;
-  select(instance: PackageInstanceKey): Promise<void>;
+  select(instance: PackageInstanceKey, view?: PackageUiView): Promise<void>;
   hide(): Promise<void>;
+  suspendBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
   recoverBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
   disposeBackend(instance: PackageInstanceKey): Promise<PackageLifecycleResult>;
 }>;
@@ -38,7 +48,9 @@ type PackageLifecycleAction = "recover" | "dispose";
 type PackageLifecycleFeedback = Readonly<{
   action: PackageLifecycleAction;
   instance: PackageInstanceKey;
-  failure: PackageLifecycleFailure;
+  /** The Package's name when the action ran. */
+  name: string;
+  failure: PackageLifecycleFailure | null;
 }>;
 
 type WorkspaceActions = Readonly<{
@@ -56,10 +68,15 @@ type WorkspaceActions = Readonly<{
 
 type ShellOptions = Readonly<{
   packageShell: PackageRouter;
+  packageManagement: PackageManagementBridge;
   theme: InstallationThemeController;
   packageVisibility: InstallationPackageVisibility;
   workspaceActions: WorkspaceActions;
   onRouteChange?: (route: ShellRoute) => void;
+  /** Copies text for the person; defaults to the clipboard. */
+  copy?: (value: string) => Promise<void>;
+  /** The timer that hides success messages; defaults to the browser's. */
+  timers?: StatusMessageTimers;
 }>;
 
 export class Shell {
@@ -68,18 +85,54 @@ export class Shell {
   private workspacePresentation: ShellPresentation | null = null;
   private packageSnapshot: PackageHostSnapshot | null = null;
   private packageSnapshotFailed = false;
+  /** The last failed Recover or Dispose, for Retry and for a later successful refresh. */
   private packageLifecycleFeedback: PackageLifecycleFeedback | null = null;
+  /** The message that result put in the Workspace page's message area. */
+  private packageLifecycleMessage: RegistrationFeedback | null = null;
   private observedActiveWorkspaceId: string | null = null;
   private packageActionTargets: readonly PackageInstanceKey[] = [];
   private packagePresentation: PackageNavigationPresentation = { teamPackages: [], privatePackages: [] };
   private presentationRevision = 0;
   private applicationUpdating = false;
+  private packagePageTabFocus = false;
+  /** Counts navigations, so one that finishes unmounting after a newer one started leaves the newer one's mount alone. */
+  private navigation = 0;
+  private readonly packageManagement: PackageManagementController;
+  private readonly packagePage: PackagePageController;
 
   public constructor(
     private readonly shellFrame: ShellFrame,
     private readonly options: ShellOptions,
   ) {
     this.shellFrame.packageMount.hidden = true;
+    this.packageManagement = new PackageManagementController(options.packageManagement, {
+      changed: () => { this.renderPackageConsumers(); },
+      refresh: async () => {
+        try {
+          this.updatePackages(await this.options.packageShell.refresh());
+        } catch (error: unknown) {
+          this.updatePackageSnapshotFailure();
+          throw error;
+        }
+      },
+    }, options.timers);
+    this.packagePage = new PackagePageController(options.packageManagement, {
+      suspend: (instance) => this.runPageLifecycle(() => this.options.packageShell.suspendBackend(instance)),
+      recover: (instance) => this.runPageLifecycle(() => this.options.packageShell.recoverBackend(instance)),
+      dispose: (instance) => this.runPageLifecycle(() => this.options.packageShell.disposeBackend(instance)),
+    }, this.packageManagement, {
+      changed: () => { this.renderPackageConsumers(); },
+      refresh: async () => {
+        try {
+          this.updatePackages(await this.options.packageShell.refresh());
+        } catch (error: unknown) {
+          this.updatePackageSnapshotFailure();
+          throw error;
+        }
+      },
+      removed: (target) => { void this.navigate({ kind: "workspace-settings", workspaceId: target.workspaceId }); },
+      copy: (value) => (this.options.copy ?? ((text) => navigator.clipboard.writeText(text)))(value),
+    }, options.timers);
   }
 
   public setApplicationUpdating(blocked: boolean): void {
@@ -121,10 +174,13 @@ export class Shell {
   public updatePackages(snapshot: PackageHostSnapshot): void {
     this.packageSnapshot = snapshot;
     this.packageSnapshotFailed = false;
-    if (this.packageLifecycleFeedback?.failure === "refresh") {
-      this.packageLifecycleFeedback = null;
-    } else if (this.packageLifecycleFeedback?.failure === "operation-and-refresh") {
-      this.packageLifecycleFeedback = { ...this.packageLifecycleFeedback, failure: "operation" };
+    this.packagePage.snapshotChanged(snapshot);
+    const lifecycle = this.packageLifecycleFeedback;
+    if (lifecycle && (lifecycle.failure === "refresh" || lifecycle.failure === "operation-and-refresh")) {
+      // The refresh worked after all, so only the operation's own result is left to show.
+      this.showPackageLifecycleFeedback(lifecycle.failure === "refresh"
+        ? { ...lifecycle, failure: null }
+        : { ...lifecycle, failure: "operation" });
     }
     this.renderPackageConsumers();
   }
@@ -134,25 +190,78 @@ export class Shell {
     this.renderPackageConsumers();
   }
 
-  public async navigate(route: ShellRoute): Promise<void> {
+  public async navigate(requested: ShellRoute): Promise<void> {
     if (this.applicationUpdating) return;
+    const navigation = ++this.navigation;
+    const route = this.availableRoute(requested);
     this.setRoute(route);
     if (route.kind === "package-instance") {
+      placePackageMount(this.shellFrame.packageMount, "pane");
       this.shellFrame.shellScreen.hidden = true;
       this.shellFrame.packageMount.hidden = false;
       this.renderContextualNavigation();
-      await this.options.packageShell.select(route.instance);
+      await this.options.packageShell.select(route.instance, "main");
       return;
     }
 
-    await this.options.packageShell.hide();
-    if (this.applicationUpdating) return;
+    if (route.kind === "package-page" && route.tab === "configuration") {
+      // The settings view mounts below the page header and its tabs.
+      placePackageMount(this.shellFrame.packageMount, "package-page");
+      this.shellFrame.shellScreen.hidden = false;
+      this.shellFrame.packageMount.hidden = false;
+      // Select before awaiting anything, so a later route's unmount is ordered after this mount.
+      const selected = this.options.packageShell.select(
+        { packageIdentity: route.packageIdentity, workspaceId: route.workspaceId },
+        "settings",
+      );
+      if (await this.preparePresentation()) this.renderAll();
+      await selected;
+      return;
+    }
+
+    // A failed unmount still leaves the Shell screen. Only an unacknowledged unmount is
+    // recorded as a UI fault; other cleanup failures are logged here.
+    await this.options.packageShell.hide().catch(warnUnmountFailure);
+    if (this.applicationUpdating || navigation !== this.navigation) return;
+    placePackageMount(this.shellFrame.packageMount, "pane");
     this.shellFrame.packageMount.hidden = true;
     this.shellFrame.shellScreen.hidden = false;
     if (await this.preparePresentation()) this.renderAll();
   }
 
+  /** The Configuration tab needs a declared settings view and an Instance here; otherwise the page opens on About. */
+  private availableRoute(route: ShellRoute): ShellRoute {
+    if (route.kind !== "package-page" || route.tab === undefined) return route;
+    if (route.tab === "configuration" && buildPackagePagePresentation(this.packageSnapshot, route)?.settings === true) {
+      return route;
+    }
+    return { kind: "package-page", workspaceId: route.workspaceId, packageIdentity: route.packageIdentity };
+  }
+
+  /** Selects a Package page tab and keeps keyboard focus on it, because rendering replaces the tabs. */
+  private async selectPackagePageTab(tab: string | undefined): Promise<void> {
+    const route = this.selectedRoute;
+    if (route.kind !== "package-page" || (tab !== "about" && tab !== "configuration")) return;
+    if ((route.tab ?? "about") === tab) return;
+    this.packagePageTabFocus = true;
+    await this.navigate({
+      kind: "package-page",
+      workspaceId: route.workspaceId,
+      packageIdentity: route.packageIdentity,
+      ...(tab === "configuration" ? { tab } : {}),
+    });
+  }
+
   private setRoute(route: ShellRoute): void {
+    if (route.kind === "package-page") {
+      const current = this.packagePage.current();
+      if (!current || current.packageIdentity !== route.packageIdentity || current.workspaceId !== route.workspaceId) {
+        this.packagePage.close();
+        this.packagePage.open({ workspaceId: route.workspaceId, packageIdentity: route.packageIdentity }, this.packageSnapshot);
+      }
+    } else {
+      this.packagePage.close();
+    }
     this.selectedRoute = route;
     this.options.onRouteChange?.(route);
   }
@@ -264,9 +373,10 @@ export class Shell {
   }
 
   private deactivatePackage(): void {
-    if (this.selectedRoute.kind === "package-instance") {
-      void this.options.packageShell.hide().catch(() => undefined);
+    if (this.selectedRoute.kind === "package-instance" || isPackageConfiguration(this.selectedRoute)) {
+      void this.options.packageShell.hide().catch(warnUnmountFailure);
     }
+    placePackageMount(this.shellFrame.packageMount, "pane");
     this.shellFrame.packageMount.hidden = true;
     this.shellFrame.shellScreen.hidden = false;
   }
@@ -274,13 +384,29 @@ export class Shell {
   private renderSelectedScreen(): void {
     if (this.applicationUpdating) return;
     if (!this.workspacePresentation || this.selectedRoute.kind === "package-instance") return;
+    if (this.selectedRoute.kind === "package-page") {
+      this.shellFrame.shellScreen.innerHTML = renderShell(this.workspacePresentation, this.selectedRoute, {
+        packagePage: `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packagePage.render(this.packageSnapshot, this.selectedRoute.tab ?? "about")}`,
+      });
+      this.bindSelectedScreen();
+      const pageOpened = this.packagePage.takeFocusRequest();
+      const tabSelected = this.packagePageTabFocus;
+      this.packagePageTabFocus = false;
+      if (!hasQueries(this.shellFrame.shellScreen)) return;
+      if (pageOpened) {
+        this.shellFrame.shellScreen.querySelector<HTMLElement>("[data-package-page-focus]")?.focus();
+      } else if (tabSelected) {
+        // Rendering replaced the tabs, so return keyboard focus to the selected one.
+        this.shellFrame.shellScreen.querySelector<HTMLElement>(`[data-package-page-tab="${this.selectedRoute.tab ?? "about"}"]`)?.focus();
+      }
+      return;
+    }
     const packageSettings = this.selectedRoute.kind === "workspace-settings"
-      ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${renderPackageInstanceSettings(
+      ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packageManagement.renderMessage(this.packageSnapshot)}${this.packageManagement.renderPanel(this.packageSnapshot)}${renderPackageInstanceSettings(
         this.packagePresentation,
         this.packageActionTargets,
-        this.packageLifecycleFeedback,
         this.options.packageVisibility,
-      )}`
+      )}${this.packageManagement.renderRegistrations(this.packageSnapshot)}`
       : undefined;
     this.shellFrame.shellScreen.innerHTML = renderShell(
       this.workspacePresentation,
@@ -288,6 +414,100 @@ export class Shell {
       { packageSettings },
     );
     this.bindSelectedScreen();
+    this.focusPackageInstallStep();
+  }
+
+  private focusPackageInstallStep(): void {
+    if (!this.packageManagement.takeFocusRequest() || !hasQueries(this.shellFrame.shellScreen)) return;
+    const selector = this.packageManagement.state().kind === "closed"
+      ? '[data-package-install-action="open"]'
+      : "[data-package-install-focus]";
+    this.shellFrame.shellScreen.querySelector<HTMLElement>(selector)?.focus();
+  }
+
+  private bindPackageManagement(): void {
+    const screen = this.shellFrame.shellScreen;
+    screen.querySelectorAll<HTMLButtonElement>("[data-package-install-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        void this.packageManagement.installAction(button.dataset.packageInstallAction);
+      });
+    });
+    screen.querySelector<HTMLFormElement>("#package-install-path-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const path = screen.querySelector<HTMLInputElement>("#package-install-path");
+      if (path) void this.packageManagement.inspectPath(path.value);
+    });
+    screen.querySelectorAll<HTMLButtonElement>("[data-package-registration-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const identity = this.packageManagement.registrationIdentity(
+          this.packageSnapshot,
+          Number(button.dataset.packageRegistrationIndex),
+        );
+        if (identity) {
+          void this.packageManagement.registrationAction(
+            button.dataset.packageRegistrationAction,
+            identity,
+            this.packageSnapshot,
+          );
+        }
+      });
+    });
+    screen.querySelector<HTMLButtonElement>("[data-package-change-restart]")?.addEventListener("click", () => {
+      void this.packageManagement.restartAfterChange();
+    });
+    screen.querySelector<HTMLButtonElement>("[data-package-message-dismiss]")?.addEventListener("click", () => {
+      this.packageManagement.dismissMessage();
+    });
+    screen.querySelectorAll<HTMLButtonElement>("[data-package-registration-page]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const identity = this.packageManagement.registrationIdentity(
+          this.packageSnapshot,
+          Number(button.dataset.packageRegistrationPage),
+        );
+        const workspaceId = routeWorkspaceId(this.selectedRoute);
+        if (identity && workspaceId) void this.navigate({ kind: "package-page", workspaceId, packageIdentity: identity });
+      });
+    });
+    screen.querySelectorAll<HTMLButtonElement>("[data-package-page-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        void this.packagePage.action(button.dataset.packagePageAction, this.packageSnapshot);
+      });
+    });
+    screen.querySelectorAll<HTMLButtonElement>("[data-package-page-tab]").forEach((button) => {
+      button.addEventListener("click", () => { void this.selectPackagePageTab(button.dataset.packagePageTab); });
+    });
+    screen.querySelector<HTMLElement>("[data-package-page-tabs]")?.addEventListener("keydown", (event) => {
+      const tab = adjacentPackagePageTab(this.selectedRoute, screen, (event as KeyboardEvent).key);
+      if (!tab) return;
+      event.preventDefault();
+      void this.selectPackagePageTab(tab);
+    });
+    this.bindPackagePageLinks(screen);
+  }
+
+  /** Package rows open their Package page through `data-package-page-index`. */
+  private bindPackagePageLinks(region: HTMLElement): void {
+    region.querySelectorAll<HTMLButtonElement>("[data-package-page-index]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const instance = this.packageActionTargets[Number(button.dataset.packagePageIndex)];
+        if (instance) {
+          void this.navigate({ kind: "package-page", workspaceId: instance.workspaceId, packageIdentity: instance.packageIdentity });
+        }
+      });
+    });
+  }
+
+  /** Applies a lifecycle result for the Package page, and throws when the operation failed. */
+  private async runPageLifecycle(operation: () => Promise<PackageLifecycleResult>): Promise<void> {
+    const result = await operation();
+    if (result.snapshot) {
+      this.packageSnapshot = result.snapshot;
+      this.packageSnapshotFailed = false;
+    }
+    if (result.failure === "refresh" || result.failure === "operation-and-refresh") this.packageSnapshotFailed = true;
+    if (result.failure === "operation" || result.failure === "operation-and-refresh") {
+      throw new Error("Package lifecycle operation failed");
+    }
   }
 
   private bindSelectedScreen(): void {
@@ -350,6 +570,7 @@ export class Shell {
       void this.options.workspaceActions.retry();
     });
     this.bindPackageSnapshotRetry(this.shellFrame.shellScreen);
+    this.bindPackageManagement();
     this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-package-action]").forEach((button) => {
       button.addEventListener("click", () => {
         const index = Number(button.dataset.packageActionIndex);
@@ -365,6 +586,8 @@ export class Shell {
         const index = Number(button.dataset.packageVisibilityIndex);
         const instance = this.packageActionTargets[index];
         if (!instance) return;
+        // Toggling is the next action, so an earlier result no longer applies.
+        this.packageManagement.clearMessage();
         this.options.packageVisibility.setHidden(instance, !this.options.packageVisibility.isHidden(instance));
         this.renderPackageConsumers();
         // Re-rendering replaces the buttons, so return keyboard focus to the toggled one.
@@ -383,8 +606,16 @@ export class Shell {
 
   private renderPackageConsumers(): void {
     if (this.applicationUpdating) return;
+    const route = this.selectedRoute;
+    // Configuration closes when its settings view is no longer available, for example after a Dispose.
+    if (isPackageConfiguration(route) && this.availableRoute(route) !== route) {
+      void this.navigate(route);
+      return;
+    }
     this.renderContextualNavigation();
-    if (this.selectedRoute.kind === "workspace-settings") this.renderSelectedScreen();
+    if (this.selectedRoute.kind === "workspace-settings" || this.selectedRoute.kind === "package-page") {
+      this.renderSelectedScreen();
+    }
   }
 
   private bindPackageSnapshotRetry(region: HTMLElement): void {
@@ -405,6 +636,11 @@ export class Shell {
     action: PackageLifecycleAction,
     instance: PackageInstanceKey,
   ): Promise<void> {
+    // A new action replaces the previous result in the message area.
+    this.packageManagement.clearMessage();
+    this.packageLifecycleFeedback = null;
+    this.packageLifecycleMessage = null;
+    const name = this.packageInstanceName(instance);
     const result = action === "recover"
       ? await this.options.packageShell.recoverBackend(instance)
       : await this.options.packageShell.disposeBackend(instance);
@@ -415,10 +651,31 @@ export class Shell {
     if (result.failure === "refresh" || result.failure === "operation-and-refresh") {
       this.packageSnapshotFailed = true;
     }
-    this.packageLifecycleFeedback = result.failure
-      ? { action, instance, failure: result.failure }
-      : null;
+    this.showPackageLifecycleFeedback({ action, instance, name, failure: result.failure });
     this.renderPackageConsumers();
+  }
+
+  /**
+   * Shows a Recover or Dispose result in the Workspace page's message area.
+   * A failed operation keeps what Retry needs; anything else forgets it.
+   */
+  private showPackageLifecycleFeedback(feedback: PackageLifecycleFeedback): void {
+    // A result the person dismissed, or a later action replaced, is not shown again.
+    if (this.packageLifecycleFeedback && this.packageManagement.currentMessage() !== this.packageLifecycleMessage) {
+      this.packageLifecycleFeedback = null;
+      this.packageLifecycleMessage = null;
+      return;
+    }
+    const message = packageLifecycleMessage(feedback);
+    this.packageManagement.showMessage(message);
+    this.packageLifecycleFeedback = feedback.failure === null ? null : feedback;
+    this.packageLifecycleMessage = message;
+  }
+
+  private packageInstanceName(instance: PackageInstanceKey): string {
+    const index = this.packageActionTargets.findIndex((target) => samePackageInstance(target, instance));
+    return packageRows(this.packagePresentation).find(({ actionIndex }) => actionIndex === index)?.name
+      ?? instance.packageIdentity;
   }
 }
 
@@ -431,6 +688,42 @@ export function shellFrameFromDocument(root: ParentNode = document): ShellFrame 
     throw new Error("Shell frame is unavailable");
   }
   return Object.freeze({ workspaceRail, contextualNavigation, shellScreen, packageMount });
+}
+
+function isPackageConfiguration(route: ShellRoute): route is Extract<ShellRoute, { kind: "package-page" }> {
+  return route.kind === "package-page" && route.tab === "configuration";
+}
+
+/**
+ * Where the Package mount sits: the whole pane for a Package UI, or below a
+ * Package page's header as that page's Configuration tab panel.
+ */
+function placePackageMount(mount: HTMLElement, placement: "pane" | "package-page"): void {
+  if (typeof mount.setAttribute !== "function") return;
+  if (placement === "package-page") {
+    mount.setAttribute("data-placement", "package-page");
+    mount.setAttribute("role", "tabpanel");
+    mount.setAttribute("aria-labelledby", "package-page-tab-configuration");
+    mount.removeAttribute("aria-label");
+  } else {
+    mount.removeAttribute("data-placement");
+    mount.removeAttribute("role");
+    mount.removeAttribute("aria-labelledby");
+    mount.setAttribute("aria-label", "Package interface");
+  }
+}
+
+/** The tab an arrow, Home, or End key moves to, among the tabs the page shows. */
+function adjacentPackagePageTab(route: ShellRoute, screen: HTMLElement, key: string): PackagePageTab | null {
+  if (route.kind !== "package-page") return null;
+  const tabs = [...screen.querySelectorAll<HTMLElement>("[data-package-page-tab]")]
+    .map((tab) => tab.dataset.packagePageTab)
+    .filter((tab): tab is PackagePageTab => tab === "about" || tab === "configuration");
+  const index = tabs.indexOf(route.tab ?? "about");
+  if (index < 0 || tabs.length === 0) return null;
+  const step = key === "ArrowRight" ? 1 : key === "ArrowLeft" ? -1 : 0;
+  const next = key === "Home" ? tabs[0] : key === "End" ? tabs.at(-1) : step ? tabs[(index + step + tabs.length) % tabs.length] : undefined;
+  return next ?? null;
 }
 
 function hasQueries(element: HTMLElement): boolean {
@@ -473,17 +766,12 @@ function packageButton(
     && route.instance.workspaceId === instance.workspaceId
     ? ' aria-current="page"'
     : "";
-  const localMarker = row.installationLocal
-    ? '<span class="package-installation-marker">Runs only on this Installation</span>'
-    : "";
-  const sourceMarker = `<span class="package-source" aria-label="Package source: ${row.sourceLabel}">${row.sourceLabel}</span>`;
-  return `<li><button type="button" data-package-index="${row.actionIndex}"${current}><span>${escape(row.name)}</span><small>${escape(row.availability)}</small>${sourceMarker}${localMarker}</button></li>`;
+  return `<li><button type="button" data-package-index="${row.actionIndex}"${current}><span>${escape(row.name)}</span><small>${escape(row.availability)}</small></button></li>`;
 }
 
 function renderPackageInstanceSettings(
   presentation: PackageNavigationPresentation,
   packageActionTargets: readonly PackageInstanceKey[],
-  feedback: PackageLifecycleFeedback | null,
   visibility: InstallationPackageVisibility,
 ): string {
   const rows = packageRows(presentation);
@@ -494,12 +782,9 @@ function renderPackageInstanceSettings(
       : "";
     const sourceMarker = `<span class="package-source" aria-label="Package source: ${row.sourceLabel}">${row.sourceLabel}</span>`;
     const instance = packageActionTargets[row.actionIndex];
-    const rowFeedback = instance && feedback && samePackageInstance(instance, feedback.instance)
-      ? renderPackageLifecycleFeedback(row, feedback)
-      : "";
     const visibilityToggle = instance ? packageVisibilityButton(row, visibility.isHidden(instance)) : "";
-    return `<article class="package-instance" aria-labelledby="package-instance-name-${row.actionIndex}"><div class="package-instance-summary"><div><h3 id="package-instance-name-${row.actionIndex}">${escape(row.name)}</h3><p>${escape(row.availability)}</p>${sourceMarker}${localMarker}</div>${visibilityToggle}</div>
-      ${rowFeedback}${renderPackageInstanceActions(row)}</article>`;
+    return `<article class="package-instance" aria-labelledby="package-instance-name-${row.actionIndex}"><div class="package-instance-summary"><div><h3 id="package-instance-name-${row.actionIndex}"><button type="button" class="package-instance-link" data-package-page-index="${row.actionIndex}" aria-label="${escape(`About ${row.name}`)}">${escape(row.name)}</button></h3><p>${escape(row.availability)}</p>${sourceMarker}${localMarker}</div>${visibilityToggle}</div>
+      ${renderPackageInstanceActions(row)}</article>`;
   }).join("")}</div>`;
 }
 
@@ -508,21 +793,26 @@ function packageVisibilityButton(row: PackageInstancePresentation, hidden: boole
   return `<button type="button" class="package-visibility-toggle" data-package-visibility-index="${row.actionIndex}" aria-pressed="${hidden ? "false" : "true"}" aria-label="${escape(label)}" title="${escape(label)}">${hidden ? EYE_CLOSED_ICON : EYE_OPEN_ICON}</button>`;
 }
 
-function renderPackageLifecycleFeedback(
-  row: PackageInstancePresentation,
-  feedback: PackageLifecycleFeedback,
-): string {
-  const verb = feedback.action === "recover" ? "recover" : "dispose of";
-  const past = feedback.action === "recover" ? "Recovered" : "Disposed of";
+/** The message area's copy for a Recover or Dispose result; the slot names the Package. */
+function packageLifecycleMessage(feedback: PackageLifecycleFeedback): RegistrationFeedback {
+  const verb = feedback.action === "recover" ? "recover" : "dispose";
+  const past = feedback.action === "recover" ? "Recovered" : "Disposed";
   const refreshFailed = feedback.failure === "refresh" || feedback.failure === "operation-and-refresh";
   const operationFailed = feedback.failure === "operation" || feedback.failure === "operation-and-refresh";
   const message = operationFailed
-    ? `Could not ${verb} ${row.name}${refreshFailed ? ", and Package information could not be refreshed" : ""}.`
-    : `${past} ${row.name}, but Package information could not be refreshed.`;
-  const retry = operationFailed
-    ? `<button type="button" data-package-failure-action="${feedback.action}">Retry ${escape(lifecycleActionLabel(feedback.action))}</button>`
-    : "";
-  return `<div class="package-lifecycle-feedback" role="alert"><p>${escape(message)}</p>${retry}</div>`;
+    ? `Could not ${verb}${refreshFailed ? ", and Package information could not be refreshed" : ""}.`
+    : refreshFailed
+      ? `${past}, but Package information could not be refreshed.`
+      : `${past}.`;
+  return {
+    source: "lifecycle",
+    identity: feedback.instance.packageIdentity,
+    name: feedback.name,
+    message,
+    failed: feedback.failure !== null,
+    restart: false,
+    ...(operationFailed ? { retry: feedback.action } : {}),
+  };
 }
 
 function renderPackageSnapshotFailure(failed: boolean, hasSnapshot: boolean): string {
@@ -555,12 +845,19 @@ function lifecycleActionAllowed(row: PackageInstancePresentation, action: string
   return row.canRecover && (action === "recover" || (action === "dispose" && row.canDispose));
 }
 
-function isLifecycleAction(action: string | undefined): action is PackageLifecycleAction {
-  return action === "recover" || action === "dispose";
+/**
+ * Logs a failed Package UI unmount for diagnosis; the person sees no change.
+ * It logs an Error's message or a bridge error's code, never a payload.
+ */
+function warnUnmountFailure(error: unknown): void {
+  const code = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+    ? error.code
+    : null;
+  console.warn("Package UI unmount cleanup failed", { reason: error instanceof Error ? error.message : code ?? typeof error });
 }
 
-function lifecycleActionLabel(action: PackageLifecycleAction): string {
-  return action === "recover" ? "Recover Backend" : "Dispose";
+function isLifecycleAction(action: string | undefined): action is PackageLifecycleAction {
+  return action === "recover" || action === "dispose";
 }
 
 function samePackageInstance(left: PackageInstanceKey, right: PackageInstanceKey): boolean {

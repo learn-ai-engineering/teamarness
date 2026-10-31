@@ -1,6 +1,6 @@
 # Package author guide
 
-A Teamarness Package is a directory of files, not a Rust library or a dynamic ABI. Build the complete Package Directory in your own repository, test it as an installation-local Package, then give the same declared bytes to the Teamarness application build. For a supported starter project, run `npm run create:package -- --output <directory> --identity <reverse-dns-id> --display-name <name>` from a Teamarness checkout. The generator creates a foundation outside the Teamarness workspaces and vendors the current Rust and TypeScript SDK source with exact lockfiles. Generated SDK copies have no supported in-place upgrade yet.
+A Teamarness Package is a directory of files, not a Rust library or a dynamic ABI. Build the complete Package Directory in your own repository, test it as a Personal Package installed from the Shell, then give the same declared bytes to the Teamarness application build. For a supported starter project, run `npm run create:package -- --output <directory> --identity <reverse-dns-id> --display-name <name>` from a Teamarness checkout. The generator creates a foundation outside the Teamarness workspaces and vendors the current Rust and TypeScript SDK source with exact lockfiles. Generated SDK copies have no supported in-place upgrade yet.
 
 Teamarness supports `aarch64-apple-darwin`, and ships a Rust Backend SDK and a TypeScript UI SDK. The Package Process Protocol is language-neutral, but no other production Backend SDK exists yet.
 
@@ -20,7 +20,7 @@ ui/
 
 You own executable packaging. Ship a self-contained executable for every declared target. Teamarness does not install Node, Python, shared libraries, language runtimes, or Package dependencies. It starts the exact admitted Backend path without a command shell and uses the Package Data Directory as its working directory.
 
-Do not use symlinks. Every manifest path must be normalized relative UTF-8 with no empty, `.`, `..`, absolute, or backslash segment. Compute each declared byte size and lowercase SHA-256 digest after the final build. Any later byte change invalidates admission until Teamarness restarts and admits the directory again.
+Do not use symlinks. Every manifest path must be normalized relative UTF-8 with no empty, `.`, `..`, absolute, or backslash segment. Compute each declared byte size and lowercase SHA-256 digest after the final build. Any later byte change invalidates admission until Teamarness admits the directory again: select **Reload** on the Package page, or restart Teamarness.
 
 ## Package Manifest
 
@@ -30,12 +30,27 @@ A version 1 manifest declares:
 
 - `identity`, a lowercase reverse-DNS Package Identity;
 - a strict Semantic Version in `version`;
-- `presentation.displayName`;
+- `presentation.displayName`, and optionally `presentation.description`, `presentation.author`, and `presentation.homepage`;
 - one Package Process Protocol major and minor range;
 - Backend files with exact target, path, size, and digest;
-- the ESM entrypoint, assets, and UI contract;
+- the ESM entrypoint, assets, and UI contract, and optionally `ui.views`;
 - every required versioned Semantic Capability;
 - optional Package-owned metadata under reverse-DNS `extensions` keys.
+
+The optional presentation fields describe the Package to the people who install it. The Host publishes them in its Package catalog. Admission refuses a manifest when one of them breaks its bound:
+
+- `description`: 1 to 1024 characters, no leading or trailing whitespace, and no control characters except line feeds.
+- `author`: 1 to 128 characters and no control characters.
+- `homepage`: an absolute `https://` URL of at most 2048 characters.
+
+```json
+"presentation": {
+  "displayName": "Emojart",
+  "description": "Generates emoji art for a Workspace.",
+  "author": "Example Author",
+  "homepage": "https://example.com/emojart"
+}
+```
 
 Source, trust, override policy, installation paths, and data paths do not belong in the manifest. Keep registration metadata outside the Package Directory.
 
@@ -70,7 +85,34 @@ The contract file may use at most 1 MiB. Each generic request, response, subscri
 
 Build one UTF-8 ESM entrypoint of at most 8 MiB. Declare at most 64 static assets, each at most 8 MiB. The entrypoint, assets, and contract may total at most 32 MiB. Do not emit undeclared chunks or remote imports.
 
-Export `mount(context)`. The context provides a fresh Shadow Root inside the Package UI Frame, Package and Workspace presentation, theme token names, the UI host version, and a mount-scoped typed client. Return an idempotent unmount function. `context.client` gives requests, cancellation, ordered subscriptions, and post-listener acknowledgement; `@teamarness/package-ui-sdk` supplies the types and the optional CSS kit.
+Export `mount(context)`. The context provides a fresh Shadow Root inside the Package UI Frame, Package and Workspace presentation, the view to show, theme token names, the UI host version, and a mount-scoped typed client. Return an idempotent unmount function. `context.client` gives requests, cancellation, ordered subscriptions, and post-listener acknowledgement; `@teamarness/package-ui-sdk` supplies the types and the optional CSS kit.
+
+### Settings view
+
+Every Package UI has a main view. A Package can also offer a settings view:
+
+1. Add `"views": ["settings"]` to the `ui` object of the manifest. `views` is optional. In version 1, `"settings"` is its only value, and it can appear once.
+2. In `mount(context)`, read `context.view`. It is `"main"` or `"settings"`. Render your settings when it is `"settings"`.
+
+```json
+"ui": {
+  "entrypoint": { "path": "ui/index.js", "size": 0, "sha256": "..." },
+  "assets": [],
+  "contract": { "path": "ui/contract.json", "sha256": "..." },
+  "views": ["settings"]
+}
+```
+
+```ts
+export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
+  if (context.view === "settings") return mountSettings(context);
+  return mountMain(context);
+}
+```
+
+The Package page in the Shell then shows a **Configuration** tab. It mounts the settings view of the Package in the current Workspace, below the Shell's page header and tabs. Selecting **About** or leaving the page unmounts it. Both views use the same Backend, client, and UI contract.
+
+A manifest with another value, or with `"settings"` twice, fails admission with `manifest_malformed` and a pointer such as `/ui/views/0`. When the Shell asks for a view the manifest does not declare, the Host refuses the mount with `ui_view_not_declared`. A UI that declares no views can ignore `context.view`, because it is always `"main"`. In tests, `createTestMountContext({ root, client, view: "settings" })` from `@teamarness/package-ui-sdk/testing` builds a settings context. The view defaults to `"main"`.
 
 ### Package UI frame restrictions
 
@@ -82,8 +124,11 @@ The Shell runs each Package UI Mount in its own sandboxed frame with an opaque o
 - There are no popups, no `window.open`, and no `alert`, `confirm`, or `prompt`.
 - A `position: fixed` overlay covers the Package pane, not the window.
 - Navigating the frame away faults the mount.
+- Nested frames are denied unless your Package declares `teamarness.content-views`; see [Show content in a nested frame](#show-content-in-a-nested-frame).
 - Any uncaught error or unhandled rejection anywhere in the frame is a UI fault, not only one attributed to your module.
 - The `__teamarness/` path of the resource URL is reserved for the Shell-owned frame document, stylesheet, and runtime. A declared asset under that path is shadowed.
+- WebAssembly can run: the frame's policy allows `'wasm-unsafe-eval'` and nothing more ([ADR 0031](../context/.decisions/0031-package-ui-frames-run-webassembly.md)). Ship the module's bytes in your entrypoint or a declared asset; you cannot fetch it. `eval` and `new Function` stay refused, and workers stay denied. A runaway module freezes the Shell as runaway JavaScript does.
+- Some controls misbehave under the frame policy ([DELTA-014](../context/.delta/DELTA-014-package-ui-frame-form-and-select-behaviour.md)). Creating a `<select>` element makes WebKit report a `style-src-attr` violation, so use buttons or a listbox built from other elements. Chromium does not fire `submit` in the sandboxed frame, so make every form act on its button's click and keep `submit` only as a fallback.
 
 ### Theme and Package-owned composition
 
@@ -165,11 +210,15 @@ Generate the UI's request types from the contract with `teamarness-contract-type
 
 ## Consume a Package Port
 
-Declare `teamarness.package-ports` 1.0 and each contract identity, version range, Port name, and kind in `consumedPorts`. A Provider declares its independently versioned `portContract` file and SHA-256 digest. The [Port declaration reference](../contracts/package-ports/v1/README.md) lists the bounds and schemas. The Host resolves one Provider per contract at admission, limits each grant to the declared ports in the calling Workspace, and does not let you select an actor or signer. A persisted Provider stays selected when it participates in a feasible graph, irrespective of discovery order or recent calls. A dense contested dependency component can instead be refused with `port_graph_search_limit` after 4,096 search states; inspect the authoring catalog, fix invalid declarations or reduce competition, and reopen the Host. Unrelated Packages continue.
+Declare `teamarness.package-ports` 2.0 and each contract identity, version range, Port name, and kind in `consumedPorts`. A Provider declares its independently versioned `portContract` file and SHA-256 digest. The [Port declaration reference](../contracts/package-ports/v1/README.md) lists the bounds and schemas. The Host resolves one Provider per contract at admission, limits each grant to the declared ports in the calling Workspace, and does not let you select an actor or signer. A persisted Provider stays selected when it participates in a feasible graph, irrespective of discovery order or recent calls. A dense contested dependency component can instead be refused with `port_graph_search_limit` after 4,096 search states; inspect the authoring catalog, fix invalid declarations or reduce competition, and reopen the Host. Unrelated Packages continue.
 
-In Rust, find the granted token through `activation.initialization().capability("teamarness.package-ports")`, then construct `ports::PortClient` with `activation.capabilities().clone()` and that token. Use `command`, `query`, or `subscribe_event` for the declared kind. Subscribe explicitly before querying your initial page. Treat `messages.changed` from Conversations as a live, coalescible invalidation with an empty payload. A display can refresh `message.page` after an event. A Consumer that must process each newly delivered Message should declare Conversations 1.2 `message.changes`: save the initial page's epoch/revision, then query `{channelId, epoch, after, limit?}` after notification or reconnection. Process revision-ordered changes and acknowledge only an examined prefix; continue bounded batches when behind, and retain unresolved pending content for safe query retry. Do not treat a Message's display position or timestamp as delivery progress. A changed epoch reports `resyncRequired`; choose an explicit recovery policy rather than replaying side effects. The Agent Package stops on invalid saved continuity and never retries an already settled reply.
+Which Providers you can reach depends on your admission tier (ADR 0036). A Team Package sees Team Providers only. A contract that only a Personal Package provides is unavailable to it: its declared row reports `available:false`, and a call fails with `port_unavailable`. A Personal Package sees Team and Personal Providers. A Personal Provider that keeps running after it loses one of its own required Ports is not served: no consumer is routed to it, and Agent discovery does not offer it until the dependency returns. [Local Package registration](local-package-registration.md#understand-the-two-tiers) describes the tiers.
 
-Its `message.post` command (Conversations 1.1) signs as the Host-derived actor: the local Installation Person, or the Workspace Agent your Package is bound to through `teamarness.agent-binding` (see [Act as a Workspace Agent](#act-as-a-workspace-agent)). Its `channel.list` query returns the Channels you may post to. For a non-object Provider event, use `EventSender::send_port_value` rather than `send`; the Port router wraps every Provider response/event for Package Process 1.0 and the Host validates the original JSON value, including an object that resembles the reserved transport shape. The SDK Port client returns the original response or event value. A non-Rust Provider or Consumer must handle the reserved Port transport envelope documented in [Package Process 1.0](../contracts/package-process/v1/README.md). A Port Contract major can exceed 1 without changing Package Process or capability version 1.0. If your command durably commits before a later local step fails, return `BackendError::new(...).with_outcome_uncertain(true)`; the SDK sends `outcomeUncertain:true` and disables retry. Never retry an `outcomeUncertain` command automatically. The test-only SDK Consumer in `tests/system/src/bin/conversations_port_consumer.rs` exercises this sequence without a UI mount.
+In Rust, find the granted token through `activation.initialization().capability("teamarness.package-ports")`, then construct `ports::PortClient` with `activation.capabilities().clone()` and that token. Pass `ports::PortAccess::Declared`, the contract identity, and the contract major to `command`, `query`, `live_query`, or `subscribe_event`. Use `declared_contracts()` to list bounded summaries and `describe(PortAccess::Declared, contract, metadata_sha256)` to reconstruct complete validated schemas and reachable definitions. See the [2.0 wire reference](../contracts/package-capabilities/v1/README.md#teamarnesspackage-ports-20). Discovery does not start a Provider or require a binding. Subscribe explicitly before querying your initial page. Treat `messages.changed` from Conversations as a live, coalescible invalidation with an empty payload. A display can refresh `message.page` after an event. A Consumer that must process each newly delivered Message should declare Conversations 1.2 `message.changes`: save the initial page's epoch/revision, then query `{channelId, epoch, after, limit?}` after notification or reconnection. Process revision-ordered changes and acknowledge only an examined prefix; continue bounded batches when behind, and retain unresolved pending content for safe query retry. Do not treat a Message's display position or timestamp as delivery progress. A changed epoch reports `resyncRequired`; choose an explicit recovery policy rather than replaying side effects. The Agent Package stops on invalid saved continuity and never retries an already settled reply.
+
+Its `message.post` command (Conversations 1.1) signs as the Host-derived actor: the local Installation Person, or the Workspace Agent your Package is bound to through `teamarness.agent-binding` (see [Act as a Workspace Agent](#act-as-a-workspace-agent)). Its `channel.list` query returns the Channels you may post to. Documents 1.1 `document.revise` accepts the same two actors, so a bound Agent's revision is signed with the Agent's key; Core's refusal surfaces as `documents.principal_not_bound`. The version a revise returns may include concurrent edits, so read again before revising. For a non-object Provider event, use `EventSender::send_port_value` rather than `send`; the Port router wraps every Provider response/event for Package Process 1.0 and the Host validates the original JSON value, including an object that resembles the reserved transport shape. The SDK Port client returns the original response or event value. A non-Rust Provider or Consumer must handle the reserved Port transport envelope documented in [Package Process 1.0](../contracts/package-process/v1/README.md). Port Contract majors are independent of Package Process 1.0 and package-ports 2.0. If your command durably commits before a later local step fails, return `BackendError::new(...).with_outcome_uncertain(true)`; the SDK sends `outcomeUncertain:true` and disables retry. Never retry an `outcomeUncertain` command automatically. The test-only SDK Consumer in `tests/system/src/bin/conversations_port_consumer.rs` exercises this sequence without a UI mount.
+
+Conversations 1.3 adds `runtime.guide`, an ordinary query with request `{}` and a bounded `{markdown}` response. Declare it to retrieve complete guide metadata and read the Provider's recovery instructions through the same generic client. Its five existing operation shapes stay unchanged. The [Conversations Package reference](../packages/conversations-package/README.md) lists limits and the distinction between the page schema's 64-item ceiling and the Backend's 32-row cap. Adding this guide makes Conversations agent-facing: bound-Agent access is now default-denied even through declared Ports. Use `agent_contracts()` and `describe(PortAccess::Agent, ...)` for complete metadata after binding. Person-authored declared consumption remains supported.
 
 For local diagnosis, `PackageHost::observe_ports()` and `Package::observe_ports()` provide bounded receivers. Acquire the Host receiver before making calls. Match a Consumer process scope and `p:` ID to the Host's assigned Provider `h:` ID; a shared event upstream has multiple Consumer scopes. A slow receiver reports `Lagged` and does not block routing. Neither receiver carries payloads or proves a write committed. To log the Conversations Provider's SDK observations during development, start its Backend with `TEAMARNESS_CONVERSATIONS_PORT_DIAGNOSTICS=1`. The resulting structured lines go to the Host's private rotated stderr files under `packages/logs/`; normal operation emits no Port observations. These files are not an in-app diagnostics API. Do not copy Message text, actor identity, grants, keys, or records into your own diagnostics.
 
@@ -177,7 +226,23 @@ For local diagnosis, `PackageHost::observe_ports()` and `Package::observe_ports(
 
 A Workspace Agent is a Principal with a Core-custodied signing key and a Steward (ADR 0023). A Package acts as one through an Agent Binding: Installation-local Core state, keyed by Workspace and Package Identity, that names the one Agent this Package Instance acts as. Declare `teamarness.agent-binding` 1.0 and, to notice removals and renames, `teamarness.principals` 1.0. The [capability reference](../contracts/package-capabilities/v1/README.md) lists the methods `current`, `candidates`, `bind`, and `unbind`. The grant fixes your Package and Workspace, so a request never names a Package and you cannot read or change another Package's binding. `candidates` lists only the Agents this Installation stewards; `bind` on another Person's Agent fails with `agent_not_stewarded`, and `bind` on an unknown Principal fails with `agent_not_found`.
 
-In Rust, build `capabilities::agent_binding::AgentBinding::from_initialization(activation.initialization(), activation.capabilities().clone())` and call `bind(principal_id)`. Once bound, two things change (ADR 0030):
+In Rust, build `capabilities::agent_binding::AgentBinding::from_initialization(activation.initialization(), activation.capabilities().clone())` and call `bind(principal_id)`. Once bound, two things change (ADRs 0030 and 0035). Guide-bearing contracts default to `port_not_enabled` even when declared; declaring a Port cannot bypass a disabled selection. Call `PortClient::agent_contracts()` to discover eligible guide-bearing contracts without starting Providers. Call `enable(contract, major)` to durably select a contract, then use `PortAccess::Agent` for commands, queries, live queries and events without individual `consumedPorts` entries. `disable(contract)` removes the selection, even if its Provider is missing. No-guide declared composition remains supported.
+
+Agent discovery follows the same tiers. A Team Package that acts as an Agent never sees a Personal Provider: `agent_contracts()` does not list its contract, `describe` and `enable` fail with `port_unavailable`, and an Agent call fails with `port_not_enabled`. A Personal harness, such as the standalone Agent Package, discovers and can enable guide-bearing contracts from Team and Personal Providers.
+
+Selections belong to your harness Package Identity and Workspace on this Installation, not to the bound Agent or Provider identity. They start empty and survive rebind, unbind, restart and reinstall under the same identities. Requests cannot select another scope or actor. An unbound Agent request refuses with `agent_not_bound`; it never uses Person authority. Repeating enable or disable is safe. A failed storage acknowledgement does not mean the selection stayed unchanged: reread discovery before deciding what to do next.
+
+A summary's `major`, `minor`, description and metadata digest describe the current eligible offer. `enabledMajor` describes your saved choice, and `enabled` remains true even if that choice is unavailable. If a replacement offers major 2 while you saved major 1, discovery exposes the new metadata but reports `available:false`. Only explicit `enable(contract, 2)` changes the saved selection. A missing or nonconforming Provider leaves an unavailable retained row with no current metadata. A saved choice cannot rewrite an incompatible manifest declaration; use the appropriate access view and requested major.
+
+Disable ends Agent-authorized live queries and events with `port_not_enabled`, including declared streams. Unbind or accepted Agent removal ends them with `agent_not_bound`; binding a different Agent uses `agent_binding_changed`. Repeating a bind to the same Agent can retain streams, but unbind followed by rebind always ends the old streams. Accepted bounded events may drain before the terminal; no new event is accepted after revocation. Other harnesses keep their subscriptions, even when they share the Agent and event upstream.
+
+Provider suspend, exit, disposal or generation replacement ends affected streams with `provider_exited`. After recovery, reconnect explicitly and reconcile with fresh queries. Recovery does not revive old streams or replay commands. An already-authorized command keeps its original actor and certainty verdict. Disabling or rebinding does not prove that command failed; never automatically retry an uncertain command.
+
+The [generic client](../tests/system/src/bin/generic_port_consumer.rs) is a test-only example with no Provider-specific adapter or `consumedPorts`. Its [system proof](../tests/system/tests/agent_port_discovery.rs) scripts Conversations through discovered schemas: explicit enablement, guide loading, subscribe-before-read, Agent-attributed posts, revision recovery after reconnect, revocation and restart retention. Run it with `cargo test -p teamarness-system-tests --test agent_port_discovery --locked`. It validates the complete reconstructed document and request/response values. Operation names and request values live in the test script, not in a Provider adapter.
+
+Keep a selected contract's complete schemas, including `$defs`; do not turn events into callable request tools or mistake a query's event schema for a response schema. Load `runtime.guide` only after the Steward enables that contract. Subscribe before reading, retain acknowledged revision progress, and reconcile explicitly after reconnect. Never automatically retry an uncertain command.
+
+The scripted proof does not qualify a model's schema dialect or tool quality. Rebuild the standalone harness with the current 2.0 declaration and canonical SDK sources, record its revision and vendor provenance, and qualify its own UI separately. The generated-project source remains `scripts/create-package.mjs`; do not patch an old generated SDK copy as if it were canonical. No current external build or Steward UI observation is implied by the repository tests or desktop bundle build.
 
 - Every Port command and live query your Package makes carries `actor:{kind:"agent",principal,identity}` instead of the Person actor. The Host reads the binding at each dispatch; event subscriptions carry the Person. A Provider that accepts the Agent kind, such as Conversations 1.1 `message.post`, appends with that `principal`, so the record is signed with the Agent's key and every Installation attributes it to the Agent. A Provider that serves only Persons refuses the Agent kind with its own error code.
 - Core signs a record-log 1.1 append that carries the Agent's `principal` for any Package Instance on this Installation, not only yours. The rule is: the Agent is a current Workspace Principal, its Steward's key group contains this Installation's key, and the Agent has at least one binding here. Anything else is `principal_not_bound`.
@@ -186,9 +251,56 @@ Core clears the binding when this Installation removes the Agent, and `current` 
 
 For a Provider, accept `ports::PortActor::Agent { principal, identity }` where your contract allows it and pass `principal` to `RecordLog::append_with_principal`; refuse the kind with your own code where it does not. Do not store bindings and do not select a signer from request content.
 
+## Show content in a nested frame
+
+Use `teamarness.content-views` 1.0 to show web content your Package did not write, for example a set of HTML, CSS, script, image and media files that an Agent produced. The Host serves the files from your Package Data Directory and the Shell isolates them from your Package UI. Your Backend answers no request per file. The [capability reference](../contracts/package-capabilities/v1/README.md#teamarnesscontent-views-10) is normative for the request shape, path rules, bounds, error codes and media-type allowlist. ADR 0034 records the design.
+
+Declare the family in the manifest:
+
+```json
+{ "identity": "teamarness.content-views", "major": 1, "minMinor": 0, "maxMinor": 0 }
+```
+
+The declaration is also your Package UI's only opt-in to nesting. The Host reports `nestedContent: true` on your UI mounts, and the Shell gives those mounts `frame-src teamarness-content:` in place of `frame-src 'none'`. No other frame policy changes. A Package that does not declare the family cannot frame content.
+
+### Open a view and frame it
+
+1. Store each file in your Package Data Directory, and keep its size and lowercase SHA-256.
+2. Call `open` with the entry path and one `{path, sha256, size, source:{kind:"file", path}}` per file. `path` is the file's path inside the view. `source.path` is relative to your Package Data Directory.
+3. Send the returned `url` to your Package UI and set it as a nested frame's `src`.
+4. Call `close` with the returned `view` when nothing shows the view any more. `close` is idempotent.
+
+In Rust, build `capabilities::content_views::ContentViews::from_initialization(activation.initialization(), activation.capabilities().clone())`; see the [Rust SDK](../crates/teamarness-package-sdk/README.md#semantic-capabilities).
+
+A view holds 1 to 1,000 files, at most 16 MiB each and 64 MiB in total, with content paths of at most 128 bytes. The extension of each path chooses its media type from the allowlist, in lowercase only: `image.PNG` is refused. To refuse a file before you store it, with the verdict the Host would give, call `teamarness_package_contract::media_types` (`media_type_for_path`, `is_valid_content_path`, and the `MAX_CONTENT_*` constants).
+
+Keep these rules in mind:
+
+- Every `open` returns a new token and URL, even for the same files.
+- The Host checks each file's size and SHA-256 on its first read. A file that changes after `open` is not served any more. To show changed files, open a new view.
+- A process generation holds at most 32 open views. Opening a 33rd closes the least recently opened one, and every view closes when the generation ends. After a Backend restart, open the view again.
+- An unknown or ended view, an unlisted path and a file that fails verification all return the same `404`.
+
+### Nest the frame safely
+
+Create the frame with `sandbox="allow-scripts"`, and set `sandbox` before `src`:
+
+```ts
+const frame = document.createElement("iframe");
+frame.setAttribute("sandbox", "allow-scripts");
+frame.setAttribute("referrerpolicy", "no-referrer");
+frame.src = url;
+```
+
+The Shell's content policy carries the CSP directive `sandbox allow-scripts` on every response, so content keeps an opaque origin even without the attribute. Set the attribute anyway. Trust no message from the frame: install no `message` listener that acts on messages whose `source` is the content window. Content cannot reach your bridge, your DOM, the Shell or another Package.
+
+Content can run inline scripts, script files, inline styles, stylesheets and WebAssembly. It cannot use `eval`, `new Function`, workers, plugins, forms or storage. A frame inside content cannot nest a further frame, because the content policy keeps `frame-src 'none'`. Subresources load only from `teamarness-content:`, `data:` and `blob:` URLs, and `fetch` reaches only `teamarness-content:`. The content policy does not yet control navigation or WebRTC, so content can reach the network. See [DELTA-015](../context/.delta/DELTA-015-exhibit-content-network-access.md). Content frames, like Package UI Frames, can see `webkit.messageHandlers.ipc`; only the Tauri invoke key rejects their posts (ADR 0015).
+
+The Exhibits Package (`packages/exhibits-package/`) follows this pattern. It reuses one frame across revisions and opens a new view when a newer revision arrives.
+
 ## Capabilities and local data
 
-Declare only the capabilities you call. Teamarness provides Workspace context, canonical membership with membership transitions and historical membership checks, Workspace Principals, the Agent Binding, domain-separated signing, and the immutable record log for Package-defined synchronized records. Each is a capability **family** with a version: a Package declares a family and the versions it accepts, and the Host grants one. Grants bind one Package Identity, Workspace, Installation, and process generation. A Package cannot select another scope. Private keys, Core database handles, Core types, raw secret bytes, and Iroh handles never cross this interface.
+Declare only the capabilities you call. Teamarness provides Workspace context, canonical membership with membership transitions and historical membership checks, Workspace Principals, the Agent Binding, content views, domain-separated signing, and the immutable record log for Package-defined synchronized records. Each is a capability **family** with a version: a Package declares a family and the versions it accepts, and the Host grants one. Grants bind one Package Identity, Workspace, Installation, and process generation. A Package cannot select another scope. Private keys, Core database handles, Core types, raw secret bytes, and Iroh handles never cross this interface.
 
 The `initialize` frame grants an absolute Package Data Directory, which the SDK gives an activation hook as `Activation::data_directory()`. Your Backend owns that directory's files, schema, and migration policy. The directory remains bound to Installation, Workspace, and Package Identity across Package source changes, versions, process generations, disposal, and application restarts. Teamarness does not inspect, migrate, back up, or delete Package-owned data.
 
@@ -200,13 +312,13 @@ Three things cross the Package boundary, and each carries its own version.
 |---|---|---|
 | Package Process Protocol | 1.0 | the frame set, the lifecycle operations, the `initialize` handshake |
 | Semantic Capability family | one per family, for example the record log's | that family's request and event shapes, bounds, vocabularies, and error codes |
-| Package UI bridge | `uiHostVersion` 1 | the mount contract your `mount(context)` is given |
+| Package UI bridge | `uiHostVersion` 2 | the mount contract your `mount(context)` is given. Version 2 added `context.view`; a UI written for version 1 keeps working |
 
 A capability is negotiated at activation: you declare a family and the versions of it you accept, the Host offers a major and a range of minors, and the highest minor both accept is granted. Within a major, a minor only adds — new optional request fields, new event kinds you may ignore, wider bounds. Nothing is removed or narrowed, and a value added to a closed vocabulary such as the record log's `availability` states is a new major, not a minor, so your Package never has to interpret a state it does not know.
 
 A capability family the Host does not provide is an unavailable capability, not a version error. A **new** family — document-oriented synchronization, say — is added beside the existing ones. It changes no existing family, no lifecycle operation, no protocol version, and no UI contract, so a Package that does not declare it is unaffected.
 
-When a breaking change eventually lands, it comes with a deprecation window: the Host supports the previous major alongside the new one for one release cycle, the Package Catalog reports which Packages still use a superseded major, and these docs and `npm run validate` warn you before the Host refuses. No such window exists yet, because nothing has broken yet. See ADR 0018, Package seam versioning.
+When a breaking change eventually lands, it comes with a deprecation window: the Host supports the previous major alongside the new one for one release cycle, the Package Catalog reports which Packages still use a superseded major, and these docs and `npm run validate` warn you before the Host refuses. Package-ports 2.0 is an explicit pre-release exception: only 2.0 is offered, and major-1 consumers must rebuild without a compatibility dispatcher (ADR 0035). Other seams retain ADR 0018's intended policy. An additive mount-contract change, such as `context.view` in version 2, raises `uiHostVersion` without a window, and this table says what each version adds. See ADR 0018, Package seam versioning, and ADR 0037.
 
 ## Trust limits
 
@@ -216,19 +328,19 @@ A Package UI runs in a sandboxed frame with an opaque origin, so it reaches neit
 
 ## Bundled and local Package Source kinds
 
-`packages/tutorial/` is checked-in Tutorial source. The application builder turns it into the bundled `dev.teamarness.tutorial` Package Directory under `packages/dev.teamarness.tutorial/`. A generated learner project such as `dev.teamarness.emojart` remains installation-local and is admitted through the owner-only registration file. Package Source values `bundled` and `local` remain canonical technical source data; the Shell presents them as `Team` and `Personal`. `Team` and `Personal` are UI aliases, not trust verdicts, and do not define registration scope or imply Workspace enablement, synchronization, sharing, networking, or collaboration.
+`packages/tutorial/` is checked-in Tutorial source. The application builder turns it into the bundled `dev.teamarness.tutorial` Package Directory under `packages/dev.teamarness.tutorial/`. A generated learner project such as `dev.teamarness.emojart` remains installation-local: you install it from the Shell, which writes the owner-only registration file. Package Source values `bundled` and `local` remain canonical technical source data; the Shell presents them as `Team` and `Personal`. `Team` and `Personal` are UI aliases, not trust verdicts, and do not define registration scope or imply Workspace enablement, synchronization, sharing, networking, or collaboration.
 
 ## Local development loop
 
 1. Run `npm run validate` after every contract or manifest change.
 2. Build the final Backend executable, ESM entrypoint, declared assets, and UI contract in the Package repository.
 3. Assemble the Package Directory and write final sizes and SHA-256 digests into `teamarness.package.json`. `npm run build` does both and validates the result.
-4. Follow [Local Package registration](local-package-registration.md). Use the manifest identity as `expectedIdentity`, accept the native-code risks, and restart Teamarness.
-5. Confirm the Package UI's display-safe readiness labels and exercise requests, subscriptions, restart, and data continuity. Workspace settings offers Recover Backend and Dispose only for a Package Instance that needs recovery. Use development logs for protocol diagnostics rather than adding identifiers, trust enums, lifecycle enums, or process generations to normal Package UI.
-6. Rebuild in place when needed, then restart. There is no source watch or hot reload for Backend bytes.
+4. Install the Package Directory from the Shell: on the Workspace page, select **+** (**Add Personal Package**), choose the folder, check the preview, and select **Trust and install**. It starts without a restart. [Local Package registration](local-package-registration.md) describes the flow, the Package page, and the hand-written registration file.
+5. Confirm the Package UI's display-safe readiness labels and exercise requests, subscriptions, restart, and data continuity. The Package page offers **Restart**, **Pause**, and **Resume**, and a **Configuration** tab when you declare a settings view. The Workspace page offers Recover Backend and Dispose only for a Package Instance that needs recovery. Use development logs for protocol diagnostics rather than adding identifiers, trust enums, lifecycle enums, or process generations to normal Package UI.
+6. Rebuild in place when needed, then select **Reload** on the Package page. Reload admits the new bytes in every Workspace and keeps the Package Data Directory. There is no source watch: Teamarness admits new bytes only when you reload or restart it.
 
 ## Promotion to application distribution
 
-Promotion changes distribution metadata, not Package-owned code or contracts. Give the release Package Directory to an application maintainer. The maintainer adds one reviewed entry (source directory and Cargo Backend package) to `packages/bundled-packages.json`, the single list of bundled Packages, and runs `node scripts/bundled-packages.mjs --write` to regenerate the matching Tauri resource and external-binary configuration; `npm test` fails if they diverge. The builder remains the only writer of `packages/application-packages.v1.json`; it stages and verifies every declared byte, size, and digest. Package authors do not edit that generated index or copy Tauri resources by hand. Run `npm run build:application-packages`, then remove the installation override and restart to confirm the bundled source uses the same Package Data Directory.
+Promotion changes distribution metadata, not Package-owned code or contracts. Give the release Package Directory to an application maintainer. The maintainer adds one reviewed entry (source directory and Cargo Backend package) to `packages/bundled-packages.json`, the single list of bundled Packages, and runs `node scripts/bundled-packages.mjs --write` to regenerate the matching Tauri resource and external-binary configuration; `npm test` fails if they diverge. The builder remains the only writer of `packages/application-packages.v1.json`; it stages and verifies every declared byte, size, and digest. Package authors do not edit that generated index or copy Tauri resources by hand. Run `npm run build:application-packages`, then remove the local registration (**Remove** or **Remove override** on the Package page) and restart Teamarness to confirm the bundled source uses the same Package Data Directory.
 
-Signing and notarization, Gatekeeper remediation, other operating systems, remote Package fetching, Package updates, hot reload, enablement policy, and synchronization engines remain outside the current delivery claims.
+Signing and notarization, Gatekeeper remediation, other operating systems, remote Package fetching, Package updates, source watching, enablement policy, and synchronization engines remain outside the current delivery claims.

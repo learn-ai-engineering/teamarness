@@ -27,6 +27,15 @@ const COMMANDS: &[&str] = &[
     "application_update_check",
     "application_update_restart",
     "application_update_quit",
+    "package_choose_directory",
+    "package_inspect_directory",
+    "package_install",
+    "package_reload",
+    "package_remove",
+    "package_write_override",
+    "package_authoring_catalog",
+    "package_restart",
+    "app_restart",
 ];
 
 fn production_release_inputs() {

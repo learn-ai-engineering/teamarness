@@ -111,7 +111,15 @@ describe("createTestMountContext", () => {
     expect(context.client).toBe(fake.client);
     expect(context.package.displayName).toBe("Demo");
     expect(context.package.processGeneration).toBe("1");
-    expect(context.uiHostVersion).toBe(1);
+    expect(context.uiHostVersion).toBe(2);
+    expect(context.view).toBe("main");
     expect(context.themeTokens).toContain("--teamarness-color-accent");
+  });
+
+  it("passes a requested view through", () => {
+    const fake = createFakePackageClient();
+    const context = createTestMountContext({ root: {}, client: fake.client, view: "settings" });
+    expect(context.view).toBe("settings");
+    expect(Object.isFrozen(context)).toBe(true);
   });
 });

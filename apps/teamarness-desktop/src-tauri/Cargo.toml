@@ -33,6 +33,7 @@ tauri-plugin-updater.workspace = true
 reqwest.workspace = true
 rustls = { version = "=0.23.44", default-features = false, features = ["ring", "std", "tls12"] }
 semver.workspace = true
+tauri-plugin-dialog.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

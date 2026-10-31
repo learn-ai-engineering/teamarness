@@ -208,7 +208,7 @@ async fn generic_port_client_uses_exact_grant_live_query_and_event_subscription(
     let directory = tempfile::tempdir().unwrap();
     let scripted = ScriptedCapability::new().calls(|method, payload| match method {
         "available" => {
-            assert_eq!(payload, empty());
+            assert_eq!(payload, serde_json::json!({"access":"declared"}));
             Ok(serde_json::json!({"contracts":[]}))
         }
         "invoke" if payload["port"] == "message.title" => {
@@ -235,22 +235,22 @@ async fn generic_port_client_uses_exact_grant_live_query_and_event_subscription(
             .grant
             .clone();
         let client = PortClient::new(context.capabilities().clone(), grant);
-        let available = client.available().await?;
+        let available = client.available(teamarness_package_sdk::ports::PortAccess::Declared, None).await?;
         let result = client
             .command(
-                "com.example.messages",
+                teamarness_package_sdk::ports::PortAccess::Declared, "com.example.messages", 1,
                 "message.post",
                 serde_json::json!({"text":"hello"}),
             )
             .await?;
-        let title = client.query("com.example.messages", "message.title", empty()).await?;
-        let marker = client.query("com.example.messages", "message.marker", empty()).await?;
+        let title = client.query(teamarness_package_sdk::ports::PortAccess::Declared, "com.example.messages", 1, "message.title", empty()).await?;
+        let marker = client.query(teamarness_package_sdk::ports::PortAccess::Declared, "com.example.messages", 1, "message.marker", empty()).await?;
         let mut query = client
-            .live_query("com.example.messages", "message.watch", empty())
+            .live_query(teamarness_package_sdk::ports::PortAccess::Declared, "com.example.messages", 1, "message.watch", empty())
             .await?;
         let event = query.recv().await.unwrap()?;
         query.close().await;
-        let mut events = client.subscribe_event("com.example.messages", "message.created").await?;
+        let mut events = client.subscribe_event(teamarness_package_sdk::ports::PortAccess::Declared, "com.example.messages", 1, "message.created").await?;
         let created = events.recv().await.unwrap()?;
         events.close().await;
         Ok(serde_json::json!({"available":available,"result":result,"title":title,"marker":marker,"event":event,"created":created}))

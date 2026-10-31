@@ -143,6 +143,25 @@ pub(crate) fn populate_cache(
         make_tree_read_only(&temporary)?;
         fs::rename(&temporary, &admitted_root).map_err(|_| failure())?;
     }
+    Ok(cache_record(admitted_root, manifest))
+}
+
+/// The cache record an admission would serve, without writing the cache.
+///
+/// A preflight admission uses it so that checking a candidate leaves no UI
+/// cache entry behind.
+pub(crate) fn planned_cache(
+    private_data_directory: &Path,
+    admission_digest: &str,
+    manifest: &LoadedManifest,
+) -> UiCacheRecord {
+    let admitted_root = private_data_directory
+        .join("packages/ui-cache/v1")
+        .join(admission_digest);
+    cache_record(admitted_root, manifest)
+}
+
+fn cache_record(admitted_root: PathBuf, manifest: &LoadedManifest) -> UiCacheRecord {
     let entrypoint = UiResourceRecord {
         relative_path: manifest.ui.entrypoint.relative_path.clone(),
         media_type: "text/javascript".to_owned(),
@@ -159,12 +178,12 @@ pub(crate) fn populate_cache(
         };
         (record.relative_path.clone(), record)
     }));
-    Ok(UiCacheRecord {
+    UiCacheRecord {
         admitted_root,
         entrypoint: manifest.ui.entrypoint.relative_path.clone(),
         resources,
         contract_digest: manifest.ui.contract.digest.clone(),
-    })
+    }
 }
 
 impl UiCacheRecord {
@@ -195,18 +214,8 @@ impl UiCacheRecord {
 }
 
 fn validate_resource_path(value: &str) -> Result<(), UiContractFailure> {
-    if value.is_empty()
-        || value.starts_with('/')
-        || value.ends_with('/')
-        || value.contains("//")
-        || value.contains('\\')
-        || value.contains('\0')
-        || value.contains('%')
-        || value.contains('?')
-        || value.contains('#')
-        || value
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    // The segment rules are shared with content-view paths.
+    if !teamarness_package_contract::media_types::is_normalized_relative_path(value)
         || Path::new(value)
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))

@@ -2,7 +2,7 @@
 
 Prefix: `TEAM.DEL`
 
-Delivery covers the desktop application bundle, bundled Packages, repository checks and protected stable release/update tooling (ADR 0031). Local automated qualification is separate from hosted publication and installed-update evidence. Developer ID signing, notarization, other targets and one-hour adoption remain deferred.
+Delivery covers the desktop application bundle, bundled Packages, repository checks and protected stable release/update tooling (ADR 0038). Local automated qualification is separate from hosted publication and installed-update evidence. Developer ID signing, notarization, other targets and one-hour adoption remain deferred.
 
 ## TEAM.DEL-R01 — Desktop Bundle
 

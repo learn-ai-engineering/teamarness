@@ -88,6 +88,8 @@ pub(crate) enum SessionOutcome {
     Unreachable,
     /// The peer answered, and the session failed anyway.
     Failed,
+    /// The responding peer deferred the session under its capacity bound.
+    Busy,
     /// The peer does not consider this Installation a Member.
     RefusedNotAuthorized,
     /// The local gate refused before anything was dialled.
@@ -351,6 +353,11 @@ impl SchedulerCore {
                     outcome: PeerOutcome::Unreachable,
                 });
             }
+            SessionOutcome::Busy => {
+                // Keep the same bounded backoff without changing reachability
+                // or consuming work that has not been exchanged.
+                self.fail(peer, now);
+            }
             SessionOutcome::Failed => {
                 self.fail(peer, now);
                 actions.push(SchedulerAction::Health {
@@ -601,6 +608,23 @@ mod tests {
             tokio::time::sleep_until(deadline).await;
             now = Instant::now();
         }
+    }
+
+    #[test]
+    fn busy_keeps_work_due_and_backoff_without_reporting_health() {
+        let base = Instant::now();
+        let mut core = core();
+        let key = records(1, "teamarness.test");
+        core.replace_due(vec![due(key.clone(), 1)], base);
+        let job = core.next_dispatch(base).unwrap();
+        assert!(
+            core.complete(&job.key, SessionOutcome::Busy, base)
+                .is_empty()
+        );
+        assert_eq!(core.next_dispatch(base), None);
+        let retry = base + Duration::from_millis(500);
+        assert_eq!(core.next_deadline(), Some(retry));
+        assert_eq!(core.next_dispatch(retry).unwrap().key, key);
     }
 
     #[test]

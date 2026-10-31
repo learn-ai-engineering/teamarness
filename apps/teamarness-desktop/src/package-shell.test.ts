@@ -21,6 +21,7 @@ const snapshot: PackageHostSnapshot = {
     { key: second, lifecycle: "active", processGeneration: 9, mountState: null },
   ],
   diagnostics: [],
+  registrations: [],
 };
 
 function snapshotAt(revision: number): PackageHostSnapshot {
@@ -438,6 +439,31 @@ it("keeps Reload UI separate from Backend lifecycle", async () => {
   await shell.reloadUi();
 
   expect(calls).toEqual(["mount:com.example.two", "mount:com.example.two"]);
+});
+
+it("mounts the selected view, defaults to main, and keeps the view on Reload UI", async () => {
+  const calls: string[] = [];
+  const mounts = {
+    setBlocked: () => undefined,
+    mount: async (instance: PackageInstanceKey, _target: unknown, _onFailure: () => void, selected: string) => {
+      calls.push(`mount:${instance.packageIdentity}:${selected}`);
+      return {};
+    },
+    unmount: async () => undefined,
+    suspendBackend: async () => undefined,
+    recoverBackend: async () => undefined,
+    disposeBackend: async () => undefined,
+  };
+  const shell = new PackageShell(snapshotBridge(async () => snapshot), mounts, view());
+  await shell.select(second, "settings");
+  await shell.reloadUi();
+  await shell.select(second);
+
+  expect(calls).toEqual([
+    "mount:com.example.two:settings",
+    "mount:com.example.two:settings",
+    "mount:com.example.two:main",
+  ]);
 });
 
 it("unmounts a hidden Package UI without a Backend lifecycle call", async () => {

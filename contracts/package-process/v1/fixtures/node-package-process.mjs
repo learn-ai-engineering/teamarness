@@ -372,6 +372,9 @@ async function serve() {
   const providerEventStreams = new Map();
   let providerEventOpens = 0;
   let providerEventCloses = 0;
+  let lastCommandActor;
+  let portCommands = 0;
+  const heldPortCommands = [];
   const uiStreams = new Map();
   const send = (frame) => process.stdout.write(encodeFrame(frame));
   for await (const chunk of process.stdin) {
@@ -431,7 +434,9 @@ async function serve() {
           providerEventOpens += 1;
           providerEventStreams.set(frame.id, { sequence: 0, credit: frame.initialCredit });
         } else if (frame.topic === "teamarness.port.query.v1") {
-          if (frame.payload.port === "message.title_watch") {
+          if (frame.payload.port === "message.idle_watch") {
+            // Kept open until explicit close or process lifecycle loss.
+          } else if (frame.payload.port === "message.title_watch") {
             send({ kind: "event", streamId: frame.id, sequence: "1", payload: { $teamarnessPortEnvelope: 1, $teamarnessPortValue: [1, 2] } });
           } else if (frame.payload.port === "message.marker_watch") {
             send({ kind: "event", streamId: frame.id, sequence: "1", payload: { $teamarnessPortEnvelope: 1,
@@ -445,8 +450,10 @@ async function serve() {
             send({ kind: "event", streamId: frame.id, sequence: "1", payload: { order: packageIdentity === "com.example.invalid" ? "invalid" : 1 } });
             if (packageIdentity !== "com.example.invalid") send({ kind: "event", streamId: frame.id, sequence: "2", payload: { order: 2 } });
           }
-          send({ kind: "stream_close", streamId: frame.id, code: "completed" });
-          uiStreams.delete(frame.id);
+          if (frame.payload.port !== "message.idle_watch") {
+            send({ kind: "stream_close", streamId: frame.id, code: "completed" });
+            uiStreams.delete(frame.id);
+          }
         }
         else if (frame.topic === "fixture.close") {
           send({ kind: "stream_close", streamId: frame.id, code: "closed" });
@@ -603,7 +610,10 @@ async function serve() {
         immutableStream = undefined;
         send({ kind: "response", id: frame.id, payload: { closed: true } });
       } else if (frame.kind === "request" && ["teamarness.port.command.v1", "teamarness.port.query.v1"].includes(frame.operation)) {
-        if (frame.payload.request.text === "stall") {
+        if (frame.operation === "teamarness.port.command.v1") { lastCommandActor = frame.payload.actor; portCommands += 1; }
+        if (frame.payload.request.text === "hold") {
+          heldPortCommands.push(frame.id);
+        } else if (frame.payload.request.text === "stall") {
           delayedRequest = frame;
         } else if (frame.payload.request.text === "exit") {
           await import("node:fs/promises").then((fs) => fs.appendFile("port-command-attempts", "1\n"));
@@ -629,7 +639,7 @@ async function serve() {
         const id = `p:port-cancel-${capabilitySequence}`;
         send({ kind: "request", id, operation: "capability.call",
           grant: capabilityGrants.get("teamarness.package-ports"), deadlineUnixMs: frame.deadlineUnixMs,
-          payload: { method: "invoke", contract: "com.example.messages", port: "message.post",
+          payload: { method: "invoke", access: frame.payload.access ?? "declared", major: 1, contract: "com.example.messages", port: "message.post",
             kind: "command", request: { text: "stall" } } });
         send({ kind: "cancel", id: `p:cancel-port-${capabilitySequence}`, targetId: id });
         send({ kind: "response", id: frame.id, payload: { cancelled: true } });
@@ -640,8 +650,23 @@ async function serve() {
         portEvents.length = 0;
         send({ kind: "stream_open", id: portQueryStream, topic: "capability.stream", initialCredit: 32,
           payload: { grant: capabilityGrants.get("teamarness.package-ports"),
-            contract: "com.example.messages", port: frame.payload.port ?? "message.watch", kind: "query", request: {} } });
+            access: frame.payload.access ?? "declared", major: frame.payload.major ?? 1, contract: frame.payload.contract ?? "com.example.messages", port: frame.payload.port ?? "message.watch", kind: "query", request: {} } });
         send({ kind: "response", id: frame.id, payload: { opened: true } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_query_emit") {
+        for (const [streamId, stream] of uiStreams) {
+          if (stream.topic !== "teamarness.port.query.v1") continue;
+          stream.sequence += 1;
+          send({ kind: "event", streamId, sequence: String(stream.sequence), payload: { order: frame.payload.order } });
+        }
+        send({ kind: "response", id: frame.id, payload: { emitted: true } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_release") {
+        const released = heldPortCommands.splice(0);
+        for (const id of released) send({ kind: "response", id, payload: { accepted: true } });
+        send({ kind: "response", id: frame.id, payload: { released: released.length } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_last_actor") {
+        send({ kind: "response", id: frame.id, payload: { actor: lastCommandActor ?? null, commands: portCommands } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.port_query_stats") {
+        send({ kind: "response", id: frame.id, payload: { active: [...uiStreams.values()].filter(s => s.topic === "teamarness.port.query.v1").length } });
       } else if (frame.kind === "request" && frame.operation === "fixture.port_events") {
         send({ kind: "response", id: frame.id, payload: frame.payload.summary
           ? { count: portEvents.length, firstLength: portEvents[0]?.$teamarnessPortValue?.length ?? null, closeCode: portCloseCode }
@@ -653,7 +678,7 @@ async function serve() {
         portEventClose = null;
         send({ kind: "stream_open", id: portEventStream, topic: "capability.stream", initialCredit: 32,
           payload: { grant: frame.payload.grant ?? capabilityGrants.get("teamarness.package-ports"),
-            contract: "com.example.messages", port: frame.payload.port ?? "message.created", kind: "event",
+            access: frame.payload.access ?? "declared", major: frame.payload.major ?? 1, contract: frame.payload.contract ?? "com.example.messages", port: frame.payload.port ?? "message.created", kind: "event",
             ...(frame.payload.extra ?? {}) } });
         send({ kind: "response", id: frame.id, payload: { opened: true } });
       } else if (frame.kind === "request" && frame.operation === "fixture.port_event_events") {

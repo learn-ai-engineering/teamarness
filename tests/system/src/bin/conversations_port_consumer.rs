@@ -47,7 +47,13 @@ async fn main() -> ExitCode {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             let after_exit = client
-                .query(CONTRACT, "message.page", json!({"channelId":GENERAL}))
+                .query(
+                    teamarness_package_sdk::ports::PortAccess::Declared,
+                    CONTRACT,
+                    1,
+                    "message.page",
+                    json!({"channelId":GENERAL}),
+                )
                 .await;
             let result = match after_exit {
                 Ok(_) => json!({"ok":true}),
@@ -74,9 +80,32 @@ async fn scenario(
     raw: &CapabilityClient,
     grant: &str,
 ) -> Result<Value, String> {
-    let available = client.available().await.map_err(code)?;
+    let available = client
+        .available(teamarness_package_sdk::ports::PortAccess::Declared, None)
+        .await
+        .map_err(code)?;
+    let summaries = client.declared_contracts().await.map_err(code)?;
+    let digest = summaries
+        .iter()
+        .find(|row| row.contract == CONTRACT)
+        .and_then(|row| row.metadata_sha256.as_deref())
+        .ok_or("proof.no_metadata")?;
+    let document = client
+        .describe(
+            teamarness_package_sdk::ports::PortAccess::Declared,
+            CONTRACT,
+            digest,
+        )
+        .await
+        .map_err(code)?;
+    let metadata = json!({"identity":document.contracts[0].identity,"ports":document.contracts[0].ports.len(),"definitions":document.definitions.keys().collect::<Vec<_>>()});
     let mut events = client
-        .subscribe_event(CONTRACT, "messages.changed")
+        .subscribe_event(
+            teamarness_package_sdk::ports::PortAccess::Declared,
+            CONTRACT,
+            1,
+            "messages.changed",
+        )
         .await
         .map_err(code)?;
     // The subscription is live: it does not produce an initial snapshot.
@@ -88,7 +117,9 @@ async fn scenario(
     }
     let first = client
         .command(
+            teamarness_package_sdk::ports::PortAccess::Declared,
             CONTRACT,
+            1,
             "message.post",
             json!({"channelId":GENERAL,"markdown":"port-proof-first"}),
         )
@@ -100,13 +131,21 @@ async fn scenario(
         .ok_or("proof.event_closed")?
         .map_err(code)?;
     let page = client
-        .query(CONTRACT, "message.page", json!({"channelId":GENERAL}))
+        .query(
+            teamarness_package_sdk::ports::PortAccess::Declared,
+            CONTRACT,
+            1,
+            "message.page",
+            json!({"channelId":GENERAL}),
+        )
         .await
         .map_err(code)?;
     events.close().await;
     let second = client
         .command(
+            teamarness_package_sdk::ports::PortAccess::Declared,
             CONTRACT,
+            1,
             "message.post",
             json!({"channelId":GENERAL,"markdown":"port-proof-second"}),
         )
@@ -116,7 +155,12 @@ async fn scenario(
     // negative replay assertion; the bounded window precedes a fresh subscription.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut late = client
-        .subscribe_event(CONTRACT, "messages.changed")
+        .subscribe_event(
+            teamarness_package_sdk::ports::PortAccess::Declared,
+            CONTRACT,
+            1,
+            "messages.changed",
+        )
         .await
         .map_err(code)?;
     let replay = tokio::time::timeout(Duration::from_millis(100), late.recv())
@@ -124,12 +168,20 @@ async fn scenario(
         .is_ok();
     late.close().await;
     let recovered = client
-        .query(CONTRACT, "message.page", json!({"channelId":GENERAL}))
+        .query(
+            teamarness_package_sdk::ports::PortAccess::Declared,
+            CONTRACT,
+            1,
+            "message.page",
+            json!({"channelId":GENERAL}),
+        )
         .await
         .map_err(code)?;
     let hidden = client
         .command(
+            teamarness_package_sdk::ports::PortAccess::Declared,
             CONTRACT,
+            1,
             "message.post",
             json!({"channelId":"ffffffffffffffffffffffffffffffff","markdown":"not-visible"}),
         )
@@ -141,7 +193,7 @@ async fn scenario(
             grant,
             "invoke",
             json!({
-                "contract":CONTRACT,"port":"message.post","kind":"command",
+                "access":"declared","major":1,"contract":CONTRACT,"port":"message.post","kind":"command",
                 "request":{"channelId":GENERAL,"markdown":"forged"},
                 "actor":{"kind":"agent","identity":"forged"}
             }),
@@ -150,13 +202,21 @@ async fn scenario(
         .err()
         .map(|err| err.code().to_owned());
     let denied = client
-        .command(CONTRACT, "not.granted", json!({}))
+        .command(
+            teamarness_package_sdk::ports::PortAccess::Declared,
+            CONTRACT,
+            1,
+            "not.granted",
+            json!({}),
+        )
         .await
         .err()
         .map(|err| err.code().to_owned());
     let undeclared_changes = client
         .query(
+            teamarness_package_sdk::ports::PortAccess::Declared,
             CONTRACT,
+            1,
             "message.changes",
             json!({"channelId":GENERAL,"epoch":"0".repeat(32),"after":"0"}),
         )
@@ -165,7 +225,9 @@ async fn scenario(
         .map(|err| err.code().to_owned());
     let malformed = client
         .command(
+            teamarness_package_sdk::ports::PortAccess::Declared,
             CONTRACT,
+            1,
             "message.post",
             json!({"channelId":GENERAL,"markdown":""}),
         )
@@ -173,7 +235,7 @@ async fn scenario(
         .err()
         .map(|err| err.code().to_owned());
     Ok(
-        json!({"available":available,"initialQuiet":initial,"first":first,"event":event,
+        json!({"available":available,"metadata":metadata,"initialQuiet":initial,"first":first,"event":event,
         "page":page,"second":second,"lateReplay":replay,"recovered":recovered,
         "denied":denied,"undeclaredChanges":undeclared_changes,"malformed":malformed,"forged":forged,"hidden":hidden}),
     )

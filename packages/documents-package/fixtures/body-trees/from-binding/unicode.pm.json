@@ -1,0 +1,14 @@
+{
+ "type": "doc",
+ "content": [
+  {
+   "type": "paragraph",
+   "content": [
+    {
+     "type": "text",
+     "text": "emoji 😀🎉, CJK 文档编辑, combining é, RTL שלום"
+    }
+   ]
+  }
+ ]
+}

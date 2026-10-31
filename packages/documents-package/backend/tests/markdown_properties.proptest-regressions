@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d74a109295030fa396908d728c7dd2ff854bad8937de3e329a2549868fbd1bf9 # shrinks to body = [Blockquote([Ordered { order: 1, items: [[Paragraph([Text("]:", Marks { strong: false, em: false, strike: false, code: true, link: Some(Link { href: "https://a.test/", title: None }) }), Text("a", Marks { strong: false, em: false, strike: false, code: false, link: None })])]] }])]
+cc 6f17613f463ab0b3524d708eb1a3aecf6f3a5274914ac8bda8caeb47546f3b0d # shrinks to body = [Paragraph([Text("a", Marks { strong: false, em: false, strike: false, code: false, link: None })]), Paragraph([Text("a", Marks { strong: false, em: false, strike: false, code: false, link: None })]), Blockquote([Rule])], pick = Index(6148914691236517206), replacement = [Blockquote([Rule])]

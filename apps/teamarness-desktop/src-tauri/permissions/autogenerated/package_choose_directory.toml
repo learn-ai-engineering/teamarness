@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-package-choose-directory"
+description = "Enables the package_choose_directory command without any pre-configured scope."
+commands.allow = ["package_choose_directory"]
+
+[[permission]]
+identifier = "deny-package-choose-directory"
+description = "Denies the package_choose_directory command without any pre-configured scope."
+commands.deny = ["package_choose_directory"]

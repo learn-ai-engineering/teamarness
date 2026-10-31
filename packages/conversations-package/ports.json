@@ -35,9 +35,15 @@
     } }
   },
   "contracts": [{
-    "identity": "dev.teamarness.conversations", "major": 1, "minor": 2,
+    "identity": "dev.teamarness.conversations", "major": 1, "minor": 3,
     "description": "Conversations Messages posted by the local Installation Person or a locally bound Workspace Agent, bounded Channel and Message reads, and live Workspace projection invalidation.",
     "ports": [
+      { "name": "runtime.guide", "kind": "query", "description": "Read bounded guidance for channel discovery, Message reads and posts, revision recovery, Host-derived authorship, errors and uncertain outcomes (1.3).",
+        "request": { "type": "object", "additionalProperties": false },
+        "response": { "type": "object", "additionalProperties": false, "required": ["markdown"], "properties": {
+          "markdown": { "type": "string", "maxLength": 32768 }
+        } }
+      },
       { "name": "message.post", "kind": "command", "description": "Post a Message as the Host-derived actor: the local Installation Person, or the Workspace Agent the calling Package Instance is bound to (1.1), whose key then signs the Message. A Person from another Installation is refused. An uncertain command must not be retried automatically.",
         "request": { "type": "object", "additionalProperties": false, "required": ["channelId", "markdown"], "properties": {
           "channelId": { "$ref": "#/$defs/channelId" }, "markdown": { "type": "string", "minLength": 1, "maxLength": 32768 }

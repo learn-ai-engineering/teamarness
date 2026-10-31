@@ -141,7 +141,7 @@ test("copies canonical SDK production trees and records exact provenance", async
     assert.equal(provenance.templateVersion, FOUNDATION_TEMPLATE_VERSION);
     assert.equal(provenance.templateVersion, 2);
     assert.equal(provenance.packageProcessProtocol, "1.0");
-    assert.equal(provenance.uiHostVersion, 1);
+    assert.equal(provenance.uiHostVersion, 2);
     assert.equal(provenance.sdkSource, "vendored-from-teamarness-checkout");
     assert.equal(provenance.sdkUpgrade, "unsupported-in-place");
     assert.equal(provenance.requestNamespace, "emojart");

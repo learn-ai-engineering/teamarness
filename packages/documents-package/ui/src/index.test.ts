@@ -1,4 +1,8 @@
 // @vitest-environment happy-dom
+/// <reference types="node" />
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { createFakePackageClient, createTestMountContext } from "@teamarness/package-ui-sdk/testing";
 import type { PackageValue } from "@teamarness/package-ui-sdk";
@@ -49,6 +53,32 @@ function backend(current: () => DocumentsSnapshot) {
     subscriptions: { "documents.changes": () => undefined },
   });
   return { fake, calls };
+}
+
+/** The Rust-written body holding every node and mark. */
+const ALL_NODES = new Uint8Array(readFileSync(join(import.meta.dirname, "../../fixtures/body-trees/from-rust/01-all-nodes.loro")));
+const mac = /Mac|iP(hone|[oa]d)/.test(globalThis.navigator?.platform ?? "");
+
+/** The Backend opens the editor session of `doc`: `begin`, the snapshot (none by default) and `end`. */
+async function opened(fake: ReturnType<typeof createFakePackageClient>, state: {
+  editable?: boolean; reason?: "identity_conflict" | "import_failure"; diagnosticRecordId?: string; snapshot?: Uint8Array;
+} = {}): Promise<void> {
+  const chunks = state.snapshot ? [state.snapshot] : [];
+  await fake.emit("documents.document.session", {
+    event: "begin", documentId: doc, sessionPeer: "7", version: "0", chunks: chunks.length, editable: state.editable ?? true,
+    ...(state.reason ? { reason: state.reason } : {}),
+    ...(state.diagnosticRecordId ? { diagnosticRecordId: state.diagnosticRecordId } : {}),
+  });
+  for (const [chunkIndex, chunk] of chunks.entries()) {
+    await fake.emit("documents.document.session", { event: "chunk", documentId: doc, chunkIndex, chunk: Buffer.from(chunk).toString("base64") });
+  }
+  await fake.emit("documents.document.session", { event: "end", documentId: doc });
+}
+
+/** Waits, a task at a time, until `done` holds. */
+async function settle(done: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 200 && !done(); attempt += 1) await tick();
+  expect(done()).toBe(true);
 }
 
 function texts(root: ParentNode, selector: string): string[] {
@@ -188,155 +218,214 @@ describe("Documents mount", () => {
     await unmount();
   });
 
-  it('does not enable Preview before a Document is open', async () => {
-    const fake = createFakePackageClient({ requests: {
-      'documents.snapshot': () => snapshot(),
-      'documents.document.open': () => ({ documentId: doc, revision: '0', editable: true, text: 'Draft' }),
-    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.text': () => undefined } });
-    const root = document.createElement('div').attachShadow({ mode: 'open' });
+  it("shows the editor placeholder only while a Document is open", async () => {
+    const fake = createFakePackageClient({ requests: { "documents.snapshot": () => snapshot() },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined } });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
-    const preview = root.querySelector('.editor-header button') as HTMLButtonElement;
-    expect(preview.disabled).toBe(true);
-    preview.click();
-    (root.querySelector('.document-title') as HTMLButtonElement).click();
+    const placeholder = root.querySelector(".editor-placeholder") as HTMLElement;
+    expect(placeholder.hidden).toBe(true);
+    expect(root.querySelector(".editor-header button")).toBeNull();
+    (root.querySelector(".document-title") as HTMLButtonElement).click();
     await tick();
-    await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text: 'Draft' });
-    expect(preview.disabled).toBe(false);
-    expect(preview.getAttribute("aria-label")).toBe("Preview");
-    expect(preview.title).toBe('Preview');
-    expect(preview.querySelector('svg path')?.getAttribute('d')).toBeTruthy();
-    expect(preview.querySelector('[role=tooltip]')?.textContent).toBe('Preview');
-    expect(preview.getAttribute('aria-pressed')).toBe('false');
-    const previewGraphic = preview.querySelector('path')?.getAttribute('d');
-    preview.click();
-    expect(preview.querySelector('path')?.getAttribute('d')).not.toBe(previewGraphic);
-    expect(preview.getAttribute('aria-label')).toBe('Edit');
-    expect(preview.querySelector('[role=tooltip]')?.textContent).toBe('Edit');
-    expect(preview.getAttribute('aria-pressed')).toBe('true');
-    preview.click();
-    expect((root.querySelector('.editor-textarea') as HTMLElement).hidden).toBe(false);
+    expect(placeholder.hidden).toBe(false);
+    expect(placeholder.textContent).toBe("Opening…");
+    expect(root.querySelector("textarea.editor-textarea")).toBeNull();
     await unmount();
   });
-
-  it("opens a Document, sends typed edits, and applies a remote delta with the caret moved", async () => {
-    const edits: { base: string; ops: unknown }[] = [];
+  it("opens a Document through its editor session and renders its body without Markdown", async () => {
     const fake = createFakePackageClient({
-      requests: {
-        "documents.snapshot": () => snapshot(),
-        "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "" }),
-        "documents.document.edit": (payload) => {
-          const { baseRevision, ops } = payload as { baseRevision: string; ops: unknown };
-          edits.push({ base: baseRevision, ops });
-          return { ok: true as const, revision: String(Number(baseRevision) + 1) };
-        },
-      },
-      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+      requests: { "documents.snapshot": () => snapshot() },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined },
     });
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
     (root.querySelector(".document-title") as HTMLButtonElement).click();
     await tick();
+    expect(fake.calls.filter((call) => call.operation === "documents.document.session"))
+      .toEqual([{ operation: "documents.document.session", payload: { documentId: doc } }]);
     const pane = root.querySelector(".editor-pane") as HTMLElement;
     expect(pane.hidden).toBe(false);
     expect(root.querySelector(".editor-title")?.textContent).toBe("Q4 plan");
-    await fake.emit("documents.document.text", { documentId: doc, revision: "0", editable: true, text: "# Q4\n" });
-    const textarea = root.querySelector("textarea") as HTMLTextAreaElement;
-    expect(textarea.value).toBe("# Q4\n");
-    expect(textarea.disabled).toBe(false);
-    textarea.value = "# Q4\n- hire\n";
-    textarea.dispatchEvent(new Event("input"));
+    expect(root.querySelector(".editor-status")?.textContent).toBe("Opening…");
+    await opened(fake, { snapshot: ALL_NODES });
     await tick();
-    expect(edits).toEqual([{ base: "0", ops: [{ retain: 5 }, { insert: "- hire\n" }] }]);
-    await fake.emit("documents.document.text", { documentId: doc, revision: "1", editable: true, origin: "local", delta: [{ retain: 5 }, { insert: "- hire\n" }] });
-    expect(textarea.value).toBe("# Q4\n- hire\n");
-    textarea.focus();
-    textarea.setSelectionRange(12, 12);
-    await fake.emit("documents.document.text", { documentId: doc, revision: "2", editable: true, origin: "remote", delta: [{ insert: "> intro\n" }] });
-    expect(textarea.value).toBe("> intro\n# Q4\n- hire\n");
-    expect(textarea.selectionStart).toBe(20);
-    expect(texts(root, ".editor-header button")).not.toContain("Close");
-    expect(pane.hidden).toBe(false);
+    expect(root.querySelector(".editor-status")?.textContent).toBe("");
+    expect((root.querySelector(".editor-placeholder") as HTMLElement).hidden).toBe(true);
+    const body = root.querySelector(".ProseMirror") as HTMLElement;
+    expect(body.getAttribute("contenteditable")).toBe("true");
+    for (const selector of ["h1", "h6", "strong", "em", "s", "code", "a", "blockquote", "ol", "ul", "hr", "pre", "br"]) {
+      expect(body.querySelector(selector), selector).not.toBeNull();
+    }
+    expect(body.querySelector("a")?.getAttribute("href")).toBe("https://example.com/a");
+    // The rendered body and the whole page show no Markdown syntax.
+    expect(root.textContent).not.toMatch(/\*\*|~~|```|\]\(|^#+ /m);
+    expect(root.querySelector("textarea.editor-textarea")).toBeNull();
+    await unmount();
+    expect(fake.calls.some((call) => call.operation === "documents.document.open")).toBe(false);
+  });
+
+  it("quotes the rendered selection when commenting on it", async () => {
+    const added: PackageValue[] = [];
+    const fake = createFakePackageClient({
+      requests: {
+        "documents.snapshot": () => snapshot(),
+        "documents.comments": () => ({ comments: [] }),
+        "documents.comment.add": (payload) => { added.push(payload); return { ok: true as const, id: "d".repeat(64) }; },
+      },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined },
+    });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector(".document-title") as HTMLButtonElement).click();
+    await tick();
+    await opened(fake, { snapshot: ALL_NODES });
+    await tick();
+    const body = root.querySelector(".ProseMirror") as HTMLElement;
+    body.dispatchEvent(new KeyboardEvent("keydown", { key: "a", ctrlKey: !mac, metaKey: mac, bubbles: true }));
+    (root.querySelector(".editor-comment") as HTMLButtonElement).click();
+    const draft = root.querySelector(".comment-quote--draft") as HTMLElement;
+    expect(draft.hidden).toBe(false);
+    const excerpt = draft.querySelector(".comment-quote-excerpt")?.textContent ?? "";
+    expect(excerpt.startsWith("One\nTwo")).toBe(true);
+    expect(excerpt).toContain("Plain strong em strike code link bare both and a hard\nbreak.");
+    expect(excerpt).not.toContain("**");
+    const input = root.querySelector(".comment-input") as HTMLTextAreaElement;
+    input.value = "On all of it";
+    (root.querySelector(".comment-compose") as HTMLFormElement).requestSubmit();
+    await tick();
+    expect(added).toEqual([{ documentId: doc, markdown: "On all of it", quote: excerpt }]);
+    expect(draft.hidden).toBe(true);
     await unmount();
   });
 
-  it("shows a terminal conflict warning without retrying or rendering quarantined text", async () => {
+  it("copies the Document as Markdown, falling back to a visible copy panel when the clipboard is refused", async () => {
+    const markdown = "# Title\n\n" + "Body text.\n\n".repeat(3000);
+    const parts: string[] = [];
+    for (let start = 0; start < markdown.length; start += 24 * 1024) parts.push(markdown.slice(start, start + 24 * 1024));
+    const digest = createHash("sha256").update(markdown).digest("hex");
+    const fake = createFakePackageClient({
+      requests: {
+        "documents.snapshot": () => snapshot(),
+        "documents.comments": () => ({ comments: [] }),
+        "documents.document.markdown": (payload) => {
+          const chunkIndex = (payload as { chunkIndex: number }).chunkIndex;
+          return { documentId: doc, digest, chunks: parts.length, chunkIndex, chunk: parts[chunkIndex]! };
+        },
+      },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined },
+    });
+    const written: string[] = [];
+    let allow = true;
+    const original = Object.getOwnPropertyDescriptor(globalThis.navigator, "clipboard");
+    Object.defineProperty(globalThis.navigator, "clipboard", {
+      configurable: true,
+      value: {
+        write: async (items: ClipboardItem[]) => {
+          if (!allow) throw Object.assign(new Error("denied"), { name: "NotAllowedError" });
+          written.push(await (await items[0]!.getType("text/plain")).text());
+        },
+      },
+    });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    try {
+      (root.querySelector(".document-title") as HTMLButtonElement).click();
+      await tick();
+      await opened(fake, { snapshot: ALL_NODES });
+      await tick();
+      const copy = root.querySelector(".editor-copy-markdown") as HTMLButtonElement;
+      copy.click();
+      await settle(() => written.length === 1);
+      expect(written).toEqual([markdown]);
+      expect(fake.calls.filter((call) => call.operation === "documents.document.markdown").map((call) => (call.payload as { chunkIndex: number }).chunkIndex))
+        .toEqual(parts.map((_, index) => index));
+      expect(root.querySelector(".editor-copy-status")?.textContent).toBe("Copied as Markdown");
+      expect((root.querySelector(".markdown-copy") as HTMLElement).hidden).toBe(true);
+
+      allow = false;
+      copy.click();
+      const panel = root.querySelector(".markdown-copy") as HTMLElement;
+      await settle(() => !panel.hidden);
+      expect((panel.querySelector("textarea") as HTMLTextAreaElement).value).toBe(markdown);
+      [...panel.querySelectorAll("button")].find((button) => button.textContent === "Close")!.click();
+      expect(panel.hidden).toBe(true);
+    } finally {
+      await unmount();
+      if (original) Object.defineProperty(globalThis.navigator, "clipboard", original);
+      else delete (globalThis.navigator as { clipboard?: unknown }).clipboard;
+    }
+  });
+  it("shows a terminal conflict warning without retrying", async () => {
     let opens = 0;
     const fake = createFakePackageClient({
       requests: {
         "documents.snapshot": () => snapshot(),
-        "documents.document.open": () => { opens++; return { documentId: doc, revision: "0", editable: true, text: "secret" }; },
+        "documents.document.open": () => { opens++; return { documentId: doc, editable: false, reason: "identity_conflict" }; },
       },
-      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined },
     });
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
     (root.querySelector(".document-title") as HTMLButtonElement).click();
     await tick();
-    await fake.emit("documents.document.text", { documentId: doc, revision: "0", editable: true, text: "secret" });
-    await fake.emit("documents.document.text", { documentId: doc, revision: "0", editable: false, reason: "identity_conflict", text: "" });
+    await opened(fake, { editable: false, reason: "identity_conflict" });
     expect(root.querySelector(".editor-status")?.textContent).toContain("Conflicting edit history");
-    expect((root.querySelector(".editor-textarea") as HTMLTextAreaElement).disabled).toBe(true);
-    expect((root.querySelector(".editor-textarea") as HTMLTextAreaElement).value).toBe("");
-    ([...root.querySelectorAll(".editor-header button")].find((button) => button.getAttribute("aria-label") === "Preview") as HTMLButtonElement).click();
-    expect(root.querySelector(".editor-preview")?.innerHTML).toBe("");
     await fake.emit("documents.changes", snapshot());
     await tick();
-    expect(opens).toBe(1);
+    expect(opens).toBe(0);
     await unmount();
   });
-
-  it("shows last-good text read-only with an import failure reference without retrying", async () => {
+  it("shows an import failure reference read-only without retrying", async () => {
     let opens = 0;
     const record = "e".repeat(64);
     const fake = createFakePackageClient({
       requests: {
         "documents.snapshot": () => snapshot(),
-        "documents.document.open": () => { opens++; return { documentId: doc, revision: "1", editable: false,
-          reason: "import_failure", diagnosticRecordId: record, text: "last good" }; },
+        "documents.document.open": () => { opens++; return { documentId: doc, editable: false, reason: "import_failure", diagnosticRecordId: record }; },
       },
-      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined },
     });
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
     (root.querySelector(".document-title") as HTMLButtonElement).click();
     await tick();
-    await fake.emit("documents.document.text", { documentId: doc, revision: "1", editable: false,
-      reason: "import_failure", diagnosticRecordId: record, text: "last good" });
-    const textarea = root.querySelector(".editor-textarea") as HTMLTextAreaElement;
-    expect(textarea.disabled).toBe(true);
-    expect(textarea.value).toBe("last good");
+    await opened(fake, { editable: false, reason: "import_failure", diagnosticRecordId: record });
     expect(root.querySelector(".editor-status")?.textContent).toContain("Incomplete edit history");
     expect(root.querySelector(".editor-status")?.textContent).toContain(record);
+    expect(root.querySelector(".editor-status")?.classList.contains("editor-status-failure")).toBe(true);
     await fake.emit("documents.changes", snapshot());
     await tick();
-    expect(opens).toBe(1);
+    expect(opens).toBe(0);
     await unmount();
   });
-
-  it("retries pending history after availability changes and enables the existing editor", async () => {
+  it("retries pending history after availability changes and reloads once the body is editable", async () => {
     let opens = 0;
     const fake = createFakePackageClient({
       requests: {
         "documents.snapshot": () => ({ ...snapshot(), availability: "waiting_for_history_access" }),
-        "documents.document.open": () => { opens++; return { documentId: doc, revision: "0", editable: opens > 1, text: "" }; },
+        "documents.document.open": () => { opens++; return { documentId: doc, editable: opens > 1 }; },
       },
-      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined },
     });
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
     (root.querySelector(".document-title") as HTMLButtonElement).click();
     await tick();
-    await fake.emit("documents.document.text", { documentId: doc, revision: "0", editable: false, text: "" });
-    expect((root.querySelector(".editor-textarea") as HTMLTextAreaElement).disabled).toBe(true);
+    await opened(fake, { editable: false });
+    expect(root.querySelector(".editor-status")?.textContent).toBe("Waiting for history");
     await fake.emit("documents.changes", snapshot());
     await tick();
-    expect(opens).toBe(2);
-    await fake.emit("documents.document.text", { documentId: doc, revision: "0", editable: true, text: "" });
-    expect((root.querySelector(".editor-textarea") as HTMLTextAreaElement).disabled).toBe(false);
+    expect(opens).toBe(1);
+    // The Backend tells the pending session to reload; the new session opens editable.
+    await fake.emit("documents.document.session", { event: "resync", documentId: doc });
+    await tick();
+    expect(fake.calls.filter((call) => call.operation === "documents.document.session")).toHaveLength(2);
+    await opened(fake);
+    expect(root.querySelector(".editor-status")?.textContent).toBe("");
     await unmount();
   });
-
-  it("lists threaded comments for the open Document and adds one with a quote", async () => {
+  it("lists threaded comments for the open Document and adds one", async () => {
     const root = "a".repeat(64);
     const reply = "b".repeat(64);
     const comments: unknown[] = [
@@ -347,18 +436,18 @@ describe("Documents mount", () => {
     const fake = createFakePackageClient({
       requests: {
         "documents.snapshot": () => snapshot(),
-        "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "" }),
+        "documents.document.open": () => ({ documentId: doc, editable: true }),
         "documents.comments": () => ({ comments } as never),
         "documents.comment.add": (payload) => { added.push(payload); return { ok: true as const, id: "d".repeat(64) }; },
         "documents.comment.resolve": () => ({ ok: true as const, id: root }),
       },
-      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined, "documents.names": () => undefined },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined, "documents.names": () => undefined },
     });
     const rootNode = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root: rootNode }));
     (rootNode.querySelector(".document-title") as HTMLButtonElement).click();
     await tick();
-    await fake.emit("documents.document.text", { documentId: doc, revision: "0", editable: true, text: "# Q4\nbody" });
+    await opened(fake);
     const items = [...rootNode.querySelectorAll(".comment")];
     expect(items).toHaveLength(2);
     expect(items[0]?.querySelector(".comment-quote")?.textContent).toBe("# Q4");
@@ -378,26 +467,17 @@ describe("Documents mount", () => {
     expect(rootNode.querySelector(".comment-author")?.textContent).toBe("Carol");
     await fake.emit("documents.names", { available: true, cursor: "2", persons: [{ ...person, name: "Carol R" }], part: 0, parts: 1 });
     expect(rootNode.querySelector(".comment-author")?.textContent).toBe("Carol R");
-    // Preview renders the current draft and hides the editor.
-    ([...rootNode.querySelectorAll(".editor-header button")].find((b) => b.getAttribute("aria-label") === "Preview") as HTMLButtonElement).click();
-    expect((rootNode.querySelector(".editor-textarea") as HTMLElement).hidden).toBe(true);
-    expect(rootNode.querySelector(".editor-preview h1")?.textContent).toBe("Q4");
-    ([...rootNode.querySelectorAll(".editor-header button")].find((b) => b.getAttribute("aria-label") === "Edit") as HTMLButtonElement).click();
-    expect((rootNode.querySelector(".editor-textarea") as HTMLElement).hidden).toBe(false);
     expect(items[1]?.classList.contains("is-resolved")).toBe(true);
     expect((items[1] as HTMLElement).style.getPropertyValue("--comment-depth")).toBe("1");
 
-    const textarea = rootNode.querySelector(".editor-textarea") as HTMLTextAreaElement;
-    textarea.setSelectionRange(0, 4);
     const input = rootNode.querySelector(".comment-input") as HTMLTextAreaElement;
     input.dispatchEvent(new Event('focus'));
-    expect(rootNode.querySelector(".comment-quote--draft")?.textContent).toContain("Commenting on highlighted text");
-    expect(rootNode.querySelector(".comment-quote--draft")?.textContent).toContain("# Q4");
+    expect((rootNode.querySelector(".comment-quote--draft") as HTMLElement).hidden).toBe(true);
     expect(rootNode.querySelector('.comment-compose-actions button')?.textContent).toBe('Comment');
     input.value = "Agree";
     (rootNode.querySelector(".comment-compose") as HTMLFormElement).requestSubmit();
     await tick();
-    expect(added).toEqual([{ documentId: doc, markdown: "Agree", quote: "# Q4" }]);
+    expect(added).toEqual([{ documentId: doc, markdown: "Agree" }]);
     expect(input.value).toBe("");
     await unmount();
   });
@@ -408,12 +488,12 @@ describe("Documents mount", () => {
     const calls: Array<{ operation: string; payload: PackageValue }> = [];
     const fake = createFakePackageClient({ requests: {
       'documents.snapshot': () => snapshot(),
-      'documents.document.open': () => ({ documentId: doc, revision: '0', editable: true, text: '' }),
+      'documents.document.open': () => ({ documentId: doc, editable: true }),
       'documents.comments': () => ({ comments: [{ id: commentId, documentId: doc, author: 'me',
         position: '01', resolved, isLocal: true, markdown: 'Parent', createdAt: '1730000000000' }] }),
       'documents.comment.resolve': (payload) => { calls.push({ operation: 'resolve', payload }); resolved = true; return { ok: true as const, id: commentId }; },
       'documents.comment.reopen': (payload) => { calls.push({ operation: 'reopen', payload }); resolved = false; return { ok: true as const, id: commentId }; },
-    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.text': () => undefined } });
+    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.session': () => undefined } });
     const host = document.createElement('div');
     document.body.append(host);
     const root = host.attachShadow({ mode: 'open' });
@@ -442,67 +522,7 @@ describe("Documents mount", () => {
     } finally { host.remove(); }
   });
 
-  it("captures only a nonempty editor selection on composer focus, caps it, and clears it on deselection or X", async () => {
-    const added: unknown[] = [];
-    const fake = createFakePackageClient({ requests: {
-      "documents.snapshot": () => snapshot(),
-      "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "" }),
-      "documents.comment.add": (payload) => { added.push(payload); return { ok: true as const, id: "d".repeat(64) }; },
-    }, subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined } });
-    const root = document.createElement("div").attachShadow({ mode: "open" });
-    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
-    (root.querySelector('.document-title') as HTMLButtonElement).click();
-    await tick();
-    const text = `  ${'x'.repeat(2100)}  `;
-    await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text });
-    const editor = root.querySelector('.editor-textarea') as HTMLTextAreaElement;
-    const composer = root.querySelector('.comment-input') as HTMLTextAreaElement;
-    const form = root.querySelector('.comment-compose') as HTMLFormElement;
-    editor.focus();
-    editor.setSelectionRange(0, text.length);
-    // happy-dom does not focus controls inside a detached ShadowRoot; dispatch the browser focus event.
-    composer.dispatchEvent(new Event('focus'));
-    expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('Commenting on highlighted text');
-    expect(root.querySelector('.comment-quote--draft span:last-of-type')?.textContent).toBe('x'.repeat(2048));
-    expect(root.querySelector('[aria-label="Clear quote"]')).not.toBeNull();
-    expect(root.querySelector('[aria-label="Quote selection"]')).toBeNull();
-    // The browser may retain an editor selection after focus moves; capture uses the editor, not window selection.
-    composer.value = 'Quoted';
-    form.requestSubmit();
-    await tick();
-    expect(added.at(-1)).toEqual({ documentId: doc, markdown: 'Quoted', quote: 'x'.repeat(2048) });
-    expect(editor.selectionStart).toBe(editor.selectionEnd);
-    composer.dispatchEvent(new Event('focus'));
-    expect((root.querySelector('.comment-quote--draft') as HTMLElement).hidden).toBe(true);
-    expect((root.querySelector('.comment-input') as HTMLTextAreaElement).value).toBe('');
-    editor.focus();
-    editor.setSelectionRange(2, 5);
-    composer.dispatchEvent(new Event('focus'));
-    expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('xxx');
-    editor.focus();
-    editor.setSelectionRange(4, 4);
-    composer.dispatchEvent(new Event('focus'));
-    expect((root.querySelector('.comment-quote--draft') as HTMLElement).hidden).toBe(true);
-    composer.value = 'Collapsed';
-    form.requestSubmit();
-    await tick();
-    expect(added.at(-1)).toEqual({ documentId: doc, markdown: 'Collapsed' });
-    editor.focus();
-    editor.setSelectionRange(2, 5);
-    composer.dispatchEvent(new Event('focus'));
-    (root.querySelector('[aria-label="Clear quote"]') as HTMLButtonElement).click();
-    expect(editor.selectionStart).toBe(editor.selectionEnd);
-    expect((root.querySelector('.comment-quote--draft') as HTMLElement).hidden).toBe(true);
-    editor.focus();
-    composer.dispatchEvent(new Event('focus'));
-    composer.value = 'Cleared';
-    form.requestSubmit();
-    await tick();
-    expect(added.at(-1)).toEqual({ documentId: doc, markdown: 'Cleared' });
-    await unmount();
-  });
-
-  it("clears quote and reply on Document switch, but retains them and composer draft after failed post", async () => {
+  it("clears a reply on Document switch, but retains it and the composer draft after a failed post", async () => {
     const other = '4'.repeat(64);
     const parent = '5'.repeat(64);
     const current = { ...snapshot(), documents: [...snapshot().documents,
@@ -511,40 +531,33 @@ describe("Documents mount", () => {
     let fail = true;
     const fake = createFakePackageClient({ requests: {
       "documents.snapshot": () => current,
-      "documents.document.open": (payload) => ({ documentId: (payload as { documentId: string }).documentId, revision: '0', editable: true, text: 'Selected text' }),
+      "documents.document.open": (payload) => ({ documentId: (payload as { documentId: string }).documentId, editable: true }),
       "documents.comments": (payload) => ({ comments: (payload as { documentId: string }).documentId === doc
         ? [{ id: parent, documentId: doc, author: 'me', position: '01', resolved: false, isLocal: true, markdown: 'Parent' }] : [] }),
       "documents.comment.add": (payload) => { added.push(payload); if (fail) throw Object.assign(new Error('failed'),
         { kind: 'teamarness.package-request-error', code: 'documents.invalid_markdown' });
         return { ok: true as const, id: 'd'.repeat(64) }; },
-    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.text': () => undefined } });
+    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.session': () => undefined } });
     const root = document.createElement('div').attachShadow({ mode: 'open' });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
     (root.querySelector('.document-title') as HTMLButtonElement).click();
     await tick();
-    await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text: 'Selected text' });
-    const editor = root.querySelector('.editor-textarea') as HTMLTextAreaElement;
+    await opened(fake);
     const composer = root.querySelector('.comment-input') as HTMLTextAreaElement;
-    editor.focus();
-    editor.setSelectionRange(0, 8);
     (root.querySelector('.comment button') as HTMLButtonElement).click();
     composer.dispatchEvent(new Event('focus'));
     expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('Replying to a comment');
-    expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('Selected');
     composer.value = 'Still writing';
     (root.querySelector('.comment-compose') as HTMLFormElement).requestSubmit();
     await tick();
-    expect(added.at(-1)).toEqual({ documentId: doc, markdown: 'Still writing', quote: 'Selected', parentId: parent });
+    expect(added.at(-1)).toEqual({ documentId: doc, markdown: 'Still writing', parentId: parent });
     expect(root.querySelector('.comment-input')).toBe(composer);
     expect(composer.value).toBe('Still writing');
-    expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('Selected');
     expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('Replying to a comment');
     (root.querySelectorAll('.document-title')[1] as HTMLButtonElement).click();
     await tick();
     expect((root.querySelector('.comment-quote--draft') as HTMLElement).hidden).toBe(true);
     expect(root.querySelector('.comment-input')).toBe(composer);
-    expect(editor.value).toBe('Selected text');
-    expect(editor.selectionStart).toBe(editor.selectionEnd);
     composer.dispatchEvent(new Event('focus'));
     expect((root.querySelector('.comment-quote--draft') as HTMLElement).hidden).toBe(true);
     fail = false;
@@ -561,7 +574,7 @@ describe("Documents mount", () => {
     const fake = createFakePackageClient({
       requests: {
         "documents.snapshot": () => snapshot(),
-        "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "" }),
+        "documents.document.open": () => ({ documentId: doc, editable: true }),
         "documents.comments": (payload) => {
           requests.push(payload);
           return requests.length === 1
@@ -569,7 +582,7 @@ describe("Documents mount", () => {
             : { comments: [{ id: parent, documentId: doc, author: "alice", position: "01", resolved: false, isLocal: false, markdown: "Parent" }], nextCursor: null, hasMore: false };
         },
       },
-      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined },
     });
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
@@ -602,7 +615,7 @@ describe("Documents mount", () => {
     const fake = createFakePackageClient({
       requests: {
         "documents.snapshot": () => snapshot(),
-        "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "" }),
+        "documents.document.open": () => ({ documentId: doc, editable: true }),
         "documents.comments": (payload) => {
           requests.push(payload);
           return "cursor" in (payload as object)
@@ -610,7 +623,7 @@ describe("Documents mount", () => {
             : { comments: [{ id: newest, documentId: doc, author: "bob", position: "02", resolved: false, isLocal: false, markdown: "Newest" }], nextCursor: "older", hasMore: true };
         },
       },
-      subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined },
     });
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
@@ -635,8 +648,8 @@ describe("Documents mount", () => {
   it("uses the bold Collection name as its only expansion control without closing the editor", async () => {
     const fake = createFakePackageClient({ requests: {
       "documents.snapshot": () => snapshot(),
-      "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "Draft" }),
-    }, subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined } });
+      "documents.document.open": () => ({ documentId: doc, editable: true }),
+    }, subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined } });
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
     const name = () => root.querySelector('.collection-button') as HTMLButtonElement;
@@ -646,12 +659,12 @@ describe("Documents mount", () => {
     expect(documentsCss).toMatch(/\.collection-button\s*\{[^}]*font-weight:\s*700/);
     (root.querySelector('.document-title') as HTMLButtonElement).click();
     await tick();
-    const editor = root.querySelector('.editor-textarea');
+    const editor = root.querySelector('.editor-placeholder');
     name().click();
     expect(name().getAttribute('aria-expanded')).toBe('false');
     expect(name().getAttribute('aria-current')).toBe('page');
     expect(root.querySelector('.document-title')).toBeNull();
-    expect(root.querySelector('.editor-textarea')).toBe(editor);
+    expect(root.querySelector('.editor-placeholder')).toBe(editor);
     expect(root.querySelector('.editor-title')?.textContent).toBe('Q4 plan');
     name().click();
     expect(name().getAttribute('aria-expanded')).toBe('true');
@@ -746,18 +759,18 @@ describe("Documents mount", () => {
   it("toggles and resizes both rails without replacing the editor or composer", async () => {
     const fake = createFakePackageClient({ requests: {
       "documents.snapshot": () => snapshot(),
-      "documents.document.open": () => ({ documentId: doc, revision: "0", editable: true, text: "" }),
-    }, subscriptions: { "documents.changes": () => undefined, "documents.document.text": () => undefined } });
+      "documents.document.open": () => ({ documentId: doc, editable: true }),
+    }, subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined } });
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
     (root.querySelector('.document-title') as HTMLButtonElement).click();
     await tick();
-    await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text: 'Draft' });
-    const editor = root.querySelector('.editor-textarea') as HTMLTextAreaElement;
+    await opened(fake);
+    const editor = root.querySelector('.editor-placeholder') as HTMLElement;
     const composer = root.querySelector('.comment-input') as HTMLTextAreaElement;
     composer.value = 'Pending comment';
     expect(root.querySelectorAll('.comments-toggle')).toHaveLength(1);
-    expect(root.querySelector('.editor-status')?.textContent).toBe('Saved');
+    expect(root.querySelector('.editor-status')?.textContent).toBe('');
     expect(root.querySelector('.editor-pane .comments-panel')).toBeNull();
     (root.querySelector('[aria-label="Hide navigation"]') as HTMLButtonElement).click();
     expect((root.querySelector('.collection-rail') as HTMLElement).hidden).toBe(true);
@@ -801,13 +814,9 @@ describe("Documents mount", () => {
     rightHandle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
     expect((root.querySelector('.documents-shell') as HTMLElement).style.getPropertyValue('--right-width')).toBe('190px');
     await fake.emit('documents.changes', snapshot());
-    expect(root.querySelector('.editor-textarea')).toBe(editor);
-    expect(editor.value).toBe('Draft');
+    expect(root.querySelector('.editor-placeholder')).toBe(editor);
     expect(root.querySelector('.comment-input')).toBe(composer);
     expect(composer.value).toBe('Pending comment');
-    (root.querySelector('.editor-header button') as HTMLButtonElement).click();
-    expect(root.querySelector('.editor-preview')?.textContent?.trim()).toBe('Draft');
-    expect(root.querySelector('.editor-header button')?.getAttribute('aria-label')).toBe('Edit');
     await unmount();
   });
 
@@ -928,43 +937,13 @@ describe("Documents mount", () => {
     } finally { host.remove(); }
   });
 
-  it('posts without a quote after editor deselection and a direct Comment button click', async () => {
-    const added: PackageValue[] = [];
-    const fake = createFakePackageClient({ requests: {
-      'documents.snapshot': () => snapshot(),
-      'documents.document.open': () => ({ documentId: doc, revision: '0', editable: true, text: 'Selected text' }),
-      'documents.comment.add': (payload) => { added.push(payload); return { ok: true as const, id: 'd'.repeat(64) }; },
-    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.text': () => undefined } });
-    const host = document.createElement('div');
-    document.body.append(host);
-    const root = host.attachShadow({ mode: 'open' });
-    try {
-      const unmount = await mount(createTestMountContext({ client: fake.client, root }));
-      (root.querySelector('.document-title') as HTMLButtonElement).click();
-      await tick();
-      await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text: 'Selected text' });
-      const editor = root.querySelector('.editor-textarea') as HTMLTextAreaElement;
-      const composer = root.querySelector('.comment-input') as HTMLTextAreaElement;
-      editor.setSelectionRange(0, 8);
-      composer.focus();
-      expect(root.querySelector('.comment-quote-excerpt')?.textContent).toBe('Selected');
-      editor.focus();
-      editor.setSelectionRange(8, 8);
-      composer.value = 'Ordinary';
-      (root.querySelector('.comment-compose button[type=submit]') as HTMLButtonElement).click();
-      await tick();
-      expect(added).toEqual([{ documentId: doc, markdown: 'Ordinary' }]);
-      await unmount();
-    } finally { host.remove(); }
-  });
-
-  it('retains focus on a quote or reply cue through a pushed snapshot', async () => {
+  it('retains focus on a reply cue through a pushed snapshot', async () => {
     const parent = '5'.repeat(64);
     const fake = createFakePackageClient({ requests: {
       'documents.snapshot': () => snapshot(),
-      'documents.document.open': () => ({ documentId: doc, revision: '0', editable: true, text: 'Selected text' }),
+      'documents.document.open': () => ({ documentId: doc, editable: true }),
       'documents.comments': () => ({ comments: [{ id: parent, documentId: doc, author: 'me', position: '01', resolved: false, isLocal: true, markdown: 'Parent' }] }),
-    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.text': () => undefined } });
+    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.session': () => undefined } });
     const host = document.createElement('div');
     document.body.append(host);
     const root = host.attachShadow({ mode: 'open' });
@@ -972,12 +951,9 @@ describe("Documents mount", () => {
       const unmount = await mount(createTestMountContext({ client: fake.client, root }));
       (root.querySelector('.document-title') as HTMLButtonElement).click();
       await tick();
-      await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text: 'Selected text' });
-      const editor = root.querySelector('.editor-textarea') as HTMLTextAreaElement;
-      editor.setSelectionRange(0, 8);
-      (root.querySelector('.comment-input') as HTMLTextAreaElement).dispatchEvent(new Event('focus'));
-      for (const label of ['Clear quote', 'Clear reply']) {
-        if (label === 'Clear reply') (root.querySelector('.comment button') as HTMLButtonElement).click();
+      await opened(fake);
+      for (const label of ['Clear reply']) {
+        (root.querySelector('.comment button') as HTMLButtonElement).click();
         const control = root.querySelector(`[aria-label="${label}"]`) as HTMLButtonElement;
         control.focus();
         expect(root.activeElement).toBe(control);
@@ -992,33 +968,6 @@ describe("Documents mount", () => {
       expect(root.activeElement).toBe(root.querySelector('[aria-label="Show navigation"]'));
       await unmount();
     } finally { host.remove(); }
-  });
-
-  it("caps a multibyte selected quote to 2048 UTF-8 bytes before posting", async () => {
-    const added: unknown[] = [];
-    const fake = createFakePackageClient({ requests: {
-      'documents.snapshot': () => snapshot(),
-      'documents.document.open': () => ({ documentId: doc, revision: '0', editable: true, text: '' }),
-      'documents.comment.add': (payload) => { added.push(payload); return { ok: true as const, id: 'd'.repeat(64) }; },
-    }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.text': () => undefined } });
-    const root = document.createElement('div').attachShadow({ mode: 'open' });
-    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
-    (root.querySelector('.document-title') as HTMLButtonElement).click();
-    await tick();
-    const text = `${'é'.repeat(1023)}😀é`;
-    await fake.emit('documents.document.text', { documentId: doc, revision: '0', editable: true, text });
-    const editor = root.querySelector('.editor-textarea') as HTMLTextAreaElement;
-    editor.setSelectionRange(0, text.length);
-    const composer = root.querySelector('.comment-input') as HTMLTextAreaElement;
-    composer.dispatchEvent(new Event('focus'));
-    const expected = 'é'.repeat(1023);
-    expect(root.querySelector('.comment-quote-excerpt')?.textContent).toBe(expected);
-    composer.value = 'Quoted';
-    (root.querySelector('.comment-compose') as HTMLFormElement).requestSubmit();
-    await tick();
-    expect(added).toEqual([{ documentId: doc, markdown: 'Quoted', quote: expected }]);
-    expect(new TextEncoder().encode(expected).length).toBe(2046);
-    await unmount();
   });
 
   it("surfaces a request error without losing the listing", async () => {

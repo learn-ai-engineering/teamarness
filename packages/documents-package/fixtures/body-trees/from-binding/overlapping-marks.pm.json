@@ -1,0 +1,55 @@
+{
+ "type": "doc",
+ "content": [
+  {
+   "type": "paragraph",
+   "content": [
+    {
+     "type": "text",
+     "text": "bold "
+    },
+    {
+     "type": "text",
+     "marks": [
+      {
+       "type": "em"
+      },
+      {
+       "type": "strong"
+      }
+     ],
+     "text": "both"
+    },
+    {
+     "type": "text",
+     "marks": [
+      {
+       "type": "em"
+      }
+     ],
+     "text": " italic"
+    },
+    {
+     "type": "text",
+     "text": " and "
+    },
+    {
+     "type": "text",
+     "marks": [
+      {
+       "type": "link",
+       "attrs": {
+        "href": "https://example.com/c",
+        "title": null
+       }
+      },
+      {
+       "type": "code"
+      }
+     ],
+     "text": "linked code"
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-package-remove"
+description = "Enables the package_remove command without any pre-configured scope."
+commands.allow = ["package_remove"]
+
+[[permission]]
+identifier = "deny-package-remove"
+description = "Denies the package_remove command without any pre-configured scope."
+commands.deny = ["package_remove"]

@@ -608,7 +608,8 @@ describe("package UI kit integration", () => {
         processGeneration: "1",
       },
       workspace: { id: "workspace", name: "Workspace" },
-      uiHostVersion: 1,
+      view: "main",
+      uiHostVersion: 2,
       themeTokens: TEAMARNESS_THEME_TOKENS,
       client,
     } satisfies PackageMountContext;
@@ -682,7 +683,8 @@ describe("package UI kit integration", () => {
         processGeneration: "1",
       },
       workspace: { id: "workspace", name: "Workspace" },
-      uiHostVersion: 1,
+      view: "main",
+      uiHostVersion: 2,
       // Provide the full set of 12 theme tokens as the Shell would.
       themeTokens: TEAMARNESS_THEME_TOKENS,
       client,
@@ -864,7 +866,8 @@ describe("composer availability", () => {
         processGeneration: "1",
       },
       workspace: { id: "workspace", name: "Workspace" },
-      uiHostVersion: 1,
+      view: "main",
+      uiHostVersion: 2,
       themeTokens: [],
       client,
     } satisfies PackageMountContext;

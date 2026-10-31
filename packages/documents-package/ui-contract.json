@@ -155,140 +155,31 @@
       "pattern": "^[0-9a-f]{32}$"
     },
     "requestStatus": {
-      "type": "object", "additionalProperties": false,
-      "required": ["requestId", "inclusion", "durability"],
-      "properties": {
-        "requestId": { "$ref": "#/$defs/requestId" },
-        "inclusion": { "enum": ["included", "absent", "unresolved"] },
-        "durability": { "enum": ["durable", "pending", "unresolved"] }
-      }
-    },
-    "textOp": {
-      "oneOf": [
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "retain"
-          ],
-          "properties": {
-            "retain": {
-              "type": "integer",
-              "minimum": 0
-            }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "insert"
-          ],
-          "properties": {
-            "insert": {
-              "type": "string",
-              "minLength": 1
-            }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "delete"
-          ],
-          "properties": {
-            "delete": {
-              "type": "integer",
-              "minimum": 1
-            }
-          }
-        }
-      ]
-    },
-    "textEvent": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "documentId",
-        "revision",
-        "editable"
+        "requestId",
+        "inclusion",
+        "durability"
       ],
       "properties": {
-        "documentId": {
-          "$ref": "#/$defs/recordId"
+        "requestId": {
+          "$ref": "#/$defs/requestId"
         },
-        "revision": {
-          "$ref": "#/$defs/revision"
-        },
-        "editable": {
-          "type": "boolean"
-        },
-        "reason": {
-          "type": "string",
-          "enum": ["identity_conflict", "import_failure"]
-        },
-        "text": {
-          "type": "string",
-          "maxLength": 98304
-        },
-        "transfer": {
-          "type": "string",
-          "enum": ["begin", "chunk", "end"]
-        },
-        "diagnosticRecordId": { "$ref": "#/$defs/recordId" },
-        "savedRevision": {
-          "$ref": "#/$defs/revision"
-        },
-        "requestId": { "$ref": "#/$defs/requestId" },
-        "transferId": { "$ref": "#/$defs/requestId" },
-        "requestStatuses": {
-          "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/requestStatus" }
-        },
-        "chunks": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "chunkIndex": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "chunk": {
-          "type": "string",
-          "maxLength": 24576
-        },
-        "origin": {
-          "type": "string",
+        "inclusion": {
           "enum": [
-            "local",
-            "remote"
+            "included",
+            "absent",
+            "unresolved"
           ]
         },
-        "delta": {
-          "type": "array",
-          "maxItems": 4096,
-          "items": {
-            "$ref": "#/$defs/textOp"
-          }
+        "durability": {
+          "enum": [
+            "durable",
+            "pending",
+            "unresolved"
+          ]
         }
-      }
-    },
-    "edited": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "ok",
-        "revision",
-        "requestId"
-      ],
-      "properties": {
-        "ok": {
-          "const": true
-        },
-        "revision": {
-          "$ref": "#/$defs/revision"
-        },
-        "requestId": { "$ref": "#/$defs/requestId" }
       }
     },
     "comment": {
@@ -357,7 +248,10 @@
           "type": "boolean"
         },
         "nextCursor": {
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -443,6 +337,199 @@
           "maximum": 16
         }
       }
+    },
+    "sessionPeer": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    },
+    "bodyReason": {
+      "type": "string",
+      "enum": [
+        "identity_conflict",
+        "import_failure"
+      ]
+    },
+    "bodyState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "documentId",
+        "editable"
+      ],
+      "properties": {
+        "documentId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "editable": {
+          "type": "boolean"
+        },
+        "reason": {
+          "$ref": "#/$defs/bodyReason"
+        },
+        "diagnosticRecordId": {
+          "$ref": "#/$defs/recordId"
+        }
+      }
+    },
+    "sessionEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "documentId",
+            "sessionPeer",
+            "version",
+            "editable",
+            "chunks"
+          ],
+          "properties": {
+            "event": {
+              "const": "begin"
+            },
+            "documentId": {
+              "$ref": "#/$defs/recordId"
+            },
+            "sessionPeer": {
+              "$ref": "#/$defs/sessionPeer"
+            },
+            "version": {
+              "$ref": "#/$defs/revision"
+            },
+            "editable": {
+              "type": "boolean"
+            },
+            "reason": {
+              "$ref": "#/$defs/bodyReason"
+            },
+            "diagnosticRecordId": {
+              "$ref": "#/$defs/recordId"
+            },
+            "chunks": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4096
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "documentId",
+            "chunkIndex",
+            "chunk"
+          ],
+          "properties": {
+            "event": {
+              "const": "chunk"
+            },
+            "documentId": {
+              "$ref": "#/$defs/recordId"
+            },
+            "chunkIndex": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4095
+            },
+            "chunk": {
+              "type": "string",
+              "maxLength": 24576,
+              "pattern": "^[A-Za-z0-9+/]*={0,2}$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "documentId"
+          ],
+          "properties": {
+            "event": {
+              "const": "end"
+            },
+            "documentId": {
+              "$ref": "#/$defs/recordId"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "documentId",
+            "update"
+          ],
+          "properties": {
+            "event": {
+              "const": "update"
+            },
+            "documentId": {
+              "$ref": "#/$defs/recordId"
+            },
+            "update": {
+              "type": "string",
+              "maxLength": 218456,
+              "pattern": "^[A-Za-z0-9+/]*={0,2}$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "documentId",
+            "durable",
+            "editable"
+          ],
+          "properties": {
+            "event": {
+              "const": "status"
+            },
+            "documentId": {
+              "$ref": "#/$defs/recordId"
+            },
+            "durable": {
+              "type": "array",
+              "maxItems": 8,
+              "items": {
+                "$ref": "#/$defs/requestId"
+              }
+            },
+            "editable": {
+              "type": "boolean"
+            },
+            "reason": {
+              "$ref": "#/$defs/bodyReason"
+            },
+            "diagnosticRecordId": {
+              "$ref": "#/$defs/recordId"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "documentId"
+          ],
+          "properties": {
+            "event": {
+              "const": "resync"
+            },
+            "documentId": {
+              "$ref": "#/$defs/recordId"
+            }
+          }
+        }
+      ]
     }
   },
   "requests": {
@@ -593,69 +680,161 @@
         "$ref": "#/$defs/documentRequest"
       },
       "response": {
-        "$ref": "#/$defs/textEvent"
+        "$ref": "#/$defs/bodyState"
       }
     },
     "documents.document.recover": {
-      "request": {
-        "type": "object", "additionalProperties": false,
-        "required": ["documentId", "transferId", "requestIds"],
-        "properties": {
-          "documentId": { "$ref": "#/$defs/recordId" },
-          "transferId": { "$ref": "#/$defs/requestId" },
-          "requestIds": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/requestId" } }
-        }
-      },
-      "response": {
-        "type": "object", "additionalProperties": false,
-        "required": ["documentId", "revision", "transferId"],
-        "properties": {
-          "documentId": { "$ref": "#/$defs/recordId" },
-          "revision": { "$ref": "#/$defs/revision" },
-          "transferId": { "$ref": "#/$defs/requestId" }
-        }
-      }
-    },
-    "documents.document.edit": {
       "request": {
         "type": "object",
         "additionalProperties": false,
         "required": [
           "documentId",
-          "requestId",
-          "baseRevision",
-          "ops"
+          "requestIds"
         ],
         "properties": {
           "documentId": {
             "$ref": "#/$defs/recordId"
           },
-          "requestId": { "$ref": "#/$defs/requestId" },
-          "baseRevision": {
-            "$ref": "#/$defs/revision"
-          },
-          "ops": {
+          "requestIds": {
             "type": "array",
-            "minItems": 1,
-            "maxItems": 4096,
+            "maxItems": 8,
             "items": {
-              "$ref": "#/$defs/textOp"
+              "$ref": "#/$defs/requestId"
             }
           }
         }
       },
       "response": {
-        "$ref": "#/$defs/edited"
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "documentId",
+          "requestStatuses"
+        ],
+        "properties": {
+          "documentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "requestStatuses": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+              "$ref": "#/$defs/requestStatus"
+            }
+          }
+        }
+      }
+    },
+    "documents.document.update": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "documentId",
+          "sessionPeer",
+          "requestId",
+          "update"
+        ],
+        "properties": {
+          "documentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "sessionPeer": {
+            "$ref": "#/$defs/sessionPeer"
+          },
+          "requestId": {
+            "$ref": "#/$defs/requestId"
+          },
+          "update": {
+            "type": "string",
+            "maxLength": 218456,
+            "pattern": "^[A-Za-z0-9+/]*={0,2}$",
+            "minLength": 4
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "requestId"
+        ],
+        "properties": {
+          "requestId": {
+            "$ref": "#/$defs/requestId"
+          }
+        }
+      }
+    },
+    "documents.document.markdown": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "documentId",
+          "chunkIndex"
+        ],
+        "properties": {
+          "documentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "chunkIndex": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4095
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "documentId",
+          "digest",
+          "chunks",
+          "chunkIndex",
+          "chunk"
+        ],
+        "properties": {
+          "documentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "chunks": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4096
+          },
+          "chunkIndex": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4095
+          },
+          "chunk": {
+            "type": "string",
+            "maxLength": 24576
+          }
+        }
       }
     },
     "documents.comments": {
       "request": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["documentId"],
+        "required": [
+          "documentId"
+        ],
         "properties": {
-          "documentId": { "$ref": "#/$defs/recordId" },
-          "cursor": { "type": "string", "minLength": 1 }
+          "documentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "cursor": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       },
       "response": {
@@ -720,12 +899,24 @@
         "$ref": "#/$defs/snapshot"
       }
     },
-    "documents.document.text": {
+    "documents.document.session": {
       "request": {
-        "$ref": "#/$defs/documentRequest"
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "documentId"
+        ],
+        "properties": {
+          "documentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "resumePeer": {
+            "$ref": "#/$defs/sessionPeer"
+          }
+        }
       },
       "event": {
-        "$ref": "#/$defs/textEvent"
+        "$ref": "#/$defs/sessionEvent"
       }
     },
     "documents.names": {

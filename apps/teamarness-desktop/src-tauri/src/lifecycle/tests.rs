@@ -1,3 +1,5 @@
+mod restart;
+
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

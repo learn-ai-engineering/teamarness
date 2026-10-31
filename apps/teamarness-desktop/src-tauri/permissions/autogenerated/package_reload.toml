@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-package-reload"
+description = "Enables the package_reload command without any pre-configured scope."
+commands.allow = ["package_reload"]
+
+[[permission]]
+identifier = "deny-package-reload"
+description = "Denies the package_reload command without any pre-configured scope."
+commands.deny = ["package_reload"]

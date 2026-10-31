@@ -19,9 +19,25 @@ use crate::{
     PackageValue, UiMountId, UiRequestId, UiSubscriptionId,
 };
 
+/// What [`InstanceActor::restart`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartOutcome {
+    /// A new process generation started.
+    Restarted,
+    /// The Instance was not in a restartable state, so nothing changed. Active,
+    /// Failed, and crash-looping Instances restart; an Instance that never
+    /// started, is suspended, has ended, or is shutting down reports this
+    /// outcome.
+    NotRunning,
+}
+
 pub(crate) struct InstanceActor {
     key: PackageInstanceKey,
     spec: ProcessSpec,
+    /// The process generation this actor started from. A re-admitted Package
+    /// continues from its previous actor's generation, so generation guards stay
+    /// monotonic for the Host's lifetime.
+    initial_generation: u64,
     state: Mutex<InstanceState>,
     lifecycle_gate: Mutex<()>,
 }
@@ -53,13 +69,15 @@ struct SubscriptionState {
 }
 
 impl InstanceActor {
-    pub(crate) fn new(key: PackageInstanceKey, spec: ProcessSpec) -> Self {
+    /// An actor whose first process generation is `initial_generation + 1`.
+    pub(crate) fn new(key: PackageInstanceKey, spec: ProcessSpec, initial_generation: u64) -> Self {
         Self {
             key,
             spec,
+            initial_generation,
             state: Mutex::new(InstanceState {
                 lifecycle: LifecycleState::Admitted,
-                generation: 0,
+                generation: initial_generation,
                 process: None,
                 append_fence: None,
                 failures: VecDeque::new(),
@@ -105,6 +123,8 @@ impl InstanceActor {
             if attempt > 0 {
                 tokio::time::sleep(RESTART_DELAYS[attempt - 1]).await;
             }
+            // Whatever generation came before has ended, and its content views with it.
+            self.end_content_views();
             let append_fence = Arc::new(AppendFence::default());
             let generation = {
                 let mut state = self.state.lock().await;
@@ -119,7 +139,7 @@ impl InstanceActor {
                 }
                 state.generation += 1;
                 state.append_fence = Some(append_fence.clone());
-                state.lifecycle = if recovering || state.generation > 1 {
+                state.lifecycle = if recovering || state.generation > self.initial_generation + 1 {
                     LifecycleState::Recovering
                 } else {
                     LifecycleState::Activating
@@ -129,7 +149,7 @@ impl InstanceActor {
             match supervisor::spawn(
                 &self.spec,
                 generation,
-                recovering || generation > 1,
+                recovering || generation > self.initial_generation + 1,
                 append_fence,
             )
             .await
@@ -183,7 +203,8 @@ impl InstanceActor {
         PackageInstanceSnapshot {
             key: self.key.clone(),
             lifecycle: state.lifecycle,
-            process_generation: (state.generation > 0).then_some(state.generation),
+            process_generation: (state.generation > self.initial_generation)
+                .then_some(state.generation),
             mount_state: state
                 .mounts
                 .values()
@@ -207,6 +228,7 @@ impl InstanceActor {
                 return Err(WireFailure::new(PackageErrorCode::InvalidLifecycleState));
             }
             state.lifecycle = LifecycleState::Suspending;
+            self.revoke_port_streams();
             state
                 .process
                 .clone()
@@ -272,11 +294,48 @@ impl InstanceActor {
                     clear_process_state(&mut state);
                     state.failures.clear();
                 }
+                self.end_content_views();
                 self.start_generation(true, false).await
             }
             LifecycleState::Disposed => Err(WireFailure::new(PackageErrorCode::Disposed)),
             _ => Err(WireFailure::new(PackageErrorCode::InvalidLifecycleState)),
         }
+    }
+
+    /// Replaces a running or failed process with a new generation, so the
+    /// Package starts again over its current Port routes. An Instance that never
+    /// started, is suspended, or has ended is left alone and reports
+    /// [`RestartOutcome::NotRunning`]: it reads the current routes whenever it
+    /// next starts. The check runs under the lifecycle gate, so the outcome
+    /// always says what happened.
+    pub(crate) async fn restart(self: &Arc<Self>) -> Result<RestartOutcome, WireFailure> {
+        let _gate = self.lifecycle_gate.lock().await;
+        let process = {
+            let mut state = self.state.lock().await;
+            if !matches!(
+                state.lifecycle,
+                LifecycleState::Active | LifecycleState::Failed | LifecycleState::CrashLoop
+            ) || state.shutting_down
+            {
+                return Ok(RestartOutcome::NotRunning);
+            }
+            // The failure monitor sees a different generation and leaves the exit alone.
+            let process = state.process.clone();
+            clear_process_state(&mut state);
+            state.failures.clear();
+            state.lifecycle = LifecycleState::Recovering;
+            process
+        };
+        if let Some(process) = process {
+            process.shutdown().await;
+        }
+        self.start_generation(true, false).await?;
+        Ok(RestartOutcome::Restarted)
+    }
+
+    /// The process generation the newest spawn used, or the seed before any spawn.
+    pub(crate) async fn generation(&self) -> u64 {
+        self.state.lock().await.generation
     }
 
     pub(crate) async fn dispose(&self) -> Result<(), WireFailure> {
@@ -287,6 +346,7 @@ impl InstanceActor {
                 return Ok(());
             }
             state.lifecycle = LifecycleState::Disposing;
+            self.revoke_port_streams();
             state.process.clone()
         };
         let mut result = Ok(());
@@ -314,6 +374,8 @@ impl InstanceActor {
         let mut state = self.state.lock().await;
         clear_process_state(&mut state);
         state.lifecycle = LifecycleState::Disposed;
+        drop(state);
+        self.end_content_views();
         result
     }
 
@@ -539,6 +601,7 @@ impl InstanceActor {
                 schemas,
                 contract,
                 port,
+                None,
             )
             .await?;
         Ok(PortQueryStream {
@@ -558,6 +621,7 @@ impl InstanceActor {
         contract: String,
         port: String,
         permits: RoutePermits,
+        lease: Option<Arc<crate::port_access::SubscriptionLease>>,
     ) -> Result<PortQueryStream, WireFailure> {
         self.activate().await?;
         let (process, id, generation) = {
@@ -587,6 +651,7 @@ impl InstanceActor {
                 schemas,
                 contract,
                 port,
+                lease.as_ref().map(|lease| lease.delivery.clone()),
             )
             .await?;
         Ok(PortQueryStream {
@@ -594,7 +659,7 @@ impl InstanceActor {
             receiver,
             client: process.client.clone(),
             id,
-            _route: Box::new(permits),
+            _route: Box::new((permits, lease)),
             _provider: provider,
         })
     }
@@ -691,6 +756,7 @@ impl InstanceActor {
                         }
                     };
                     if let Some(should_restart) = handling {
+                        self.revoke_port_streams();
                         process.terminate().await;
                         if should_restart {
                             let _ = self.start_generation(true, true).await;
@@ -876,6 +942,8 @@ impl InstanceActor {
                 }
             };
             if let Some(should_restart) = handling {
+                actor.revoke_port_streams();
+                actor.end_content_views();
                 process.terminate().await;
                 if should_restart {
                     let _ = Box::pin(actor.start_generation(true, true)).await;
@@ -902,7 +970,39 @@ impl InstanceActor {
         }
         let mut state = self.state.lock().await;
         clear_process_state(&mut state);
+        drop(state);
+        self.end_content_views();
         true
+    }
+
+    fn revoke_port_streams(&self) {
+        if let Some(broker) = self.spec.broker.upgrade() {
+            broker.revoke_provider(&self.key);
+        }
+    }
+
+    /// Closes every content view this Instance holds: its process generation has ended.
+    fn end_content_views(&self) {
+        self.spec.calls.content_views.close_instance(&self.key);
+    }
+
+    /// The generation of the live process, if one is running.
+    pub(crate) async fn live_generation(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .await
+            .process
+            .as_ref()
+            .map(|process| process.generation)
+    }
+
+    /// Whether this Package declared one Semantic Capability family.
+    pub(crate) fn declares_capability(&self, family: &str) -> bool {
+        self.spec
+            .template
+            .capabilities
+            .iter()
+            .any(|requirement| requirement.family == family)
     }
 }
 
