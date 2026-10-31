@@ -20,7 +20,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::harness::{
-    Addressing, ConversationClient, open_core, open_host, shutdown, workspace_root,
+    self, Addressing, ConversationClient, open_core, open_host, shutdown, workspace_root,
 };
 use teamarness_package_host::{
     ContentViewToken, OpenUiMount, OpenUiSubscription, PackageHost, PackageHostCommand,
@@ -43,45 +43,6 @@ fn write_executable(path: &Path, bytes: &[u8]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-}
-
-/// Stages the real Exhibits manifest, contracts and Backend, with a placeholder UI.
-fn stage_exhibits(application: &Path) {
-    let source = workspace_root().join("packages/exhibits-package");
-    let root = application.join(EXHIBITS);
-    let mut manifest: Value =
-        serde_json::from_slice(&fs::read(source.join("teamarness.package.json")).unwrap()).unwrap();
-    let backend = fs::read(env!("CARGO_BIN_EXE_exhibits-backend-under-test")).unwrap();
-    write_executable(
-        &root.join(manifest["backends"][0]["path"].as_str().unwrap()),
-        &backend,
-    );
-    manifest["backends"][0]["size"] = json!(backend.len());
-    manifest["backends"][0]["sha256"] = json!(digest(&backend));
-    let ui = b"export function mount() { return async () => {}; }";
-    let css = b"";
-    fs::create_dir_all(root.join("ui")).unwrap();
-    fs::write(root.join("ui/index.js"), ui).unwrap();
-    fs::write(root.join("ui/style.css"), css).unwrap();
-    manifest["ui"]["entrypoint"]["size"] = json!(ui.len());
-    manifest["ui"]["entrypoint"]["sha256"] = json!(digest(ui));
-    manifest["ui"]["assets"][0]["size"] = json!(css.len());
-    manifest["ui"]["assets"][0]["sha256"] = json!(digest(css));
-    for (field, file) in [("ui", "ui-contract.json"), ("portContract", "ports.json")] {
-        let bytes = fs::read(source.join(file)).unwrap();
-        fs::write(root.join(file), &bytes).unwrap();
-        let target = if field == "ui" {
-            &mut manifest["ui"]["contract"]
-        } else {
-            &mut manifest["portContract"]
-        };
-        target["sha256"] = json!(digest(&bytes));
-    }
-    fs::write(
-        root.join("teamarness.package.json"),
-        serde_json::to_vec(&manifest).unwrap(),
-    )
-    .unwrap();
 }
 
 /// Stages the test-only Consumer from its manifest template, the way the packaged smoke does.
@@ -114,7 +75,7 @@ fn stage_consumer(application: &Path) {
 
 fn stage_application(root: &Path) -> PathBuf {
     let application = root.join("application");
-    stage_exhibits(&application);
+    harness::stage_exhibits(&application);
     stage_consumer(&application);
     fs::write(
         application.join("application-packages.v1.json"),

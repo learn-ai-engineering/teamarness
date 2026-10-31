@@ -42,17 +42,6 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn documents_stage() -> PackageStage {
-    PackageStage {
-        identity: DOCUMENTS,
-        display_name: "Documents",
-        backend: PathBuf::from(env!("CARGO_BIN_EXE_documents-backend-under-test")),
-        backend_file: "backend/teamarness-documents-package-aarch64-apple-darwin",
-        source: "packages/documents-package",
-        record_log_minor: 1,
-    }
-}
-
 /// Stages the consumer Package, declaring Documents `1.min_minor` through `1.max_minor`.
 fn stage_consumer(application: &Path, min_minor: u16, max_minor: u16) {
     let root = application.join(CONSUMER);
@@ -311,7 +300,7 @@ fn unique_text(bytes: usize) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
-    let application = harness::StagedApplication::with(&documents_stage());
+    let application = harness::StagedApplication::with(&PackageStage::documents());
     // A 1.0 Consumer keeps working against the 1.2 Provider.
     stage_consumer(&application.application_path, 0, 0);
     let root = application.root.path();
@@ -556,7 +545,7 @@ async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
 /// key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn agent_bound_consumer_creates_and_revises_documents_as_the_agent() {
-    let application = harness::StagedApplication::with(&documents_stage());
+    let application = harness::StagedApplication::with(&PackageStage::documents());
     stage_consumer(&application.application_path, 2, 2);
     let root = application.root.path();
     let core = open_core(Addressing::Loopback, &root.join("alice-core")).await;

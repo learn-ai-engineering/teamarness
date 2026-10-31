@@ -2101,3 +2101,619 @@ async fn uncertain_generic_command_requires_full_host_retirement_before_rebindin
     shutdown(replacement).await;
     core.shutdown().await.unwrap();
 }
+
+const DOCUMENTS: &str = "dev.teamarness.documents";
+const EXHIBITS: &str = "dev.teamarness.exhibits";
+
+/// Conversations, Documents and Exhibits, all real, in one disposable application.
+fn stage_authoring_application() -> harness::StagedApplication {
+    let app = harness::StagedApplication::new();
+    harness::stage_package_with(app.root.path(), &harness::PackageStage::documents());
+    harness::stage_exhibits(&app.application_path);
+    fs::write(
+        app.application_path.join("application-packages.v1.json"),
+        serde_json::to_vec(&json!({
+            "schemaVersion": 1,
+            "packages": [{"directory": PACKAGE_ID}, {"directory": DOCUMENTS}, {"directory": EXHIBITS}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    app
+}
+
+/// Select the offered major of `contract` for the bound Agent, as its Steward would.
+async fn enable_package(agent: &ConversationClient<'_>, contract: &str) {
+    let offered = serde_json::to_value(
+        agent
+            .request("authoring-offer", "agent.packages.get", object([]))
+            .await,
+    )
+    .unwrap();
+    let row = offered["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["contract"] == contract)
+        .unwrap_or_else(|| panic!("{contract} is offered: {offered}"))
+        .clone();
+    assert_eq!(row["available"], true, "{row}");
+    assert_eq!(row["enabled"], false, "{row}");
+    let selected = serde_json::to_value(
+        agent
+            .request(
+                "authoring-enable",
+                "agent.packages.set",
+                object([
+                    ("contract", PackageValue::String(contract.into())),
+                    ("enabled", PackageValue::Boolean(true)),
+                    (
+                        "major",
+                        PackageValue::Unsigned(row["major"].as_u64().unwrap()),
+                    ),
+                ]),
+            )
+            .await,
+    )
+    .unwrap();
+    assert!(
+        selected["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["contract"] == contract && row["enabled"] == true),
+        "{selected}"
+    );
+}
+
+/// One chat turn: the scripted model makes each call in `calls` in order, reading each result,
+/// then answers `reply`. Returns the results in call order.
+async fn scripted_turn(
+    agent: &ConversationClient<'_>,
+    requests: &mut tokio::sync::mpsc::Receiver<ModelRequest>,
+    calls: &[(&str, Value)],
+    reply: &str,
+) -> Vec<Value> {
+    chat_send(agent, reply).await;
+    let mut request = model_request(requests).await;
+    let mut results = Vec::new();
+    for (name, arguments) in calls {
+        request
+            .answer
+            .send(tool_call(name, arguments.clone()))
+            .unwrap();
+        request = model_request(requests).await;
+        results.push(tool_result(&request.body));
+    }
+    request
+        .answer
+        .send(json!({"role":"assistant","content":reply}))
+        .unwrap();
+    chat_idle(agent).await;
+    results
+}
+
+/// Revises `document` as the Agent from `base`, one turn per attempt, until the Documents replay
+/// has qualified and the revise lands.
+async fn agent_revises(
+    agent: &ConversationClient<'_>,
+    requests: &mut tokio::sync::mpsc::Receiver<ModelRequest>,
+    document: &str,
+    base: &Value,
+    markdown: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let result = scripted_turn(
+            agent,
+            requests,
+            &[(
+                "documents__document_revise",
+                json!({"documentId":document,"baseVersion":base,"markdown":markdown}),
+            )],
+            "revised",
+        )
+        .await
+        .remove(0);
+        if result.get("error").is_none() {
+            return result;
+        }
+        assert_eq!(
+            result["details"]["provider"]["code"], "documents.pending",
+            "{result}"
+        );
+        assert!(std::time::Instant::now() < deadline, "the replay qualifies");
+        // poll-interval: bounded by the deadline above; qualification has no Port event.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn documents_ui(client: &ConversationClient<'_>, operation: &str, payload: Value) -> Value {
+    serde_json::to_value(
+        client
+            .request(
+                "documents-ui",
+                operation,
+                serde_json::from_value(payload).unwrap(),
+            )
+            .await,
+    )
+    .unwrap()
+}
+
+/// Verifies AC2–AC4 end to end: a bound Agent, scripted only at the model, enables Documents,
+/// reads its guide, creates and revises a Document, and revises a Document the Person created.
+/// Core signs the Agent's create and both edits with the Agent's key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires a freshly built external Agent and TEAMARNESS_AGENT_PACKAGE_DIR"]
+async fn bound_agent_creates_and_revises_documents_through_model_tools() {
+    let (endpoint, mut requests, _) = controlled_model().await;
+    let app = stage_authoring_application();
+    let core = open_core(Addressing::Loopback, &app.root.path().join("core")).await;
+    let workspace = core.create_workspace("Agent Documents").unwrap();
+    let workspace_id = workspace.id();
+    let scribe = core.add_agent(workspace_id, "Scribe").unwrap();
+    let scribe_key = core
+        .principal(workspace_id, scribe)
+        .unwrap()
+        .unwrap()
+        .keys()[0]
+        .to_string();
+    let person_key = core.public_identity().to_string();
+    assert_ne!(scribe_key, person_key);
+    let private = app.root.path().join("host");
+    register_agent(&private);
+    let host = open_host(&app.application_path, private, core.clone()).await;
+    let key = |id: &str| {
+        PackageInstanceKey::new(
+            id.parse().unwrap(),
+            WorkspaceId::new(workspace_id.to_string()).unwrap(),
+        )
+    };
+    let agent_mount = open_mount(&host, &key(AGENT_PACKAGE_ID)).await;
+    let agent = ConversationClient {
+        host: &host,
+        mount: &agent_mount,
+    };
+    let documents_mount = open_mount(&host, &key(DOCUMENTS)).await;
+    let documents = ConversationClient {
+        host: &host,
+        mount: &documents_mount,
+    };
+
+    // The Person makes a Collection and a Document through the Documents UI.
+    let collection = documents_ui(
+        &documents,
+        "documents.collection.create",
+        json!({"name":"Plans"}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let person_document = documents_ui(
+        &documents,
+        "documents.document.create",
+        json!({"collectionId":collection,"title":"Q4"}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    configure_loopback_model(&agent, endpoint).await;
+    agent
+        .request(
+            "bind-scribe",
+            "agent.binding.set",
+            object([("principalId", PackageValue::String(scribe.to_string()))]),
+        )
+        .await;
+    enable_package(&agent, DOCUMENTS).await;
+
+    // One turn: read the guide, then create.
+    chat_send(&agent, "write meeting notes").await;
+    let first = model_request(&mut requests).await;
+    let offered: Vec<_> = first.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned())
+        .collect();
+    for name in [
+        "documents__runtime_guide",
+        "documents__document_create",
+        "documents__document_revise",
+        "documents__document_list",
+    ] {
+        assert!(offered.iter().any(|offered| offered == name), "{offered:?}");
+    }
+    first
+        .answer
+        .send(tool_call("documents__runtime_guide", json!({})))
+        .unwrap();
+    let guided = model_request(&mut requests).await;
+    let guide = tool_result(&guided.body)["markdown"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(guide.contains("## Create"), "{guide}");
+    assert!(guide.contains("baseVersion set to the returned version"));
+    guided
+        .answer
+        .send(tool_call(
+            "documents__document_create",
+            json!({"collectionId":collection,"title":"Scribe notes"}),
+        ))
+        .unwrap();
+    let created = model_request(&mut requests).await;
+    let create = tool_result(&created.body);
+    let notes = create["documentId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("document.create: {create}"))
+        .to_owned();
+    created
+        .answer
+        .send(json!({"role":"assistant","content":"created"}))
+        .unwrap();
+    chat_idle(&agent).await;
+
+    // The Agent gives it content from the returned version.
+    let revised = agent_revises(
+        &agent,
+        &mut requests,
+        &notes,
+        &create["version"],
+        "Notes by the Scribe\n",
+    )
+    .await;
+    assert_eq!(revised["changed"], true, "{revised}");
+
+    // The Agent finds the Person's Document and revises it too.
+    let listed = scripted_turn(
+        &agent,
+        &mut requests,
+        &[("documents__document_list", json!({}))],
+        "listed",
+    )
+    .await
+    .remove(0);
+    let listed_documents = listed["documents"].as_array().unwrap();
+    let q4 = listed_documents
+        .iter()
+        .find(|document| document["id"] == person_document)
+        .unwrap_or_else(|| panic!("the Person's Document is listed: {listed}"));
+    assert_eq!(q4["title"], "Q4");
+    assert!(
+        listed_documents
+            .iter()
+            .any(|document| document["id"] == notes && document["title"] == "Scribe notes"),
+        "{listed}"
+    );
+    let revised = agent_revises(
+        &agent,
+        &mut requests,
+        &person_document,
+        &q4["version"],
+        "Reviewed by the Scribe\n",
+    )
+    .await;
+    assert_eq!(revised["changed"], true, "{revised}");
+
+    for (document, expected) in [
+        (&notes, "Notes by the Scribe\n"),
+        (&person_document, "Reviewed by the Scribe\n"),
+    ] {
+        let markdown = documents_ui(
+            &documents,
+            "documents.document.markdown",
+            json!({"documentId":document,"chunkIndex":0}),
+        )
+        .await;
+        assert_eq!(markdown["chunk"], expected, "{markdown}");
+    }
+
+    // Core holds the Person's create, the Agent's create, and the Agent's two edits.
+    let mut records = core
+        .subscribe_records(workspace_id, DOCUMENTS, None)
+        .unwrap();
+    let page = records.next_page(256).unwrap();
+    let authors = |purpose: &str| -> Vec<String> {
+        page.events
+            .iter()
+            .filter(|event| event.purpose() == purpose)
+            .map(|event| event.author().to_string())
+            .collect()
+    };
+    assert_eq!(
+        authors("document.create"),
+        vec![person_key, scribe_key.clone()],
+        "the Person created Q4 and the Agent created its notes"
+    );
+    assert_eq!(
+        authors("document.edit"),
+        vec![scribe_key.clone(), scribe_key],
+        "both revises are the Agent's records"
+    );
+    println!(
+        "agent documents timeline: enable -> guide -> create -> revise own -> list -> revise Person's; Core authors match"
+    );
+    shutdown(host).await;
+    core.shutdown().await.unwrap();
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The `file.put` arguments for a file small enough to be one chunk.
+fn put_whole(bytes: &[u8]) -> Value {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    json!({
+        "sha256": sha256_hex(bytes), "size": bytes.len(), "chunkIndex": 0, "chunkCount": 1,
+        "data": STANDARD.encode(bytes),
+    })
+}
+
+/// Verifies AC5–AC6 end to end: a bound Agent, scripted only at the model, enables Exhibits,
+/// uploads two linked pages, creates a Draft, finds it by title, revises it, and reads a stored
+/// page back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires a freshly built external Agent and TEAMARNESS_AGENT_PACKAGE_DIR"]
+async fn bound_agent_authors_and_revises_an_exhibit_through_model_tools() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let (endpoint, mut requests, _) = controlled_model().await;
+    let app = stage_authoring_application();
+    let core = open_core(Addressing::Loopback, &app.root.path().join("core")).await;
+    let workspace = core.create_workspace("Agent Exhibits").unwrap();
+    let workspace_id = workspace.id();
+    let scout = core.add_agent(workspace_id, "Scout").unwrap();
+    let private = app.root.path().join("host");
+    register_agent(&private);
+    let host = open_host(&app.application_path, private, core.clone()).await;
+    let agent_mount = open_mount(
+        &host,
+        &PackageInstanceKey::new(
+            AGENT_PACKAGE_ID.parse().unwrap(),
+            WorkspaceId::new(workspace_id.to_string()).unwrap(),
+        ),
+    )
+    .await;
+    let agent = ConversationClient {
+        host: &host,
+        mount: &agent_mount,
+    };
+    configure_loopback_model(&agent, endpoint).await;
+    agent
+        .request(
+            "bind-scout",
+            "agent.binding.set",
+            object([("principalId", PackageValue::String(scout.to_string()))]),
+        )
+        .await;
+    enable_package(&agent, EXHIBITS).await;
+
+    let index = b"<!doctype html><title>Plan</title><h1>Plan</h1><a href=\"page2.html\">Next</a>\n";
+    let page2 =
+        b"<!doctype html><title>Details</title><h1>Details</h1><a href=\"index.html\">Back</a>\n";
+    let index_v2 =
+        b"<!doctype html><title>Plan</title><h1>Plan, revised</h1><a href=\"page2.html\">Next</a>\n";
+    let files = |entry: &[u8]| {
+        json!([
+            {"path":"index.html","sha256":sha256_hex(entry)},
+            {"path":"page2.html","sha256":sha256_hex(page2)},
+        ])
+    };
+    let results = scripted_turn(
+        &agent,
+        &mut requests,
+        &[
+            ("exhibits__file_put", put_whole(index)),
+            ("exhibits__file_put", put_whole(page2)),
+            (
+                "exhibits__draft_update",
+                json!({"exhibitId":"plan","title":"Launch plan","entry":"index.html",
+                    "files":files(index),"expectedRevision":0}),
+            ),
+            ("exhibits__exhibit_list", json!({})),
+        ],
+        "published",
+    )
+    .await;
+    assert_eq!(results[0], json!({"complete":true}));
+    assert_eq!(results[1], json!({"complete":true}));
+    assert_eq!(results[2], json!({"revision":1}));
+    let listed = results[3]["exhibits"].as_array().unwrap();
+    let plan = listed
+        .iter()
+        .find(|exhibit| exhibit["title"] == "Launch plan")
+        .unwrap_or_else(|| panic!("the Draft is listed by title: {}", results[3]));
+    assert_eq!(plan["id"], "plan");
+    assert_eq!(plan["revision"], 1);
+
+    // A revision replaces the entry page; reading the stored page back returns its bytes.
+    let results = scripted_turn(
+        &agent,
+        &mut requests,
+        &[
+            ("exhibits__file_put", put_whole(index_v2)),
+            (
+                "exhibits__draft_update",
+                json!({"exhibitId":"plan","title":"Launch plan","entry":"index.html",
+                    "files":files(index_v2),"expectedRevision":1}),
+            ),
+            ("exhibits__exhibit_list", json!({})),
+            (
+                "exhibits__file_read",
+                json!({"sha256":sha256_hex(page2),"chunkIndex":0}),
+            ),
+        ],
+        "revised",
+    )
+    .await;
+    assert_eq!(results[0], json!({"complete":true}));
+    assert_eq!(results[1], json!({"revision":2}));
+    assert!(
+        results[2]["exhibits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|exhibit| exhibit["id"] == "plan" && exhibit["revision"] == 2),
+        "{}",
+        results[2]
+    );
+    assert_eq!(results[3]["chunkCount"], 1, "{}", results[3]);
+    assert_eq!(
+        STANDARD
+            .decode(results[3]["data"].as_str().unwrap())
+            .unwrap(),
+        page2
+    );
+
+    // The Exhibits UI sees the Agent's Draft at its new revision.
+    let exhibits_mount = open_mount(
+        &host,
+        &PackageInstanceKey::new(
+            EXHIBITS.parse().unwrap(),
+            WorkspaceId::new(workspace_id.to_string()).unwrap(),
+        ),
+    )
+    .await;
+    let exhibits = ConversationClient {
+        host: &host,
+        mount: &exhibits_mount,
+    };
+    let opened = serde_json::to_value(
+        exhibits
+            .request(
+                "exhibit-open",
+                "exhibit.open",
+                object([("exhibitId", PackageValue::String("plan".into()))]),
+            )
+            .await,
+    )
+    .unwrap();
+    assert_eq!(opened["revision"], 2, "{opened}");
+    let chat =
+        serde_json::to_value(agent.request("chat", "agent.chat.get", object([])).await).unwrap();
+    let activity = chat["entries"].as_array().unwrap().last().unwrap()["activity"].clone();
+    assert!(
+        activity
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["package"] == "exhibits" && row["ok"] == true),
+        "{activity}"
+    );
+    println!(
+        "agent exhibits timeline: enable -> put x2 -> draft r1 -> list by title -> put -> draft r2 -> read back"
+    );
+    shutdown(host).await;
+    core.shutdown().await.unwrap();
+}
+
+/// Verifies AC7 end to end: a `file.put` whose arguments exceed the turn's budget is refused
+/// before dispatch, nothing is stored, the stored history carries a placeholder, and the turn
+/// continues to its reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires a freshly built external Agent and TEAMARNESS_AGENT_PACKAGE_DIR"]
+async fn oversized_exhibit_file_put_is_refused_and_the_turn_continues() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let (endpoint, mut requests, _) = controlled_model().await;
+    let app = stage_authoring_application();
+    let core = open_core(Addressing::Loopback, &app.root.path().join("core")).await;
+    let workspace = core.create_workspace("Agent oversized put").unwrap();
+    let workspace_id = workspace.id();
+    let scout = core.add_agent(workspace_id, "Scout").unwrap();
+    let private = app.root.path().join("host");
+    register_agent(&private);
+    let host = open_host(&app.application_path, private, core.clone()).await;
+    let agent_mount = open_mount(
+        &host,
+        &PackageInstanceKey::new(
+            AGENT_PACKAGE_ID.parse().unwrap(),
+            WorkspaceId::new(workspace_id.to_string()).unwrap(),
+        ),
+    )
+    .await;
+    let agent = ConversationClient {
+        host: &host,
+        mount: &agent_mount,
+    };
+    configure_loopback_model(&agent, endpoint).await;
+    agent
+        .request(
+            "bind-scout",
+            "agent.binding.set",
+            object([("principalId", PackageValue::String(scout.to_string()))]),
+        )
+        .await;
+    enable_package(&agent, EXHIBITS).await;
+
+    // One full 131072-byte chunk of a two-chunk file: valid for the Port, too large for a turn.
+    let file: Vec<u8> = (0..200_000u32).map(|index| (index % 251) as u8).collect();
+    let sha256 = sha256_hex(&file);
+    let data = STANDARD.encode(&file[..131_072]);
+    let reply = "That file is too large to send in one turn.";
+    chat_send(&agent, "publish a large file").await;
+    let first = model_request(&mut requests).await;
+    first
+        .answer
+        .send(tool_call(
+            "exhibits__file_put",
+            json!({"sha256":sha256,"size":file.len(),"chunkIndex":0,"chunkCount":2,"data":data}),
+        ))
+        .unwrap();
+    let refused = model_request(&mut requests).await;
+    let refusal = tool_result(&refused.body);
+    assert_eq!(
+        refusal["error"], "agent.tool_arguments_too_large",
+        "{refusal}"
+    );
+    assert_eq!(refusal["retryable"], false, "{refusal}");
+    let messages = refused.body["messages"].as_array().unwrap();
+    let call = &messages[messages.len() - 2];
+    assert_eq!(call["role"], "assistant");
+    assert_eq!(
+        call["tool_calls"][0]["function"]["arguments"],
+        r#"{"elided":"agent.tool_arguments_too_large"}"#,
+        "{call}"
+    );
+    assert!(!refused.body.to_string().contains(&data[..1024]));
+    refused
+        .answer
+        .send(tool_call(
+            "exhibits__files_missing",
+            json!({"sha256s":[sha256]}),
+        ))
+        .unwrap();
+    let missing = model_request(&mut requests).await;
+    assert_eq!(
+        tool_result(&missing.body),
+        json!({"missing":[{"sha256":sha256,"chunks":"all"}]})
+    );
+    assert!(!missing.body.to_string().contains(&data[..1024]));
+    missing
+        .answer
+        .send(json!({"role":"assistant","content":reply}))
+        .unwrap();
+    chat_idle(&agent).await;
+    let chat =
+        serde_json::to_value(agent.request("chat", "agent.chat.get", object([])).await).unwrap();
+    assert!(chat.get("lastError").is_none(), "{chat}");
+    let last = chat["entries"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["content"], reply, "{last}");
+    assert!(
+        last["activity"].as_array().unwrap().contains(&json!({
+            "package":"exhibits","port":"file.put","ok":false,
+            "code":"agent.tool_arguments_too_large"
+        })),
+        "{last}"
+    );
+    shutdown(host).await;
+    core.shutdown().await.unwrap();
+}

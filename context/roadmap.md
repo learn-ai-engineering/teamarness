@@ -79,6 +79,8 @@ Started on 2026-10-31 on branch `don-smith/agent_doc_exhibit` in the Host and th
 - The Agent stops withholding the Exhibits `file.put` and `file.read` Ports, and publishes small multi-page Exhibits. Before it sends a tool call, it refuses one whose arguments would exceed the turn's remaining message budget, with `agent.tool_arguments_too_large`.
 - The Agent's main view shows Chat only, and its Configuration is the Package's settings view.
 
+Integration evidence, 2026-10-31: three external cases in `tests/system/tests/agent_reply_flow.rs` run the built Agent against real Documents and Exhibits, with only the model scripted. In the first case, the bound Agent enables Documents, reads the guide, creates and revises a Document, and revises a Document that a Person created. Core shows the Agent's key as the author of the create and both edits. In the second case, the Agent uploads two linked pages, creates a Draft, finds it by title, makes revision 2 and reads a page back. In the third case, an oversized `file.put` is refused with `agent.tool_arguments_too_large` and nothing is stored. The next model request carries the elided placeholder, and the turn ends with its reply. Verify has not run yet.
+
 **Outcome:** In chat, an Agent creates and revises a Document and publishes an Exhibit that the Steward opens by name, all attributed to the Agent.
 
 **Follow-ups:** a shared, human-curated Exhibit library catalog; larger Exhibits and an archive format; per-Agent turn bounds; and staging the Agent harness for the Host's integration tests.
