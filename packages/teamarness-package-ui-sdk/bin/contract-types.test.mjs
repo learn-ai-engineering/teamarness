@@ -262,7 +262,13 @@ test("generated types typecheck against the SDK client", async (t) => {
       }),
     );
 
-    await run_("npx", ["tsc", "--noEmit", "-p", directory], { cwd: repositoryRoot });
+    const compilerArguments = ["tsc", "--noEmit", "--pretty", "false", "-p", directory];
+    const compilerOptions = {
+      cwd: repositoryRoot,
+      // Keep diagnostics assertions covered even when the parent enables colour.
+      env: { ...process.env, FORCE_COLOR: "1" },
+    };
+    await run_("npx", compilerArguments, compilerOptions);
 
     // The same client refuses an operation the contract does not describe.
     await writeFile(
@@ -273,9 +279,7 @@ test("generated types typecheck against the SDK client", async (t) => {
         + `  return typedPackageClient<TutorialContract>(client).request("tutorial.nope", {});\n`
         + `}\n`,
     );
-    const failure = await run_("npx", ["tsc", "--noEmit", "-p", directory], {
-      cwd: repositoryRoot,
-    }).then(
+    const failure = await run_("npx", compilerArguments, compilerOptions).then(
       () => null,
       (error) => error,
     );
