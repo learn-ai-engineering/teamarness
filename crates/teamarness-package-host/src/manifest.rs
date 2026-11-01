@@ -56,8 +56,10 @@ pub(crate) struct LoadedManifest {
 }
 
 pub(crate) fn load(package_root: &Path, target: &str) -> Result<LoadedManifest, ManifestFailure> {
-    let loaded = contract::load_package_directory(package_root, target)
-        .map_err(|error| ManifestFailure::new(host_code(error.code)))?;
+    let loaded = contract::load_package_directory(package_root, target).map_err(|error| {
+        trace_admission_failure("manifest.load", error.rule, None);
+        ManifestFailure::new(host_code(error.code))
+    })?;
     let identity = PackageIdentity::from_str(&loaded.identity)
         .map_err(|_| ManifestFailure::new(PackageErrorCode::InvalidPackageIdentity))?;
     Ok(LoadedManifest {
@@ -77,6 +79,21 @@ pub(crate) fn load(package_root: &Path, target: &str) -> Result<LoadedManifest, 
         port_contract_digest: loaded.port_contract_digest,
         manifest_digest: loaded.manifest_digest,
     })
+}
+
+// Temporary debug-CI tracing for the first hosted admission failure. Never pass
+// paths, pointers, payloads, arbitrary error messages, or credentials here.
+pub(crate) fn trace_admission_failure(
+    stage: &'static str,
+    rule: &'static str,
+    io_kind: Option<std::io::ErrorKind>,
+) {
+    #[cfg(debug_assertions)]
+    if std::env::var("CI").as_deref() == Ok("true") {
+        eprintln!("admission-diagnostic stage={stage} rule={rule} io_kind={io_kind:?}");
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = (stage, rule, io_kind);
 }
 
 /// Maps a shared admission code onto the Host's stable error vocabulary.

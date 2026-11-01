@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 use teamarness_package_contract::ui_contract as contract;
 
-use crate::manifest::{LoadedManifest, VerifiedFile, sha256};
+use crate::manifest::{LoadedManifest, VerifiedFile, sha256, trace_admission_failure};
 use crate::{PackageErrorCode, PackageValue};
 
 // The protocol layer bounds UI payloads with the shared constant; a `#[path]`-included test
@@ -109,7 +109,10 @@ impl CompiledUiContract {
 pub(crate) fn compile_contract(bytes: &[u8]) -> Result<CompiledUiContract, UiContractFailure> {
     contract::compile_ui_contract(bytes)
         .map(CompiledUiContract)
-        .map_err(|_| failure())
+        .map_err(|error| {
+            trace_admission_failure("ui.compile", error.rule, None);
+            failure()
+        })
 }
 
 pub(crate) fn populate_cache(
@@ -118,7 +121,8 @@ pub(crate) fn populate_cache(
     manifest: &LoadedManifest,
 ) -> Result<UiCacheRecord, UiContractFailure> {
     let cache_parent = private_data_directory.join("packages/ui-cache/v1");
-    fs::create_dir_all(&cache_parent).map_err(|_| failure())?;
+    fs::create_dir_all(&cache_parent)
+        .map_err(|error| cache_io_failure("cache.create_parent", error))?;
     set_mode(&cache_parent, 0o700)?;
     let admitted_root = cache_parent.join(admission_digest);
     if admitted_root.exists() {
@@ -132,16 +136,19 @@ pub(crate) fn populate_cache(
         let temporary =
             cache_parent.join(format!(".{admission_digest}.tmp-{}", std::process::id()));
         if temporary.exists() {
-            fs::remove_dir_all(&temporary).map_err(|_| failure())?;
+            fs::remove_dir_all(&temporary)
+                .map_err(|error| cache_io_failure("cache.remove_temporary", error))?;
         }
-        fs::create_dir(&temporary).map_err(|_| failure())?;
+        fs::create_dir(&temporary)
+            .map_err(|error| cache_io_failure("cache.create_temporary", error))?;
         copy_file(&temporary, &manifest.ui.entrypoint)?;
         copy_file(&temporary, &manifest.ui.contract)?;
         for asset in &manifest.ui.assets {
             copy_file(&temporary, &asset.file)?;
         }
         make_tree_read_only(&temporary)?;
-        fs::rename(&temporary, &admitted_root).map_err(|_| failure())?;
+        fs::rename(&temporary, &admitted_root)
+            .map_err(|error| cache_io_failure("cache.publish_rename", error))?;
     }
     Ok(cache_record(admitted_root, manifest))
 }
@@ -227,18 +234,22 @@ fn validate_resource_path(value: &str) -> Result<(), UiContractFailure> {
 
 fn copy_file(root: &Path, file: &VerifiedFile) -> Result<(), UiContractFailure> {
     let target = root.join(&file.relative_path);
-    let parent = target.parent().ok_or_else(failure)?;
-    fs::create_dir_all(parent).map_err(|_| failure())?;
-    fs::write(target, &file.bytes).map_err(|_| failure())
+    let parent = target
+        .parent()
+        .ok_or_else(|| cache_failure("cache.copy", "missing_parent"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| cache_io_failure("cache.copy.create_parent", error))?;
+    fs::write(target, &file.bytes).map_err(|error| cache_io_failure("cache.copy.write", error))
 }
 
 fn verify_cache_root(root: &Path) -> Result<(), UiContractFailure> {
-    let metadata = fs::symlink_metadata(root).map_err(|_| failure())?;
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| cache_io_failure("cache.verify_root.metadata", error))?;
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
         || metadata.permissions().mode() & 0o777 != 0o500
     {
-        return Err(failure());
+        return Err(cache_failure("cache.verify_root", "type_or_mode"));
     }
     Ok(())
 }
@@ -248,23 +259,26 @@ fn verify_cached_file(root: &Path, file: &VerifiedFile) -> Result<(), UiContract
     let components: Vec<_> = Path::new(&file.relative_path).components().collect();
     for (index, component) in components.iter().enumerate() {
         path.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&path).map_err(|_| failure())?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| cache_io_failure("cache.verify_file.component", error))?;
         let is_file = index + 1 == components.len();
         if metadata.file_type().is_symlink()
             || (is_file && !metadata.is_file())
             || (!is_file && !metadata.is_dir())
             || metadata.permissions().mode() & 0o777 != if is_file { 0o400 } else { 0o500 }
         {
-            return Err(failure());
+            return Err(cache_failure("cache.verify_file", "type_or_mode"));
         }
     }
-    let metadata = fs::metadata(&path).map_err(|_| failure())?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| cache_io_failure("cache.verify_file.metadata", error))?;
     if metadata.len() != file.bytes.len() as u64 {
-        return Err(failure());
+        return Err(cache_failure("cache.verify_file", "length"));
     }
-    let bytes = fs::read(path).map_err(|_| failure())?;
+    let bytes =
+        fs::read(path).map_err(|error| cache_io_failure("cache.verify_file.read", error))?;
     if sha256(&bytes) != file.digest {
-        return Err(failure());
+        return Err(cache_failure("cache.verify_file", "digest"));
     }
     Ok(())
 }
@@ -280,8 +294,12 @@ fn walk_files(root: &Path) -> Result<Vec<PathBuf>, UiContractFailure> {
     let mut pending = vec![root.to_owned()];
     let mut entries = Vec::new();
     while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(directory).map_err(|_| failure())? {
-            let path = entry.map_err(|_| failure())?.path();
+        for entry in
+            fs::read_dir(directory).map_err(|error| cache_io_failure("cache.walk.open", error))?
+        {
+            let path = entry
+                .map_err(|error| cache_io_failure("cache.walk.entry", error))?
+                .path();
             if path.is_dir() {
                 pending.push(path.clone());
             }
@@ -293,7 +311,18 @@ fn walk_files(root: &Path) -> Result<Vec<PathBuf>, UiContractFailure> {
 }
 
 fn set_mode(path: &Path, mode: u32) -> Result<(), UiContractFailure> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|_| failure())
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|error| cache_io_failure("cache.set_mode", error))
+}
+
+fn cache_io_failure(stage: &'static str, error: std::io::Error) -> UiContractFailure {
+    trace_admission_failure(stage, "filesystem", Some(error.kind()));
+    failure()
+}
+
+fn cache_failure(stage: &'static str, rule: &'static str) -> UiContractFailure {
+    trace_admission_failure(stage, rule, None);
+    failure()
 }
 
 fn failure() -> UiContractFailure {
