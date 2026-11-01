@@ -28,7 +28,9 @@ button, input, select, textarea { font: inherit; }
 .tree-row:hover, .document-row:hover { background: var(--teamarness-color-background); }
 .collection-button, .document-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; border: 0; background: transparent; color: var(--teamarness-color-text); cursor: pointer; padding: .55rem .25rem; }
 .collection-button { font-weight: 700; }
-.collection-button[aria-current="page"], .document-title[aria-current="true"] { background: color-mix(in srgb, var(--teamarness-color-accent) 14%, var(--teamarness-color-panel)); box-shadow: inset 3px 0 var(--teamarness-color-accent); font-weight: 700; }
+/* The open Document: a copy of the Shell navigation's selected item (`.package-group button`). */
+.document-title { border-radius: var(--teamarness-radius-control, 6px); }
+.document-title:hover, .document-title[aria-current="true"] { color: var(--teamarness-color-accent); background: var(--teamarness-color-background); }
 .is-archived .collection-button, .is-archived .document-title { color: var(--teamarness-color-text-muted); text-decoration: line-through; }
 .document-list { padding: 0 0 0 1.15rem; }
 .document-title { font-size: .92rem; }

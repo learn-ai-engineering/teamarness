@@ -120,6 +120,9 @@ function delayedClient() {
   const raw: PackageClient = {
     request: <T extends PackageValue>(operation: string, payload: PackageValue): Promise<T> => {
       if (operation === "conversations.snapshot") return Promise.resolve(snapshot()) as unknown as Promise<T>;
+      // Drafts answer at once, so `pending` holds only the history requests these tests drive.
+      if (operation === "conversations.draft.get") return Promise.resolve({ text: "" }) as unknown as Promise<T>;
+      if (operation === "conversations.draft.set") return Promise.resolve({}) as unknown as Promise<T>;
       const reply = deferred<PackageValue>();
       pending.push({ operation, payload, reply });
       return reply.promise as Promise<T>;

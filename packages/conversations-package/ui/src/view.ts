@@ -78,6 +78,8 @@ export class ConversationsView {
   private readonly textarea: HTMLTextAreaElement;
   private readonly sendButton: HTMLButtonElement;
   private inputRevision = 0;
+  /** The controller draft version the textarea last showed. */
+  private shownDraftVersion = -1;
   private renderedChannelId: string | null = null;
   private renderedMessages: ControllerState["messages"] | null = null;
   private renderedPrincipals: ControllerState["principals"] | null = null;
@@ -192,7 +194,7 @@ export class ConversationsView {
     this.textarea.placeholder = "Write a message…";
     this.textarea.addEventListener("input", () => {
       ++this.inputRevision;
-      controller.draft = this.textarea.value;
+      controller.editDraft(this.textarea.value);
     });
     this.composer.append(this.textarea);
 
@@ -211,7 +213,7 @@ export class ConversationsView {
         if (this.disposed || !acknowledged || controller.state.selectedChannelId !== channelId
           || this.inputRevision !== revision || this.textarea.value !== markdown) return;
         this.textarea.value = "";
-        controller.draft = "";
+        controller.clearDraft();
       });
     });
 
@@ -665,6 +667,14 @@ export class ConversationsView {
   }
 
   private patchComposer(state: ControllerState): void {
+    // A Channel switch or a remembered draft replaces the text; the Member's typing never does.
+    if (this.shownDraftVersion !== this.controller.draftVersion) {
+      this.shownDraftVersion = this.controller.draftVersion;
+      if (this.textarea.value !== this.controller.draft) {
+        this.textarea.value = this.controller.draft;
+        ++this.inputRevision;
+      }
+    }
     // Sending is local-first: a Message is committed and synchronized later,
     // so only a Package that cannot read its own history yet may not send.
     const canSend =

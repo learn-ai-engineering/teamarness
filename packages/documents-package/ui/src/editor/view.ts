@@ -490,6 +490,11 @@ export class DocumentEditor {
     this.refreshToolbar();
   }
 
+  /** The element that scrolls the body. */
+  get scroller(): HTMLElement {
+    return this.surface;
+  }
+
   /** The ProseMirror view, while a body is shown. */
   get editorView(): EditorView | null {
     return this.view;

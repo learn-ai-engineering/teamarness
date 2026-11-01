@@ -1435,3 +1435,166 @@ describe("Channel scroll reset", () => {
     await unmount();
   });
 });
+
+// Verifies: AC13 (better-doc-agent) — a Channel's draft survives a Package switch (an unmount
+// and remount), each Channel keeps its own draft, and a post clears it only once acknowledged.
+describe("remembered Channel drafts", () => {
+  const CHANNEL = snapshot().channels[0]!.id;
+  const SECOND = "1".repeat(32);
+  const channels = [snapshot().channels[0]!, { id: SECOND, slug: "second", canHide: false, unreadCount: 0 }];
+  const deadline = { timeout: 2000 };
+
+  /** A Backend whose drafts live in one map that outlives each mount, like the real Backend. */
+  function draftBackend(options: { failPost?: boolean; failDraftGet?: boolean } = {}) {
+    const drafts = new Map<string, string>();
+    const source = createFakePackageClient({
+      requests: {
+        "conversations.snapshot": () => ({ availability: "current", channels }),
+        "conversations.channel.open": () => page("fixture"),
+        "conversations.channel.changes": () => ({ events: [], continuation: "0", highWater: "0" }),
+        "conversations.message.post": () => {
+          if (options.failPost) throw new Error("post failed");
+          return { ok: true };
+        },
+        "conversations.draft.get": (payload) => {
+          if (options.failDraftGet) throw new Error("draft unavailable");
+          return { text: drafts.get((payload as { channelId: string }).channelId) ?? "" };
+        },
+        "conversations.draft.set": (payload) => {
+          const { channelId, text } = payload as { channelId: string; text: string };
+          if (text === "") drafts.delete(channelId); else drafts.set(channelId, text);
+          return {};
+        },
+      },
+      subscriptions: { "conversations.changes": () => undefined },
+    });
+    const saves = () => source.calls.filter(({ operation }) => operation === "conversations.draft.set")
+      .map(({ payload }) => payload);
+    return { ...source, drafts, saves };
+  }
+  const textareaOf = (root: ShadowRoot) => root.querySelector<HTMLTextAreaElement>("textarea")!;
+  const type = (root: ShadowRoot, value: string) => {
+    const textarea = textareaOf(root);
+    textarea.value = value;
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  const send = (root: ShadowRoot) => textareaOf(root).closest("form")!
+    .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+  const choose = async (root: ShadowRoot, channelId: string) => {
+    root.querySelector<HTMLButtonElement>(`[data-channel-id="${channelId}"]`)!.click();
+    await vi.waitFor(() => expect(root.querySelector(`[data-channel-id="${channelId}"]`)
+      ?.getAttribute("aria-current")).toBe("page"), deadline);
+  };
+
+  it("saves a settled draft once and restores it for the selected Channel after a remount", async () => {
+    const source = draftBackend();
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    type(root, "half");
+    type(root, "half a thought");
+    expect(source.saves()).toEqual([]);
+    await vi.waitFor(() => expect(source.saves()).toEqual([{ channelId: CHANNEL, text: "half a thought" }]), deadline);
+    await unmount();
+
+    const remounted = shadowRoot();
+    const again = await mount(createTestMountContext({ root: remounted, client: source.client }));
+    await vi.waitFor(() => expect(textareaOf(remounted).value).toBe("half a thought"), deadline);
+    await again();
+  });
+
+  it("sends a still-pending save when the Package unmounts", async () => {
+    const source = draftBackend();
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    type(root, "typed just before switching");
+    await unmount();
+    expect(source.saves()).toEqual([{ channelId: CHANNEL, text: "typed just before switching" }]);
+    expect(source.drafts.get(CHANNEL)).toBe("typed just before switching");
+  });
+
+  it("keeps a separate draft for each Channel", async () => {
+    const source = draftBackend();
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    type(root, "for general");
+    await choose(root, SECOND);
+    expect(source.drafts.get(CHANNEL)).toBe("for general");
+    expect(textareaOf(root).value).toBe("");
+    type(root, "for second");
+    await choose(root, CHANNEL);
+    await vi.waitFor(() => expect(textareaOf(root).value).toBe("for general"), deadline);
+    await choose(root, SECOND);
+    await vi.waitFor(() => expect(textareaOf(root).value).toBe("for second"), deadline);
+    expect(source.drafts).toEqual(new Map([[CHANNEL, "for general"], [SECOND, "for second"]]));
+    await unmount();
+  });
+
+  it("forgets the draft when the Member empties the box", async () => {
+    const source = draftBackend();
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    type(root, "second thoughts");
+    await vi.waitFor(() => expect(source.drafts.get(CHANNEL)).toBe("second thoughts"), deadline);
+    type(root, "");
+    await vi.waitFor(() => expect(source.drafts.has(CHANNEL)).toBe(false), deadline);
+    await unmount();
+  });
+
+  it("clears the draft after a successful post", async () => {
+    const source = draftBackend();
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    type(root, "ship it");
+    await vi.waitFor(() => expect(source.drafts.get(CHANNEL)).toBe("ship it"), deadline);
+    send(root);
+    await vi.waitFor(() => expect(textareaOf(root).value).toBe(""), deadline);
+    await unmount();
+    expect(source.drafts.has(CHANNEL)).toBe(false);
+    expect(source.saves().at(-1)).toEqual({ channelId: CHANNEL, text: "" });
+  });
+
+  it("clears the posted draft of a Channel the Member left before the acknowledgement", async () => {
+    let acknowledge!: () => void;
+    const source = draftBackend();
+    const client: PackageClient = { ...source.client, request: (operation, payload, options) => {
+      if (operation !== "conversations.message.post") return source.client.request(operation, payload, options);
+      return new Promise((resolve) => { acknowledge = () => resolve({ ok: true } as never); });
+    } };
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client }));
+    type(root, "posted from general");
+    send(root);
+    await choose(root, SECOND);
+    expect(source.drafts.get(CHANNEL)).toBe("posted from general");
+    acknowledge();
+    await vi.waitFor(() => expect(source.drafts.has(CHANNEL)).toBe(false), deadline);
+    await unmount();
+  });
+
+  it("keeps the draft when the post fails", async () => {
+    const source = draftBackend({ failPost: true });
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    type(root, "not sent yet");
+    send(root);
+    await vi.waitFor(() => expect(root.querySelector<HTMLButtonElement>(".composer button")?.disabled).toBe(false), deadline);
+    expect(textareaOf(root).value).toBe("not sent yet");
+    await unmount();
+    expect(source.drafts.get(CHANNEL)).toBe("not sent yet");
+
+    const remounted = shadowRoot();
+    const again = await mount(createTestMountContext({ root: remounted, client: source.client }));
+    await vi.waitFor(() => expect(textareaOf(remounted).value).toBe("not sent yet"), deadline);
+    await again();
+  });
+
+  it("treats a draft that cannot be read as empty", async () => {
+    const source = draftBackend({ failDraftGet: true });
+    const root = shadowRoot();
+    const unmount = await mount(createTestMountContext({ root, client: source.client }));
+    expect(textareaOf(root).value).toBe("");
+    type(root, "still works");
+    await vi.waitFor(() => expect(source.saves()).toEqual([{ channelId: CHANNEL, text: "still works" }]), deadline);
+    await unmount();
+  });
+});

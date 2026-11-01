@@ -157,6 +157,8 @@ class Installation {
     this.subscriptions = new Map();
     this.appendedRequests = new Set();
     this.revision = 0;
+    /** The UI's remembered place, held in memory as the Rust Backend holds it. */
+    this.place = {};
   }
 
   /** Imports every record this Installation can now see, and relays each to its sessions. */
@@ -239,6 +241,11 @@ class Installation {
         };
       case "documents.document.open":
         return { documentId: DOCUMENT, editable: true };
+      case "documents.place.get":
+        return this.place;
+      case "documents.place.set":
+        this.place = payload;
+        return {};
       case "documents.document.update":
         return this.update(view, payload);
       case "documents.document.recover":
