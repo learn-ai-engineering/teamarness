@@ -28,6 +28,9 @@ use crate::store::{DocumentStore, ImportClassifier, IngestResult, Ingested, Stor
 mod guide;
 #[path = "ports.rs"]
 mod ports;
+// SPIKE filesystem-docs: throwaway in-Backend folder sync.
+#[path = "folder_sync_spike.rs"]
+mod folder_sync_spike;
 
 /// How many distinct synchronization warning codes are remembered at a time.
 const MAX_WARNINGS: usize = 8;
@@ -723,6 +726,9 @@ pub struct DocumentsActive {
     session: Mutex<Option<Session>>,
     hub: BodyHub,
     flusher: Mutex<Option<Session>>,
+    /// SPIKE filesystem-docs: the folder sync task and what restarts it.
+    folder_sync: Mutex<Option<Session>>,
+    folder_sync_config: folder_sync_spike::FolderSync,
     /// Where the UI last was: held in memory only, so it lasts while the Backend runs.
     place: Mutex<Place>,
 }
@@ -1122,6 +1128,7 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         let cancellation = activation.cancellation().clone();
         async move {
             let directory = initialization.data_directory().path().to_owned();
+            let data_dir = directory.clone();
             let store = teamarness_package_sdk::blocking(&cancellation, move |_| {
                 DocumentStore::open(directory.join("documents.sqlite3"))
                     .map_err(|_| storage_failed())
@@ -1180,6 +1187,15 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             }
             let session = start_session(&store, &log, &sync, &changes, &hub);
             let flusher = start_flusher(&log, &hub, &changes, installation.clone());
+            let folder_sync_config = folder_sync_spike::FolderSync {
+                log: log.clone(),
+                hub: hub.clone(),
+                changes: changes.clone(),
+                installation: installation.clone(),
+                store: store.clone(),
+                dir: data_dir,
+            };
+            let folder_sync = folder_sync_spike::start(folder_sync_config.clone());
             Ok(DocumentsActive {
                 store,
                 log,
@@ -1190,16 +1206,20 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 session: Mutex::new(Some(session)),
                 hub,
                 flusher: Mutex::new(Some(flusher)),
+                folder_sync: Mutex::new(Some(folder_sync)),
+                folder_sync_config,
                 place: Mutex::new(Place::default()),
             })
         }
     })
     .on_suspend(|state: Arc<DocumentsActive>| async move {
+        folder_sync_spike::stop(&state.folder_sync).await;
         stop_session(&state).await;
         stop_flusher(&state).await;
         Ok(())
     })
     .on_resume(|state: Arc<DocumentsActive>| async move {
+        folder_sync_spike::stop(&state.folder_sync).await;
         stop_session(&state).await;
         stop_flusher(&state).await;
         let replay_store = state.store.clone();
@@ -1228,9 +1248,15 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             .flusher
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(flusher);
+        *state
+            .folder_sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(folder_sync_spike::start(state.folder_sync_config.clone()));
         Ok(())
     })
     .on_dispose(|state: Arc<DocumentsActive>| async move {
+        folder_sync_spike::stop(&state.folder_sync).await;
         stop_session(&state).await;
         stop_flusher(&state).await;
         Ok(())

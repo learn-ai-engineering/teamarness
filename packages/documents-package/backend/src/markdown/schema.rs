@@ -722,7 +722,9 @@ pub(super) fn read_runs(text: &LoroText) -> Result<Vec<Inline>, SchemaViolation>
         .into_iter()
         .filter_map(|delta| match delta {
             TextDelta::Insert { insert, attributes } => {
-                Some(marks_of(attributes.as_ref()).map(|marks| Inline::Text(insert, marks)))
+                // SPIKE filesystem-docs: pinned, because `notify`'s objc2 impls overflow inference.
+                let attributes: Option<&HashMap<String, LoroValue, _>> = attributes.as_ref();
+                Some(marks_of::<HashMap<String, LoroValue, _>>(attributes).map(|marks| Inline::Text(insert, marks)))
             }
             _ => None,
         })
