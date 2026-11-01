@@ -70,9 +70,9 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
-### Backlog Package (implemented on branch, Verify pending)
+### Backlog Package (complete, verified locally)
 
-Implemented on 2026-11-01 on branch `don-smith/add_backlog_package`, workstream `backlog-package`. It is not integrated into `main`. Verify, including the developer's manual checks, has not run yet. The new bundled Team Package `dev.teamarness.backlog` holds Epics and Tickets for the Workspace (`TEAM.SYS.BACKLOG-R01` to `R10`).
+Implemented on 2026-11-01 on branch `don-smith/add_backlog_package`, workstream `backlog-package`, and fast-forwarded into local `main`. The new bundled Team Package `dev.teamarness.backlog` holds Epics and Tickets for the Workspace (`TEAM.SYS.BACKLOG-R01` to `R10`).
 
 - ADR 0039 (accepted 2026-11-01) settles Ticket field updates. A Ticket changes field by field, and each field keeps the change that is last in log order. A Ticket's version is the highest applied OrderKey. A save on an older version than this Installation has seen is refused with `backlog.stale_version`, and the refusal returns the current Ticket. Saves on Installations that had not seen each other are not refused; they converge per field.
 - Records go on the immutable record log with a Package-owned codec. Titles, bodies and drafts are never stored as plaintext in SQLite (ADR 0027).
@@ -84,9 +84,11 @@ Implemented on 2026-11-01 on branch `don-smith/add_backlog_package`, workstream 
 
 Automated evidence: Backend unit tests, Backlog UI tests, and the system tests `backlog_two_installation_flow` (replication, offline catch-up, per-field convergence) and `backlog_ports_proof` (guide, list, get, create, update, stale refusal, Agent attribution, live UI update).
 
+Manual checks M1–M7 passed on 2026-11-01 with a real model. The first run found that edit fields lost focus on every keystroke, and a corrective commit fixed it. M5 part B (Former member) could not run, because no Member can be removed yet. Verify passed on 2026-11-01 with no P0 or P1 findings.
+
 **Outcome:** A Workspace plans its work as Epics and Tickets, and its Agents read and update Tickets beside the Members.
 
-**Follow-ups:** a former assignee's name needs `teamarness.principals` 1.1; conflict detection across Installations (deferred by ADR 0039); chunking the `backlog.changes` snapshot; remembering the new-Ticket draft.
+**Follow-ups:** conflict detection across Installations (deferred by ADR 0039); the items in DELTA-021, including the untested Former member check, the snapshot limit of about 500 Tickets, and Port 1.0 text fixes before release.
 
 ### Better Doc Agent (complete, verified locally)
 
