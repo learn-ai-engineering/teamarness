@@ -93,7 +93,7 @@ describe("Documents mount", () => {
     expect(root.querySelector("h1")?.textContent).toBe("Documents");
     expect(root.querySelector("[role=status]")?.textContent).toBe("Up to date");
     expect(texts(root, ".collection-button")).toEqual(["Planning"]);
-    expect(root.querySelector(".collection-button")?.getAttribute("aria-current")).toBe("page");
+    expect(root.querySelector(".collection-button")?.getAttribute("data-selected")).toBe("true");
     expect(root.querySelector(".collection-list .document-title")?.textContent).toBe("Q4 plan");
     expect(root.querySelector(".documents-panel")).toBeNull();
     expect(texts(root, ".document-title")).toEqual(["Q4 plan"]);
@@ -173,7 +173,7 @@ describe("Documents mount", () => {
     };
     await fake.emit("documents.changes", current);
     expect(texts(root, ".collection-button")).toEqual(["Planning", "Research"]);
-    expect(root.querySelector(".collection-button")?.getAttribute("aria-current")).toBe("page");
+    expect(root.querySelector(".collection-button")?.getAttribute("data-selected")).toBe("true");
     expect(texts(root, ".document-title")).toEqual(["Q4 plan", "OKRs"]);
     (root.querySelector('[aria-label="Actions for Q4 plan"]') as HTMLButtonElement).click();
     expect(root.querySelector(".document-move")).not.toBeNull();
@@ -183,10 +183,10 @@ describe("Documents mount", () => {
     input.value = "Mine";
     (root.querySelector(".collection-create") as HTMLFormElement).requestSubmit();
     await tick();
-    expect(root.querySelector(".collection-button[aria-current=page]")?.textContent).toBe("Planning");
+    expect(root.querySelector(".collection-button[data-selected=true]")?.textContent).toBe("Planning");
     current = { ...current, collections: [...current.collections, { id: "9".repeat(64), name: "Mine", archived: false }] };
     await fake.emit("documents.changes", current);
-    expect(root.querySelector(".collection-button[aria-current=page]")?.textContent).toBe("Mine");
+    expect(root.querySelector(".collection-button[data-selected=true]")?.textContent).toBe("Mine");
     expect(texts(root, ".document-title")).toEqual(["Q4 plan", "OKRs"]);
     expect(texts(root, ".documents-empty")).toEqual(["No documents yet."]);
     await unmount();
@@ -205,7 +205,7 @@ describe("Documents mount", () => {
       collection.id === planning ? { ...collection, archived: true } : collection) };
     await fake.emit("documents.changes", current);
     expect(texts(root, ".collection-button")).toEqual(["Research"]);
-    expect(root.querySelector(".collection-button[aria-current=page]")?.textContent).toBe("Research");
+    expect(root.querySelector(".collection-button[data-selected=true]")?.textContent).toBe("Research");
     expect(texts(root, ".document-title")).toEqual(["New plan"]);
     const toggle = root.querySelector(".archived-toggle") as HTMLButtonElement;
     toggle.click();
@@ -655,14 +655,16 @@ describe("Documents mount", () => {
     const name = () => root.querySelector('.collection-button') as HTMLButtonElement;
     expect(root.querySelectorAll('.tree-row button')).toHaveLength(3);
     expect(name().getAttribute('aria-expanded')).toBe('true');
-    expect(name().getAttribute('aria-current')).toBe('page');
+    expect(name().getAttribute('data-selected')).toBe('true');
+    expect(name().hasAttribute('aria-current')).toBe(false);
     expect(documentsCss).toMatch(/\.collection-button\s*\{[^}]*font-weight:\s*700/);
     (root.querySelector('.document-title') as HTMLButtonElement).click();
     await tick();
     const editor = root.querySelector('.editor-placeholder');
     name().click();
     expect(name().getAttribute('aria-expanded')).toBe('false');
-    expect(name().getAttribute('aria-current')).toBe('page');
+    expect(name().getAttribute('data-selected')).toBe('true');
+    expect(name().hasAttribute('aria-current')).toBe(false);
     expect(root.querySelector('.document-title')).toBeNull();
     expect(root.querySelector('.editor-placeholder')).toBe(editor);
     expect(root.querySelector('.editor-title')?.textContent).toBe('Q4 plan');
@@ -685,12 +687,12 @@ describe("Documents mount", () => {
     (root.querySelector(".collection-button") as HTMLButtonElement).click();
     expect(texts(root, ".document-title")).toEqual(["Notes"]);
     (root.querySelector('[aria-label="Add Document to Planning"]') as HTMLButtonElement).click();
-    expect(root.querySelector('.collection-button[aria-current="page"]')?.textContent).toBe("Planning");
+    expect(root.querySelector('.collection-button[data-selected="true"]')?.textContent).toBe("Planning");
     expect(root.querySelector('.document-create')).not.toBeNull();
     (root.querySelector('.document-create button[aria-label="Cancel"]') as HTMLButtonElement).click();
     ([...root.querySelectorAll('.document-title')].find((b) => b.textContent === 'Notes') as HTMLButtonElement).click();
     await tick();
-    expect(root.querySelector('.collection-button[aria-current="page"]')?.textContent).toBe("Research");
+    expect(root.querySelector('.collection-button[data-selected="true"]')?.textContent).toBe("Research");
     expect(texts(root, ".document-title")).toEqual(["Q4 plan", "Notes"]);
     await unmount();
   });
@@ -990,5 +992,137 @@ describe("Documents mount", () => {
     expect(root.querySelector("[role=alert]")?.textContent).toMatch(/Collection names/);
     expect(texts(root, ".collection-button")).toEqual(["Planning"]);
     await unmount();
+  });
+});
+
+/** Waits, with a deadline, until `done` holds. */
+async function within(done: () => boolean, milliseconds = 2000): Promise<void> {
+  const deadline = Date.now() + milliseconds;
+  while (!done() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(done()).toBe(true);
+}
+
+describe("Documents selection and remembered place", () => {
+  const research = "4".repeat(64);
+  const notes = "5".repeat(64);
+  /** Research lists first, so a mount without a remembered place selects it. */
+  function listing(): DocumentsSnapshot {
+    const base = snapshot();
+    return { ...base, collections: [{ id: research, name: "Research", archived: false }, ...base.collections],
+      documents: [...base.documents, { id: notes, collectionId: research, title: "Notes", archived: false }] };
+  }
+
+  function placeBackend(place: PackageValue | (() => PackageValue)) {
+    const saved: PackageValue[] = [];
+    const fake = createFakePackageClient({
+      requests: {
+        "documents.snapshot": () => listing(),
+        "documents.comments": () => ({ comments: [] }),
+        "documents.place.get": () => (typeof place === "function" ? place() : place),
+        "documents.place.set": (payload) => { saved.push(payload); return {}; },
+      },
+      subscriptions: { "documents.changes": () => undefined, "documents.document.session": () => undefined },
+    });
+    return { fake, saved };
+  }
+
+  const sessions = (fake: ReturnType<typeof createFakePackageClient>) =>
+    fake.calls.filter((call) => call.operation === "documents.document.session").map((call) => call.payload);
+
+  it("never marks a Collection current; only the open Document is", async () => {
+    const { fake } = placeBackend({});
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    expect(root.querySelector("[aria-current]")).toBeNull();
+    ([...root.querySelectorAll(".collection-button")].find((b) => b.textContent === "Planning") as HTMLButtonElement).click();
+    ([...root.querySelectorAll(".document-title")].find((b) => b.textContent === "Q4 plan") as HTMLButtonElement).click();
+    await tick();
+    expect(root.querySelectorAll("[aria-current]")).toHaveLength(1);
+    expect(root.querySelector('.document-title[aria-current="true"]')?.textContent).toBe("Q4 plan");
+    expect(root.querySelector(".collection-button[aria-current]")).toBeNull();
+    // The open Document has the Shell-nav selection style, with no bar and normal weight.
+    const selected = /\.document-title:hover,\s*\.document-title\[aria-current="true"\]\s*\{([^}]*)\}/.exec(documentsCss)?.[1] ?? "";
+    expect(selected).toMatch(/color:\s*var\(--teamarness-color-accent\)/);
+    expect(selected).toMatch(/background:\s*var\(--teamarness-color-background\)/);
+    expect(documentsCss).not.toMatch(/collection-button\[aria-current/);
+    expect(documentsCss).not.toMatch(/box-shadow:\s*inset 3px/);
+    await unmount();
+  });
+
+  it("restores a remembered Collection, Document and scroll position on mount", async () => {
+    const { fake } = placeBackend({ collectionId: planning, documentId: doc, scrollTop: 240 });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    await within(() => sessions(fake).length === 1);
+    expect(sessions(fake)).toEqual([{ documentId: doc }]);
+    expect(root.querySelector(".collection-button[data-selected=true]")?.textContent).toBe("Planning");
+    expect(root.querySelector('.document-title[aria-current="true"]')?.textContent).toBe("Q4 plan");
+    const surface = root.querySelector(".editor-surface") as HTMLElement;
+    await opened(fake, { snapshot: ALL_NODES });
+    await within(() => root.querySelector(".ProseMirror") !== null);
+    expect(surface.scrollTop).toBe(240);
+    await unmount();
+  });
+
+  it("falls back to the first Collection with nothing open when the remembered Document is gone", async () => {
+    const { fake, saved } = placeBackend({ collectionId: planning, documentId: "6".repeat(64), scrollTop: 240 });
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    await tick();
+    expect(sessions(fake)).toEqual([]);
+    expect(root.querySelector(".collection-button[data-selected=true]")?.textContent).toBe("Planning");
+    expect(root.querySelector(".editor-title")?.textContent).toBe("Choose a Document");
+    expect((root.querySelector(".documents-page > p.teamarness-notice--danger") as HTMLElement).hidden).toBe(true);
+    // A Collection that is gone too falls back to today's first-Collection selection.
+    await unmount();
+    const gone = placeBackend({ collectionId: "7".repeat(64), documentId: "6".repeat(64) });
+    const again = document.createElement("div").attachShadow({ mode: "open" });
+    const remount = await mount(createTestMountContext({ client: gone.fake.client, root: again }));
+    await tick();
+    expect(sessions(gone.fake)).toEqual([]);
+    expect(again.querySelector(".collection-button[data-selected=true]")?.textContent).toBe("Research");
+    await remount();
+    // A Backend without a remembered place (or one that fails) still mounts as before.
+    const failing = createFakePackageClient({ requests: { "documents.snapshot": () => listing() },
+      subscriptions: { "documents.changes": () => undefined } });
+    const plain = document.createElement("div").attachShadow({ mode: "open" });
+    const unmountPlain = await mount(createTestMountContext({ client: failing.client, root: plain }));
+    expect(plain.querySelector(".collection-button[data-selected=true]")?.textContent).toBe("Research");
+    await unmountPlain();
+    expect(saved.every((place) => (place as { documentId?: string }).documentId === undefined)).toBe(true);
+  });
+
+  it("saves the selection and editor scroll, debounced, and a remount returns to them", async () => {
+    let remembered: PackageValue = {};
+    const { fake, saved } = placeBackend(() => remembered);
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    ([...root.querySelectorAll(".collection-button")].find((b) => b.textContent === "Planning") as HTMLButtonElement).click();
+    ([...root.querySelectorAll(".document-title")].find((b) => b.textContent === "Q4 plan") as HTMLButtonElement).click();
+    await within(() => saved.some((place) => (place as { documentId?: string }).documentId === doc), 1000);
+    expect(saved.at(-1)).toEqual({ collectionId: planning, documentId: doc });
+    await opened(fake, { snapshot: ALL_NODES });
+    await within(() => root.querySelector(".ProseMirror") !== null);
+    const surface = root.querySelector(".editor-surface") as HTMLElement;
+    const before = saved.length;
+    for (const top of [40, 80, 120]) {
+      surface.scrollTop = top;
+      surface.dispatchEvent(new Event("scroll"));
+    }
+    await within(() => (saved.at(-1) as { scrollTop?: number } | undefined)?.scrollTop === 120, 1000);
+    // A burst of scroll events is saved once.
+    expect(saved.length - before).toBe(1);
+    expect(saved.at(-1)).toEqual({ collectionId: planning, documentId: doc, scrollTop: 120 });
+    remembered = saved.at(-1) as PackageValue;
+    await unmount();
+
+    const again = document.createElement("div").attachShadow({ mode: "open" });
+    const remount = await mount(createTestMountContext({ client: fake.client, root: again }));
+    await within(() => sessions(fake).length === 2);
+    await opened(fake, { snapshot: ALL_NODES });
+    await within(() => again.querySelector(".ProseMirror") !== null);
+    expect((again.querySelector(".editor-surface") as HTMLElement).scrollTop).toBe(120);
+    expect(again.querySelector('.document-title[aria-current="true"]')?.textContent).toBe("Q4 plan");
+    await remount();
   });
 });

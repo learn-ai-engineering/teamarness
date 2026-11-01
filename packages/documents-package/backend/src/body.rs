@@ -561,6 +561,14 @@ pub(crate) fn genesis() -> Vec<u8> {
         .expect("a fresh document exports its updates")
 }
 
+/// The frontiers of a body that holds only `genesis`: the version a new Document starts at.
+pub(crate) fn genesis_frontiers(genesis: &[u8]) -> Frontiers {
+    let doc = LoroDoc::new();
+    // An update that fails to import has no operations, so its frontiers are empty.
+    let _ = doc.import(genesis);
+    doc.oplog_frontiers()
+}
+
 /// Whether `update` is exactly a body genesis: self-contained, from one peer, and holding only
 /// the empty body.
 pub(crate) fn is_valid_genesis(update: &[u8]) -> bool {

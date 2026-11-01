@@ -117,6 +117,17 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Draft** | An Exhibit's revisable, Installation-local state: a title, an entry page and a complete file list, stored in the Exhibits Package Data Directory and never replicated. Each update replaces the whole Draft atomically and increments its revision. A Person and a bound Workspace Agent can both update a Draft |
 | **Snapshot** | An immutable, shared copy of an Exhibit that a Person takes from a Draft so other Members can view it and continue from it. Only a Person takes a Snapshot, never an Agent. The term is defined now; Exhibits slice 2 delivers it, and slice 1 has Drafts only |
 
+## Backlog
+
+| Term | Definition |
+|---|---|
+| **Epic** | A titled group of Tickets within a Workspace, identified by the Record ID of the record that created it. A Person creates, renames, archives and restores it; it is never deleted |
+| **Ticket** | A unit of work that belongs to exactly one Epic, identified by the Record ID of its create record. It has a title, a Markdown body, a Ticket Status, a Ticket Priority and an optional Assignee. It can be moved between Epics, archived and restored; it is never deleted |
+| **Ticket Status** | A Ticket's lifecycle stage, one of `not_ready` (not yet specified enough to start), `ready`, `in_progress` and `done`. New Tickets are `not_ready` |
+| **Ticket Priority** | A Ticket's urgency, one of `high`, `medium` and `low`. New Tickets are `medium` |
+| **Assignee** | The Workspace Person a Ticket is assigned to, stored as a Principal ID, or none. Agents are never Assignees. An Assignee who is no longer a current Principal is shown as a former member |
+| **Ticket Version** | The greatest Order Key of any record applied to a Ticket on this Installation. A save carries the version it was based on, and the Backlog refuses it when the Ticket has since changed on this Installation (ADR 0039) |
+
 ## Synchronization and Protection
 
 | Term | Definition |

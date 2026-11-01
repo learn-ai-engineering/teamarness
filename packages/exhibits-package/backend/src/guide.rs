@@ -6,7 +6,8 @@ use teamarness_package_contract::media_types::MEDIA_TYPES;
 
 use crate::domain::{
     CHUNK_BYTES, ID_PATTERN, LIST_PAGE, MAX_CONCURRENT_PUTS, MAX_FILE_BYTES, MAX_FILES,
-    MAX_ID_CHARS, MAX_MISSING_QUERY, MAX_PATH_BYTES, MAX_TITLE_CHARS, MAX_TOTAL_BYTES, READ_PAGE,
+    MAX_ID_CHARS, MAX_MISSING_QUERY, MAX_PATH_BYTES, MAX_TITLE_CHARS, MAX_TOTAL_BYTES,
+    MAX_WRITE_BYTES, READ_PAGE, TEXT_PAGE_BYTES,
 };
 
 /// The enforced limits, as `runtime.guide` publishes them.
@@ -70,21 +71,33 @@ segment and no `\\`, `%`, `?`, `#` or `\"`.
 - Keep library files (frameworks, fonts) byte-for-byte identical between revisions and \
 Exhibits: content is stored by SHA-256, so an unchanged file is never uploaded twice.
 
-## Uploading
+## Storing files
 
-1. For each file, compute its SHA-256 (lowercase hex) and size.
-2. Call `files.missing` with up to {MAX_MISSING_QUERY} hashes. Upload only what it reports.
-3. Upload a file with `file.put` in chunks of exactly {CHUNK_BYTES} raw bytes \
-(standard padded base64 in `data`); only the last chunk may be shorter. `chunkCount` is \
-`ceil(size / {CHUNK_BYTES})`, and 1 for an empty file. Chunks may arrive in any order and \
-may be repeated. The file is verified when its last missing chunk arrives, and `complete` \
-becomes true. Keep at most {MAX_CONCURRENT_PUTS} `file.put` calls in flight.
-4. Call `draft.update` with the Exhibit ID, a title, the entry path and every file as \
-`{{path, sha256}}`. It creates the Draft or replaces it completely, and returns the new \
-`revision`. Pass the revision you last saw as `expectedRevision` to avoid overwriting \
-someone else's update (`exhibits.revision_conflict` carries the current revision).
-5. If `draft.update` fails with `exhibits.missing_files`, upload the files it names \
-(at most 32 are listed; `missingCount` says how many) and call it again.
+Write text files with `file.write`. Send binary files with `file.put`.
+
+- **Text files** (HTML, CSS, JavaScript, SVG, JSON, Markdown, plain text): call `file.write` \
+with the whole file as `text`. It returns the file's `sha256` and `size`; use that `sha256` \
+in `draft.update`. If you are a model, always use `file.write` for text: never compute a \
+SHA-256 or base64 yourself. `text` is at most {MAX_WRITE_BYTES} bytes of UTF-8 \
+(`exhibits.too_large` otherwise), so split larger code or data into several files. Control \
+characters other than tab, line feed, form feed and carriage return are refused with \
+`exhibits.not_text`. Writing \
+the same text again is safe and returns the same `sha256`.
+- **Binary files** (images, fonts, media, WebAssembly), or any file a program uploads:
+   1. Compute its SHA-256 (lowercase hex) and size.
+   2. Call `files.missing` with up to {MAX_MISSING_QUERY} hashes. Upload only what it reports.
+   3. Upload it with `file.put` in chunks of exactly {CHUNK_BYTES} raw bytes (standard \
+padded base64 in `data`); only the last chunk may be shorter. `chunkCount` is \
+`ceil(size / {CHUNK_BYTES})`, and 1 for an empty file. Chunks may arrive in any order and may \
+be repeated. The file is verified when its last missing chunk arrives, and `complete` becomes \
+true. Keep at most {MAX_CONCURRENT_PUTS} `file.put` calls in flight.
+
+Then call `draft.update` with the Exhibit ID, a title, the entry path and every file as \
+`{{path, sha256}}`. The media type comes from the path's extension. It creates the Draft or \
+replaces it completely, and returns the new `revision`. Pass the revision you last saw as \
+`expectedRevision` to avoid overwriting someone else's update (`exhibits.revision_conflict` \
+carries the current revision). If `draft.update` fails with `exhibits.missing_files`, store \
+the files it names (at most 32 are listed; `missingCount` says how many) and call it again.
 
 Over a Port, every refusal arrives as `provider_error`: the `exhibits.*` code is in \
 `details.provider.code`, and its details (such as `missing` and `missingCount`) are in \
@@ -99,17 +112,30 @@ A command may fail with `outcome_unknown`: it may or may not have taken effect. 
 either. After an uncertain `file.put`, call `files.missing` and send only the chunks it \
 reports. If a re-sent chunk fails with `exhibits.content_mismatch`, the chunks received did \
 not form the file and were discarded: upload the whole file again. After an uncertain \
+`file.write`, call it again with the same text. After an uncertain \
 `draft.update`, call `exhibit.read` and compare the revision and files before trying again.
 
-## Reading back
+## Reading back and revising
 
 - `exhibit.list` returns Exhibits newest first, {LIST_PAGE} per page; pass `nextBefore` back \
 as `before` for the next page.
 - `exhibit.read` returns the Draft's entry, title, revision and files, {READ_PAGE} files per \
 page; pass `nextOffset` back as `offset`.
-- `file.read` returns one chunk of a stored file, so you can revise content you did not keep.
+- **Text files:** `file.text` returns a stored file as plain text, {TEXT_PAGE_BYTES} bytes per \
+page by default (`maxBytes` up to {MAX_WRITE_BYTES}). While `nextOffset` is present, pass it \
+back as `offset` for the rest. If you are a model, always read text this way.
+- **Binary files:** `file.read` returns one {CHUNK_BYTES}-byte chunk as base64, for a program \
+that decodes it. `file.text` refuses binary files with `exhibits.not_text`.
 - `draft.delete` removes a Draft. Its files are kept for 24 hours, so recreating it soon \
 needs no upload.
+
+To revise an Exhibit you did not just write:
+
+1. Call `exhibit.read` for its revision and files.
+2. Read only the files you will change with `file.text`.
+3. Write each changed file again with `file.write`. Unchanged files keep their `sha256`.
+4. Call `draft.update` with **every** file, changed or not, and the revision from step 1 as \
+`expectedRevision`. A file you leave out is removed from the Exhibit.
 ",
         max_file = mib(MAX_FILE_BYTES),
         max_total = mib(MAX_TOTAL_BYTES),
@@ -176,6 +202,15 @@ mod tests {
             "16 MiB per file",
             "64 MiB in total",
             "131072 raw bytes",
+            "always use `file.write` for text",
+            "never compute a SHA-256 or base64 yourself",
+            "at most 98304 bytes of UTF-8",
+            "Binary files",
+            "`file.text` returns a stored file as plain text",
+            "8192 bytes per page",
+            "always read text this way",
+            "`exhibits.not_text`",
+            "with **every** file",
             "at most 4 `file.put` calls",
             "files.missing",
             "outcome_unknown",

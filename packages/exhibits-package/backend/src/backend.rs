@@ -14,7 +14,10 @@ use teamarness_package_sdk::{
 };
 use tokio::sync::broadcast;
 
-use crate::domain::{ExhibitsError, LIST_PAGE, rfc3339, validate_chunk_header};
+use crate::domain::{
+    ExhibitsError, LIST_PAGE, MAX_WRITE_BYTES, MIN_TEXT_PAGE_BYTES, TEXT_PAGE_BYTES, is_text,
+    rfc3339, validate_chunk_header,
+};
 use crate::guide;
 use crate::store::{
     Author, Clock, DraftUpdate, ExhibitStore, Missing, content_source_path, system_clock,
@@ -55,6 +58,12 @@ struct PutRequest {
     chunk_index: u64,
     chunk_count: u64,
     data: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WriteRequest {
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +112,15 @@ struct ReadRequest {
 struct FileReadRequest {
     sha256: String,
     chunk_index: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TextRequest {
+    sha256: String,
+    #[serde(default)]
+    offset: u64,
+    max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +186,7 @@ pub fn router_with_clock(clock: Clock) -> Router<ExhibitsActive> {
         },
     )
     .port_request(CONTRACT, "file.put", "command", file_put)
+    .port_request(CONTRACT, "file.write", "command", file_write)
     .port_request(CONTRACT, "files.missing", "query", files_missing)
     .port_request(CONTRACT, "draft.update", "command", draft_update)
     .port_request(
@@ -181,6 +200,7 @@ pub fn router_with_clock(clock: Clock) -> Router<ExhibitsActive> {
     )
     .port_request(CONTRACT, "exhibit.read", "query", exhibit_read)
     .port_request(CONTRACT, "file.read", "query", file_read)
+    .port_request(CONTRACT, "file.text", "query", file_text)
     .port_request(CONTRACT, "draft.delete", "command", draft_delete)
     .request(
         "exhibit.list",
@@ -316,6 +336,28 @@ async fn file_put(
     Ok(json!({ "complete": complete }))
 }
 
+/// Stores a whole text file for a caller that cannot hash or encode: the Provider computes the
+/// SHA-256 and stores the UTF-8 bytes as a completed `file.put` would.
+async fn file_write(
+    context: Context<ExhibitsActive>,
+    actor: PortActor,
+    request: WriteRequest,
+) -> Result<JsonValue, BackendError> {
+    authorize(&context, &actor)?;
+    if request.text.len() > MAX_WRITE_BYTES {
+        return Err(ExhibitsError::TooLarge { limit: "text" }.into());
+    }
+    if !is_text(&request.text) {
+        return Err(ExhibitsError::NotText.into());
+    }
+    let size = request.text.len();
+    let sha256 = on_store(&context, move |store| {
+        store.write_whole(request.text.as_bytes())
+    })
+    .await?;
+    Ok(json!({ "sha256": sha256, "size": size }))
+}
+
 async fn files_missing(
     context: Context<ExhibitsActive>,
     actor: PortActor,
@@ -446,6 +488,46 @@ async fn file_read(
     })
     .await?;
     Ok(json!({ "data": STANDARD.encode(data), "chunkCount": count }))
+}
+
+/// Reads a stored text file as UTF-8 text, one page at a time, for a caller that cannot decode
+/// base64. A page ends on a character boundary; `nextOffset` names where the next one starts.
+async fn file_text(
+    context: Context<ExhibitsActive>,
+    actor: PortActor,
+    request: TextRequest,
+) -> Result<JsonValue, BackendError> {
+    authorize(&context, &actor)?;
+    let max_bytes = request.max_bytes.unwrap_or(TEXT_PAGE_BYTES);
+    if !(MIN_TEXT_PAGE_BYTES..=MAX_WRITE_BYTES).contains(&max_bytes) {
+        return Err(ExhibitsError::InvalidRequest.into());
+    }
+    let offset = request.offset;
+    let (bytes, size) = on_store(&context, move |store| {
+        store.read_range(&request.sha256, offset, max_bytes as u64)
+    })
+    .await?;
+    let end = offset + bytes.len() as u64;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        // A character cut by the page end is left for the next page; anything else is not text.
+        Err(error) if end < size && error.utf8_error().error_len().is_none() => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).map_err(|_| ExhibitsError::NotText)?
+        }
+        Err(_) => return Err(ExhibitsError::NotText.into()),
+    };
+    if !is_text(&text) {
+        return Err(ExhibitsError::NotText.into());
+    }
+    let next = offset + text.len() as u64;
+    let mut answer = json!({ "text": text, "size": size });
+    if next < size {
+        answer["nextOffset"] = json!(next);
+    }
+    Ok(answer)
 }
 
 async fn draft_delete(

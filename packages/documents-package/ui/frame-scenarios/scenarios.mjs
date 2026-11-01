@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_UPDATE } from "./backend.mjs";
-import { sleep } from "./harness.mjs";
+import { DOCUMENT, sleep } from "./harness.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const ALL_NODES = fs.readFileSync(path.resolve(here, "../../fixtures/body-trees/from-rust/01-all-nodes.md"), "utf8");
@@ -590,6 +590,33 @@ export const SCENARIOS = [
       assert.ok(Buffer.byteLength(quote) <= 2048 && Buffer.byteLength(quote) > 2000, `quote of ${Buffer.byteLength(quote)} bytes`);
       assert.ok(quote.startsWith("Alpha bravo charlie\né"), quote.slice(0, 40));
       return `quotes "bravo" and ${Buffer.byteLength(quote)} bytes of a long selection`;
+    },
+  },
+  {
+    name: "a remount returns to the open Document and its scroll position",
+    async run(h) {
+      await h.addView("A1", "A");
+      h.workspace.installation("A").revise(`${paragraphsMarkdown(80, 400)}\n`);
+      await h.converge(["A1"]);
+      const scroll = (view, top) => h.rawFrame(view).evaluate((value) => {
+        const surface = document.getElementById("teamarness-package-host").shadowRoot.querySelector(".editor-surface");
+        if (value !== null) surface.scrollTop = value;
+        return { top: surface.scrollTop, max: surface.scrollHeight - surface.clientHeight };
+      }, top ?? null);
+      const { max } = await scroll("A1");
+      assert.ok(max > 1000, `the body scrolls (${max} px)`);
+      const { top: saved } = await scroll("A1", Math.round(max / 2));
+      // Saved on scroll, debounced, with no unmount hook to rely on.
+      await h.waitFor(async () => h.workspace.installation("A").place.scrollTop === saved, "the saved scroll position", 2_000);
+      assert.equal(h.workspace.installation("A").place.documentId, DOCUMENT);
+      await h.page.evaluate((view) => window.__removeView(view), "A1");
+      h.views.delete("A1");
+      await h.addView("A2", "A");
+      await h.waitFor(async () => Math.abs((await scroll("A2")).top - saved) <= 1, "the restored scroll position", 5_000);
+      const current = await h.rawFrame("A2").evaluate(() => document.getElementById("teamarness-package-host").shadowRoot
+        .querySelector('.document-title[aria-current="true"]')?.textContent ?? null);
+      assert.equal(current, "Scenario document");
+      return `restored ${saved} of ${max} px`;
     },
   },
   {

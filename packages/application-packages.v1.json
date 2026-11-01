@@ -18,6 +18,9 @@
     },
     {
       "directory": "packages/dev.teamarness.exhibits"
+    },
+    {
+      "directory": "packages/dev.teamarness.backlog"
     }
   ]
 }

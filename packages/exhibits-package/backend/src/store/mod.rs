@@ -27,9 +27,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
 use crate::domain::{
-    ExhibitsError, GC_GRACE_MS, MAX_FILES, MAX_MISSING_QUERY, MAX_TOTAL_BYTES, READ_PAGE,
-    chunk_count, chunk_length, is_sha256, validate_chunk_header, validate_id, validate_path,
-    validate_title,
+    CHUNK_BYTES, ExhibitsError, GC_GRACE_MS, MAX_FILES, MAX_MISSING_QUERY, MAX_TOTAL_BYTES,
+    READ_PAGE, chunk_count, chunk_length, is_sha256, validate_chunk_header, validate_id,
+    validate_path, validate_title,
 };
 
 /// The current time in Unix milliseconds. Injected, so tests move time without sleeping.
@@ -201,6 +201,26 @@ impl ExhibitStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(fault("stat_content")(error)),
         }
+    }
+
+    /// Stores a whole file the caller sent as bytes and returns its SHA-256 (lowercase hex).
+    ///
+    /// The file goes through the same chunk path as `file.put`, so it is verified, promoted and
+    /// recorded exactly as an uploaded file is. Writing a file already stored changes nothing.
+    ///
+    /// # Errors
+    /// `exhibits.too_large` (`file`) over 16 MiB, or `exhibits.storage_failed`.
+    pub fn write_whole(&self, data: &[u8]) -> Result<String, ExhibitsError> {
+        let sha256 = hex(&Sha256::digest(data));
+        let size = data.len() as u64;
+        let count = chunk_count(size);
+        for index in 0..count {
+            let start = usize::try_from(index * CHUNK_BYTES as u64)
+                .map_err(|_| ExhibitsError::TooLarge { limit: "file" })?;
+            let end = (start + CHUNK_BYTES).min(data.len());
+            self.put_chunk(&sha256, size, index, count, &data[start..end])?;
+        }
+        Ok(sha256)
     }
 
     /// Receives one chunk of a file and returns whether the file is now complete.
@@ -422,6 +442,34 @@ impl ExhibitStore {
         let mut bytes = vec![0; usize::try_from(chunk_length(size, index)).unwrap_or_default()];
         file.read_exact(&mut bytes).map_err(fault("read_content"))?;
         Ok((bytes, count))
+    }
+
+    /// Reads at most `length` bytes of a complete file from `offset`, and the file's size.
+    ///
+    /// # Errors
+    /// `exhibits.invalid_request` for a malformed hash or an offset past the end,
+    /// `exhibits.not_found` for a file the store does not hold completely, or
+    /// `exhibits.storage_failed`.
+    pub fn read_range(
+        &self,
+        sha256: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Vec<u8>, u64), ExhibitsError> {
+        if !is_sha256(sha256) {
+            return Err(ExhibitsError::InvalidRequest);
+        }
+        let _connection = self.lock();
+        let size = self.complete_size(sha256)?.ok_or(ExhibitsError::NotFound)?;
+        if offset > size {
+            return Err(ExhibitsError::InvalidRequest);
+        }
+        let mut file = fs::File::open(self.complete_path(sha256)).map_err(fault("open_content"))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(fault("seek_content"))?;
+        let mut bytes = vec![0; usize::try_from(length.min(size - offset)).unwrap_or_default()];
+        file.read_exact(&mut bytes).map_err(fault("read_content"))?;
+        Ok((bytes, size))
     }
 
     /// Creates a Draft, or atomically replaces its title, entry and file list, and returns the

@@ -41,6 +41,15 @@ path = "../../packages/documents-package/backend/src/main.rs"
 name = "documents-port-consumer-under-test"
 path = "src/bin/documents_port_consumer.rs"
 
+# The Backlog Backend is built the same way, from the Package's own `src/main.rs`.
+[[bin]]
+name = "backlog-backend-under-test"
+path = "../../packages/backlog-package/backend/src/main.rs"
+
+[[bin]]
+name = "backlog-port-consumer-under-test"
+path = "src/bin/backlog_port_consumer.rs"
+
 [[bin]]
 name = "generic-port-consumer-under-test"
 path = "src/bin/generic_port_consumer.rs"
@@ -55,6 +64,7 @@ path = "src/bin/agent_qualification_provider.rs"
 
 [dependencies]
 base64.workspace = true
+teamarness-backlog-package = { path = "../../packages/backlog-package/backend" }
 teamarness-conversations-package = { path = "../../packages/conversations-package/backend" }
 teamarness-documents-package = { path = "../../packages/documents-package/backend" }
 teamarness-exhibits-package = { path = "../../packages/exhibits-package/backend" }

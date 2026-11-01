@@ -8,7 +8,10 @@ use teamarness_package_sdk::testing::{
 };
 
 use super::*;
-use crate::domain::{CHUNK_BYTES, MAX_FILES, MAX_MISSING_QUERY, MAX_PATH_BYTES, READ_PAGE};
+use crate::domain::{
+    CHUNK_BYTES, MAX_FILES, MAX_MISSING_QUERY, MAX_PATH_BYTES, MAX_WRITE_BYTES, READ_PAGE,
+    TEXT_PAGE_BYTES,
+};
 use crate::store::hex;
 
 const ALICE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -29,7 +32,7 @@ fn agent() -> JsonValue {
 }
 
 fn envelope(port: &str, actor: &JsonValue, request: JsonValue) -> JsonValue {
-    json!({"contract":CONTRACT,"major":1,"minor":0,"port":port,"actor":actor,"request":request})
+    json!({"contract":CONTRACT,"major":1,"minor":2,"port":port,"actor":actor,"request":request})
 }
 
 fn sha(bytes: &[u8]) -> String {
@@ -147,7 +150,7 @@ fn the_port_contract_declares_every_port_with_agent_guidance() {
     assert_eq!(contract.contracts.len(), 1);
     let provided = &contract.contracts[0];
     assert_eq!(provided.identity, CONTRACT);
-    assert_eq!((provided.major, provided.minor), (1, 0));
+    assert_eq!((provided.major, provided.minor), (1, 2));
     let mut names: Vec<(String, String)> = provided
         .ports
         .iter()
@@ -177,6 +180,8 @@ fn the_port_contract_declares_every_port_with_agent_guidance() {
             ("exhibit.read", "query"),
             ("file.put", "command"),
             ("file.read", "query"),
+            ("file.text", "query"),
+            ("file.write", "command"),
             ("files.missing", "query"),
             ("runtime.guide", "query"),
         ]
@@ -204,6 +209,8 @@ fn the_largest_requests_and_answers_fit_one_port_message() {
             json!({"sha256":sha,"size":crate::domain::MAX_FILE_BYTES,"chunkIndex":0,"chunkCount":128,
                 "data":STANDARD.encode(vec![0xff_u8; CHUNK_BYTES])}),
         ),
+        ("file.write", json!({"text":"\"".repeat(MAX_WRITE_BYTES)})),
+        ("file.write", json!({"text":"\\".repeat(MAX_WRITE_BYTES)})),
         (
             "files.missing",
             json!({"sha256s": vec![sha.clone(); MAX_MISSING_QUERY]}),
@@ -304,6 +311,12 @@ fn the_port_schemas_refuse_unbounded_or_forged_requests() {
             json!({"exhibitId":"ok","title":"t","entry":"index.html","files":[{"path":"index.html","sha256":sha}],"actor":"forged"}),
         ),
         ("exhibit.list", json!({"limit":65})),
+        (
+            "file.write",
+            json!({"text":"x".repeat(MAX_WRITE_BYTES + 1)}),
+        ),
+        ("file.write", json!({})),
+        ("file.write", json!({"text":"x","path":"index.html"})),
         ("runtime.guide", json!({"verbose":true})),
     ] {
         assert!(
@@ -774,5 +787,348 @@ async fn exhibits_changed_carries_one_event_per_update_and_delete() {
         ]
     );
     changes.close().await;
+    session.harness.shutdown().await.unwrap();
+}
+
+/// Asserts that `new` is an additive minor over `old`: every earlier Port keeps its kind and
+/// schemas, `added` Ports are new, and only the `amended` Ports change their description.
+fn assert_additive(old: &[u8], new: &[u8], minors: (u16, u16), added: usize, amended: &[&str]) {
+    use teamarness_package_contract::port_contract::check_additive_minor_documents;
+    let old = compile_port_contracts(old).unwrap();
+    let new = compile_port_contracts(new).unwrap();
+    assert_eq!(
+        (old.contracts[0].major, old.contracts[0].minor),
+        (1, minors.0)
+    );
+    assert_eq!(
+        (new.contracts[0].major, new.contracts[0].minor),
+        (1, minors.1)
+    );
+    check_additive_minor_documents(&old, &new, CONTRACT).unwrap();
+    assert_eq!(
+        old.contracts[0].ports.len() + added,
+        new.contracts[0].ports.len()
+    );
+    for before in &old.contracts[0].ports {
+        let after = new.contracts[0]
+            .ports
+            .iter()
+            .find(|port| port.name == before.name)
+            .unwrap();
+        assert_eq!(before.kind, after.kind);
+        assert_eq!(before.request, after.request);
+        assert_eq!(before.response, after.response);
+        assert_eq!(before.event, after.event);
+        if !amended.contains(&before.name.as_str()) {
+            assert_eq!(before.description, after.description, "{}", before.name);
+        }
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R18 — 1.1 keeps every 1.0 Port, kind, schema and description, and
+// adds file.write.
+#[test]
+fn port_contract_1_1_is_additive_over_1_0() {
+    assert_additive(
+        include_bytes!("../../tests/fixtures/ports-1.0.json"),
+        include_bytes!("../../tests/fixtures/ports-1.1.json"),
+        (0, 1),
+        1,
+        &[],
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R18 — 1.2 keeps every 1.1 Port, kind and schema and adds file.text;
+// only exhibit.read and file.read change their description, to point text reads at file.text,
+// and file.write's names the control characters it refuses.
+#[test]
+fn port_contract_1_2_is_additive_over_1_1() {
+    assert_additive(
+        include_bytes!("../../tests/fixtures/ports-1.1.json"),
+        include_bytes!("../../../ports.json"),
+        (1, 2),
+        1,
+        &["exhibit.read", "file.read", "file.write"],
+    );
+}
+
+// Verifies: TEAM.SYS.PKG-R18 — file.text reads a stored text file back as plain text in pages
+// that end on character boundaries, for the Person and a bound Agent.
+#[tokio::test]
+async fn file_text_reads_stored_text_back_in_pages() {
+    let mut session = start().await;
+    for actor in [person(), agent()] {
+        let page = format!(
+            "<!doctype html>\n<h1 class=\"title\">Hello \u{1F600}</h1>\n{}",
+            "<p>row</p>\n".repeat(2_000)
+        );
+        let written = session
+            .port("file.write", &actor, json!({"text":page}))
+            .await
+            .unwrap();
+        // A small file comes back whole, with no nextOffset.
+        let small = session
+            .port(
+                "file.write",
+                &actor,
+                json!({"text":"body { color: #333; }"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .port("file.text", &actor, json!({"sha256":small["sha256"]}))
+                .await
+                .unwrap(),
+            json!({"text":"body { color: #333; }","size":21})
+        );
+        // A larger file is read in default pages; joined, they are the file.
+        let mut text = String::new();
+        let mut offset = None;
+        let mut pages = 0;
+        loop {
+            let mut request = json!({"sha256":written["sha256"]});
+            if let Some(offset) = offset {
+                request["offset"] = json!(offset);
+            }
+            let answer = session.port("file.text", &actor, request).await.unwrap();
+            assert_eq!(answer["size"], page.len());
+            let chunk = answer["text"].as_str().unwrap();
+            assert!(chunk.len() <= TEXT_PAGE_BYTES);
+            assert!(answer.to_string().chars().count() <= 16_384);
+            text.push_str(chunk);
+            pages += 1;
+            match answer.get("nextOffset") {
+                Some(next) => offset = Some(next.as_u64().unwrap()),
+                None => break,
+            }
+        }
+        assert_eq!(text, page);
+        assert_eq!(pages, page.len().div_ceil(TEXT_PAGE_BYTES));
+        // A page that would cut the four-byte emoji ends before it instead.
+        let cut = page.find('\u{1F600}').unwrap() + 2;
+        let answer = session
+            .port(
+                "file.text",
+                &actor,
+                json!({"sha256":written["sha256"],"maxBytes":cut}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer["text"], page[..cut - 2]);
+        assert_eq!(answer["nextOffset"], cut - 2);
+        // The whole file in one page.
+        assert_eq!(
+            session
+                .port(
+                    "file.text",
+                    &actor,
+                    json!({"sha256":written["sha256"],"maxBytes":MAX_WRITE_BYTES})
+                )
+                .await
+                .unwrap(),
+            json!({"text":page,"size":page.len()})
+        );
+    }
+    session.harness.shutdown().await.unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R18 — file.text refuses binary content, unknown files, bad offsets and
+// page sizes, and another Installation's Person.
+#[tokio::test]
+async fn file_text_refuses_binary_unknown_and_strangers() {
+    let mut session = start().await;
+    let binary = session
+        .upload(&agent(), &[0x89, b'P', b'N', b'G', 0xff, 0xfe])
+        .await;
+    // Valid UTF-8, but a file of zeros is not text: JSON would write each byte as six.
+    let nul = session.upload(&agent(), &[0; 64]).await;
+    // An offset inside a character starts no text.
+    let accented = session.upload(&agent(), "é".as_bytes()).await;
+    let text = session
+        .port("file.write", &agent(), json!({"text":"abc"}))
+        .await
+        .unwrap()["sha256"]
+        .clone();
+    for (request, expected) in [
+        (json!({"sha256":binary}), "exhibits.not_text"),
+        (json!({"sha256":sha(b"never stored")}), "exhibits.not_found"),
+        (
+            json!({"sha256":text,"offset":4}),
+            "exhibits.invalid_request",
+        ),
+        (json!({"sha256":nul}), "exhibits.not_text"),
+        (json!({"sha256":accented,"offset":1}), "exhibits.not_text"),
+    ] {
+        assert_eq!(
+            code(session.port("file.text", &agent(), request).await),
+            expected
+        );
+    }
+    // Reading from the end answers empty text.
+    assert_eq!(
+        session
+            .port("file.text", &agent(), json!({"sha256":text,"offset":3}))
+            .await
+            .unwrap(),
+        json!({"text":"","size":3})
+    );
+    let stranger = json!({"kind":"person","identity":"9".repeat(64)});
+    assert_eq!(
+        code(
+            session
+                .port("file.text", &stranger, json!({"sha256":text}))
+                .await
+        ),
+        "exhibits.actor_unauthorized"
+    );
+    session.harness.shutdown().await.unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R18 — file.write stores the UTF-8 text content-addressed, as a
+// completed file.put would, for the Person and a bound Agent.
+#[tokio::test]
+async fn file_write_stores_text_as_an_uploaded_file() {
+    let mut session = start().await;
+    for (actor, id) in [(person(), "person-written"), (agent(), "agent-written")] {
+        let page = format!("<!doctype html><h1>{id} \u{1F600}</h1><link href=\"style.css\">");
+        let style = "body { color: #333; }\n";
+        let written = session
+            .port("file.write", &actor, json!({"text":page}))
+            .await
+            .unwrap();
+        assert_eq!(
+            written,
+            json!({"sha256":sha(page.as_bytes()),"size":page.len()})
+        );
+        // Idempotent: the same text again answers the same hash and stores nothing new.
+        assert_eq!(
+            session
+                .port("file.write", &actor, json!({"text":page}))
+                .await
+                .unwrap(),
+            written
+        );
+        let style_sha = session
+            .port("file.write", &actor, json!({"text":style}))
+            .await
+            .unwrap()["sha256"]
+            .clone();
+        // An empty file is a file too.
+        let empty = session
+            .port("file.write", &actor, json!({"text":""}))
+            .await
+            .unwrap();
+        assert_eq!(empty, json!({"sha256":sha(b""),"size":0}));
+        // A written file is stored completely, so files.missing leaves it out.
+        assert_eq!(
+            session
+                .port(
+                    "files.missing",
+                    &actor,
+                    json!({"sha256s":[written["sha256"], style_sha, empty["sha256"]]})
+                )
+                .await
+                .unwrap(),
+            json!({"missing":[]})
+        );
+        // A file written as text and one uploaded with file.put are the same stored content.
+        assert_eq!(session.upload(&actor, style.as_bytes()).await, style_sha);
+        let created = session
+            .port(
+                "draft.update",
+                &actor,
+                json!({"exhibitId":id,"title":"Written","entry":"index.html","expectedRevision":0,
+                    "files":[{"path":"index.html","sha256":written["sha256"]},{"path":"style.css","sha256":style_sha}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created, json!({"revision":1}));
+        let read = session
+            .port("exhibit.read", &actor, json!({"exhibitId":id}))
+            .await
+            .unwrap();
+        assert_eq!(
+            read["files"],
+            json!([
+                {"path":"index.html","sha256":written["sha256"],"size":page.len(),"mediaType":"text/html; charset=utf-8"},
+                {"path":"style.css","sha256":style_sha,"size":style.len(),"mediaType":"text/css; charset=utf-8"},
+            ])
+        );
+        let chunk = session
+            .port(
+                "file.read",
+                &actor,
+                json!({"sha256":written["sha256"],"chunkIndex":0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chunk["chunkCount"], 1);
+        assert_eq!(
+            STANDARD.decode(chunk["data"].as_str().unwrap()).unwrap(),
+            page.as_bytes()
+        );
+    }
+    // The largest text is accepted.
+    let largest = "x".repeat(MAX_WRITE_BYTES);
+    assert_eq!(
+        session
+            .port("file.write", &agent(), json!({"text":largest}))
+            .await
+            .unwrap()["size"],
+        MAX_WRITE_BYTES
+    );
+    session.harness.shutdown().await.unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R18 — text over the bound is refused with exhibits.too_large and
+// nothing is stored; control characters are refused with exhibits.not_text; another Installation's Person is refused as for file.put.
+#[tokio::test]
+async fn file_write_refuses_oversized_text_and_strangers() {
+    let mut session = start().await;
+    // 24577 four-byte characters pass the schema's character bound but not the byte bound.
+    let wide = "\u{1F600}".repeat(MAX_WRITE_BYTES / 4 + 1);
+    let error = session
+        .port("file.write", &agent(), json!({"text":wide}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "exhibits.too_large");
+    assert_eq!(error.details()["limit"], "text");
+    // Control characters other than tab, line feed, form feed and carriage return are not
+    // text; those four are.
+    for (text, expected) in [
+        ("a\u{0}b", Some("exhibits.not_text")),
+        ("\u{1b}[0m", Some("exhibits.not_text")),
+        ("a\tb\r\n\u{c}", None),
+    ] {
+        let answer = session
+            .port("file.write", &agent(), json!({"text":text}))
+            .await;
+        assert_eq!(
+            answer.err().map(|error| error.code().to_owned()).as_deref(),
+            expected,
+            "{text:?}"
+        );
+    }
+    assert_eq!(
+        session
+            .port(
+                "files.missing",
+                &agent(),
+                json!({"sha256s":[sha(wide.as_bytes())]})
+            )
+            .await
+            .unwrap(),
+        json!({"missing":[{"sha256":sha(wide.as_bytes()),"chunks":"all"}]})
+    );
+    let stranger = json!({"kind":"person","identity":"9".repeat(64)});
+    assert_eq!(
+        code(
+            session
+                .port("file.write", &stranger, json!({"text":"x"}))
+                .await
+        ),
+        "exhibits.actor_unauthorized"
+    );
     session.harness.shutdown().await.unwrap();
 }

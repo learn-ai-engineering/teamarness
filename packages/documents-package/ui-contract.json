@@ -530,6 +530,23 @@
           }
         }
       ]
+    },
+    "place": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "collectionId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "documentId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "scrollTop": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000000
+        }
+      }
     }
   },
   "requests": {
@@ -886,6 +903,24 @@
       },
       "response": {
         "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.place.get": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "response": {
+        "$ref": "#/$defs/place"
+      }
+    },
+    "documents.place.set": {
+      "request": {
+        "$ref": "#/$defs/place"
+      },
+      "response": {
+        "type": "object",
+        "additionalProperties": false
       }
     }
   },

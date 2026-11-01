@@ -67,7 +67,7 @@ fn accepts_bundled_package_manifests() {
         );
         seen += 1;
     }
-    assert_eq!(seen, 6, "expected six bundled Package manifests");
+    assert_eq!(seen, 7, "expected seven bundled Package manifests");
 }
 
 /// The schema's `maxLength` counts code points, so the manifest rule does too.

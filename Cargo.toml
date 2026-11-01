@@ -12,6 +12,7 @@ members = [
     "packages/repo-aware/backend",
     "packages/documents-package/backend",
     "packages/exhibits-package/backend",
+    "packages/backlog-package/backend",
     "tests/system",
 ]
 resolver = "3"

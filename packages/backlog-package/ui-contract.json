@@ -1,0 +1,800 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "recordId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "principalId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "identity": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{82}$"
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "time": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 253402300799999
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^\\S(.*\\S)?$"
+    },
+    "body": {
+      "type": "string",
+      "maxLength": 65536
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "not_ready",
+        "ready",
+        "in_progress",
+        "done"
+      ]
+    },
+    "priority": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "availability": {
+      "type": "string",
+      "enum": [
+        "waiting_for_history_access",
+        "offline",
+        "catching_up",
+        "current"
+      ]
+    },
+    "epic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "epicId",
+        "title",
+        "archived",
+        "createdOrder"
+      ],
+      "properties": {
+        "epicId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "archived": {
+          "type": "boolean"
+        },
+        "createdOrder": {
+          "$ref": "#/$defs/version"
+        }
+      }
+    },
+    "ticketSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ticketId",
+        "epicId",
+        "title",
+        "status",
+        "priority",
+        "assignee",
+        "archived",
+        "version",
+        "createdOrder"
+      ],
+      "properties": {
+        "ticketId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "epicId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "priority": {
+          "$ref": "#/$defs/priority"
+        },
+        "assignee": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/principalId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "archived": {
+          "type": "boolean"
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "createdOrder": {
+          "$ref": "#/$defs/version"
+        }
+      }
+    },
+    "ticket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ticketId",
+        "epicId",
+        "title",
+        "body",
+        "status",
+        "priority",
+        "assignee",
+        "archived",
+        "version",
+        "creator",
+        "createdAt",
+        "lastEditor",
+        "lastAt"
+      ],
+      "properties": {
+        "ticketId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "epicId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "body": {
+          "$ref": "#/$defs/body"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "priority": {
+          "$ref": "#/$defs/priority"
+        },
+        "assignee": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/principalId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "archived": {
+          "type": "boolean"
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "creator": {
+          "$ref": "#/$defs/identity"
+        },
+        "createdAt": {
+          "$ref": "#/$defs/time"
+        },
+        "lastEditor": {
+          "$ref": "#/$defs/identity"
+        },
+        "lastAt": {
+          "$ref": "#/$defs/time"
+        }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "availability",
+        "warnings",
+        "epics",
+        "tickets"
+      ],
+      "properties": {
+        "availability": {
+          "$ref": "#/$defs/availability"
+        },
+        "warnings": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "epics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/epic"
+          }
+        },
+        "tickets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ticketSummary"
+          }
+        }
+      }
+    },
+    "principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "principalId",
+        "identity",
+        "kind",
+        "name",
+        "fingerprint"
+      ],
+      "properties": {
+        "principalId": {
+          "$ref": "#/$defs/principalId"
+        },
+        "identity": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "person",
+            "agent"
+          ]
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fingerprint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      }
+    },
+    "names": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "available",
+        "cursor",
+        "principals"
+      ],
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "cursor": {
+          "$ref": "#/$defs/revision"
+        },
+        "principals": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/principal"
+          }
+        },
+        "part": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15
+        },
+        "parts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        }
+      }
+    },
+    "epicRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "epicId"
+      ],
+      "properties": {
+        "epicId": {
+          "$ref": "#/$defs/recordId"
+        }
+      }
+    },
+    "ticketRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ticketId"
+      ],
+      "properties": {
+        "ticketId": {
+          "$ref": "#/$defs/recordId"
+        }
+      }
+    },
+    "ticketBaseRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ticketId",
+        "baseVersion"
+      ],
+      "properties": {
+        "ticketId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "baseVersion": {
+          "$ref": "#/$defs/version"
+        }
+      }
+    },
+    "versionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version"
+      ],
+      "properties": {
+        "version": {
+          "$ref": "#/$defs/version"
+        }
+      }
+    },
+    "draftKey": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{64}|new:[0-9a-f]{64})$"
+    },
+    "draft": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseVersion"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "body": {
+          "$ref": "#/$defs/body"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "priority": {
+          "$ref": "#/$defs/priority"
+        },
+        "assignee": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/principalId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "baseVersion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/version"
+            },
+            {
+              "const": ""
+            }
+          ]
+        }
+      }
+    },
+    "rememberedState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "filters",
+        "showArchived",
+        "expandedEpicIds",
+        "drafts"
+      ],
+      "properties": {
+        "selectedTicketId": {
+          "$ref": "#/$defs/recordId"
+        },
+        "editing": {
+          "type": "boolean"
+        },
+        "filters": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "priority",
+            "status"
+          ],
+          "properties": {
+            "priority": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/priority"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/status"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        "showArchived": {
+          "type": "boolean"
+        },
+        "expandedEpicIds": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/recordId"
+          }
+        },
+        "drafts": {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {
+            "$ref": "#/$defs/draftKey"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/draft"
+          }
+        }
+      }
+    },
+    "empty": {
+      "type": "object",
+      "additionalProperties": false
+    }
+  },
+  "requests": {
+    "backlog.epic.create": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "title"
+        ],
+        "properties": {
+          "title": {
+            "$ref": "#/$defs/title"
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "epicId"
+        ],
+        "properties": {
+          "epicId": {
+            "$ref": "#/$defs/recordId"
+          }
+        }
+      }
+    },
+    "backlog.epic.rename": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "epicId",
+          "title"
+        ],
+        "properties": {
+          "epicId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "title": {
+            "$ref": "#/$defs/title"
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/empty"
+      }
+    },
+    "backlog.epic.archive": {
+      "request": {
+        "$ref": "#/$defs/epicRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/empty"
+      }
+    },
+    "backlog.epic.restore": {
+      "request": {
+        "$ref": "#/$defs/epicRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/empty"
+      }
+    },
+    "backlog.ticket.create": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "epicId",
+          "title"
+        ],
+        "properties": {
+          "epicId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "title": {
+            "$ref": "#/$defs/title"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "status": {
+            "$ref": "#/$defs/status"
+          },
+          "priority": {
+            "$ref": "#/$defs/priority"
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ticketId",
+          "version"
+        ],
+        "properties": {
+          "ticketId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "version": {
+            "$ref": "#/$defs/version"
+          }
+        }
+      }
+    },
+    "backlog.ticket.update": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ticketId",
+          "baseVersion"
+        ],
+        "minProperties": 3,
+        "properties": {
+          "ticketId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "baseVersion": {
+            "$ref": "#/$defs/version"
+          },
+          "title": {
+            "$ref": "#/$defs/title"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "status": {
+            "$ref": "#/$defs/status"
+          },
+          "priority": {
+            "$ref": "#/$defs/priority"
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/versionResult"
+      }
+    },
+    "backlog.ticket.assign": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ticketId",
+          "baseVersion",
+          "assignee"
+        ],
+        "properties": {
+          "ticketId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "baseVersion": {
+            "$ref": "#/$defs/version"
+          },
+          "assignee": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/principalId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/versionResult"
+      }
+    },
+    "backlog.ticket.move": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ticketId",
+          "baseVersion",
+          "epicId"
+        ],
+        "properties": {
+          "ticketId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "baseVersion": {
+            "$ref": "#/$defs/version"
+          },
+          "epicId": {
+            "$ref": "#/$defs/recordId"
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/versionResult"
+      }
+    },
+    "backlog.ticket.archive": {
+      "request": {
+        "$ref": "#/$defs/ticketBaseRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/versionResult"
+      }
+    },
+    "backlog.ticket.restore": {
+      "request": {
+        "$ref": "#/$defs/ticketBaseRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/versionResult"
+      }
+    },
+    "backlog.ticket.get": {
+      "request": {
+        "$ref": "#/$defs/ticketRequest"
+      },
+      "response": {
+        "$ref": "#/$defs/ticket"
+      }
+    },
+    "backlog.draft.get": {
+      "request": {
+        "$ref": "#/$defs/empty"
+      },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/rememberedState"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "backlog.draft.put": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "$ref": "#/$defs/rememberedState"
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/empty"
+      }
+    },
+    "backlog.draft.clear": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key"
+        ],
+        "properties": {
+          "key": {
+            "$ref": "#/$defs/draftKey"
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/empty"
+      }
+    }
+  },
+  "subscriptions": {
+    "backlog.changes": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "event": {
+        "$ref": "#/$defs/snapshot"
+      }
+    },
+    "backlog.names": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "event": {
+        "$ref": "#/$defs/names"
+      }
+    }
+  }
+}

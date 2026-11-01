@@ -33,6 +33,8 @@ export type Channel = {
 
 export type ChannelId = string;
 
+export type DraftText = string;
+
 export type Epoch = string;
 
 export type Message = {
@@ -120,6 +122,15 @@ export type ConversationsContract = {
         readonly "channelId": ChannelId;
         readonly "ids": readonly string[];
       }; readonly response: Resolved };
+    readonly "conversations.draft.get": { readonly request: {
+        readonly "channelId": ChannelId;
+      }; readonly response: {
+        readonly "text": DraftText;
+      } };
+    readonly "conversations.draft.set": { readonly request: {
+        readonly "channelId": ChannelId;
+        readonly "text": DraftText;
+      }; readonly response: Record<string, never> };
     readonly "conversations.message.post": { readonly request: {
         readonly "channelId": ChannelId;
         readonly "markdown": string;

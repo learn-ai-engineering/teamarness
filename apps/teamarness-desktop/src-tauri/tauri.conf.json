@@ -44,7 +44,8 @@
       "../../../target/teamarness-packages/dev.teamarness.conversations/": "packages/dev.teamarness.conversations/",
       "../../../target/teamarness-packages/dev.teamarness.repo-aware/": "packages/dev.teamarness.repo-aware/",
       "../../../target/teamarness-packages/dev.teamarness.documents/": "packages/dev.teamarness.documents/",
-      "../../../target/teamarness-packages/dev.teamarness.exhibits/": "packages/dev.teamarness.exhibits/"
+      "../../../target/teamarness-packages/dev.teamarness.exhibits/": "packages/dev.teamarness.exhibits/",
+      "../../../target/teamarness-packages/dev.teamarness.backlog/": "packages/dev.teamarness.backlog/"
     },
     "externalBin": [
       "../../../target/teamarness-packages/dev.teamarness.reference/backend/teamarness-reference-package",
@@ -52,7 +53,8 @@
       "../../../target/teamarness-packages/dev.teamarness.conversations/backend/teamarness-conversations-package",
       "../../../target/teamarness-packages/dev.teamarness.repo-aware/backend/teamarness-repo-aware-package",
       "../../../target/teamarness-packages/dev.teamarness.documents/backend/teamarness-documents-package",
-      "../../../target/teamarness-packages/dev.teamarness.exhibits/backend/teamarness-exhibits-package"
+      "../../../target/teamarness-packages/dev.teamarness.exhibits/backend/teamarness-exhibits-package",
+      "../../../target/teamarness-packages/dev.teamarness.backlog/backend/teamarness-backlog-package"
     ]
   }
 }

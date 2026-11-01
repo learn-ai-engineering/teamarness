@@ -70,6 +70,59 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### Backlog Package (complete, verified locally)
+
+Implemented on 2026-11-01 on branch `don-smith/add_backlog_package`, workstream `backlog-package`, and fast-forwarded into local `main`. The new bundled Team Package `dev.teamarness.backlog` holds Epics and Tickets for the Workspace (`TEAM.SYS.BACKLOG-R01` to `R10`).
+
+- ADR 0039 (accepted 2026-11-01) settles Ticket field updates. A Ticket changes field by field, and each field keeps the change that is last in log order. A Ticket's version is the highest applied OrderKey. A save on an older version than this Installation has seen is refused with `backlog.stale_version`, and the refusal returns the current Ticket. Saves on Installations that had not seen each other are not refused; they converge per field.
+- Records go on the immutable record log with a Package-owned codec. Titles, bodies and drafts are never stored as plaintext in SQLite (ADR 0027).
+- A Person creates, renames, archives and restores Epics, and creates, moves, archives and restores Tickets. Nothing is deleted. Show archived reveals archived items.
+- The left pane shows collapsible Epics in alphabetical order. Tickets are ordered by priority, then status, then creation time. A Priority filter and a Status filter combine, and each clears in one action. Every dropdown is a Package-local WAI-ARIA listbox, not a native `<select>`.
+- The detail pane shows the title, the rendered Markdown body (tables and read-only task lists), status, priority, assignee, and who created and last changed the Ticket. Edit shows the raw Markdown; Save sends only the changed fields. The assignee is a current Workspace Person or nobody. A former assignee shows as **Former member** with a short identity.
+- Drafts, the selected Ticket, edit mode, filters, Show archived and Epic expansion survive a Package switch on the same Installation. They are held in Backend memory only, so they do not survive an application restart.
+- Port Contract `dev.teamarness.backlog` 1.0 offers `runtime.guide`, `ticket.list`, `ticket.get`, `ticket.create`, `ticket.update` and the `backlog.changed` event. A bound Agent creates Tickets in an existing, open Epic and changes their title, body, status and priority, signed with its own key. It cannot create Epics, assign, move, archive or restore.
+
+Automated evidence: Backend unit tests, Backlog UI tests, and the system tests `backlog_two_installation_flow` (replication, offline catch-up, per-field convergence) and `backlog_ports_proof` (guide, list, get, create, update, stale refusal, Agent attribution, live UI update).
+
+Manual checks M1–M7 passed on 2026-11-01 with a real model. The first run found that edit fields lost focus on every keystroke, and a corrective commit fixed it. M5 part B (Former member) could not run, because no Member can be removed yet. Verify passed on 2026-11-01 with no P0 or P1 findings.
+
+**Outcome:** A Workspace plans its work as Epics and Tickets, and its Agents read and update Tickets beside the Members.
+
+**Follow-ups:** conflict detection across Installations (deferred by ADR 0039); the items in DELTA-021, including the untested Former member check, the snapshot limit of about 500 Tickets, and Port 1.0 text fixes before release.
+
+### Better Doc Agent (complete, verified locally)
+
+Implemented on 2026-11-01 on branch `don-smith/better_doc_agent` in the Host and on `main` in the standalone Agent Package, workstream `better-doc-agent`. A Person asks a Workspace Agent for changes from inside a Document by @mentioning it in a Comment.
+
+- Documents Port Contract 1.3 (additive) adds Comment Ports. `comments.changed` is a live event without a payload. `comment.changes` is a Workspace-wide Comment feed with an epoch and a cursor. `comment.thread` returns a Comment's thread together with its Document. `comment.add` adds a Comment as the Host-derived actor, so an Agent's Comment is signed with the Agent's key (`TEAM.SYS.DOCS-R07`, `R12`).
+- The Agent harness follows Comment mentions with the same rules as Conversations mentions. Only a Person's Comment that mentions the Agent triggers it, and each trigger is acted on once. The Agent posts one reply under the triggering Comment and never resolves it. The model reads and revises the Document with its ordinary Documents tools. `comment.add` is withheld from the model.
+- Documents highlights only the open Document, and Conversations highlights the selected Channel, both in the Shell's nav style. Documents restores the open Document and its scroll position after a Package switch. Conversations keeps a draft for each Channel, and Agent chat keeps its draft. This state is held in each Package Backend's memory while the app runs.
+- Agent chat renders Markdown with a copy of the Conversations renderer. Both copies now render tables.
+
+Manual checks AC1–AC14 passed with a real model on 2026-11-01. Verify passed on 2026-11-01 with no P0 or P1 findings. The production-relay test `three_profiles_converge_after_late_admission` fails in this environment with and without the change. Accepted tech debt is recorded in DELTA-020.
+
+**Outcome:** A Person @mentions an Agent in a Document Comment. The Agent revises the Document and replies in the thread, even while another Package is selected.
+
+**Follow-ups:** Agent-to-Agent mentions, with skill-guided loop limits; the items in DELTA-020.
+
+### Agent Doc Exhibit (complete, verified locally)
+
+Started on 2026-10-31 on branch `don-smith/agent_doc_exhibit` in the Host and the standalone Agent Package, workstream `agent-doc-exhibit`. A Steward's Agent works with Documents and Exhibits in chat, and the Agent's Configuration moves to its Package page.
+
+- ADR 0038 (accepted 2026-10-31) amends ADR 0033 §1. Documents Port Contract 1.2 adds `document.create`, which a bound Agent may call, and a `runtime.guide`, so Documents is an agent-facing contract under ADR 0035. A create is title-only and returns the version for a first revise. An archived Collection is refused with `documents.collection_archived`.
+- The Agent creates and revises Documents as itself, including Documents a Person created.
+- The Agent stops withholding the Exhibits `file.put` and `file.read` Ports, and publishes small multi-page Exhibits. Before it sends a tool call, it refuses one whose arguments would exceed the turn's remaining message budget, with `agent.tool_arguments_too_large`.
+- The Agent's main view shows Chat only, and its Configuration is the Package's settings view.
+- Exhibits Port Contract 1.1 (additive) adds `file.write`: a model sends a whole text file as plain `text` (at most 98,304 bytes), and the Provider computes the SHA-256 and stores it. The guide tells models never to compute hashes or base64 themselves; `file.put` stays for binary files.
+- Exhibits Port Contract 1.2 (additive) adds `file.text`, the read-back pair of `file.write`: it returns a stored text file as plain text in pages of 8,192 bytes by default, so a model can revise an Exhibit it did not just write. `file.read` stays for binary files. Text holds no control characters other than tab and line breaks (`exhibits.not_text`), which keeps every write and page inside the Port payload bound.
+- The Agent's turn allows 32 model calls, 64 tool calls and 20 minutes; each model call may take 5 minutes (`agent.endpoint_timed_out`). A tool result that would cross the turn's remaining message budget reaches the model as `agent.tool_result_too_large`, so no tool result can end a turn on its message bound. The Agent declares no consumed Ports: its Conversations replies use dynamic Agent access like every model tool.
+
+Integration evidence, 2026-10-31: three external cases in `tests/system/tests/agent_reply_flow.rs` run the built Agent against real Documents and Exhibits, with only the model scripted. In the first case, the bound Agent enables Documents, reads the guide, creates and revises a Document, and revises a Document that a Person created. Core shows the Agent's key as the author of the create and both edits. In the second case, the Agent writes two linked pages with `file.write`, creates a Draft, finds it by title, makes revision 2 and reads a page back as text with `file.text`. In the third case, an oversized `file.put` is refused with `agent.tool_arguments_too_large` and nothing is stored. The next model request carries the elided placeholder, and the turn ends with its reply. Manual checks AC1–AC7 passed with a real model (2026-10-31 to 2026-11-01). Verify passed on 2026-11-01: attempt 1 found one AC7 defect, a turn that could fail after a stored write, and attempt 2 confirmed it fixed. Accepted tech debt is recorded in DELTA-019.
+
+**Outcome:** In chat, an Agent creates and revises a Document and publishes an Exhibit that the Steward opens by name, all attributed to the Agent.
+
+**Follow-ups:** a shared, human-curated Exhibit library catalog; larger Exhibits and an archive format; per-Agent turn bounds; staging the Agent harness for the Host's integration tests; and sizing a Package's settings view to its content so the Package page scrolls as one, as About does.
+
 ### Packagement (complete, verified locally)
 
 Implemented on 2026-10-25 on branch `don-smith/packagement`, workstream `packagement`. ADR 0036 (accepted 2026-10-25) splits Package Admission into a Team tier, fixed at Host open, and a Personal tier that changes while the Host runs. A Team Package never routes to a Personal Provider.
@@ -236,7 +289,7 @@ The record format changed incompatibly, so development data directories that hol
 
 ### Stable application releases and updates (implemented locally; qualification pending)
 
-Started on 2026-10-24 in the `auto-update` workstream on branch `don-smith/auto_update`. The workstream implements same-public-repository stable release tooling, exact Rust 1.99.1/Node 24.20.0 native Apple Silicon qualification, signed-version bounded acquisition, main-Shell consent, and one stop-first terminal lifecycle (ADR 0038). Publication qualifies complete drafts and serializes strictly increasing stable versions; public releases are immutable by workflow policy. Local checks/builds do not prove hosted permission boundaries or installed continuity.
+Started on 2026-10-24 in the `auto-update` workstream on branch `don-smith/auto_update`. The workstream implements same-public-repository stable release tooling, exact Rust 1.99.1/Node 24.20.0 native Apple Silicon qualification, signed-version bounded acquisition, main-Shell consent, and one stop-first terminal lifecycle (ADR 0040). Publication qualifies complete drafts and serializes strictly increasing stable versions; public releases are immutable by workflow policy. Local checks/builds do not prove hosted permission boundaries or installed continuity.
 
 **Pending, owners Don/maintainer:** public-disclosure/visibility and protected main/tags/environment setup, production-key custody, actual hosted checks/publication/anonymous downloads, final packaged-app/Ready-state WKWebView isolation, ordinary Quit/Backend exits, Gatekeeper/copied writable launch and real installed A→B identity/data/argument/process continuity. These block passing Verify and general distribution. Earlier manual gates and separate Core test-reliability risks remain visible in the workstream. See [releasing runbook](../docs/releasing.md).
 
@@ -323,11 +376,11 @@ Start a separate Scope if sustained name-delivery or membership churn becomes an
 
 ### Documents Agent tools and Comments (follow-up)
 
-Identified on 2026-10-25 when rendered Document editing closed. Documents Port Contract 1.1 already lets a bound Workspace Agent list, read, observe and revise Documents (ADR 0033). The Agent Package now supports generic tools, but Documents has no `runtime.guide` and is not yet eligible for Agent discovery. The generic guidance direction is delivered by [ADR 0035](.decisions/0035-agent-controlled-port-discovery.md) and the completed alignment workstream above. [TEAM-DQ10](open-questions.md) retains these Documents follow-ups:
+Identified on 2026-10-25 when rendered Document editing closed. Documents Port Contract 1.1 already lets a bound Workspace Agent list, read, observe and revise Documents (ADR 0033). The Agent Package now supports generic tools. Documents 1.2 adds `runtime.guide` and `document.create` (ADR 0038), so it is eligible for Agent discovery; see **Agent Doc Exhibit** under **Current work**. The generic guidance direction is delivered by [ADR 0035](.decisions/0035-agent-controlled-port-discovery.md) and the completed alignment workstream above. [TEAM-DQ10](open-questions.md) retains these Documents follow-ups:
 
 - Documents guidance and generic Agent tools can follow the ordinary `runtime.guide` convention; no Documents-specific Host adapter is planned.
 - Agent document tools in the standalone Agent Package, built on that guidance. A tool reads before every revise and revises against the version it read (R12).
-- Agent mentions and Comment Ports for Documents. The Documents Port Contract has no Comment operations today.
+- Agent mentions and Comment Ports for Documents: delivered by Documents 1.3 (see **Better Doc Agent** under **Current work**).
 - A developer check once tools exist: an Agent revises a Document that a Member has open, and the change appears live.
 
 ### Documents editor maintenance (unscheduled)
