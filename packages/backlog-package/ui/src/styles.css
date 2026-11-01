@@ -42,7 +42,8 @@ button, input, textarea { font: inherit; }
 .ticket-title { font-size: .92rem; }
 .ticket-meta { flex: none; color: var(--teamarness-color-text-muted); font-size: .75rem; }
 .ticket-meta.priority-high { color: var(--teamarness-color-danger, var(--teamarness-color-text)); }
-.ticket-title[aria-current="true"] { background: color-mix(in srgb, var(--teamarness-color-accent) 14%, var(--teamarness-color-panel)); box-shadow: inset 3px 0 var(--teamarness-color-accent); font-weight: 700; }
+/* The selected Ticket: a copy of the Shell navigation's selected item (`.package-group button`). */
+.ticket-title:hover, .ticket-title[aria-current="true"] { color: var(--teamarness-color-accent); background: var(--teamarness-color-background); }
 .is-archived .epic-title, .is-archived .ticket-title-text { color: var(--teamarness-color-text-muted); text-decoration: line-through; }
 .ticket-list { padding: 0 0 0 1.4rem; }
 .backlog-empty { padding: .5rem; color: var(--teamarness-color-text-muted); font-size: .85rem; }
