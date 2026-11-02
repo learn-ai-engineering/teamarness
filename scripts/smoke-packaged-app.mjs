@@ -290,9 +290,9 @@ async function probeLaunch(dataDirectory) {
     `), "UI isolation probe navigation");
     if (updateProbe) {
       await waitForAccessible(accessibilityScript(childPid, `
-        set restartButton to my namedDescendant(appUi, "Restart now", "AXButton")
-        return name of restartButton
-      `), "instrumented Ready controls");
+        set workspaceSwitcher to my namedDescendant(appUi, "Workspace switcher", "AXGroup")
+        return name of my namedDescendantStartingWith(workspaceSwitcher, "Update ", "AXButton")
+      `), "instrumented Ready indicator");
       assert.equal(diagnostics.updateProbe.ready, true, "requires the disposable verified Ready probe build, not default Disabled");
       assert.ok(diagnostics.updateProbe.handlers > 0, "main Shell must enter the native status handler");
     }
@@ -328,6 +328,13 @@ async function probeLaunch(dataDirectory) {
       assert.equal(diagnostics.updateProbe.handlers, handlerEntriesBeforeFrame, "Package update attempts reached native command handling");
       assert.equal(diagnostics.updateProbe.installBlocked, 0, "frame entered terminal installation");
       assert.equal(diagnostics.updateProbe.restartBlocked, 0, "frame entered terminal restart");
+      await runAppleScript(accessibilityScript(childPid, `
+        set workspaceSwitcher to my namedDescendant(appUi, "Workspace switcher", "AXGroup")
+        click my namedDescendantStartingWith(workspaceSwitcher, "Update ", "AXButton")
+      `), "main Shell opens update popover");
+      await waitForAccessible(accessibilityScript(childPid, `
+        return name of my namedDescendant(appUi, "Restart now", "AXButton")
+      `), "main Shell explicit restart consent");
       await runAppleScript(accessibilityScript(childPid, `
         click my namedDescendant(appUi, "Restart now", "AXButton")
       `), "main Shell positive restart control");

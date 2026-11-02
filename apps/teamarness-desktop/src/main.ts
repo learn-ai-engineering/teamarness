@@ -27,8 +27,14 @@ const packageShell = createPackageShell(
   frame.packageMount,
 );
 
+const updateView = new BrowserApplicationUpdateView(
+  document.getElementById("application-update-notice")!,
+  document.getElementById("application-update-terminal")!,
+  (blocked) => { shell.setApplicationUpdating(blocked); document.getElementById("app")!.hidden = blocked; },
+);
 const shell = new Shell(frame, {
   packageShell,
+  mountApplicationUpdates: (root) => { updateView.mountFooter(root); },
   packageManagement: createTauriPackageManagementBridge(),
   theme,
   packageVisibility: createInstallationPackageVisibility(),
@@ -57,12 +63,7 @@ void packageShell.startSnapshotUpdates({
 void controller.load();
 window.addEventListener("beforeunload", () => controller.dispose(), { once: true });
 
-const updateView = new BrowserApplicationUpdateView(
-  document.getElementById("application-update-notice")!,
-  document.getElementById("application-update-terminal")!,
-  (blocked) => { shell.setApplicationUpdating(blocked); document.getElementById("app")!.hidden = blocked; },
-);
 const updates = new ApplicationUpdateController(applicationUpdateBridge, (view) => { updateView.render(view, updates); });
 void updates.attach();
 window.addEventListener("pageshow", () => { void updates.attach(); });
-window.addEventListener("beforeunload", () => { updates.detach(); }, { once: true });
+window.addEventListener("beforeunload", () => { updates.detach(); updateView.dispose(); }, { once: true });

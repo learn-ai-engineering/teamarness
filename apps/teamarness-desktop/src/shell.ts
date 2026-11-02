@@ -73,6 +73,8 @@ type ShellOptions = Readonly<{
   packageVisibility: InstallationPackageVisibility;
   workspaceActions: WorkspaceActions;
   onRouteChange?: (route: ShellRoute) => void;
+  /** Reattaches the application-owned version/update controls after a rail redraw. */
+  mountApplicationUpdates?: (root: HTMLElement) => void;
   /** Copies text for the person; defaults to the clipboard. */
   copy?: (value: string) => Promise<void>;
   /** The timer that hides success messages; defaults to the browser's. */
@@ -306,7 +308,8 @@ export class Shell {
     this.shellFrame.workspaceRail.innerHTML = `<div class="workspace-rail__brand" aria-label="Teamarness">T</div>
       <ul class="workspace-switcher">${workspaces}</ul>
       <button class="workspace-add" id="choose-workspace" type="button" aria-label="Add or join a Workspace"${addCurrent}>+</button>
-      <div class="theme-switcher" role="group" aria-label="Theme">${THEME_OPTIONS.map((option) => themeButton(option, preference)).join("")}</div>`;
+      <div class="theme-switcher" role="group" aria-label="Theme">${THEME_OPTIONS.map((option) => themeButton(option, preference)).join("")}</div>
+      <div class="application-update-footer" data-application-update-footer></div>`;
     if (!hasQueries(this.shellFrame.workspaceRail)) return;
     this.shellFrame.workspaceRail.querySelectorAll<HTMLButtonElement>("[data-workspace-index]").forEach((button) => {
       button.addEventListener("click", () => {
@@ -327,6 +330,8 @@ export class Shell {
         this.shellFrame.workspaceRail.querySelector<HTMLButtonElement>(`[data-theme-preference="${value}"]`)?.focus();
       });
     });
+    const updates = this.shellFrame.workspaceRail.querySelector<HTMLElement>("[data-application-update-footer]");
+    if (updates) this.options.mountApplicationUpdates?.(updates);
   }
 
   private renderContextualNavigation(): void {

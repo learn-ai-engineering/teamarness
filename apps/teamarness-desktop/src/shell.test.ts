@@ -176,10 +176,12 @@ class NavRegion extends Region {
 }
 
 class ThemeRailRegion extends Region {
+  public readonly updateFooter = new Region();
   public readonly dark = new TestControl();
   public focusedSelector: string | null = null;
 
   public querySelector(selector: string): (TestControl & { focus(): void }) | null {
+    if (selector === "[data-application-update-footer]") return this.updateFooter as unknown as TestControl & { focus(): void };
     if (!selector.startsWith("[data-theme-preference=")) return null;
     return Object.assign(new TestControl(), { focus: () => { this.focusedSelector = selector; } });
   }
@@ -252,6 +254,7 @@ function harness(
   agentActions: Readonly<{ addAgent?: (id: string, name: string) => Promise<void>; removeAgent?: (id: string, agentId: string) => Promise<void>; renameAgent?: (id: string, agentId: string, name: string) => Promise<void> }> = {},
   packageVisibility: InstallationPackageVisibility = createInstallationPackageVisibility({ storage: null }),
   packageManagement: PackageManagementBridge = unusedPackageManagement(),
+  mountApplicationUpdates?: (root: HTMLElement) => void,
 ): {
   shell: Shell;
   frame: ShellFrame;
@@ -312,6 +315,7 @@ function harness(
       retry: async () => { calls.push("retry"); },
     },
     onRouteChange: (route) => { routes.push(route); },
+    mountApplicationUpdates,
     timers,
   });
   return { shell, frame, calls, routes, timers };
@@ -785,6 +789,22 @@ describe("Installation Package visibility", () => {
     screen.toggle.click();
     expect(test.frame.contextualNavigation.innerHTML).toContain("<span>One</span>");
   });
+});
+
+it("mounts application controls below themes and reattaches them after a rail redraw", async () => {
+  const rail = new ThemeRailRegion();
+  const mount = vi.fn();
+  const test = harness(undefined, {}, rail as unknown as HTMLElement, undefined, {}, undefined, undefined, mount);
+  await test.shell.updateWorkspace(model());
+  expect(rail.innerHTML.indexOf("data-application-update-footer")).toBeGreaterThan(rail.innerHTML.indexOf('class="theme-switcher"'));
+  expect(mount).toHaveBeenLastCalledWith(rail.updateFooter);
+  const count = mount.mock.calls.length;
+  rail.dark.click();
+  expect(mount).toHaveBeenCalledTimes(count + 1);
+  test.shell.setApplicationUpdating(true);
+  await test.shell.updateWorkspace(model());
+  expect(mount).toHaveBeenCalledTimes(count + 1);
+  expect(rail.hidden).toBe(true);
 });
 
 // Verifies: TEAM.SYS.SHELL-R07
