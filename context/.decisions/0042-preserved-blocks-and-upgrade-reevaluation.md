@@ -18,7 +18,7 @@ A new schema node has a cost. An Installation on an older build reads a tree tha
 
 **Import and export.** The backend recognises the three constructs on every import path. The writer emits the source as raw text and never escapes it, so the export is byte-stable. The parser enables the table and front matter extensions, and the writer does not, so nothing else in the export changes.
 
-**A table's resolved links.** A table keeps its lines, so a cell's `[x][r]` cannot hold a definition's target, and the definition does not survive import. Import therefore adds one paragraph after the table that holds each resolved link as `[x](target)`. The Document gains text the author did not write, and no target is lost. The contract records this as a normalisation.
+**A table's resolved links.** A table keeps its lines, so a cell's `[x][r]` cannot hold a definition's target, and the definition does not survive import. Import therefore adds one paragraph after the table that holds each resolved link as `[x](target)`. The Document gains text the author did not write. The paragraph holds only what resolved, so the limits below can still lose a target. The contract records this as a normalisation.
 
 **The fallback rule.** A construct becomes a Preserved Block only when its source is sound: it re-imports as the same block in each place it can move to. Otherwise it imports as literal text, as it did before this decision, and content is never lost. Export applies the same rule to a stored source, because a character-level merge of two valid sources can leave one that is no longer a table. Such a source is not a schema violation.
 
@@ -52,6 +52,7 @@ Opening cannot run inside the transaction, because it is an asynchronous capabil
 - **Concurrent inserts above front matter can pause a Document.** If two Installations add front matter concurrently, or one adds it while another inserts a first block, the converged tree is schema-invalid on every Installation. Re-evaluation does not cure this, because the tree still fails. A local merge against a stale base is refused before it appends, so this needs a real concurrent race. The editor must also refuse a local step that puts a block above front matter.
 - **Task lists, images, inline HTML and a footnote with no link definition stay literal text.** They belong to later workstreams. An image's title is dropped. A definition that parses as a link definition, which includes a footnote such as `[^1]: note`, resolves into the link that uses it, and one that no link uses is dropped, as before this decision.
 - **A table's cell and its target are apart.** Outside the app a cell still reads `[x][r]`, with its target in the next paragraph.
+- **Import can lose a link target, and nothing signals it.** comrak's reference budget can leave a reference unresolved, and a label whose first use does not fit loses its target. A destination with a space loses its target, as it did before this decision. A reference past a table header's width is not parsed, so it now loses its target where it kept one before. `markdown-contract.md` states the limits. DELTA-023 records the evidence, and the budget gates Filesystem Docs slice B.
 - **A source's normalisations are the ones `markdown-contract.md` lists.** A source is byte-exact apart from those.
 
 ## Evidence

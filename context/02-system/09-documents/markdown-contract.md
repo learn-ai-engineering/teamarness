@@ -68,12 +68,13 @@ For every body, the export SHALL satisfy three guarantees:
 2. **Canonical round trip.** Import of the export gives exactly the body's canonical form. For a body that Markdown can carry, the canonical form is the body itself.
 3. **No content loss.** Every content character of a body survives export and import. Only whitespace at the edges of a line is normalised.
 
-This guarantee covers a body. Import of Markdown from outside does not keep all of it. Import drops these, and nothing else:
+This guarantee covers a body. Import of Markdown from outside does not keep all of it. Import drops these. The list is what testing has found so far, not a proof that nothing else can be lost.
 
 - a reference definition that no link uses;
 - the `<!-- end list -->` separator comment;
 - the title of an image, and a link inside an image's alt text;
-- a link with no text, outside a table.
+- a link with no text, outside a table that keeps its lines. The exception is a reference in a table that falls back to literal text: the links paragraph still holds its URL;
+- a link target, under the [limits on link targets](#limits-on-link-targets).
 
 ### Preserved Blocks
 
@@ -95,14 +96,14 @@ The canonical form makes only these changes. Content always wins over formatting
 
 - **Line-edge whitespace.** Spaces at the start of a line, and at the end of a block, are dropped, because Markdown drops them.
 - **Delimiters move off whitespace.** Bold, italic and strikethrough move off whitespace at their edges, and off whitespace at boundaries where they overlap other formatting. For example, a body with overlapping bold and italic exports as `The **quick** ***brown*** *fox AAA BBB jumps* over the dog`. Only when CommonMark flanking rules make a span impossible is the smallest such span dropped.
-- **Code and link fallback.** When comrak's writer cannot carry a paragraph's inline code or link formatting, the code formatting is dropped first and then the link formatting, until the paragraph round-trips. The known case is text that would read as a link reference definition (`]:`): written as is, it would delete the paragraph.
+- **Code and link fallback.** When comrak's writer cannot carry a paragraph's inline code or link formatting, the code formatting is dropped first and then the link formatting, until the paragraph round-trips. The known cases are text that would read as a link reference definition (`]:`), which would delete the paragraph if written as is, and a link destination with a space.
 - **Lists are written tight whenever that is safe.** Spacing is not stored. A list is written loose only when a tight list would join two of its blocks. A list item with a Preserved Block followed by another block is always loose.
 - **Empty paragraphs** have no Markdown form. Export omits them, and merge keeps them (see below).
 - **A list item's empty leading paragraph** is not written when other blocks follow it. Import restores it.
 - **Soft line breaks** import as spaces.
 - **Trailing hard breaks** at the end of a paragraph are dropped, and a hard break inside a heading imports as nothing.
 - **Unsupported Markdown is literal text.** Task lists, images, inline HTML and a footnote with no link definition import as the characters the author wrote, escaped on export. An image keeps its alt text and URL and loses its title. Entities import as the characters they name.
-- **Reference definitions are consumed.** A definition is consumed only when it parses as a link definition: one token as its destination, and an optional title. A definition that a link uses resolves into that link, which imports as an inline link. A definition that no link uses is dropped, and its text is lost. A footnote definition such as `[^1]: note` parses as a link definition, so `a[^1]` with that definition exports as `a[^1](note)`. Any other footnote, such as `[^1]: a longer note`, stays literal text.
+- **Reference definitions are consumed.** A definition is consumed only when it parses as a link definition: one token as its destination, and an optional title. A definition that a link uses resolves into that link, which imports as an inline link, within the [limits on link targets](#limits-on-link-targets). A definition that no link uses is dropped, and its text is lost. A footnote definition such as `[^1]: note` parses as a link definition, so `a[^1]` with that definition exports as `a[^1](note)`. Any other footnote, such as `[^1]: a longer note`, stays literal text.
 - **A table's resolved links get a paragraph.** A table keeps its lines, so a cell's `[x][r]` cannot hold the target of a definition. Import adds one paragraph directly after the table that holds each Link and Image of the table that a definition resolved, in cell order, as `[x](target)`. This is text the author did not write. For example, `| a |\n|---|\n| [x][r] |\n\n[r]: https://x.test/page\n` exports as `| a |\n|---|\n| [x][r] |\n\n[x](https://x.test/page)\n`. A table with no resolved link gets no paragraph. The same applies in a list item, in a blockquote, and to a table that falls back to literal text.
   - The cell still reads `[x][r]` outside the app, and its target is in the next paragraph.
   - The export holds no definition, so a later import adds nothing. The paragraph is ordinary content, and a revision can remove it.
@@ -115,6 +116,18 @@ The canonical form makes only these changes. Content always wins over formatting
 - **Other syntax forms** import as their canonical equivalents: setext headings, `*` and `+` bullets, `1)` lists, `__bold__`, `_em_`, `~strike~`, indented code, `~~~` fences and two-space hard breaks.
 
 The canonical corpus (`backend/tests/fixtures/markdown-corpus/`) records these normalisations. It has 22 byte-stable canonical documents and 40 agent-style inputs, each with its expected canonical export.
+
+### Limits on link targets
+
+Three limits can lose the target of a link in imported Markdown. Nothing signals the loss. `context/.delta/DELTA-023-preserved-blocks-accepted-tech-debt.md` records the evidence.
+
+- **Comrak's reference budget.** On each successful lookup of a definition, comrak 0.57.0 charges the bytes of the URL and the title against a budget. The budget is the body's size in bytes, up to 100 000, and front matter does not count towards it. The budget cannot be configured.
+  - A lookup that does not fit resolves to nothing and charges nothing, so a later, shorter URL can still resolve.
+  - A reference that does not resolve exports as escaped literal text. For example, three uses of a 100-byte URL in a 199-byte document export as one link and two `\[x\]\[r\]`.
+  - The first resolved use of a label keeps the target. A label whose first use does not fit counts as unused, so its definition and its target are lost.
+  - A table's links paragraph holds only the references that resolved.
+- **A destination the writer cannot carry.** A destination with a space keeps the link's text and loses its target: `a [x](<b c>) d` exports as `a x d`, and `[r]: <b c>` puts only `x` in a table's links paragraph. An inline link in a table that keeps its lines stays in the cell.
+- **A reference past the header's width.** The cell is not parsed, so the reference resolves to nothing. If no other link uses the definition, its target is lost.
 
 ### Known gap
 
