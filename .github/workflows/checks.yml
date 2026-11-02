@@ -54,6 +54,10 @@
           "run": "npm run tauri build -- --bundles app,dmg -- --locked"
         },
         {
+          "name": "Build pinned native qualification tools",
+          "run": "cargo build --locked -p teamarness-desktop --example qualify-update\ncargo build --locked -p teamarness-package-contract --bin teamarness-package-validate"
+        },
+        {
           "name": "Disposable signed artifact qualification (no production secrets)",
           "run": "node scripts/release/build.mjs --disposable --public-key-out \"$RUNNER_TEMP/disposable-public-key.txt\""
         }

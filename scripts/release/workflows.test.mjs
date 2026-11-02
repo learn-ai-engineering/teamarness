@@ -69,6 +69,29 @@ function checksJob(job) {
   assert.deepEqual(workflow.jobs.publish.concurrency, { group: "teamarness-stable-publication", "cancel-in-progress": false });
   assert.equal(JSON.stringify(workflow).match(/secrets\./g).length, 2);
 });
+// Verifies: TEAM.DEL-R04, TEAM.DEL-R05
+ test("native validators are built before every artifact qualification path", async () => {
+  const checks = await load("checks");
+  const release = await load("release");
+  const jobs = [
+    ["PR/main checks", checks.jobs.checks, "build.mjs --disposable"],
+    ["stable checks", release.jobs.checks, "build.mjs --disposable"],
+    ["signed build", release.jobs["signed-build"], "verify:release-artifacts"],
+    ["publish", release.jobs.publish, "release:publish"],
+  ];
+  for (const [name, job, qualifier] of jobs) {
+    const qualifyAt = job.steps.findIndex((step) => step.run?.includes(qualifier));
+    assert.ok(qualifyAt >= 0, `${name}: qualification step must exist`);
+    for (const command of [
+      "cargo build --locked -p teamarness-desktop --example qualify-update",
+      "cargo build --locked -p teamarness-package-contract --bin teamarness-package-validate",
+    ]) {
+      const buildAt = job.steps.findIndex((step) => step.run?.split("\n").includes(command));
+      assert.ok(buildAt >= 0 && buildAt < qualifyAt, `${name}: build ${command} before qualification`);
+      assert.ok(!JSON.stringify(job.steps[buildAt]).includes("secrets."), `${name}: validator builds need no signing secrets`);
+    }
+  }
+});
 // Verifies: TEAM.DEL-R05
  test("only same-run allowlisted distribution is transferred; validators rebuild before publication", async () => {
   const workflow = await load("release");
