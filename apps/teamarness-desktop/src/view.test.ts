@@ -4,7 +4,7 @@ import type { TeamarnessBridge } from "./bridge";
 import type { BridgeError, Installation, Invitation, Membership, PrincipalsSnapshot, Workspace, WorkspaceState } from "./contracts";
 import { buildShellPresentation } from "./presentation";
 import type { ShellRoute } from "./shell";
-import { ShellController, ShellRenderer, renderShell, type ShellModel } from "./view";
+import { ShellController, ShellRenderer, renderShell, writeClipboardTextWhenReady, type ShellModel } from "./view";
 
 const installation = fixture.installation as Installation;
 const workspace = fixture.workspace as Workspace;
@@ -337,12 +337,70 @@ describe("Shell Workspace screens", () => {
 
   it("copies an invitation without rendering its bearer value", async () => {
     const copied: string[] = [];
-    const controller = new ShellController(fakeBridge(), () => undefined, async (value) => { copied.push(value); });
+    const controller = new ShellController(fakeBridge(), () => undefined, async (value) => { copied.push(await value); });
     await controller.copyInvitation(workspace.id);
     expect(copied).toEqual([invitation.value]);
     expect(controller.snapshot().notice).toBe("Workspace Invitation copied. Keep it private.");
     expect(await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id }))
       .not.toContain(invitation.value);
+  });
+
+  // WebKit rejects a clipboard write that starts after the click's task has ended.
+  it("starts the clipboard write during the click, before the invitation exists", async () => {
+    let release: ((value: Invitation) => void) | undefined;
+    const pending = new Promise<Invitation>((resolve) => { release = resolve; });
+    const copied: Promise<string>[] = [];
+    const controller = new ShellController(
+      fakeBridge({ createWorkspaceInvitation: () => pending }),
+      () => undefined,
+      async (value) => { copied.push(value); await value; },
+    );
+    const operation = controller.copyInvitation(workspace.id);
+    expect(copied).toHaveLength(1);
+    release?.(invitation);
+    await operation;
+    await expect(copied[0]).resolves.toBe(invitation.value);
+    expect(controller.snapshot().notice).toBe("Workspace Invitation copied. Keep it private.");
+  });
+
+  it("reports the bridge failure when an invitation cannot be created", async () => {
+    const failure: BridgeError = { code: "readiness", retryable: true };
+    const controller = new ShellController(
+      fakeBridge({ createWorkspaceInvitation: async () => { throw failure; } }),
+      () => undefined,
+      async (value) => { await value; },
+    );
+    await controller.copyInvitation(workspace.id);
+    expect(controller.snapshot().error).toBe("readiness");
+    expect(controller.snapshot().notice).toBeNull();
+  });
+
+  it("names the clipboard when the invitation cannot be copied", async () => {
+    const controller = new ShellController(fakeBridge(), () => undefined, async () => { throw new Error("denied"); });
+    await controller.copyInvitation(workspace.id);
+    expect(controller.snapshot().error).toBe("clipboard_write");
+    expect(controller.snapshot().notice).toBeNull();
+    expect(await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id }))
+      .toContain("could not be copied to the clipboard");
+  });
+
+  it("hands the clipboard a pending plain-text item synchronously", async () => {
+    const written: { "text/plain": Promise<Blob> }[] = [];
+    const write = vi.fn(async (items: { "text/plain": Promise<Blob> }[]) => { written.push(...items); });
+    vi.stubGlobal("navigator", { clipboard: { write } });
+    vi.stubGlobal("ClipboardItem", class { public constructor(items: { "text/plain": Promise<Blob> }) { return items; } });
+    try {
+      let release: ((value: string) => void) | undefined;
+      const operation = writeClipboardTextWhenReady(new Promise<string>((resolve) => { release = resolve; }));
+      expect(write).toHaveBeenCalledTimes(1);
+      release?.("value");
+      await operation;
+      const blob = await written[0]?.["text/plain"];
+      expect(blob?.type).toBe("text/plain");
+      expect(await blob?.text()).toBe("value");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("pastes and joins a Workspace", async () => {

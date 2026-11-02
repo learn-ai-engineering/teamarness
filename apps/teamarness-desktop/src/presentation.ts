@@ -1,4 +1,4 @@
-import type { BridgeErrorCode } from "./contracts";
+import type { ShellErrorCode } from "./contracts";
 import { presentMembers, type MemberPresentation } from "./member-presentation";
 import type { PackageHostSnapshot } from "./package-contracts";
 import type { ShellModel } from "./view";
@@ -128,8 +128,9 @@ export function lifecycleDescriptor(
   }
 }
 
-function errorMessage(code: BridgeErrorCode): string {
-  const messages: Record<BridgeErrorCode, string> = {
+function errorMessage(code: ShellErrorCode): string {
+  const messages: Record<ShellErrorCode, string> = {
+    clipboard_write: "The Workspace Invitation could not be copied to the clipboard. Try again.",
     invalid_input: "The supplied value is invalid.",
     authentication: "Workspace Invitation authentication failed.",
     expired: "The Workspace Invitation has expired.",

@@ -69,6 +69,9 @@ export type BridgeErrorCode =
   | "not_steward"
   | "principal_not_bound";
 
+/** A failure the Shell can show: a bridge code, or one raised by the webview itself. */
+export type ShellErrorCode = BridgeErrorCode | "clipboard_write";
+
 export type BridgeError = Readonly<{
   code: BridgeErrorCode;
   retryable: boolean;
