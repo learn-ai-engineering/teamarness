@@ -16,7 +16,6 @@ serde_json.workspace = true
 sha2.workspace = true
 teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk" }
 tokio.workspace = true
-notify = { version = "=8.2.1", default-features = false, features = ["macos_fsevent"] } # SPIKE filesystem-docs
 
 [dev-dependencies]
 proptest.workspace = true

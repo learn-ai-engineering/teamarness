@@ -10,8 +10,6 @@ mod backend;
 pub(crate) mod body;
 pub(crate) mod domain;
 pub mod markdown;
-#[doc(hidden)]
-pub mod spike_folder_sync; // SPIKE filesystem-docs: throwaway
 pub(crate) mod store;
 
 pub use backend::{DocumentsActive, router};
