@@ -218,6 +218,36 @@ The runtime refuses a data directory that still holds retired version-1 protecti
 
 The Documents record format changed incompatibly when Document bodies became structured trees (ADR 0032): a `document.create` record now carries a body genesis, and plain-text body records are no longer read. A development data directory that holds Documents from before that change must be reset in the same way. There is no migration, because no released build wrote those records.
 
+## Publish a stable release
+
+A stable release starts when a `vX.Y.Z` tag is pushed. The tag must match the desktop version in the tagged commit, and that commit must be on `main`. Do not sign the commit or the tag. The release workflow signs the update artifacts with the key in the `release` environment.
+
+1. From an up-to-date `main`, set the next version on a branch, then commit the changed version and lockfiles:
+
+   ```sh
+   git switch main && git pull
+   git switch -c release/vX.Y.Z
+   node scripts/release/version.mjs set X.Y.Z
+   ```
+
+2. Merge that branch through a pull request.
+3. Tag the merged commit and push only that tag:
+
+   ```sh
+   git switch main && git pull
+   node scripts/release/version.mjs check --tag vX.Y.Z
+   git tag vX.Y.Z origin/main
+   git push origin vX.Y.Z
+   ```
+
+4. In GitHub Actions, approve the `signed-build` and `publish` jobs for the `Stable release` run.
+
+Repository rules prevent moving or deleting a pushed `v*` tag. If a release fails because of its source, correct the source and release a higher version. For example, `v0.1.3` failed preflight, so the next release is `v0.1.4`.
+
+If preflight fails with `Unsupported release event/repository/ref/source SHA`, check that the desktop version in the tagged commit matches the tag.
+
+See [Stable releases and application update recovery](docs/releasing.md) for approvals, failure handling, and recovery.
+
 ## Package development
 
 Start with [Build your first Package with an agent](docs/build-your-first-package.md). It begins with the finished Tutorial, explains the boundary between the Teamarness Core Runtime and a Package, then walks through generating, building, registering, and using an external Emojart project. Generate Emojart outside the Teamarness repository with `npm run create:package -- --output <directory> --identity dev.teamarness.emojart --display-name Emojart`. Read the [Package author guide](docs/package-author-guide.md) for the full Package Directory, Backend, UI, contract, and application-distribution rules. Read the UI SDK's [Package UI theme and CSS kit](packages/teamarness-package-ui-sdk/README.md) guidance for the exact semantic tokens, opt-in classes, cleanup contract, and Package-owned header and navigation model. Run `npm run validate:packages` to apply Package Admission's manifest and UI contract rules to every bundled Package's source and staged directory, with a Backend smoke launch, without starting the application; a generated project runs the same validator as `npm run validate`. Read [Local Package registration](docs/local-package-registration.md) to install, reload, and remove a Personal Package from the Shell, override a Team Package, write the registration file by hand, and keep Package Data Directory continuity. A local registration does not grant Workspace enablement or synchronize, share, network, or collaborate Package code or data.
