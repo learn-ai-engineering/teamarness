@@ -11,17 +11,19 @@ fn manifest(version: &str) -> serde_json::Value {
 
 /// Verifies: TEAM.SYS.SHELL-R07
 #[test]
-fn update_metadata_requires_newer_canonical_stable_and_exact_repository() {
+fn update_metadata_only_returns_newer_canonical_stable_from_exact_repository() {
     let installed = semver::Version::new(1, 0, 0);
-    assert!(Metadata::parse(&serde_json::to_vec(&manifest("1.2.3")).unwrap(), &installed).is_ok());
-    for version in [
-        "1.0.0",
-        "0.9.0",
-        "1.2.3-beta",
-        "1.2.3+build",
-        "01.2.3",
-        "v1.2.3",
-    ] {
+    assert!(
+        Metadata::parse(&serde_json::to_vec(&manifest("1.2.3")).unwrap(), &installed)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        Metadata::parse(&serde_json::to_vec(&manifest("1.0.0")).unwrap(), &installed)
+            .unwrap()
+            .is_none()
+    );
+    for version in ["0.9.0", "1.2.3-beta", "1.2.3+build", "01.2.3", "v1.2.3"] {
         assert!(
             Metadata::parse(&serde_json::to_vec(&manifest(version)).unwrap(), &installed).is_err()
         );
@@ -354,6 +356,31 @@ async fn update_apply_admission_only_transfers_same_verified_candidate_once() {
     assert!(!service.request_check());
 }
 
+/// Verifies: TEAM.SYS.SHELL-R07
+#[tokio::test]
+async fn update_current_release_is_idle_without_download_or_pending_candidate() {
+    let service = UpdateService::new(
+        Version::new(1, 0, 0),
+        Some(System {
+            clock: Arc::new(SystemClock),
+            transfer: Arc::new(DiscoveryResult(Ok(Some(
+                serde_json::to_vec(&manifest("1.0.0")).unwrap(),
+            )))),
+            verifier: official(),
+        }),
+    );
+    assert!(service.request_check());
+    wait_state(&service, State::Idle).await;
+    let status = service.status();
+    assert_eq!(status.error, None);
+    assert_eq!(status.candidate_version, None);
+    assert_eq!(status.pending_generation, None);
+    assert_eq!(status.notes, None);
+    assert_eq!(status.downloaded_bytes, 0);
+    assert!(service.admit_apply("1").is_err());
+    service.stop();
+}
+
 struct DiscoveryResult(Result<Option<Vec<u8>>, ErrorCategory>);
 impl Transfer for DiscoveryResult {
     fn fetch(
@@ -366,7 +393,7 @@ impl Transfer for DiscoveryResult {
         Box::pin(async move {
             assert!(
                 matches!(resource, Resource::Feed),
-                "invalid discovery cannot start an archive transfer"
+                "discovery without a candidate cannot start an archive transfer"
             );
             self.0.clone()
         })
@@ -380,26 +407,32 @@ async fn update_invalid_discovery_never_downloads_or_marks_ready() {
         Err(ErrorCategory::Network),
         Ok(Some(b"invalid JSON".to_vec())),
     ];
-    for version in [
-        "1.0.0",
-        "0.9.0",
-        "1.2.3-beta",
-        "1.2.3+build",
-        "01.2.3",
-        "v1.2.3",
-    ] {
+    for version in ["0.9.0", "1.2.3-beta", "1.2.3+build", "01.2.3", "v1.2.3"] {
         cases.push(Ok(Some(serde_json::to_vec(&manifest(version)).unwrap())));
     }
-    for mutate in 0..5 {
-        let mut feed = manifest("1.2.3");
-        match mutate {
-            0 => feed["notes"] = json!("<script>not plain text</script>"),
-            1 => feed["notes"] = json!("x".repeat(4097)),
-            2 => feed["platforms"]["darwin-aarch64-app"]["signature"] = json!("different"),
-            3 => feed["platforms"]["darwin-aarch64"]["signature"] = json!("x".repeat(4097)),
-            _ => feed["platforms"] = json!({}),
+    for version in ["1.0.0", "1.2.3"] {
+        for mutate in 0..6 {
+            let mut feed = manifest(version);
+            match mutate {
+                0 => feed["notes"] = json!("<script>not plain text</script>"),
+                1 => feed["notes"] = json!("x".repeat(4097)),
+                2 => feed["platforms"]["darwin-aarch64-app"]["signature"] = json!("different"),
+                3 => {
+                    for target in ["darwin-aarch64", "darwin-aarch64-app"] {
+                        feed["platforms"][target]["signature"] = json!("x".repeat(4097));
+                    }
+                }
+                4 => {
+                    for target in ["darwin-aarch64", "darwin-aarch64-app"] {
+                        feed["platforms"][target]["url"] = json!(
+                            "https://github.com/other/teamarness/releases/download/v1.0.0/app"
+                        );
+                    }
+                }
+                _ => feed["platforms"] = json!({}),
+            }
+            cases.push(Ok(Some(serde_json::to_vec(&feed).unwrap())));
         }
-        cases.push(Ok(Some(serde_json::to_vec(&feed).unwrap())));
     }
     for result in cases {
         let first_release = matches!(&result, Ok(None));
