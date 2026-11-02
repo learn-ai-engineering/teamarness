@@ -8536,6 +8536,7 @@ dependencies = [
  "serde_json",
  "teamarness-package-protocol",
  "teamarness-package-sdk",
+ "teamarness-repo-aware-package",
  "tempfile",
  "tokio",
  "uuid",
