@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ApplicationUpdateController, renderApplicationUpdate } from "./application-update";
+import { ApplicationUpdateController, renderApplicationUpdate, renderApplicationUpdateFooter, type ApplicationUpdateView } from "./application-update";
 import type { ApplicationUpdateBridge, ApplicationUpdateSnapshot } from "./application-update-contracts";
 
 export const snapshot = (revision = 1, state: ApplicationUpdateSnapshot["update"]["state"] = "ready"): ApplicationUpdateSnapshot => ({
@@ -23,6 +23,11 @@ function fixture() {
 }
 
 describe("Installation update consent", () => {
+  it.each(["idle", "checking"] as const)("renders no top updater panel while %s", (state) => {
+    const base = snapshot(2, state);
+    const value = { ...base, update: { ...base.update, candidateVersion: null, pendingGeneration: null, notes: null, downloadedBytes: 0 } };
+    expect(renderApplicationUpdate({ snapshot: value, updating: false, dismissed: false, unavailable: false })).toBe("");
+  });
   // Verifies: TEAM.SYS.SHELL-R07
   it("subscribes before status, rejects older revisions, and queries again on reattachment", async () => {
     const f = fixture();
@@ -42,7 +47,8 @@ describe("Installation update consent", () => {
     const f = fixture(); await f.controller.attach();
     f.controller.later();
     expect(f.views.at(-1)?.dismissed).toBe(true);
-    expect(renderApplicationUpdate(f.views.at(-1)!)).toContain("Update ready");
+    expect(renderApplicationUpdate(f.views.at(-1)!)).toBe("");
+    expect(renderApplicationUpdateFooter(f.views.at(-1)!)).toContain('data-update-action="menu-update"');
     expect(f.bridge.restart).not.toHaveBeenCalled();
     f.controller.showReady();
     expect(f.views.at(-1)?.dismissed).toBe(false);
@@ -51,10 +57,10 @@ describe("Installation update consent", () => {
   });
   // Verifies: TEAM.SYS.SHELL-R07
   it("renders safe notes/progress and nonmodal failures", () => {
-    const html = renderApplicationUpdate({ snapshot: snapshot(), updating: false, dismissed: false, unavailable: false });
+    const html = renderApplicationUpdateFooter({ snapshot: snapshot(), updating: false, dismissed: false, unavailable: false }, true);
     expect(html).toContain("&lt;img"); expect(html).not.toContain("<img");
     expect(html).toContain("Unsaved");
-    const downloading = renderApplicationUpdate({ snapshot: snapshot(2, "downloading"), updating: false, dismissed: false, unavailable: false });
+    const downloading = renderApplicationUpdateFooter({ snapshot: snapshot(2, "downloading"), updating: false, dismissed: false, unavailable: false }, true);
     expect(downloading).toContain("20"); expect(downloading).toContain('role="status"');
   });
   // Verifies: TEAM.SYS.SHELL-R07
@@ -109,4 +115,99 @@ it("reattachment resolves unknown rejected admission only from a fresh authorita
   f.emit(snapshot(4)); expect(f.views.at(-1)?.updating).toBe(true);
   vi.mocked(f.bridge.status).mockResolvedValue(snapshot(5, "idle"));
   await f.controller.attach(); expect(f.views.at(-1)?.updating).toBe(false);
+});
+
+describe("Quiet footer updates", () => {
+  function view(state: ApplicationUpdateSnapshot["update"]["state"] = "idle"): ApplicationUpdateView {
+    const base = snapshot(2, state);
+    return { snapshot: { ...base, update: { ...base.update, installedVersion: "0.1.1", ...(state === "idle" ? { candidateVersion: null, pendingGeneration: null, notes: null, downloadedBytes: 0 } : {}) } }, updating: false, dismissed: false, unavailable: false };
+  }
+
+  it("shows only the installed version while healthy, with status and manual checking behind it", () => {
+    const current = view();
+    expect(renderApplicationUpdate(current)).toBe("");
+    const closed = renderApplicationUpdateFooter(current);
+    expect(closed).toContain(">v0.1.1</button>");
+    expect(closed).not.toContain('data-update-action="menu-update"');
+    expect(closed).not.toContain("Check now");
+    const open = renderApplicationUpdateFooter(current, true);
+    expect(open).toContain("Up to date.");
+    expect(open).toContain("Check now");
+    expect(open).not.toContain('aria-modal="true"');
+  });
+
+  it("does not claim a completed check before the first check", () => {
+    const current = view();
+    const initial = { ...current, snapshot: { ...current.snapshot!, update: { ...current.snapshot!.update, revision: 0 } } };
+    expect(renderApplicationUpdateFooter(initial, true)).toContain("Waiting for the first update check");
+    expect(renderApplicationUpdateFooter(initial, true)).not.toContain("Up to date");
+  });
+
+  it("keeps routine checking silent and disables redundant manual checks", () => {
+    const current = view("checking");
+    expect(renderApplicationUpdate(current)).toBe("");
+    expect(renderApplicationUpdateFooter(current)).not.toContain('data-update-action="menu-update"');
+    const open = renderApplicationUpdateFooter(current, true);
+    expect(open).toContain("Checking for an application update");
+    expect(open).toContain('data-update-action="check" disabled');
+  });
+
+  it.each(["downloading", "verifying", "ready"] as const)("keeps %s in the footer, not a top panel", (state) => {
+    const current = view(state);
+    expect(renderApplicationUpdate(current)).toBe("");
+    expect(renderApplicationUpdateFooter(current)).toContain('data-update-action="menu-update"');
+    expect(renderApplicationUpdateFooter(current)).not.toContain('data-update-action="restart"');
+    const open = renderApplicationUpdateFooter(current, true);
+    expect(open).toContain('role="status"');
+    expect(open).not.toContain("limit 100");
+    if (state === "ready") {
+      expect(open).toContain("Restart now");
+      expect(open).toContain("Later");
+      expect(open).toContain("Save your work");
+    }
+  });
+
+  it("retains a ready icon after Later without exposing a restart shortcut", () => {
+    const current = { ...view("ready"), dismissed: true };
+    expect(renderApplicationUpdate(current)).toBe("");
+    expect(renderApplicationUpdateFooter(current)).toContain("Review and restart");
+    expect(renderApplicationUpdateFooter(current)).not.toContain('data-update-action="restart"');
+    expect(renderApplicationUpdateFooter(current, true)).toContain("Restart now");
+  });
+
+  it("can dismiss a check-error row without erasing the error from the popover", () => {
+    const base = view();
+    const failed = { ...base, snapshot: { ...base.snapshot!, update: { ...base.snapshot!.update, error: "network" as const } } };
+    expect(renderApplicationUpdate(failed)).toContain("Dismiss update notification");
+    expect(renderApplicationUpdate(failed)).toContain("network");
+    expect(renderApplicationUpdate(failed, true)).toBe("");
+    expect(renderApplicationUpdateFooter(failed, true)).toContain("network");
+    expect(renderApplicationUpdateFooter(failed, true)).toContain("Check now");
+  });
+
+  it("keeps recovery visible even after a notification was dismissed, and removes all footer actions", () => {
+    const base = view("ready");
+    const failed: ApplicationUpdateView = { ...base, updating: true, snapshot: { ...base.snapshot!, lifecycle: { ...base.snapshot!.lifecycle, phase: "failed", failure: "install" } } };
+    expect(renderApplicationUpdate(failed, true)).toContain("Update recovery");
+    expect(renderApplicationUpdate(failed, true)).toContain("Quit");
+    expect(renderApplicationUpdate(failed, true)).not.toContain("dismiss-error");
+    expect(renderApplicationUpdateFooter(failed, true)).toBe("");
+  });
+
+  it("lets an unavailable status be retried instead of trusting an old busy snapshot", () => {
+    const unavailable = { ...view("checking"), unavailable: true };
+    const open = renderApplicationUpdateFooter(unavailable, true);
+    expect(open).toContain("status unavailable");
+    expect(open).toContain("Check now");
+    expect(open).not.toContain('data-update-action="check" disabled');
+  });
+
+  it("shows the version in disabled builds without offering production checking", () => {
+    const current = view("disabled");
+    expect(renderApplicationUpdate(current)).toBe("");
+    const open = renderApplicationUpdateFooter(current, true);
+    expect(open).toContain("v0.1.1");
+    expect(open).toContain("Updates are disabled");
+    expect(open).toContain('data-update-action="check" disabled');
+  });
 });

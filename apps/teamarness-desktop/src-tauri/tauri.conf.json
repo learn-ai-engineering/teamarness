@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Teamarness",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "dev.teamarness.desktop",
   "build": {
     "beforeDevCommand": "npm run build:application-packages && npm run build:frame-runtime && npm run dev",

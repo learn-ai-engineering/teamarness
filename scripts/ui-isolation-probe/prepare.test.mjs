@@ -121,4 +121,9 @@ test("probe attempts all four commands with missing/fake keys, generation 1 and 
   assert.match(smoke, /handlerEntriesBeforeFrame/);
   assert.match(smoke, /requires the disposable verified Ready probe build, not default Disabled/);
   assert.match(smoke, /main consent must reach the non-destructive adapter exactly once/);
+  assert.match(smoke, /instrumented Ready indicator/);
+  const open = smoke.indexOf('"main Shell opens update popover"');
+  const consent = smoke.indexOf('"main Shell explicit restart consent"');
+  const restart = smoke.indexOf('"main Shell positive restart control"');
+  assert.ok(open > 0 && consent > open && restart > consent, "the smoke opens the footer popover before explicit restart consent");
 });
