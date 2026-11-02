@@ -1,0 +1,98 @@
+{
+ "type": "doc",
+ "content": [
+  {
+   "type": "preserved_block",
+   "attrs": {
+    "kind": "front_matter"
+   },
+   "content": [
+    {
+     "type": "text",
+     "text": "---\ntitle: \"a | b\"\n---"
+    }
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": [
+    {
+     "type": "text",
+     "text": "prose"
+    }
+   ]
+  },
+  {
+   "type": "preserved_block",
+   "attrs": {
+    "kind": "table"
+   },
+   "content": [
+    {
+     "type": "text",
+     "text": "| a | b |\n|---|---|\n| 1 | 2 |"
+    }
+   ]
+  },
+  {
+   "type": "preserved_block",
+   "attrs": {
+    "kind": "html"
+   },
+   "content": [
+    {
+     "type": "text",
+     "text": "<div class=\"x\">\n</div>"
+    }
+   ]
+  },
+  {
+   "type": "blockquote",
+   "content": [
+    {
+     "type": "preserved_block",
+     "attrs": {
+      "kind": "table"
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "| c |\n|---|"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "type": "bullet_list",
+   "content": [
+    {
+     "type": "list_item",
+     "content": [
+      {
+       "type": "paragraph",
+       "content": [
+        {
+         "type": "text",
+         "text": "item"
+        }
+       ]
+      },
+      {
+       "type": "preserved_block",
+       "attrs": {
+        "kind": "html"
+       },
+       "content": [
+        {
+         "type": "text",
+         "text": "<!-- note -->"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

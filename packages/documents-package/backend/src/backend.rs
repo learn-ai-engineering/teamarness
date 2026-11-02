@@ -8469,6 +8469,72 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
+    // Verifies: TEAM.SYS.DOCS-R11 — a Document created through the Ports keeps its table and front
+    // matter byte for byte, and revisions made against one version, by a Person and by an Agent,
+    // merge their cell edits into the one table.
+    #[tokio::test]
+    async fn create_then_markdown_keeps_preserved_blocks_and_cell_edits_merge_in_place() {
+        const FRONT_MATTER: &str = "---\ntitle: \"a | b\"\ntags: [x,   y]\n---\n";
+        const TABLE: &str = "|  a  | b |\n|:---|--:|\n| 1   | 2 |\n| \\| | `x` |\n";
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (collection, _) = ported_document(&mut session).await;
+        let created = create_as(&mut session.harness, alice(), &collection, "Plan")
+            .await
+            .unwrap();
+        let document = created["documentId"].as_str().unwrap().to_owned();
+        let source = format!("{FRONT_MATTER}\nProse.\n\n{TABLE}");
+        let first = revise(
+            &mut session.harness,
+            &document,
+            &created["version"],
+            &source,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["changed"], true);
+        assert_eq!(first["normalised"], false);
+        let read = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read["markdown"], source.as_str());
+        assert_eq!(read["version"], first["version"]);
+
+        // Two revisions from one version, each changing one cell of the same table.
+        let person = source.replace("| 1   |", "| 9   |");
+        revise(&mut session.harness, &document, &first["version"], &person)
+            .await
+            .unwrap();
+        let by_agent = source.replace("| 2 |", "| 8 |");
+        let merged = port_as(
+            &mut session.harness,
+            "command",
+            "document.revise",
+            agent(),
+            json!({"documentId":document,"baseVersion":first["version"],"markdown":by_agent}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged["changed"], true);
+        let read = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        // Both cells changed in the one table, with nothing else touched and nothing duplicated.
+        assert_eq!(
+            read["markdown"],
+            source.replace("| 1   | 2 |", "| 9   | 8 |").as_str()
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
     // Verifies: TEAM.SYS.DOCS-R12 — a create refused before its append, or by Core for an Agent it
     // does not sign for, is certain and creates nothing (ADR 0038).
     #[tokio::test]

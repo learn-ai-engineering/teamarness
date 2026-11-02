@@ -80,6 +80,10 @@ button, input, select, textarea { font: inherit; }
 .editor-surface .ProseMirror pre { margin: 0 0 .7em; padding: .6rem .8rem; border-radius: var(--teamarness-radius-control, 6px); background: var(--teamarness-color-panel); font-family: var(--teamarness-font-mono, ui-monospace, monospace); font-size: .88em; overflow-x: auto; }
 .editor-surface .ProseMirror code { font-family: var(--teamarness-font-mono, ui-monospace, monospace); font-size: .9em; padding: .05em .25em; border-radius: 4px; background: var(--teamarness-color-panel); }
 .editor-surface .ProseMirror pre code { padding: 0; background: none; }
+/* A Preserved Block's read-only frame. */
+.editor-surface .ProseMirror .preserved-block { margin: 0 0 .7em; border: 1px solid var(--teamarness-color-border); border-radius: var(--teamarness-radius-control, 6px); background: var(--teamarness-color-panel); color: var(--teamarness-color-text); cursor: default; }
+.editor-surface .ProseMirror .preserved-block figcaption { padding: .2rem .6rem; border-bottom: 1px solid var(--teamarness-color-border); color: var(--teamarness-color-text-muted); font-size: .75rem; user-select: none; }
+.editor-surface .ProseMirror .preserved-block pre { margin: 0; border-radius: 0; background: transparent; white-space: pre; }
 .editor-surface .ProseMirror ul, .editor-surface .ProseMirror ol { margin: 0 0 .7em; padding-left: 1.6rem; }
 .editor-surface .ProseMirror li > p { margin: 0 0 .2em; }
 .editor-surface .ProseMirror hr { border: 0; border-top: 1px solid var(--teamarness-color-border); margin: 1em 0; }

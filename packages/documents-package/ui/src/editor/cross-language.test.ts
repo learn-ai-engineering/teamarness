@@ -14,9 +14,6 @@ function fixtures(directory: string): string[] {
   return readdirSync(join(TREES, directory)).filter((file) => file.endsWith(".loro")).sort();
 }
 
-/** Rust-written trees that hold a `preserved_block`, which the UI schema does not define yet. */
-const isPreserved = (file: string): boolean => file.includes("preserved");
-
 /** Reads a snapshot through the binding's own reader, failing on anything it logs. */
 function read(directory: string, file: string): Node {
   const errors = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -30,8 +27,8 @@ describe("the shared body schema across languages", () => {
   afterEach(() => { vi.restoreAllMocks(); });
 
   it("reads every Rust-written tree through the binding as a schema-valid document", () => {
-    const files = fixtures("from-rust").filter((file) => !isPreserved(file));
-    expect(files.length).toBeGreaterThanOrEqual(19);
+    const files = fixtures("from-rust");
+    expect(files.length).toBeGreaterThanOrEqual(25);
     const seen = { nodes: new Set<string>(), marks: new Set<string>() };
     for (const file of files) {
       const node = read("from-rust", file);
@@ -47,11 +44,22 @@ describe("the shared body schema across languages", () => {
     expect([...seen.marks].sort()).toEqual(Object.keys(schema.marks).sort());
   });
 
-  // Fails when the twin node arrives. Then remove `isPreserved` and this test, so that the test
-  // above reads the preserved trees too.
-  it("skips only the preserved trees, because the UI schema has no twin node yet", () => {
-    expect(schema.nodes.preserved_block).toBeUndefined();
-    expect(fixtures("from-rust").filter(isPreserved)).toHaveLength(6);
+  it("reads every kind of Rust-written Preserved Block with its exact source", () => {
+    const blocks: Array<[unknown, string]> = [];
+    read("from-rust", "24-preserved-all-kinds.loro").descendants((node) => {
+      if (node.type.name === "preserved_block") blocks.push([node.attrs.kind, node.textContent]);
+    });
+    expect(blocks).toEqual([
+      ["front_matter", '---\ntitle: "a | b"\n---'],
+      ["table", "| a | b |\n|---|---|\n| 1 | 2 |"],
+      ["html", '<div class="x">\n</div>'],
+      ["table", "| c |\n|---|"],
+      ["html", "<!-- note -->"],
+    ]);
+  });
+
+  it("reads a Preserved Block with no kind as html, as the Rust core does", () => {
+    expect(schema.nodes.preserved_block!.create().attrs.kind).toBe("html");
   });
 
   it("reads the Rust genesis as one empty paragraph", () => {
