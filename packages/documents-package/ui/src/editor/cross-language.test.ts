@@ -14,6 +14,9 @@ function fixtures(directory: string): string[] {
   return readdirSync(join(TREES, directory)).filter((file) => file.endsWith(".loro")).sort();
 }
 
+/** Rust-written trees that hold a `preserved_block`, which the UI schema does not define yet. */
+const isPreserved = (file: string): boolean => file.includes("preserved");
+
 /** Reads a snapshot through the binding's own reader, failing on anything it logs. */
 function read(directory: string, file: string): Node {
   const errors = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -27,7 +30,7 @@ describe("the shared body schema across languages", () => {
   afterEach(() => { vi.restoreAllMocks(); });
 
   it("reads every Rust-written tree through the binding as a schema-valid document", () => {
-    const files = fixtures("from-rust");
+    const files = fixtures("from-rust").filter((file) => !isPreserved(file));
     expect(files.length).toBeGreaterThanOrEqual(19);
     const seen = { nodes: new Set<string>(), marks: new Set<string>() };
     for (const file of files) {
@@ -42,6 +45,13 @@ describe("the shared body schema across languages", () => {
     const nodes = Object.keys(schema.nodes).filter((name) => name !== "doc");
     expect([...seen.nodes].sort()).toEqual(nodes.sort());
     expect([...seen.marks].sort()).toEqual(Object.keys(schema.marks).sort());
+  });
+
+  // Fails when the twin node arrives. Then remove `isPreserved` and this test, so that the test
+  // above reads the preserved trees too.
+  it("skips only the preserved trees, because the UI schema has no twin node yet", () => {
+    expect(schema.nodes.preserved_block).toBeUndefined();
+    expect(fixtures("from-rust").filter(isPreserved)).toHaveLength(6);
   });
 
   it("reads the Rust genesis as one empty paragraph", () => {

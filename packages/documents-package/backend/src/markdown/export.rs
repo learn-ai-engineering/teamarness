@@ -1,5 +1,9 @@
 //! Markdown export and import through comrak (CommonMark plus GFM strikethrough), and the
 //! canonicalisation layer that makes the export byte-stable.
+//!
+//! Import also recognises GFM tables, YAML front matter and HTML blocks as Preserved Blocks. The
+//! writer never needs those extensions: a Preserved Block is written as raw text, so the
+//! extensions cannot change how anything else is escaped.
 
 use std::borrow::Cow;
 
@@ -13,8 +17,8 @@ use comrak::{Arena, Options, format_commonmark, parse_document};
 use loro::LoroDoc;
 
 use super::schema::{
-    Block, Inline, Link, MAX_NESTING, Marks, SchemaViolation, check_blocks, normalize_inlines,
-    read_tree,
+    Block, Inline, Link, MAX_NESTING, Marks, PreservedKind, SchemaViolation, check_blocks,
+    normalize_inlines, read_tree,
 };
 
 /// Exports the body as Canonical Markdown.
@@ -37,26 +41,16 @@ const INLINE_NESTING: usize = 16;
 /// Imports Markdown from outside the backend: its nesting is checked before any recursive
 /// walk, and the blocks must be writable under the schema.
 pub(super) fn parse_revision(markdown: &str) -> Result<Vec<Block>, SchemaViolation> {
-    let arena = Arena::new();
-    let root = parse_document(&arena, markdown, &options());
-    let mut depth = 0usize;
-    for edge in root.traverse() {
-        match edge {
-            NodeEdge::Start(_) => {
-                depth += 1;
-                // The document node itself is depth 1 here.
-                if depth > MAX_NESTING + INLINE_NESTING + 1 {
-                    return Err(SchemaViolation::TooDeep);
-                }
-            }
-            NodeEdge::End(_) => depth -= 1,
-        }
-    }
-    let blocks = blocks_of(root);
+    let blocks = import(
+        markdown,
+        Recognise::Checked,
+        MAX_NESTING + INLINE_NESTING + 1,
+    )?;
     check_blocks(&blocks)?;
     Ok(blocks)
 }
 
+/// The options that write Markdown, and that import it where nothing is recognised.
 fn options() -> Options<'static> {
     let mut options = Options::default();
     options.extension.strikethrough = true;
@@ -66,25 +60,131 @@ fn options() -> Options<'static> {
     options
 }
 
+/// The options that import Markdown with Preserved Blocks recognised.
+fn import_options(front_matter: bool) -> Options<'static> {
+    let mut options = options();
+    options.extension.table = true;
+    if front_matter {
+        options.extension.front_matter_delimiter = Some(FRONT_MATTER_DELIMITER.to_owned());
+    }
+    options
+}
+
 /// Comrak separates adjacent lists of the same kind with this comment.
 const LIST_SEPARATOR: &str = "<!-- end list -->";
 
+const FRONT_MATTER_DELIMITER: &str = "---";
+
 // ---------------------------------------------------------------- import
+
+/// How import treats the constructs a Preserved Block can hold.
+#[derive(Clone, Copy, PartialEq)]
+enum Recognise {
+    /// A construct becomes a Preserved Block only if its source is sound; otherwise it is
+    /// imported as literal text.
+    Checked,
+    /// Every construct becomes a Preserved Block, as the soundness check itself needs.
+    Unchecked,
+    /// Nothing is recognised. The parser has no extensions for them, and HTML is literal text.
+    Never,
+}
 
 /// Imports Markdown as blocks. Callers bound its nesting first (see [`parse_revision`]).
 pub fn parse(markdown: &str) -> Vec<Block> {
+    import(markdown, Recognise::Checked, usize::MAX).expect("the nesting is not bounded here")
+}
+
+fn import(
+    markdown: &str,
+    recognise: Recognise,
+    max_depth: usize,
+) -> Result<Vec<Block>, SchemaViolation> {
+    if recognise == Recognise::Never {
+        let arena = Arena::new();
+        let root = parse_document(&arena, markdown, &options());
+        check_depth(root, max_depth)?;
+        return Ok(blocks_of(root, &Source::new(markdown, recognise)));
+    }
+    let source = Source::new(markdown, recognise);
     let arena = Arena::new();
-    let root = parse_document(&arena, markdown, &options());
-    blocks_of(root)
+    let root = parse_document(&arena, markdown, &import_options(true));
+    check_depth(root, max_depth)?;
+    let opening_is_literal = recognise == Recognise::Checked
+        && root.first_child().is_some_and(|first| {
+            matches!(&first.data.borrow().value, NodeValue::FrontMatter(literal)
+                if !is_sound(PreservedKind::FrontMatter, &front_matter_source(literal)))
+        });
+    if !opening_is_literal {
+        return Ok(blocks_of(root, &source));
+    }
+    // What opened the document is not front matter after all, such as two horizontal rules.
+    let arena = Arena::new();
+    let root = parse_document(&arena, markdown, &import_options(false));
+    check_depth(root, max_depth)?;
+    Ok(blocks_of(root, &source))
 }
 
-fn blocks_of<'a>(node: &'a AstNode<'a>) -> Vec<Block> {
-    node.children().filter_map(block_of).collect()
+/// Refuses a syntax tree deeper than `max_depth`, without recursion.
+fn check_depth<'a>(root: &'a AstNode<'a>, max_depth: usize) -> Result<(), SchemaViolation> {
+    let mut depth = 0usize;
+    for edge in root.traverse() {
+        match edge {
+            NodeEdge::Start(_) => {
+                depth += 1;
+                // The document node itself is depth 1 here.
+                if depth > max_depth {
+                    return Err(SchemaViolation::TooDeep);
+                }
+            }
+            NodeEdge::End(_) => depth -= 1,
+        }
+    }
+    Ok(())
 }
 
-fn block_of<'a>(node: &'a AstNode<'a>) -> Option<Block> {
+/// The input being imported, by line, for the source of Preserved Blocks.
+struct Source<'s> {
+    lines: Vec<&'s str>,
+    recognise: Recognise,
+}
+
+impl<'s> Source<'s> {
+    fn new(markdown: &'s str, recognise: Recognise) -> Self {
+        Self {
+            lines: source_lines(markdown),
+            recognise,
+        }
+    }
+}
+
+/// Lines as comrak counts them: `\n`, `\r\n` and `\r` each end one.
+fn source_lines(markdown: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut rest = markdown;
+    while let Some(end) = rest.find(['\n', '\r']) {
+        lines.push(&rest[..end]);
+        let ending = if rest[end..].starts_with("\r\n") {
+            2
+        } else {
+            1
+        };
+        rest = &rest[end + ending..];
+    }
+    if !rest.is_empty() {
+        lines.push(rest);
+    }
+    lines
+}
+
+fn blocks_of<'a>(node: &'a AstNode<'a>, source: &Source) -> Vec<Block> {
+    node.children()
+        .flat_map(|child| block_of(child, source))
+        .collect()
+}
+
+fn block_of<'a>(node: &'a AstNode<'a>, source: &Source) -> Vec<Block> {
     let value = node.data.borrow().value.clone();
-    Some(match value {
+    vec![match value {
         NodeValue::Paragraph => Block::Paragraph(inlines_of(node)),
         NodeValue::Heading(heading) => Block::Heading {
             level: heading.level,
@@ -93,7 +193,7 @@ fn block_of<'a>(node: &'a AstNode<'a>) -> Option<Block> {
                 .filter(|inline| !matches!(inline, Inline::Break))
                 .collect(),
         },
-        NodeValue::BlockQuote => Block::Blockquote(non_empty(blocks_of(node))),
+        NodeValue::BlockQuote => Block::Blockquote(non_empty(blocks_of(node, source))),
         NodeValue::ThematicBreak => Block::Rule,
         NodeValue::CodeBlock(code) => {
             let mut text = code.literal.clone();
@@ -108,7 +208,7 @@ fn block_of<'a>(node: &'a AstNode<'a>) -> Option<Block> {
         NodeValue::List(list) => {
             let items = node
                 .children()
-                .map(|item| list_item(blocks_of(item)))
+                .map(|item| list_item(blocks_of(item, source)))
                 .collect();
             match list.list_type {
                 ListType::Bullet => Block::Bullet { items },
@@ -118,13 +218,184 @@ fn block_of<'a>(node: &'a AstNode<'a>) -> Option<Block> {
                 },
             }
         }
-        NodeValue::HtmlBlock(html) if html.literal.trim() == LIST_SEPARATOR => return None,
-        // Not in the baseline: kept as literal text so nothing an author wrote is lost.
-        NodeValue::HtmlBlock(html) => Block::Paragraph(vec![Inline::Text(
-            html.literal.trim_end().to_owned(),
-            Marks::default(),
-        )]),
-        _ => return None,
+        NodeValue::HtmlBlock(html) if html.literal.trim() == LIST_SEPARATOR => return Vec::new(),
+        NodeValue::HtmlBlock(html) => {
+            let kept = (source.recognise != Recognise::Never)
+                .then(|| source_of(node, source))
+                .flatten()
+                .filter(|text| source.accepts(PreservedKind::Html, text));
+            match kept {
+                Some(text) => Block::Preserved {
+                    kind: PreservedKind::Html,
+                    source: text,
+                },
+                // Kept as literal text so nothing an author wrote is lost.
+                None => literal_paragraph(&html.literal),
+            }
+        }
+        NodeValue::Table(_) => {
+            let kept = source_of(node, source);
+            match kept.filter(|text| source.accepts(PreservedKind::Table, text)) {
+                Some(text) => Block::Preserved {
+                    kind: PreservedKind::Table,
+                    source: text,
+                },
+                // What the same lines are with no table extension.
+                None => {
+                    return import(&loose_lines(node, source), Recognise::Never, usize::MAX)
+                        .expect("the nesting is not bounded here");
+                }
+            }
+        }
+        NodeValue::FrontMatter(literal) => Block::Preserved {
+            kind: PreservedKind::FrontMatter,
+            source: front_matter_source(&literal),
+        },
+        _ => return Vec::new(),
+    }]
+}
+
+impl Source<'_> {
+    fn accepts(&self, kind: PreservedKind, text: &str) -> bool {
+        self.recognise == Recognise::Unchecked || is_sound(kind, text)
+    }
+}
+
+/// The source of a front matter node: comrak's literal runs through the blank line after it.
+fn front_matter_source(literal: &str) -> String {
+    source_lines(literal.trim_end()).join("\n")
+}
+
+/// The exact source lines of a block node with every container prefix removed, or `None` when
+/// a prefix is not one this can remove exactly (a tab across a column boundary).
+fn source_of<'a>(node: &'a AstNode<'a>, source: &Source) -> Option<String> {
+    let position = node.data.borrow().sourcepos;
+    let first = position.start.line.checked_sub(1)?;
+    let lines = source.lines.get(first..position.end.line)?;
+    let (opening, rest) = lines.split_first()?;
+    let mut containers: Vec<&AstNode> = node.ancestors().skip(1).collect();
+    containers.reverse();
+    let mut out = vec![opening.get(position.start.column.checked_sub(1)?..)?];
+    for line in rest {
+        out.push(strip_containers(line, &containers)?);
+    }
+    while out.last().is_some_and(|line| line.trim().is_empty()) {
+        out.pop();
+    }
+    Some(out.join("\n"))
+}
+
+/// Removes the container prefix from one continuation line, column by column.
+fn strip_containers<'l>(line: &'l str, containers: &[&AstNode]) -> Option<&'l str> {
+    let mut rest = line;
+    for container in containers {
+        match &container.data.borrow().value {
+            NodeValue::BlockQuote => {
+                let indent = rest.len() - rest.trim_start_matches(' ').len();
+                let after = rest[indent..].strip_prefix('>').filter(|_| indent <= 3)?;
+                rest = after.strip_prefix(' ').unwrap_or(after);
+            }
+            NodeValue::Item(item) => {
+                let width = item.marker_offset + item.padding;
+                let indent = rest.len() - rest.trim_start_matches(' ').len();
+                if indent >= width {
+                    rest = &rest[width..];
+                } else if rest.trim().is_empty() {
+                    rest = "";
+                } else {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(rest)
+}
+
+/// A node's lines with their edge whitespace gone, for when they stay literal text.
+fn loose_lines<'a>(node: &'a AstNode<'a>, source: &Source) -> String {
+    let position = node.data.borrow().sourcepos;
+    let first = position.start.line.saturating_sub(1);
+    let mut containers: Vec<&AstNode> = node.ancestors().skip(1).collect();
+    containers.reverse();
+    let mut out = String::new();
+    for (index, line) in source
+        .lines
+        .iter()
+        .enumerate()
+        .take(position.end.line)
+        .skip(first)
+    {
+        let text = if index == first {
+            line.get(position.start.column.saturating_sub(1)..)
+                .unwrap_or(line)
+        } else {
+            strip_containers(line, &containers).unwrap_or(line)
+        };
+        out.push_str(text.trim());
+        out.push('\n');
+    }
+    out
+}
+
+/// The literal-text form of what cannot be a Preserved Block: one paragraph, its line breaks
+/// soft as in any paragraph. Nothing an author wrote is lost.
+fn literal_paragraph(text: &str) -> Block {
+    let lines: Vec<&str> = source_lines(text)
+        .into_iter()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let text = lines.join(" ");
+    if text.is_empty() {
+        return Block::Paragraph(Vec::new());
+    }
+    Block::Paragraph(vec![Inline::Text(text, Marks::default())])
+}
+
+/// Whether `source` can be stored as a Preserved Block of `kind`: it re-imports as exactly that
+/// block wherever the block can be moved, and whatever follows it stays out of it.
+fn is_sound(kind: PreservedKind, source: &str) -> bool {
+    if source.contains('\r') || source.trim().is_empty() || source != source.trim_end() {
+        return false;
+    }
+    let block = Block::Preserved {
+        kind,
+        source: source.to_owned(),
+    };
+    let text = |words: &str| Block::Paragraph(vec![Inline::Text(words.into(), Marks::default())]);
+    let after = text("after");
+    let bullet = |item: Vec<Block>| Block::Bullet {
+        items: vec![item, vec![after.clone()]],
+    };
+    let contexts = match kind {
+        PreservedKind::FrontMatter => {
+            let lines: Vec<&str> = source.lines().collect();
+            // A blank line inside either delimiter is how horizontal rules are written.
+            if lines.get(1).is_none_or(|line| line.trim().is_empty())
+                || lines
+                    .get(lines.len().wrapping_sub(2))
+                    .is_none_or(|line| line.trim().is_empty())
+            {
+                return false;
+            }
+            vec![vec![block, after.clone()]]
+        }
+        PreservedKind::Table | PreservedKind::Html => vec![
+            vec![
+                Block::Bullet {
+                    items: vec![vec![text("before")]],
+                },
+                block.clone(),
+                after.clone(),
+            ],
+            vec![Block::Blockquote(vec![block.clone(), after.clone()])],
+            vec![bullet(vec![Block::Paragraph(Vec::new()), block.clone()])],
+            vec![bullet(vec![text("before"), block, after.clone()])],
+        ],
+    };
+    contexts.iter().all(|blocks| {
+        import(&serialize_raw(blocks), Recognise::Unchecked, usize::MAX).as_ref() == Ok(blocks)
     })
 }
 
@@ -292,6 +563,13 @@ fn block_node<'a>(arena: &'a Arena<'a>, block: &Block) -> &'a AstNode<'a> {
         Block::Ordered { order, items } => {
             list_node(arena, ListType::Ordered, *order as usize, items)
         }
+        // Raw text in a paragraph: comrak adds the container prefixes and the block spacing as
+        // for a paragraph, and never escapes it.
+        Block::Preserved { source, .. } => {
+            let paragraph = node(arena, NodeValue::Paragraph);
+            paragraph.append(node(arena, NodeValue::Raw(source.clone())));
+            paragraph
+        }
     }
 }
 
@@ -369,6 +647,9 @@ fn append_inlines<'a>(arena: &'a Arena<'a>, parent: &'a AstNode<'a>, content: &[
                             literal: text.clone(),
                         }),
                     )
+                } else if reads_as_delimiter_row(content, index) {
+                    parent.append(node(arena, NodeValue::Raw("\\".to_owned())));
+                    node(arena, NodeValue::Text(Cow::Owned(text.clone())))
                 } else {
                     node(arena, NodeValue::Text(Cow::Owned(text.clone())))
                 },
@@ -415,6 +696,23 @@ fn append_inlines<'a>(arena: &'a Arena<'a>, parent: &'a AstNode<'a>, content: &[
     }
 }
 
+/// Whether the text at `index` is a whole line after a hard break that would make the line
+/// above it a table header. Comrak already escapes a line that starts with `-`.
+fn reads_as_delimiter_row(content: &[Inline], index: usize) -> bool {
+    let Some(Inline::Text(text, marks)) = content.get(index) else {
+        return false;
+    };
+    index > 0
+        && content[index - 1] == Inline::Break
+        && *marks == Marks::default()
+        && matches!(content.get(index + 1), None | Some(Inline::Break))
+        && text.starts_with(['|', ':'])
+        && text.contains('-')
+        && text
+            .chars()
+            .all(|c| matches!(c, '|' | ':' | '-' | ' ' | '\t'))
+}
+
 // ---------------------------------------------------------------- canonical form
 
 /// The body as Markdown can carry it. Identity for anything Markdown expresses.
@@ -450,6 +748,10 @@ fn canonical_block(block: &Block) -> Block {
             order: *order,
             items: items.iter().map(|item| canonical_item(item)).collect(),
         },
+        // A concurrent edit can leave a source that no longer reads as what it was.
+        Block::Preserved { kind, source } if !is_sound(*kind, source) => {
+            canonical_block(&literal_paragraph(source))
+        }
         other => other.clone(),
     }
 }
@@ -472,6 +774,7 @@ fn can_be_tight(items: &[Vec<Block>]) -> bool {
 /// through blockquotes until the next list.
 fn tight_safe(blocks: &[Block]) -> bool {
     blocks.windows(2).all(|pair| match pair {
+        [Block::Preserved { .. }, _] => false,
         [Block::Heading { .. } | Block::Code { .. } | Block::Rule, _] => true,
         [Block::Bullet { .. }, Block::Bullet { .. }]
         | [Block::Ordered { .. }, Block::Ordered { .. }] => false,

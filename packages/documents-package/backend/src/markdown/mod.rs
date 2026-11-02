@@ -11,7 +11,8 @@
 //!   for link.
 //! - [`export`] gives Canonical Markdown. Export, import and export again gives the same
 //!   bytes, and no content character is lost; only formatting Markdown cannot express, line-edge
-//!   whitespace and empty paragraphs are normalised.
+//!   whitespace and empty paragraphs are normalised. Tables, front matter and HTML blocks are
+//!   [`Block::Preserved`], whose source is written verbatim.
 //! - [`canonical`] gives the Canonical Markdown a revision becomes, so a caller can tell whether
 //!   a revision was already canonical.
 //! - [`merge`] merges a Markdown revision made against a base version as one Loro update from a
@@ -26,8 +27,8 @@ mod schema;
 pub use export::{canonical, export};
 pub use merge::{DIFF_BUDGET, MergeError, Merged, merge, merge_within};
 pub use schema::{
-    Block, Inline, Link, MAX_NESTING, MAX_ORDER, Marks, SchemaViolation, WriteError, read_tree,
-    write_tree,
+    Block, Inline, Link, MAX_NESTING, MAX_ORDER, Marks, PreservedKind, SchemaViolation, WriteError,
+    read_tree, write_tree,
 };
 
 /// Model-level functions for the property suites in `tests/`. Not part of the interface.

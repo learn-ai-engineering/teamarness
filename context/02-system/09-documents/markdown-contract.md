@@ -18,6 +18,7 @@ A Document body is the Loro tree that `loro-prosemirror` 0.4.4 writes for one fi
   - `bullet_list` holds `list_item`.
   - `ordered_list` has `order`, from 0 to 999 999 999, and holds `list_item`.
   - `list_item` holds a `paragraph`, then blocks.
+  - `preserved_block` has `kind` (`table`, `front_matter` or `html`) and holds unmarked text. It may sit wherever a `code_block` may, except that `front_matter` is only ever the first top-level block.
 - **Marks:** `strong`, `em`, `strikethrough`, `code`, and `link` with `href` and an optional `title`.
 - Number attributes are stored as JavaScript numbers (doubles).
 - The schema has no list `tight` attribute. List spacing is not stored.
@@ -33,20 +34,23 @@ A tree is **schema-invalid** when a peer wrote a shape that the binding never wr
 - a node, text run or plain value sits where its parent's content does not allow it, for example a `list_item` outside a list, a `hard_break` in a heading, or text directly in a block list;
 - an `attributes` or `children` entry is not the container that the schema expects;
 - an attribute has the wrong type or is out of range;
-- a mark is not in the schema, a link has no string `href`, or a code block's text carries a mark;
+- a mark is not in the schema, a link has no string `href`, or the text of a code block or a Preserved Block carries a mark;
+- a `preserved_block` has a `kind` that is not in the schema;
+- a `front_matter` Preserved Block is not the first top-level block;
 - nodes are nested deeper than 64 levels (the root's children are level 1, and a list item is one level below its list).
 
 Shapes that ordinary concurrent edits can produce are **not** violations, and the reader SHALL accept them:
 
 - an empty body;
 - an empty list or blockquote;
-- a list item that lost its leading paragraph.
+- a list item that lost its leading paragraph;
+- a Preserved Block whose source no longer reads as its kind.
 
-Unknown attributes on known nodes are ignored.
+Unknown attributes on known nodes are ignored. A `preserved_block` with no `kind` reads as `html`, the default of the editor schema.
 
 ## Canonical Markdown
 
-**Canonical Markdown** is the body as Markdown can carry it. The export SHALL be CommonMark with the GFM strikethrough extension only, written as follows:
+**Canonical Markdown** is the body as Markdown can carry it. Apart from the source of Preserved Blocks, the export SHALL be CommonMark with the GFM strikethrough extension only, written as follows:
 
 - ATX headings (`#`);
 - `-` bullets, and `1.`-style ordered lists that keep their start number;
@@ -64,6 +68,20 @@ For every body, the export SHALL satisfy three guarantees:
 2. **Canonical round trip.** Import of the export gives exactly the body's canonical form. For a body that Markdown can carry, the canonical form is the body itself.
 3. **No content loss.** Every content character survives export and import. Only whitespace at the edges of a line is normalised.
 
+### Preserved Blocks
+
+A **Preserved Block** keeps Markdown that the editor cannot carry as its exact source lines. Import recognises three constructs on every path, and export writes the source byte for byte:
+
+- a GFM table;
+- YAML front matter: a `---` block that opens the document, with no blank line directly inside either delimiter;
+- an HTML block, except the `<!-- end list -->` separator.
+
+The stored source has no container prefix (`> `, list indent) and no final line ending. The writer adds the prefix back.
+
+A source is **sound** when it re-imports as the same Preserved Block in every place it can move to: after a list, inside a blockquote, as the first block of a list item, and after a paragraph in a list item, with another block following each time. Front matter is checked at the top of the document only.
+
+Import SHALL fall back to literal text for a construct that is not sound, so content is never lost. An HTML block becomes one literal paragraph. A table becomes what its lines are without the table extension. An opening `---` block is read without the front matter extension, so two horizontal rules stay rules. An unclosed `<!-- comment` is the common case of an HTML block that falls back, because it would swallow whatever follows it. Export treats a stored source that is not sound the same way: a concurrent edit can leave one, and it exports as one literal paragraph.
+
 ### Normalisations
 
 The canonical form makes only these changes. Content always wins over formatting.
@@ -71,16 +89,18 @@ The canonical form makes only these changes. Content always wins over formatting
 - **Line-edge whitespace.** Spaces at the start of a line, and at the end of a block, are dropped, because Markdown drops them.
 - **Delimiters move off whitespace.** Bold, italic and strikethrough move off whitespace at their edges, and off whitespace at boundaries where they overlap other formatting. For example, a body with overlapping bold and italic exports as `The **quick** ***brown*** *fox AAA BBB jumps* over the dog`. Only when CommonMark flanking rules make a span impossible is the smallest such span dropped.
 - **Code and link fallback.** When comrak's writer cannot carry a paragraph's inline code or link formatting, the code formatting is dropped first and then the link formatting, until the paragraph round-trips. The known case is text that would read as a link reference definition (`]:`): written as is, it would delete the paragraph.
-- **Lists are written tight whenever that is safe.** Spacing is not stored. A list is written loose only when a tight list would join two of its blocks.
+- **Lists are written tight whenever that is safe.** Spacing is not stored. A list is written loose only when a tight list would join two of its blocks. A list item with a Preserved Block followed by another block is always loose.
 - **Empty paragraphs** have no Markdown form. Export omits them, and merge keeps them (see below).
 - **A list item's empty leading paragraph** is not written when other blocks follow it. Import restores it.
 - **Soft line breaks** import as spaces.
 - **Trailing hard breaks** at the end of a paragraph are dropped, and a hard break inside a heading imports as nothing.
-- **Unsupported Markdown is literal text.** Tables, task lists, HTML and images import as the characters the author wrote, escaped on export, so nothing an author wrote is lost. Entities import as the characters they name.
+- **Unsupported Markdown is literal text.** Task lists, images, inline HTML, footnotes and reference definitions import as the characters the author wrote, escaped on export, so nothing an author wrote is lost. Entities import as the characters they name.
+- **A Preserved Block's edges and line endings.** `\r\n` and `\r` in a source become `\n`. The first line loses its indentation, and trailing blank lines are dropped. Export puts a blank line between a Preserved Block and the next block.
+- **A paragraph line that would make a table.** Hard breaks can put a delimiter row such as `|---|` directly under a line of text. Export writes a backslash before its first character, so the paragraph stays a paragraph.
 - **Reference-style links** import as inline links.
 - **Other syntax forms** import as their canonical equivalents: setext headings, `*` and `+` bullets, `1)` lists, `__bold__`, `_em_`, `~strike~`, indented code, `~~~` fences and two-space hard breaks.
 
-The canonical corpus (`backend/tests/fixtures/markdown-corpus/`) records these normalisations. It has 17 byte-stable canonical documents and 22 agent-style inputs, each with its expected canonical export.
+The canonical corpus (`backend/tests/fixtures/markdown-corpus/`) records these normalisations. It has 22 byte-stable canonical documents and 32 agent-style inputs, each with its expected canonical export.
 
 ### Known gap
 
@@ -102,7 +122,7 @@ Reconciliation works like this:
 
 1. Blocks at each level are aligned on their canonical forms: the unchanged prefix and suffix, then a longest common subsequence of the blocks between them.
 2. Unchanged blocks are never touched.
-3. In each gap between aligned blocks, leftover blocks of the same kind are paired by position and edited in place. Text is edited by character diff, formatting by mark and unmark ranges, and attributes only where they differ. List items pair with list items, and their blocks are reconciled recursively.
+3. In each gap between aligned blocks, leftover blocks of the same kind are paired by position and edited in place. Text is edited by character diff, formatting by mark and unmark ranges, and attributes only where they differ. A Preserved Block is edited as text; one of another `kind` is replaced. List items pair with list items, and their blocks are reconciled recursively.
 4. Remaining leftovers are deleted or inserted.
 
 A formatting-only change therefore costs mark operations and no text operations.
@@ -124,6 +144,7 @@ These are the accepted merge semantics:
 - **Large rewrites lose minimality.** When the blocks between the unchanged prefix and suffix would need more than 4 Mi alignment cells, they are paired by position without a common subsequence. The result still exports the revision exactly.
 - **Without a base, a revision overwrites newer text.** A revision merged against the current version instead of the exported one reverts edits made after the export. This is why the port requires a base version.
 - **Concurrent structural changes duplicate text.** For example, wrapping a block in a list while another Member makes it a heading converges with the text duplicated. This is how the binding replaces nodes.
+- **Concurrent inserts above front matter pause the Document.** Two Installations that add front matter concurrently, or one that adds it while another inserts a first block, converge on a tree where front matter is not first. That tree is schema-invalid, so ADR 0029's import failure applies on every Installation that receives both records. One Installation that merges against a stale base is refused instead, because it checks the result before it appends. See ADR 0042.
 
 ## Verification
 
@@ -137,6 +158,8 @@ These are the accepted merge semantics:
   - P5: any revision lands exactly.
   - P6: a one-block edit keeps every other block's identity.
   - P7: concurrent human and agent edits both survive.
+  - P8: concurrent edits to one table both survive, in one block.
+  - P9: a Preserved Block source of any shape exports stably, with no content lost.
 - The `CASES` environment variable sets the scale, with a default of 3 000. Merge properties run a third of it. The long run is `CASES=60000 cargo test -p teamarness-documents-package --release --test markdown_properties`.
 - `backend/tests/markdown_corpus.rs` checks the corpus.
 - `packages/documents-package/fixtures/merge-scenarios.json` is the shared merge scenario table. The backend runs it against `merge`, and the Documents port system test runs it through `document.revise`.

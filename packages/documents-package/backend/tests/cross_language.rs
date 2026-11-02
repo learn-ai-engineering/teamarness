@@ -36,6 +36,13 @@ Plain **strong** *em* ~~strike~~ `code` [link](https://example.com/a \"Title\") 
 ```rust\nfn main() {}\n```\n\n\
 ```\nplain code\n```\n";
 
+/// Every kind of Preserved Block, top level and nested.
+const PRESERVED_KINDS: &str = "---\ntitle: \"a | b\"\n---\n\n\
+| a | b |\n|---|---|\n| 1 | 2 |\n\n\
+<div class=\"x\">\n</div>\n\n\
+> | c |\n> |---|\n\n\
+- item\n\n  <!-- note -->\n";
+
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/body-trees")
 }
@@ -44,8 +51,8 @@ fn blessing() -> bool {
     std::env::var_os("BODY_TREES_BLESS").is_some()
 }
 
-/// The Markdown each Rust fixture is written from: a genesis, the canonical corpus, and one body
-/// with every node and mark.
+/// The Markdown each Rust fixture is written from: a genesis, one body with every node and mark,
+/// the canonical corpus, and one body with every kind of Preserved Block.
 fn rust_sources() -> Vec<(String, String)> {
     let corpus =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/markdown-corpus/canonical");
@@ -67,6 +74,10 @@ fn rust_sources() -> Vec<(String, String)> {
             fs::read_to_string(path).unwrap(),
         ));
     }
+    sources.push((
+        format!("{:02}-preserved-all-kinds", files.len() + 2),
+        PRESERVED_KINDS.to_owned(),
+    ));
     sources
 }
 

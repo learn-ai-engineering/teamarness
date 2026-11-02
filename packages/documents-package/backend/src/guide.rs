@@ -31,6 +31,8 @@ To give the new Document content, call document.revise with that documentId, bas
 
 document.revise takes documentId, baseVersion and markdown. markdown is the whole Document as you want it, revised from the Markdown that document.markdown exported at baseVersion. Read first, change that text, and pass the version you read as baseVersion. Version tokens are opaque: never construct or change one.
 
+Tables, YAML front matter and HTML blocks are kept verbatim: document.markdown returns their source unchanged, and you edit them as Markdown in your revision.
+
 The Provider merges your revision from its base into the current body. Unchanged blocks are untouched, changed blocks are edited in place, and edits other Members or Agents made since the base survive. The result can therefore differ from your Markdown, so read again before the next revise. changed false means the revision changed nothing and no record was written. normalised true means your Markdown was not Canonical Markdown and was normalised before the merge. The returned version is the one your own revision left the Document at; it may include concurrent edits.
 
 One revise is one record of at most {update_kib} KiB of changes. A larger change is refused with documents.revision_too_large: split it into several revises, each against the version the previous one returned. A body may hold at most {text_kib} KiB of text; a revision that grows it further is refused with documents.document_too_large. documents.schema_violation means the Markdown cannot be held in a Document body. documents.base_unavailable means the base is unknown here or is not a token from this Provider: read again and revise against the new version. documents.unknown_document names a Document that does not exist here.

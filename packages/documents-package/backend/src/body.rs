@@ -632,7 +632,7 @@ fn content_bytes(blocks: &[Block]) -> usize {
                 .sum(),
             Block::Blockquote(children) => content_bytes(children),
             Block::Rule => 0,
-            Block::Code { text, .. } => text.len(),
+            Block::Code { text, .. } | Block::Preserved { source: text, .. } => text.len(),
             Block::Bullet { items } | Block::Ordered { items, .. } => {
                 items.iter().map(|item| content_bytes(item)).sum()
             }

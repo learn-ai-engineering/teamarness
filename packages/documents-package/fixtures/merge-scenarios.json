@@ -114,8 +114,39 @@
       "initial": "x\n",
       "base": "initial",
       "concurrentHumanEdits": [],
-      "revision": "| a | b |\n|---|---|\n| 1 | 2 |\n",
-      "expectedMarkdown": "| a | b | |---|---| | 1 | 2 |\n"
+      "revision": "- [ ] task\n\n![alt](https://x.test/a.png)\n",
+      "expectedMarkdown": "- \\[ \\] task\n\n\\!\\[alt\\](https://x.test/a.png)\n"
+    },
+    {
+      "name": "a person adds a table row while an agent edits a cell; the table merges and is not duplicated",
+      "initial": "# Team\n\n| Name | Role |\n|---|---|\n| Ada | lead |\n| Lin | dev |\n",
+      "base": "initial",
+      "concurrentHumanEdits": [
+        {
+          "block": 1,
+          "at": "end",
+          "text": "\n| Mo | ops |"
+        }
+      ],
+      "revision": "# Team\n\n| Name | Role |\n|---|---|\n| Ada | owner |\n| Lin | dev |\n",
+      "expectedMarkdown": "# Team\n\n| Name | Role |\n|---|---|\n| Ada | owner |\n| Lin | dev |\n| Mo | ops |\n"
+    },
+    {
+      "name": "an agent replaces a table with prose",
+      "initial": "Intro.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nOutro.\n",
+      "base": "current",
+      "concurrentHumanEdits": [],
+      "revision": "Intro.\n\nThe table said one and two.\n\nOutro.\n",
+      "expectedMarkdown": "Intro.\n\nThe table said one and two.\n\nOutro.\n"
+    },
+    {
+      "name": "an unchanged table, front matter and HTML block merge to nothing",
+      "initial": "---\nt: 1\n---\n\n| a |\n|---|\n\n<div>\n</div>\n",
+      "base": "current",
+      "concurrentHumanEdits": [],
+      "revision": "---\nt: 1\n---\n\n| a |\n|---|\n\n<div>\n</div>\n",
+      "expectedMarkdown": "---\nt: 1\n---\n\n| a |\n|---|\n\n<div>\n</div>\n",
+      "expectedOps": 0
     }
   ]
 }
