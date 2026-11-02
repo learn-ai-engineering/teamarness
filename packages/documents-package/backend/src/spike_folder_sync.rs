@@ -86,32 +86,18 @@ pub fn imported(doc: &LoroDoc, state: &mut FileState, text: &str) -> bool {
 
 /// Text to write for the doc's current body, given the file's current text.
 pub fn render(doc: &LoroDoc, previous: &str, mode: WriteMode) -> String {
-    render_text(&export(doc).expect("valid body"), previous, mode)
-}
-
-/// [`render`] from the doc's Canonical Markdown export (what `DocumentBody::text` holds).
-pub fn render_text(exported: &str, previous: &str, mode: WriteMode) -> String {
+    let exported = export(doc).expect("valid body");
     match mode {
-        WriteMode::Canonical => exported.to_owned(),
-        WriteMode::Splice => splice(previous, exported),
+        WriteMode::Canonical => exported,
+        WriteMode::Splice => splice(previous, &exported),
     }
 }
 
 /// Writes `text` atomically (temp file + rename) unless the file changed on disk since
 /// `state.written` — then it returns `false` and the caller must import first.
 pub fn write_back(path: &Path, state: &mut FileState, doc: &LoroDoc, text: &str) -> bool {
-    if !write_back_text(path, &mut state.written, text) {
-        return false;
-    }
-    state.base = doc.oplog_frontiers();
-    true
-}
-
-/// [`write_back`] without a doc: the same refuse-if-changed rule on `written`; the caller moves
-/// its base itself.
-pub fn write_back_text(path: &Path, written: &mut Hash, text: &str) -> bool {
     if let Ok(on_disk) = fs::read(path) {
-        if hash(&on_disk) != *written {
+        if hash(&on_disk) != state.written {
             return false;
         }
     }
@@ -122,7 +108,8 @@ pub fn write_back_text(path: &Path, written: &mut Hash, text: &str) -> bool {
         file.sync_all().unwrap();
     }
     fs::rename(&tmp, path).unwrap();
-    *written = hash(text.as_bytes());
+    state.written = hash(text.as_bytes());
+    state.base = doc.oplog_frontiers();
     true
 }
 
