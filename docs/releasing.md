@@ -13,7 +13,7 @@ Only native Apple Silicon macOS is supported. Updater cryptographic signatures a
 ## Maintainer setup — separate deployment approval required
 
 1. Review source **and repository history** for public disclosure, including old secrets/private material, before making the existing repository public. This tooling is not a disclosure audit and never changes repository settings.
-2. Protect `main`: require the complete Checks job, review/integration policy and prevent force pushes/deletion. Stable tag source must be reachable from protected `main`. Establish tag rulesets targeting `v*` that prevent tag updates/deletion, restrict creation to authorized maintainers, and have no routine bypass. Do not move a failed tag: correct source with a newer version.
+2. Protect `main`: require the lightweight `checks` job, review/integration policy and prevent force pushes/deletion. Stable tag source must be reachable from protected `main`. Establish tag rulesets targeting `v*` that prevent tag updates/deletion, restrict creation to authorized maintainers, and have no routine bypass. Do not move a failed tag: correct source with a newer version.
 3. Create protected environment **`release`**, restrict deployment refs to stable release tags, require maintainer approval, and review environment bypass/admin policy. Don explicitly selects a solo-maintainer exception for initial releases: `don-smith` reviews and approves his own release runs. Keep administrator deployment bypass disabled. A separate approver and prevention of self-approval remain the preferred multi-maintainer setup. Both signed-build and publish require approval. Use repository-scoped `GITHUB_TOKEN`; restrict Actions defaults to read-only. Do not grant untrusted PRs signing secrets or write tokens. No `pull_request_target` source execution is used.
 4. After approval, generate the production updater key using the pinned CLI's `npm run tauri signer generate -- --help` and its encrypted-key/password options in a private offline location, **not** in source or a shared build output. Maintain an encrypted offline backup and prove recovery privately. Never paste keys/passwords into logs, release assets, workstream evidence, or chat. This implementation did not generate or authorize a production key.
 5. Store the encrypted key as environment secret `TAURI_SIGNING_PRIVATE_KEY` and password as `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Set environment variable `TEAMARNESS_UPDATER_PUBLIC_KEY` to the reviewed public-key text (not a path). All shipped versions must retain this trust root; compare it independently before approving a build. Only the signing step receives private inputs. The public-key overlay is temporary and only the public key compiles into the app; there is no runtime trust-root override.
@@ -23,7 +23,7 @@ Only native Apple Silicon macOS is supported. Updater cryptographic signatures a
 
 | Job | Permission | Environment / secrets |
 |---|---|---|
-| PR/main Checks | `contents: read` | no environment or production secrets; disposable signing key only |
+| PR/main Checks | `contents: read` | lightweight Linux checks; no environment or signing secrets |
 | stable checks | `contents: read` | read-only preflight; complete check/build/default bundle + disposable artifact qualification |
 | signed-build (needs checks) | `contents: read` | protected `release`; private key/password **only** in Build and sign step |
 | publish (needs checks + signed-build) | `contents: write` | protected `release`; **no signing secrets**; public key and same-repository token only |
@@ -31,6 +31,13 @@ Only native Apple Silicon macOS is supported. Updater cryptographic signatures a
 Checkout always uses event SHA with `persist-credentials: false`. No build caches are used. The signed build uploads exactly the four public files plus `qualification.json`; no signing files, runtime data, logs, executables, arbitrary `target/` directory or cache is transferred. Download uses only the named artifact from the **same workflow run**, not a supplied run ID or fork. Publisher rebuilds the pinned native verifier and Package validator from that same trusted checkout, never trusting an uploaded executable.
 
 Publish uses one cross-version concurrency group, `teamarness-stable-publication`, with `cancel-in-progress: false`. GitHub can replace a pending run; concurrency is not a guaranteed queue. Rerun a dropped run if still needed; delayed/backfill versions fail the strict increasing-version check. Manual maintainers must not race or bypass this policy by changing tags/drafts/assets outside the workflow.
+
+## Validation cadence
+
+- During development, run focused checks for the change. `npm run check:fast` installs locked npm dependencies, builds the UI SDK, checks Rust formatting and source guards, and runs workspace lint/typechecks, release-tool unit tests and all UI workspace tests. It does not compile or test Rust, build native bundles, or qualify release artifacts.
+- PRs and main pushes run `check:fast` on `ubuntu-24.04`, with pinned Node/Rust tools and read-only permissions. The required job remains named `checks`; branch protection stays enabled. A green main check is not full native release qualification. Rust/native failures can therefore reach main but must block a release.
+- Pushes to `ci/**` run the same lightweight job. This lets a maintainer validate an exact commit before a protected direct-main fast-forward, without bypassing required checks. Delete the temporary validation branch afterward. This is not a publication route.
+- A stable tag runs the complete native Apple Silicon checks, workspace/default bundle builds and disposable signed-artifact qualification once. Signing depends on that successful release-run gate. Production signing, same-run artifact transfers, authenticated readback and separate publication approval remain unchanged. No PR artifact or local test result substitutes for this gate.
 
 ## Prepare and qualify a release
 
@@ -49,6 +56,8 @@ mkdir -m 700 /private/path/teamarness-v0.1.0-distribution &&
 ```
 
 Use the actual prior version and a new archive path; if an earlier attempt was incomplete, explicitly name only the known files present. Stop and investigate any other entries rather than deleting them or bypassing the qualifier's allowlist. Confirm the named files are preserved in the archive and distribution is ready for the new version before proceeding. Do not use wildcards, recursive cleanup, or place signing material in either asset directory.
+
+The commands below are the complete local qualification path when needed; they are not a mandatory duplicate of the hosted release gate before every PR. For ordinary development, use focused checks or `npm run check:fast` instead. Hosted release checks still run in full.
 
 ```sh
 node scripts/release/version.mjs set 0.1.1

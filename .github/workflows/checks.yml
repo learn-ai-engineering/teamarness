@@ -4,7 +4,8 @@
     "pull_request": {},
     "push": {
       "branches": [
-        "main"
+        "main",
+        "ci/**"
       ]
     }
   },
@@ -13,13 +14,12 @@
   },
   "jobs": {
     "checks": {
-      "runs-on": "macos-15",
+      "runs-on": "ubuntu-24.04",
       "permissions": {
         "contents": "read"
       },
       "env": {
-        "CI": "true",
-        "CARGO_INCREMENTAL": "0"
+        "CI": "true"
       },
       "steps": [
         {
@@ -36,30 +36,12 @@
           }
         },
         {
-          "name": "Install exact Rust",
-          "run": "rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy\nrustup override set 1.99.1"
+          "name": "Install exact Rust formatter",
+          "run": "rustup toolchain install 1.99.1 --profile minimal --component rustfmt\nrustup override set 1.99.1"
         },
         {
-          "name": "Record native image/tools and inputs",
-          "id": "inputs",
-          "run": "node scripts/release/ci.mjs"
-        },
-        {
-          "run": "npm run check"
-        },
-        {
-          "run": "cargo build --workspace --locked"
-        },
-        {
-          "run": "npm run tauri build -- --bundles app,dmg -- --locked"
-        },
-        {
-          "name": "Build pinned native qualification tools",
-          "run": "cargo build --locked -p teamarness-desktop --example qualify-update\ncargo build --locked -p teamarness-package-contract --bin teamarness-package-validate"
-        },
-        {
-          "name": "Disposable signed artifact qualification (no production secrets)",
-          "run": "node scripts/release/build.mjs --disposable --public-key-out \"$RUNNER_TEMP/disposable-public-key.txt\""
+          "name": "Check formatting, guards, types, lint and fast tests",
+          "run": "npm run check:fast"
         }
       ]
     }
