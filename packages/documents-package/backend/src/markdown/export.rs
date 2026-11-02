@@ -6,6 +6,7 @@
 //! extensions cannot change how anything else is escaped.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use comrak::arena_tree::NodeEdge;
 use comrak::nodes::{
@@ -241,19 +242,20 @@ fn block_of<'a>(node: &'a AstNode<'a>, source: &Source) -> Vec<Block> {
             }
         }
         NodeValue::Table(_) => {
-            let kept = source_of(node, source);
-            match kept.filter(|text| source.accepts(PreservedKind::Table, text)) {
-                Some(text) => Block::Preserved {
+            let kept =
+                source_of(node, source).filter(|text| source.accepts(PreservedKind::Table, text));
+            let lines = kept.clone().unwrap_or_else(|| loose_lines(node, source));
+            let mut blocks = match kept {
+                Some(text) => vec![Block::Preserved {
                     kind: PreservedKind::Table,
                     source: text,
-                },
+                }],
                 // What the same lines are with no table extension.
-                None => {
-                    let loose = loose_lines(node, source);
-                    return import(&loose, Recognise::Never, MAX_IMPORT_DEPTH)
-                        .unwrap_or_else(|_| vec![literal_paragraph(&loose)]);
-                }
-            }
+                None => import(&lines, Recognise::Never, MAX_IMPORT_DEPTH)
+                    .unwrap_or_else(|_| vec![literal_paragraph(&lines)]),
+            };
+            blocks.extend(links_paragraph(node, &lines, source));
+            return blocks;
         }
         NodeValue::FrontMatter(literal) => Block::Preserved {
             kind: PreservedKind::FrontMatter,
@@ -267,6 +269,78 @@ impl Source<'_> {
     fn accepts(&self, kind: PreservedKind, text: &str) -> bool {
         self.recognise == Recognise::Unchecked || is_sound(kind, text)
     }
+}
+
+/// The paragraph that holds what a table's links and images resolved through a reference
+/// definition. A definition is consumed and the table keeps its lines, so nothing else would
+/// hold the target. What the table's lines give alone, with no definition, needs no paragraph.
+///
+/// Without a definition the export never resolves anything here, so the paragraph is added once.
+/// A revision that brings the definition back after it finds the paragraph already there.
+fn links_paragraph<'a>(node: &'a AstNode<'a>, lines: &str, source: &Source) -> Option<Block> {
+    if source.recognise != Recognise::Checked {
+        return None;
+    }
+    let targets = link_targets(node);
+    if targets.is_empty() {
+        return None;
+    }
+    let arena = Arena::new();
+    let alone = parse_document(&arena, lines, &import_options(false));
+    let mut own: HashMap<Vec<Inline>, usize> = HashMap::new();
+    // Too deep to walk means nothing is known about the lines alone, and every target is kept.
+    if check_depth(alone, MAX_IMPORT_DEPTH).is_ok() {
+        for target in link_targets(alone) {
+            *own.entry(target).or_default() += 1;
+        }
+    }
+    let mut content = Vec::new();
+    for target in targets {
+        match own.get_mut(&target) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => {
+                if !content.is_empty() {
+                    content.push(Inline::Text(" ".to_owned(), Marks::default()));
+                }
+                content.extend(target);
+            }
+        }
+    }
+    if content.is_empty() {
+        return None;
+    }
+    let links = Block::Paragraph(normalize_inlines(content));
+    let already_there = node.next_sibling().is_some_and(|next| {
+        matches!(next.data.borrow().value, NodeValue::Paragraph)
+            && canonicalize(&[Block::Paragraph(inlines_of(next))])
+                == canonicalize(std::slice::from_ref(&links))
+    });
+    (!already_there).then_some(links)
+}
+
+/// Each Link and Image under `node` as inline content. A link with no text has its URL as text,
+/// so that it still shows.
+fn link_targets<'a>(node: &'a AstNode<'a>) -> Vec<Vec<Inline>> {
+    let mut targets = Vec::new();
+    for target in node.descendants() {
+        let link = match &target.data.borrow().value {
+            NodeValue::Link(link) => Some(link_mark(link)),
+            NodeValue::Image(_) => None,
+            _ => continue,
+        };
+        let mut content = Vec::new();
+        collect_inline(target, &Marks::default(), &mut content);
+        if let (true, Some(link)) = (content.is_empty(), link) {
+            let text = link.href.clone();
+            let marks = Marks {
+                link: Some(link),
+                ..Marks::default()
+            };
+            content.push(Inline::Text(text, marks));
+        }
+        targets.push(normalize_inlines(content));
+    }
+    targets
 }
 
 /// The source of a front matter node: comrak's literal runs through the blank line after it.
@@ -441,72 +515,80 @@ fn inlines_of<'a>(node: &'a AstNode<'a>) -> Vec<Inline> {
 
 fn collect_inlines<'a>(node: &'a AstNode<'a>, marks: &Marks, out: &mut Vec<Inline>) {
     for child in node.children() {
-        let value = child.data.borrow().value.clone();
-        match value {
-            NodeValue::Text(text) => out.push(Inline::Text(text.into_owned(), marks.clone())),
-            NodeValue::SoftBreak => out.push(Inline::Text(" ".to_owned(), marks.clone())),
-            NodeValue::LineBreak => out.push(Inline::Break),
-            NodeValue::Code(code) => out.push(Inline::Text(
-                code.literal,
-                Marks {
-                    code: true,
-                    ..marks.clone()
-                },
-            )),
-            NodeValue::Emph => collect_inlines(
-                child,
-                &Marks {
-                    em: true,
-                    ..marks.clone()
-                },
-                out,
-            ),
-            NodeValue::Strong => collect_inlines(
-                child,
-                &Marks {
-                    strong: true,
-                    ..marks.clone()
-                },
-                out,
-            ),
-            NodeValue::Strikethrough => collect_inlines(
-                child,
-                &Marks {
-                    strike: true,
-                    ..marks.clone()
-                },
-                out,
-            ),
-            NodeValue::Link(link) => collect_inlines(
-                child,
-                &Marks {
-                    link: Some(Link {
-                        href: link.url.clone(),
-                        title: (!link.title.is_empty()).then(|| link.title.clone()),
-                    }),
-                    ..marks.clone()
-                },
-                out,
-            ),
-            // Not in the baseline: kept as literal text.
-            NodeValue::HtmlInline(html) => out.push(Inline::Text(html, marks.clone())),
-            NodeValue::Image(image) => {
-                let mut alt = Vec::new();
-                collect_inlines(child, &Marks::default(), &mut alt);
-                let alt: String = alt
-                    .iter()
-                    .filter_map(|inline| match inline {
-                        Inline::Text(text, _) => Some(text.as_str()),
-                        Inline::Break => None,
-                    })
-                    .collect();
-                out.push(Inline::Text(
-                    format!("![{alt}]({})", image.url),
-                    marks.clone(),
-                ));
-            }
-            _ => collect_inlines(child, marks, out),
+        collect_inline(child, marks, out);
+    }
+}
+
+fn collect_inline<'a>(node: &'a AstNode<'a>, marks: &Marks, out: &mut Vec<Inline>) {
+    let value = node.data.borrow().value.clone();
+    match value {
+        NodeValue::Text(text) => out.push(Inline::Text(text.into_owned(), marks.clone())),
+        NodeValue::SoftBreak => out.push(Inline::Text(" ".to_owned(), marks.clone())),
+        NodeValue::LineBreak => out.push(Inline::Break),
+        NodeValue::Code(code) => out.push(Inline::Text(
+            code.literal,
+            Marks {
+                code: true,
+                ..marks.clone()
+            },
+        )),
+        NodeValue::Emph => collect_inlines(
+            node,
+            &Marks {
+                em: true,
+                ..marks.clone()
+            },
+            out,
+        ),
+        NodeValue::Strong => collect_inlines(
+            node,
+            &Marks {
+                strong: true,
+                ..marks.clone()
+            },
+            out,
+        ),
+        NodeValue::Strikethrough => collect_inlines(
+            node,
+            &Marks {
+                strike: true,
+                ..marks.clone()
+            },
+            out,
+        ),
+        NodeValue::Link(link) => collect_inlines(
+            node,
+            &Marks {
+                link: Some(link_mark(&link)),
+                ..marks.clone()
+            },
+            out,
+        ),
+        // Not in the baseline: kept as literal text.
+        NodeValue::HtmlInline(html) => out.push(Inline::Text(html, marks.clone())),
+        NodeValue::Image(image) => {
+            let mut alt = Vec::new();
+            collect_inlines(node, &Marks::default(), &mut alt);
+            let alt: String = alt
+                .iter()
+                .filter_map(|inline| match inline {
+                    Inline::Text(text, _) => Some(text.as_str()),
+                    Inline::Break => None,
+                })
+                .collect();
+            out.push(Inline::Text(
+                format!("![{alt}]({})", image.url),
+                marks.clone(),
+            ));
         }
+        _ => collect_inlines(node, marks, out),
+    }
+}
+
+fn link_mark(link: &NodeLink) -> Link {
+    Link {
+        href: link.url.clone(),
+        title: (!link.title.is_empty()).then(|| link.title.clone()),
     }
 }
 

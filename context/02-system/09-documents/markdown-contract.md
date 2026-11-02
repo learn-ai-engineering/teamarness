@@ -66,14 +66,21 @@ For every body, the export SHALL satisfy three guarantees:
 
 1. **Fixed point.** Export, then import, then export again gives the same bytes.
 2. **Canonical round trip.** Import of the export gives exactly the body's canonical form. For a body that Markdown can carry, the canonical form is the body itself.
-3. **No content loss.** Every content character survives export and import. Only whitespace at the edges of a line is normalised. The one exception is on import: a reference definition that no link uses is dropped (see Normalisations).
+3. **No content loss.** Every content character of a body survives export and import. Only whitespace at the edges of a line is normalised.
+
+This guarantee covers a body. Import of Markdown from outside does not keep all of it. Import drops these, and nothing else:
+
+- a reference definition that no link uses;
+- the `<!-- end list -->` separator comment;
+- the title of an image, and a link inside an image's alt text;
+- a link with no text, outside a table.
 
 ### Preserved Blocks
 
 A **Preserved Block** keeps Markdown that the editor cannot carry as its exact source lines. Import recognises three constructs on every path, and export writes the source byte for byte:
 
 - a GFM table;
-- YAML front matter: a `---` block that opens the document, with no blank line directly inside either delimiter;
+- YAML front matter: a `---` block that opens the document, with no blank line directly inside either delimiter, and no whitespace after either delimiter;
 - an HTML block, except the `<!-- end list -->` separator.
 
 The stored source has no container prefix (`> `, list indent) and no final line ending. The writer adds the prefix back.
@@ -94,14 +101,20 @@ The canonical form makes only these changes. Content always wins over formatting
 - **A list item's empty leading paragraph** is not written when other blocks follow it. Import restores it.
 - **Soft line breaks** import as spaces.
 - **Trailing hard breaks** at the end of a paragraph are dropped, and a hard break inside a heading imports as nothing.
-- **Unsupported Markdown is literal text.** Task lists, images, inline HTML and a footnote marker with no definition import as the characters the author wrote, escaped on export, so nothing an author wrote is lost. Entities import as the characters they name.
-- **Reference definitions are consumed.** A definition that a link uses resolves into that link, which imports as an inline link. A definition that no link uses is dropped, and its text is lost. A footnote definition such as `[^1]: note` is a reference definition to the parser, so `a[^1]` with that definition exports as `a[^1](note)`.
-- **A Preserved Block's edges and line endings.** `\r\n` and `\r` in a source become `\n`. The first line loses its indentation, and trailing blank lines are dropped. Whitespace at the end of the final line stays, as on any other line. Export puts a blank line between a Preserved Block and the next block.
+- **Unsupported Markdown is literal text.** Task lists, images, inline HTML and a footnote with no link definition import as the characters the author wrote, escaped on export. An image keeps its alt text and URL and loses its title. Entities import as the characters they name.
+- **Reference definitions are consumed.** A definition is consumed only when it parses as a link definition: one token as its destination, and an optional title. A definition that a link uses resolves into that link, which imports as an inline link. A definition that no link uses is dropped, and its text is lost. A footnote definition such as `[^1]: note` parses as a link definition, so `a[^1]` with that definition exports as `a[^1](note)`. Any other footnote, such as `[^1]: a longer note`, stays literal text.
+- **A table's resolved links get a paragraph.** A table keeps its lines, so a cell's `[x][r]` cannot hold the target of a definition. Import adds one paragraph directly after the table that holds each Link and Image of the table that a definition resolved, in cell order, as `[x](target)`. This is text the author did not write. For example, `| a |\n|---|\n| [x][r] |\n\n[r]: https://x.test/page\n` exports as `| a |\n|---|\n| [x][r] |\n\n[x](https://x.test/page)\n`. A table with no resolved link gets no paragraph. The same applies in a list item, in a blockquote, and to a table that falls back to literal text.
+  - The cell still reads `[x][r]` outside the app, and its target is in the next paragraph.
+  - The export holds no definition, so a later import adds nothing. The paragraph is ordinary content, and a revision can remove it.
+  - A revision that brings the definition back adds no second paragraph when the same links already follow the table.
+  - A link with no text uses its URL as its text.
+  - A cell past the header's width is not parsed. Its reference resolves to nothing, so its definition counts as unused and is dropped.
+- **A Preserved Block's edges and line endings.** `\r\n` and `\r` in a source become `\n`. The first line loses its indentation, and trailing blank lines are dropped. Whitespace at the end of the final line stays, as on any other line. Front matter is the exception: whitespace after a delimiter means the block is not front matter, and it imports as it did before Preserved Blocks. Export puts a blank line between a Preserved Block and the next block.
 - **A paragraph line that would make a table.** Hard breaks can put a delimiter row such as `|---|` directly under a line of text. Export writes a backslash before its first character, so the paragraph stays a paragraph.
 - **Reference-style links** import as inline links.
 - **Other syntax forms** import as their canonical equivalents: setext headings, `*` and `+` bullets, `1)` lists, `__bold__`, `_em_`, `~strike~`, indented code, `~~~` fences and two-space hard breaks.
 
-The canonical corpus (`backend/tests/fixtures/markdown-corpus/`) records these normalisations. It has 22 byte-stable canonical documents and 35 agent-style inputs, each with its expected canonical export.
+The canonical corpus (`backend/tests/fixtures/markdown-corpus/`) records these normalisations. It has 22 byte-stable canonical documents and 40 agent-style inputs, each with its expected canonical export.
 
 ### Known gap
 
@@ -161,6 +174,7 @@ These are the accepted merge semantics:
   - P7: concurrent human and agent edits both survive.
   - P8: concurrent edits to one table both survive, in one block.
   - P9: a Preserved Block source of any shape exports stably, with no content lost.
+  - P10: a table's link through a reference definition keeps its target, and bringing the definition back changes nothing.
 - The `CASES` environment variable sets the scale, with a default of 3 000. Merge properties run a third of it. The long run is `CASES=60000 cargo test -p teamarness-documents-package --release --test markdown_properties`.
 - `backend/tests/markdown_corpus.rs` checks the corpus.
 - `packages/documents-package/fixtures/merge-scenarios.json` is the shared merge scenario table. The backend runs it against `merge`, and the Documents port system test runs it through `document.revise`.

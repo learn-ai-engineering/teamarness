@@ -246,6 +246,42 @@ proptest! {
         let merged = merge_into(&doc, &latest(&doc), &md, AGENT);
         prop_assert_eq!(merged.ops, 0, "markdown:\n{}", md);
     }
+
+    /// P10: a table's link through a reference definition keeps its target, anywhere and beside
+    /// any body. The export is a fixed point, and bringing the definition back changes nothing.
+    #[test]
+    fn a_tables_reference_link_keeps_its_target(
+        text in "[a-z]{1,6}( [a-z]{1,6})?",
+        path in "[a-z]{1,6}",
+        place in 0..3,
+        rest in blocks(word_text().boxed(), false),
+    ) {
+        let table = Block::Preserved {
+            kind: PreservedKind::Table,
+            source: format!("| a |\n|---|\n| [{text}][r] |"),
+        };
+        let mut body = vec![match place {
+            0 => table,
+            1 => Block::Blockquote(vec![table]),
+            _ => Block::Bullet { items: vec![vec![Block::Paragraph(vec![]), table]] },
+        }];
+        body.extend(rest);
+        let definition = format!("\n[r]: https://x.test/{path}\n");
+        let revision = format!("{}{definition}", to_markdown(&body));
+
+        let doc = doc_with(&[]);
+        merge_into(&doc, &latest(&doc), &revision, AGENT);
+        let md = export(&doc).unwrap();
+        let link = format!("[{text}](https://x.test/{path})");
+        prop_assert!(md.contains(&link), "markdown:\n{}", md);
+        prop_assert_eq!(to_markdown(&parse(&md)), md.clone());
+
+        let unchanged = merge_into(&doc, &latest(&doc), &md, HUMAN);
+        prop_assert_eq!(unchanged.ops, 0, "markdown:\n{}", md);
+        let again = format!("{md}{definition}");
+        let unchanged = merge_into(&doc, &latest(&doc), &again, HUMAN + 1);
+        prop_assert_eq!(unchanged.ops, 0, "markdown:\n{}", again);
+    }
 }
 
 // ---------------------------------------------------------------- regressions

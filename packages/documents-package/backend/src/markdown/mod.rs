@@ -10,8 +10,9 @@
 //!   has none, with the binding's mark expand configuration: `after` for every mark, `none`
 //!   for link.
 //! - [`export`] gives Canonical Markdown. Export, import and export again gives the same
-//!   bytes, and no content character is lost; only formatting Markdown cannot express, line-edge
-//!   whitespace and empty paragraphs are normalised. Tables, front matter and HTML blocks are
+//!   bytes, and no content character of a body is lost; only formatting Markdown cannot express,
+//!   line-edge whitespace and empty paragraphs are normalised. Import of outside Markdown drops
+//!   only what the contract names. Tables, front matter and HTML blocks are
 //!   [`Block::Preserved`], whose source is written verbatim.
 //! - [`canonical`] gives the Canonical Markdown a revision becomes, so a caller can tell whether
 //!   a revision was already canonical.
