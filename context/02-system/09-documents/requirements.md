@@ -36,6 +36,14 @@ Concurrent edits, including edits made while disconnected and edits from two vie
 
 **Import failure.** A signed body edit whose Loro import returns an error, or whose import leaves a tree the shared schema does not allow (sanitized category `schema_violation`, migration `0007_schema_violation.sql`), SHALL retain its sealed row, opaque ID and cursor with an atomic Document-local import-failure marker; it SHALL NOT be counted as applied, included or Saved on that Installation. The last known-good body SHALL remain visible marked incomplete/read-only with a bounded local diagnostic reference; later edits on that Document remain sealed/unapplied while unrelated Documents continue. Missing causal history reported as a successful pending import SHALL remain pending rather than failed. This is not an all-peer import acknowledgment or automatic repair.
 
+**Format upgrade.** The Backend SHALL hold a format generation, raised by any change that adds a body node or a record kind, and SHALL store the generation it last ran under (migration `0009_format_generation.sql`). When the stored generation is lower, activation SHALL re-evaluate once, before any body opens and before replay qualification is reported, and only from retained sealed rows, without any record being delivered again (ADR 0042):
+
+- Every `schema_violation` marker SHALL be cleared and its Document imported again, including the later edits that the marker held back. A Document that still fails SHALL be marked again and SHALL stay as this section describes.
+- Every `malformed_record` row SHALL be decoded and projected again in ingestion order. A row that still fails SHALL stay quarantined.
+- A `malformed_record` row that cannot be opened yet for lack of history access SHALL leave the stored generation unchanged, so the next activation tries again.
+
+Other import-failure categories SHALL stay as they are. Re-evaluation SHALL log bounded counts only.
+
 ## TEAM.SYS.DOCS-R06 — Edit Latency
 
 With both Installations online, a body edit SHALL be visible to another Member within two seconds (vision success criterion 4). Verification is manual across separate networks.
@@ -72,7 +80,7 @@ Unknown append outcomes SHALL preserve exact live retry bytes and an unsaved cue
 These are not delivered:
 
 - folder mapping;
-- formatting beyond the baseline body schema (R13), such as tables, images, task lists or underline;
+- formatting beyond the baseline body schema (R13), such as editable or rendered tables, images, task lists or underline. Tables, front matter and HTML blocks are kept only as read-only Preserved Blocks (R11, R13);
 - exact text-range Comment anchors (Comments quote excerpts, R07);
 - document-level permissions beyond Canonical Membership;
 - log compaction;
@@ -86,6 +94,7 @@ The Documents Backend SHALL be the only Markdown authority; the Package UI SHALL
 
 - The Backend SHALL export **Canonical Markdown**: the body as Markdown can carry it, with formatting that Markdown cannot express dropped before writing. Export, then import, then export SHALL give the same bytes, and no text content SHALL be lost.
 - A Markdown revision SHALL merge against an explicit base version. Unchanged blocks SHALL be untouched, changed blocks SHALL be edited in place, and concurrent edits made since the base SHALL survive through Loro, including an edit elsewhere in the same paragraph. Merging back an unchanged export SHALL produce no operations.
+- GFM tables, YAML front matter and HTML blocks SHALL import as **Preserved Blocks** on every Markdown import path, and the export SHALL write each one's source byte for byte, apart from the normalisations the contract lists. A Preserved Block SHALL merge at character level. A construct that would not re-import as the same block SHALL stay literal text, so no content is lost. Task lists, images, inline HTML, footnotes and reference definitions SHALL stay literal text (ADR 0042).
 - Property tests SHALL prove round trip, fixed point, content preservation, no-op merge, revision equality, block identity and concurrent survival, at 3 000 cases in the ordinary test run.
 
 **Copy as Markdown.** A Member SHALL be able to copy a Document as Canonical Markdown. The UI SHALL read it through `documents.document.markdown`, one 24 KiB chunk per request with a SHA-256 digest of the whole text. Every chunk SHALL carry the same digest, and the read SHALL restart from the first chunk when the Document changes during the read. The clipboard write SHALL start inside the Member's click. When the frame's permissions policy refuses clipboard writes, the UI SHALL show the Markdown in a copy panel instead. A pending body SHALL report pending, and an import-failed body SHALL copy its last known-good text.
@@ -109,7 +118,9 @@ A version token SHALL be the Loro frontiers' IDs sorted by peer then counter, ea
 
 ## TEAM.SYS.DOCS-R13 — Rendered Editing
 
-A Member SHALL edit a Document body in rendered form, and no Markdown source SHALL be shown while editing. The editor SHALL be ProseMirror bound to the Editor Session's Loro document (R05) through `loro-prosemirror`, over the one shared schema. Toolbar controls, keyboard shortcuts and input rules SHALL create every baseline node and mark: headings, paragraphs, bulleted and numbered lists, blockquotes, code blocks, horizontal rules, hard breaks, bold, italic, strikethrough, inline code and links. A link's address SHALL be at most 2 048 characters and SHALL be a web, mail or relative link.
+A Member SHALL edit a Document body in rendered form, and no Markdown source SHALL be shown while editing, except inside a Preserved Block. The editor SHALL be ProseMirror bound to the Editor Session's Loro document (R05) through `loro-prosemirror`, over the one shared schema. Toolbar controls, keyboard shortcuts and input rules SHALL create every baseline node and mark: headings, paragraphs, bulleted and numbered lists, blockquotes, code blocks, horizontal rules, hard breaks, bold, italic, strikethrough, inline code and links. A link's address SHALL be at most 2 048 characters and SHALL be a web, mail or relative link.
+
+A Preserved Block (R11) SHALL show its source read-only in a monospace frame labelled by kind, such as "Table · preserved Markdown". This frame is the one place the editor shows Markdown source. A Member SHALL be able to select, move and delete the block as a whole, and the rest of the Document SHALL stay editable. The editor SHALL refuse a local step that edits the source. It SHALL also refuse a local step that leaves front matter anywhere except as the first top-level block, and SHALL show a notice for each refusal. A remote update SHALL still apply. Copy as Markdown and `document.markdown` SHALL return the source verbatim, and a block copied within the editor SHALL keep its node. The UI SHALL NOT convert a pasted table into a Preserved Block.
 
 Undo and redo SHALL be per person: `LoroUndoPlugin` on Mod-z, Shift-Mod-z and Mod-y, and the toolbar's Undo and Redo, SHALL revert only the session's own changes, never another Member's, another view's or a port revision's, within the bounds of R09. Typing SHALL undo in bursts: consecutive plain-text insertion, backspace and delete within one textblock SHALL be one undo step, which ends at an idle gap of 750 ms, at any other change (such as a paste, a structural change or a mark), at a selection jump, at an undo or redo, and before an import of another peer's changes, so no step spans another peer's change. Each other local change SHALL be its own undo step (the undo manager merges nothing by time), except that the pieces of a split paste SHALL be one step. A burst SHALL grow only while its undo still fits one record (R09). The undo history SHALL hold at most 500 steps, dropping the oldest. A change too large to undo in one record is not undoable (R09); recovering from one is left to a future way to view earlier Document versions and copy from them. Undoing an agent's or another Member's edits is out of scope. `prosemirror-history` SHALL NOT be used.
 

@@ -24,7 +24,15 @@ A new schema node has a cost. An Installation on an older build reads a tree tha
 
 **Merge.** A Preserved Block is a text block. The same `kind` is edited in place by character diff, and another `kind` is replaced. New front matter is placed before any empty paragraph a revision cannot mention, and a merge that would leave a schema-invalid tree is refused.
 
-**Upgrade re-evaluation.** Documents keeps a format generation. After an upgrade, an Installation re-evaluates once what its older build paused or quarantined, so a Document paused only because its build was old recovers without any action. A record that still fails stays failed.
+**Upgrade re-evaluation.** Documents keeps a format generation: the constant `FORMAT_GENERATION` in the Backend, raised by any change that adds a body node or a record kind, and a stored value on `metadata` that starts at 0. A Document paused only because its build was old recovers without any action. A record that still fails stays failed.
+
+When the stored generation is lower, activation does the following before any body opens and before qualification is reported:
+
+1. It opens the retained `malformed_record` rows through the record log. Nothing is delivered again.
+2. In one immediate SQLite transaction, it clears every `schema_violation` marker and releases the Document's later edits that were quarantined as `import_failure`. It then projects each opened row that now decodes, in ingestion order, and stores the new generation.
+3. The ordinary body open imports each released Document from its retained rows. A Document that fails again is marked again through the ordinary path.
+
+Opening cannot run inside the transaction, because it is an asynchronous capability call. No session is running at this point, so the rows cannot change between the two steps. A crash before the commit changes nothing, and a crash after it leaves work that every activation's body open already does. A row that is waiting for history access could still project, so it holds the generation back and the next activation tries again. Other import-failure categories, such as `decode_or_checksum`, are left alone, because a new node or record kind does not change what they mean. Diagnostics are bounded counts, as ADR 0029 requires.
 
 ## Rejected alternatives
 
@@ -48,7 +56,8 @@ A new schema node has a cost. An Installation on an older build reads a tree tha
 - `packages/documents-package/backend/src/markdown/{schema,export,merge}.rs`; `context/02-system/09-documents/markdown-contract.md`.
 - `backend/tests/markdown_properties.rs` runs the round-trip, fixed-point, no-loss, no-op, revision, block-identity and concurrency properties with Preserved Blocks in the generators, at the top level and nested. `markdown_corpus.rs`, `markdown_merge_scenarios.rs` and `cross_language.rs` pin the corpus, the shared scenarios and the tree format.
 - A census over 985 Markdown files, `context/` plus the MyFlow workstream artifacts, found 10 971 table lines and 8 638 front matter lines, and none of them changed through import and export. The census is not committed. It ran once at the commit that adds the node.
-- **Weaknesses.** The concurrent front matter race is reasoned from the schema rule and Loro list semantics, and no test exercises it across Installations. The census corpus is planning documents, so HTML blocks are thinly covered (15 files).
+- `packages/documents-package/backend/src/store/mod.rs` (`reevaluate_after_upgrade`) and `backend.rs` (activation). The tests `upgrade_reimports_schema_violation_document`, `upgrade_reprojects_malformed_record`, `still_failing_record_stays_failed`, `reevaluation_runs_once_per_generation` and `reevaluation_retries_a_record_waiting_for_history_access` start from a schema v8 store and activate.
+- **Weaknesses.** The concurrent front matter race is reasoned from the schema rule and Loro list semantics, and no test exercises it across Installations. The upgrade tests build the older state in the current store and then lower its schema version, because no older build runs in a test. A two-build check is a manual step. The census corpus is planning documents, so HTML blocks are thinly covered (15 files).
 
 ### Provenance (non-versioned)
 

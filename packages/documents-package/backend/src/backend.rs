@@ -20,9 +20,11 @@ use teamarness_package_sdk::{
 };
 use tokio::sync::{Notify, broadcast, watch};
 
-use crate::body::{BodyError, DocumentBody};
+use crate::body::{BodyError, DocumentBody, FORMAT_GENERATION};
 use crate::domain::{DomainError, DomainRecord, MAX_UPDATE};
-use crate::store::{DocumentStore, ImportClassifier, IngestResult, Ingested, StoreError};
+use crate::store::{
+    DocumentStore, ImportClassifier, IngestResult, Ingested, Reevaluation, StoreError,
+};
 
 #[path = "guide.rs"]
 mod guide;
@@ -1156,6 +1158,7 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
                 publication_gate: Arc::new(Mutex::new(())),
             };
+            reevaluate_after_upgrade(&store, &log, &cancellation).await?;
             rehydrate(&store, &log, &hub, &cancellation).await?;
 
             let sync = Arc::new(Mutex::new(SyncReport::catching_up()));
@@ -2230,6 +2233,77 @@ async fn reopen_metadata(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Re-evaluates what an older build paused or quarantined, once per [`FORMAT_GENERATION`] and
+/// before any body opens (ADR 0042). It opens retained rows only; nothing is delivered again.
+async fn reevaluate_after_upgrade(
+    store: &DocumentStore,
+    log: &RecordLog,
+    cancellation: &CancellationToken,
+) -> Result<(), BackendError> {
+    let reader = store.clone();
+    let rows = teamarness_package_sdk::blocking(cancellation, move |_| {
+        if reader.format_generation().map_err(|_| storage_failed())? >= FORMAT_GENERATION {
+            return Ok(None);
+        }
+        reader
+            .malformed_records()
+            .map(Some)
+            .map_err(|_| storage_failed())
+    })
+    .await?;
+    let Some(rows) = rows else {
+        return Ok(());
+    };
+    let mut opened = HashMap::new();
+    let mut undecided = false;
+    for batch in open_batches(&rows) {
+        let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
+        let results = log
+            .open(&sealed)
+            .await
+            .map_err(|cause| capability_error("open-malformed-records", cause))?;
+        if results.len() != batch.len() {
+            return Err(error("documents.document_pending", true));
+        }
+        for (row, result) in batch.iter().zip(results) {
+            match result {
+                OpenResult::Ready(record)
+                    if record.record_id.as_str() == row.record_id
+                        && record.order_key.as_str() == row.order_key
+                        && record.author == row.author
+                        && record.purpose == row.purpose
+                        && record.signature == row.signature =>
+                {
+                    opened.insert(row.record_id.clone(), record.canonical);
+                }
+                OpenResult::WaitingForHistoryAccess => undecided = true,
+                OpenResult::Ready(_) | OpenResult::WrongScope | OpenResult::Corrupt => {}
+            }
+        }
+    }
+    let writer = store.clone();
+    let outcome = teamarness_package_sdk::blocking(cancellation, move |_| {
+        writer
+            .reevaluate_after_upgrade(FORMAT_GENERATION, &opened, undecided)
+            .map_err(|_| storage_failed())
+    })
+    .await?;
+    if outcome != Reevaluation::default() {
+        eprintln!(
+            "{}",
+            json!({
+                "event": "documents.format_reevaluation",
+                "generation": FORMAT_GENERATION,
+                "reimported": outcome.reimported,
+                "reprojected": outcome.reprojected,
+                "stillFailed": outcome.still_failed,
+                "retrying": undecided,
+            })
+        );
     }
     Ok(())
 }
@@ -4441,10 +4515,10 @@ mod tests {
             drop(store);
             let connection = rusqlite::Connection::open(&path).unwrap();
             if old_version == 4 {
-                connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;").unwrap();
+                connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; PRAGMA user_version=4;").unwrap();
             } else {
                 connection
-                    .execute_batch("DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=5;")
+                    .execute_batch("DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; PRAGMA user_version=5;")
                     .unwrap();
             }
             drop(connection);
@@ -4481,6 +4555,411 @@ mod tests {
                 hex(64, 5)
             );
         }
+    }
+
+    /// Bytes no build decodes: the canonical form an older build could not read, or a record
+    /// no build ever will.
+    const UNDECODABLE: &[u8] = b"not a domain record";
+
+    /// Leaves the store at `path` as the last build before format generations left it.
+    fn as_older_build(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE metadata DROP COLUMN format_generation; PRAGMA user_version=8;",
+            )
+            .unwrap();
+    }
+
+    /// Ingests record `seed`, sealed as the one byte `seed`, as the older build saw `canonical`.
+    fn ingest_seen_as(
+        store: &DocumentStore,
+        seed: u64,
+        record: &DomainRecord,
+        canonical: &[u8],
+    ) -> crate::store::IngestResult {
+        store
+            .ingest(
+                &hex(64, seed),
+                &hex(82, seed),
+                "bob",
+                record.kind(),
+                "c2ln",
+                canonical,
+                &[seed as u8],
+                None,
+            )
+            .unwrap()
+    }
+
+    fn ingest_as_seen(store: &DocumentStore, seed: u64, record: &DomainRecord) {
+        ingest_seen_as(store, seed, record, &record.encode());
+    }
+
+    /// A record log that opens the row sealed as byte `n` into `records[n - 1]`, as this build's
+    /// Core would. A seed in `waiting` has no history access yet.
+    fn log_opening(
+        records: Vec<(DomainRecord, Vec<u8>)>,
+        waiting: Arc<Mutex<HashSet<u64>>>,
+    ) -> ScriptedCapability {
+        ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => Ok(
+                json!({"results":payload["sealedRecords"].as_array().unwrap().iter().map(|sealed| {
+                let seed = URL_SAFE_NO_PAD.decode(sealed.as_str().unwrap()).unwrap()[0] as u64;
+                if waiting.lock().unwrap().contains(&seed) {
+                    return json!({"status":"waiting_for_history_access"});
+                }
+                let (record, canonical) = &records[seed as usize - 1];
+                json!({"status":"ready","recordId":hex(64,seed),"orderKey":hex(82,seed),
+                    "author":"bob","purpose":record.kind(),"signature":"c2ln",
+                    "canonical":URL_SAFE_NO_PAD.encode(canonical)})
+            }).collect::<Vec<_>>()}),
+            ),
+            _ => Err(error("unavailable", false)),
+        })
+    }
+
+    /// `records` as Core opens them today, each with its own canonical bytes.
+    fn encoded(records: &[DomainRecord]) -> Vec<(DomainRecord, Vec<u8>)> {
+        records
+            .iter()
+            .map(|record| (record.clone(), record.encode()))
+            .collect()
+    }
+
+    fn quarantine_code(path: &std::path::Path, seed: u64) -> Option<String> {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT quarantine_code FROM records WHERE record_id=?1",
+                [hex(64, seed)],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A concurrent peer's update that leaves front matter below the genesis paragraph, which
+    /// stays a schema violation under every build so far (ADR 0042).
+    fn front_matter_below_a_block() -> Vec<u8> {
+        let doc = loro::LoroDoc::new();
+        doc.import(&TEST_GENESIS).unwrap();
+        let before = doc.oplog_vv();
+        let Some(loro::ValueOrContainer::Container(loro::Container::List(children))) =
+            doc.get_map("doc").get("children")
+        else {
+            panic!("the genesis has a children list");
+        };
+        let node = children
+            .insert_container(children.len(), loro::LoroMap::new())
+            .unwrap();
+        node.insert("nodeName", "preserved_block").unwrap();
+        node.insert_container("attributes", loro::LoroMap::new())
+            .unwrap()
+            .insert("kind", "front_matter")
+            .unwrap();
+        let text = node
+            .insert_container("children", loro::LoroList::new())
+            .unwrap()
+            .insert_container(0, loro::LoroText::new())
+            .unwrap();
+        text.insert(0, "---\nt: 1\n---").unwrap();
+        doc.commit();
+        doc.export(loro::ExportMode::updates(&before)).unwrap()
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a Document an older build paused because it could not read a
+    // Preserved Block recovers at activation, with the later records ADR 0029 held back, whether
+    // the older build held them at replay or quarantined them at delivery.
+    #[tokio::test]
+    async fn upgrade_reimports_schema_violation_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let document = hex(64, 2);
+        let mut writer = Writer::new();
+        let edit = |id: u64, update: Vec<u8>| {
+            DomainRecord::identified_document_edit("bob", &document, &hex(32, id), &[1; 32], update)
+                .unwrap()
+        };
+        let table = "| a |\n|---|\n| 1 |\n";
+        let records = [
+            DomainRecord::collection_create("bob", "Plan").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap(),
+            edit(3, writer.write(table)),
+            edit(4, writer.write(&format!("{table}\nheld at replay\n"))),
+            edit(
+                5,
+                writer.write(&format!("{table}\nheld at replay\n\nheld at delivery\n")),
+            ),
+        ];
+        let store = DocumentStore::open(&path).unwrap();
+        for (index, record) in records[..4].iter().enumerate() {
+            ingest_as_seen(&store, index as u64 + 1, record);
+        }
+        store
+            .mark_import_failure(&document, &hex(64, 3), "schema_violation")
+            .unwrap();
+        ingest_as_seen(&store, 5, &records[4]);
+        assert_eq!(quarantine_code(&path, 5).as_deref(), Some("import_failure"));
+        drop(store);
+        as_older_build(&path);
+
+        let log = log_opening(encoded(&records), Arc::default());
+        let mut session = start(directory.path(), log).await;
+
+        let store = session.handles.store.clone();
+        assert!(!session.handles.qualified.load(Ordering::Acquire));
+        assert_eq!(store.import_failure(&document).unwrap(), None);
+        assert_eq!(store.format_generation().unwrap(), FORMAT_GENERATION);
+        assert_eq!(quarantine_code(&path, 5), None);
+        let opened = body_view(&mut session.harness, &document).await;
+        assert_eq!(opened["editable"], true);
+        assert_eq!(
+            opened["text"],
+            format!("{table}\nheld at replay\n\nheld at delivery\n")
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — records an older build could not decode project at activation
+    // from their retained rows, in ingestion order: a rename, a create that a waiting edit
+    // depends on, a Comment and an edit.
+    #[tokio::test]
+    async fn upgrade_reprojects_malformed_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let document = hex(64, 2);
+        let late = hex(64, 4);
+        let records = [
+            DomainRecord::collection_create("bob", "Plan").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Old title", genesis()).unwrap(),
+            DomainRecord::document_rename("bob", &document, "New title").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Late", genesis()).unwrap(),
+            DomainRecord::identified_document_edit(
+                "bob",
+                &late,
+                &hex(32, 5),
+                &[1; 32],
+                Writer::new().write("waited\n"),
+            )
+            .unwrap(),
+            DomainRecord::comment_add("bob", &document, None, None, "Seen now").unwrap(),
+            DomainRecord::identified_document_edit(
+                "bob",
+                &document,
+                &hex(32, 7),
+                &[1; 32],
+                Writer::new().write("unread edit\n"),
+            )
+            .unwrap(),
+        ];
+        let store = DocumentStore::open(&path).unwrap();
+        ingest_as_seen(&store, 1, &records[0]);
+        ingest_as_seen(&store, 2, &records[1]);
+        for seed in [3, 4, 6, 7] {
+            assert_eq!(
+                ingest_seen_as(&store, seed, &records[seed as usize - 1], UNDECODABLE),
+                crate::store::IngestResult::Quarantined("malformed_record".into())
+            );
+        }
+        ingest_as_seen(&store, 5, &records[4]);
+        assert_eq!(
+            quarantine_code(&path, 5).as_deref(),
+            Some("waiting_for_target")
+        );
+        drop(store);
+        as_older_build(&path);
+
+        let log = log_opening(encoded(&records), Arc::default());
+        let mut session = start(directory.path(), log).await;
+
+        for seed in 1..=7 {
+            assert_eq!(quarantine_code(&path, seed), None, "record {seed}");
+        }
+        let store = session.handles.store.clone();
+        assert_eq!(store.format_generation().unwrap(), FORMAT_GENERATION);
+        let snapshot = session
+            .harness
+            .request("documents.snapshot", json!({}))
+            .await
+            .unwrap();
+        let titles: Vec<&str> = snapshot["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|document| document["title"].as_str().unwrap())
+            .collect();
+        assert!(titles.contains(&"New title"), "{titles:?}");
+        assert!(titles.contains(&"Late"), "{titles:?}");
+        let comments = store.comments(&document).unwrap();
+        assert_eq!(comments[0].markdown.as_deref(), Some("Seen now"));
+        assert_eq!(
+            store.edit_identity(&hex(32, 7)).unwrap().unwrap().0,
+            hex(64, 7),
+            "a re-projected edit is indexed before its body opens"
+        );
+        let edited = body_view(&mut session.harness, &document).await;
+        assert_eq!(edited["text"], "unread edit\n");
+        let opened = body_view(&mut session.harness, &late).await;
+        assert_eq!(opened["editable"], true);
+        assert_eq!(opened["text"], "waited\n");
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — re-evaluation cures only what this build can read. A tree that
+    // is still invalid is marked again and shows its last good text, a record that still does not
+    // decode stays quarantined, and non-first front matter stays a violation (ADR 0042).
+    #[tokio::test]
+    async fn still_failing_record_stays_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let invalid = hex(64, 2);
+        let misplaced = hex(64, 6);
+        let edit = |document: &str, id: u64, update: Vec<u8>| {
+            DomainRecord::identified_document_edit("bob", document, &hex(32, id), &[1; 32], update)
+                .unwrap()
+        };
+        let records = [
+            DomainRecord::collection_create("bob", "Plan").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Invalid", genesis()).unwrap(),
+            edit(&invalid, 3, Writer::new().write("good\n")),
+            edit(&invalid, 4, schema_invalid_update()),
+            edit(&invalid, 5, Writer::new().write("held back\n")),
+            DomainRecord::document_create("bob", &hex(64, 1), "Misplaced", genesis()).unwrap(),
+            edit(&misplaced, 7, front_matter_below_a_block()),
+            DomainRecord::document_rename("bob", &invalid, "Never").unwrap(),
+        ];
+        let store = DocumentStore::open(&path).unwrap();
+        for (index, record) in records[..4].iter().enumerate() {
+            ingest_as_seen(&store, index as u64 + 1, record);
+        }
+        store
+            .mark_import_failure(&invalid, &hex(64, 4), "schema_violation")
+            .unwrap();
+        ingest_as_seen(&store, 5, &records[4]);
+        ingest_as_seen(&store, 6, &records[5]);
+        ingest_as_seen(&store, 7, &records[6]);
+        store
+            .mark_import_failure(&misplaced, &hex(64, 7), "schema_violation")
+            .unwrap();
+        ingest_seen_as(&store, 8, &records[7], UNDECODABLE);
+        drop(store);
+        as_older_build(&path);
+
+        let mut opened_by_core = encoded(&records);
+        opened_by_core[7].1 = UNDECODABLE.to_vec();
+        let log = log_opening(opened_by_core, Arc::default());
+        let mut session = start(directory.path(), log).await;
+
+        let store = session.handles.store.clone();
+        assert_eq!(
+            store.import_failure(&invalid).unwrap(),
+            Some((hex(64, 4), "schema_violation".into()))
+        );
+        assert_eq!(
+            store.import_failure(&misplaced).unwrap(),
+            Some((hex(64, 7), "schema_violation".into()))
+        );
+        assert_eq!(
+            quarantine_code(&path, 8).as_deref(),
+            Some("malformed_record")
+        );
+        assert_eq!(store.format_generation().unwrap(), FORMAT_GENERATION);
+        let opened = body_view(&mut session.harness, &invalid).await;
+        assert_eq!(opened["reason"], "import_failure");
+        assert_eq!(opened["editable"], false);
+        assert_eq!(opened["text"], "good\n");
+        let opened = body_view(&mut session.harness, &misplaced).await;
+        assert_eq!(opened["reason"], "import_failure");
+        assert_eq!(opened["editable"], false);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — after one re-evaluation, activation at the same generation
+    // leaves a marker and a quarantine as they are.
+    #[tokio::test]
+    async fn reevaluation_runs_once_per_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let document = hex(64, 2);
+        let records = [
+            DomainRecord::collection_create("bob", "Plan").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap(),
+            DomainRecord::document_rename("bob", &document, "New title").unwrap(),
+        ];
+        let store = DocumentStore::open(&path).unwrap();
+        ingest_as_seen(&store, 1, &records[0]);
+        ingest_as_seen(&store, 2, &records[1]);
+        drop(store);
+        as_older_build(&path);
+
+        let log = log_opening(encoded(&records), Arc::default());
+        let session = start(directory.path(), log.clone()).await;
+        assert_eq!(
+            session.handles.store.format_generation().unwrap(),
+            FORMAT_GENERATION
+        );
+        // Both would be cured by a second re-evaluation: the tree is valid, and the row decodes.
+        ingest_seen_as(&session.handles.store, 3, &records[2], UNDECODABLE);
+        session
+            .handles
+            .store
+            .mark_import_failure(&document, &hex(64, 2), "schema_violation")
+            .unwrap();
+        session.harness.shutdown().await.unwrap();
+
+        let mut session = start(directory.path(), log).await;
+        let store = session.handles.store.clone();
+        assert_eq!(
+            store.import_failure(&document).unwrap(),
+            Some((hex(64, 2), "schema_violation".into()))
+        );
+        assert_eq!(
+            quarantine_code(&path, 3).as_deref(),
+            Some("malformed_record")
+        );
+        assert_eq!(store.format_generation().unwrap(), FORMAT_GENERATION);
+        let opened = body_view(&mut session.harness, &document).await;
+        assert_eq!(opened["reason"], "import_failure");
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a quarantined record that this activation cannot open yet is
+    // not given up on: the generation stays behind, and a later activation projects it.
+    #[tokio::test]
+    async fn reevaluation_retries_a_record_waiting_for_history_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let document = hex(64, 2);
+        let records = [
+            DomainRecord::collection_create("bob", "Plan").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap(),
+            DomainRecord::document_rename("bob", &document, "New title").unwrap(),
+        ];
+        let store = DocumentStore::open(&path).unwrap();
+        ingest_as_seen(&store, 1, &records[0]);
+        ingest_as_seen(&store, 2, &records[1]);
+        ingest_seen_as(&store, 3, &records[2], UNDECODABLE);
+        drop(store);
+        as_older_build(&path);
+
+        let waiting: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::from([3])));
+        let log = log_opening(encoded(&records), waiting.clone());
+        let session = start(directory.path(), log.clone()).await;
+        assert_eq!(session.handles.store.format_generation().unwrap(), 0);
+        assert_eq!(
+            quarantine_code(&path, 3).as_deref(),
+            Some("malformed_record")
+        );
+        session.harness.shutdown().await.unwrap();
+
+        waiting.lock().unwrap().clear();
+        let session = start(directory.path(), log).await;
+        assert_eq!(
+            session.handles.store.format_generation().unwrap(),
+            FORMAT_GENERATION
+        );
+        assert_eq!(quarantine_code(&path, 3), None);
+        session.harness.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -4663,7 +5142,7 @@ mod tests {
             ).unwrap();
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;").unwrap();
+        connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; PRAGMA user_version=4;").unwrap();
         drop(connection);
         let access = Arc::new(AtomicBool::new(false));
         let gained = access.clone();
@@ -4810,7 +5289,7 @@ mod tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; PRAGMA user_version=4;")
             .unwrap();
         drop(connection);
         let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
