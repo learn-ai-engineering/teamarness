@@ -9884,4 +9884,109 @@ mod tests {
         assert_eq!(seen, 9, "every change is reachable");
         session.harness.shutdown().await.unwrap();
     }
+
+    /// A signed record whose stored text reads as nesting far beyond any limit, delivered on the
+    /// thread that delivers records. An abort here happens before the commit, so without the
+    /// bound the same record would abort the Package again on each redelivery.
+    #[test]
+    fn a_record_with_deeply_nested_text_is_applied_and_the_cursor_advances() {
+        use crate::markdown::{Block, Inline, Marks, PreservedKind};
+        use loro::{ExportMode, LoroDoc};
+
+        const DEPTH: usize = 20_000;
+        let deep = ">".repeat(DEPTH);
+        for blocks in [
+            vec![Block::Preserved {
+                kind: PreservedKind::Html,
+                source: deep.clone(),
+            }],
+            vec![Block::Paragraph(vec![Inline::Text(
+                format!("a\n{deep}"),
+                Marks {
+                    code: true,
+                    ..Marks::default()
+                },
+            )])],
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
+            let (events, _receiver) = broadcast::channel(256);
+            let hub = test_hub(store.clone(), events);
+            let (collection, document, edit_id) = (hex(64, 1), hex(64, 2), hex(64, 3));
+
+            let body = LoroDoc::new();
+            body.import(&genesis()).unwrap();
+            let before = body.oplog_vv();
+            body.set_peer_id(0xABCDEF).unwrap();
+            crate::markdown::write_tree(&body, &blocks).unwrap();
+            let update = body.export(ExportMode::updates(&before)).unwrap();
+            assert!(update.len() <= MAX_UPDATE, "a record can carry this update");
+
+            let records = [
+                (
+                    collection.clone(),
+                    DomainRecord::collection_create(ALICE, "Plan").unwrap(),
+                ),
+                (
+                    document.clone(),
+                    DomainRecord::document_create(ALICE, &collection, "Doc", genesis()).unwrap(),
+                ),
+                (
+                    edit_id.clone(),
+                    DomainRecord::identified_document_edit(
+                        ALICE,
+                        &document,
+                        &hex(32, 9),
+                        &[7; 32],
+                        update,
+                    )
+                    .unwrap(),
+                ),
+            ];
+
+            let runtime = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+            let results = runtime
+                .block_on(runtime.spawn_blocking({
+                    let hub = hub.clone();
+                    move || {
+                        // The last record is delivered twice, as after a restart.
+                        let last = records.len() - 1;
+                        let deliveries = (0..records.len()).chain([last]);
+                        let results: Vec<IngestResult> = deliveries
+                            .map(|index| {
+                                let (id, record) = &records[index];
+                                let seed = index as u64 + 1;
+                                let bytes = record.encode();
+                                hub.ingest_record(
+                                    id,
+                                    &hex(82, seed),
+                                    ALICE,
+                                    record.kind(),
+                                    "sig",
+                                    &bytes,
+                                    &bytes,
+                                    Some(&hex(50, seed)),
+                                    &|| {},
+                                )
+                                .unwrap()
+                                .result
+                            })
+                            .collect();
+                        results
+                    }
+                }))
+                .unwrap();
+            assert_eq!(results[2], IngestResult::Applied);
+            assert_eq!(results[3], IngestResult::Duplicate);
+            assert_eq!(store.cursor().unwrap(), Some(hex(50, 3)));
+            assert_eq!(store.import_failure(&document).unwrap(), None);
+            assert_eq!(
+                hub.with_body(&document, |body| body.text().to_owned())
+                    .matches('>')
+                    .count(),
+                DEPTH,
+                "no character is lost"
+            );
+        }
+    }
 }

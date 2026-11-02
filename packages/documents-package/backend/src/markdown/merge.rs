@@ -14,7 +14,7 @@ use loro::{
     PeerID, UpdateOptions, ValueOrContainer,
 };
 
-use super::export::{parse, parse_revision, serialize};
+use super::export::{parse_revision, reimport, serialize};
 use super::schema::{
     ATTRIBUTES, Block, CHILDREN, Inline, Marks, PreservedKind, SchemaViolation, Segment,
     block_attributes, body_list, child_list, configure, insert_block, insert_inlines, insert_item,
@@ -244,7 +244,10 @@ fn replace_changed(run: &LoroText, target: &str) -> Result<(), MergeError> {
 
 /// What Markdown makes of a block on its own. `None` means it vanishes (an empty paragraph).
 fn normalize(block: &Block) -> Option<Block> {
-    let mut parsed = parse(&serialize(std::slice::from_ref(block)));
+    // Too deep to import: as with several blocks, Markdown does not give this block back.
+    let Ok(mut parsed) = reimport(&serialize(std::slice::from_ref(block))) else {
+        return Some(block.clone());
+    };
     match parsed.len() {
         0 => None,
         1 => parsed.pop(),

@@ -127,8 +127,6 @@ pub enum IngestResult {
     ImportFailure(String),
 }
 
-/// What one ingest committed, plus every body update it made applicable: the record's own
-/// edit, and any deferred edits a newly created Document unblocked.
 /// What one re-evaluation after a format upgrade did, as counts only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Reevaluation {
@@ -141,6 +139,8 @@ pub struct Reevaluation {
     pub still_failed: usize,
 }
 
+/// What one ingest committed, plus every body update it made applicable: the record's own
+/// edit, and any deferred edits a newly created Document unblocked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ingested {
     pub result: IngestResult,

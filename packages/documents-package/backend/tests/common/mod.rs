@@ -305,14 +305,16 @@ pub fn front_matter_source() -> impl Strategy<Value = String> {
 
 /// A Preserved Block that may sit anywhere a code block may.
 pub fn preserved() -> impl Strategy<Value = Block> {
+    // Whitespace after the final line is part of the source.
+    let trailing = || prop_oneof![4 => Just(""), 1 => Just(" "), 1 => Just("  "), 1 => Just("\t")];
     prop_oneof![
-        table_source().prop_map(|source| Block::Preserved {
+        (table_source(), trailing()).prop_map(|(source, trailing)| Block::Preserved {
             kind: PreservedKind::Table,
-            source,
+            source: source + trailing,
         }),
-        html_source().prop_map(|source| Block::Preserved {
+        (html_source(), trailing()).prop_map(|(source, trailing)| Block::Preserved {
             kind: PreservedKind::Html,
-            source,
+            source: source + trailing,
         }),
     ]
 }

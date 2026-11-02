@@ -1,7 +1,7 @@
 # 0042 — Markdown the editor cannot carry is kept as Preserved Blocks, and Documents re-evaluate after a format upgrade
 
 **Status:** accepted (2026-11-02)
-**Amends:** ADR 0032 (**Body model**: the fixed schema gains a node; **Markdown**: tables, front matter and HTML blocks are no longer imported as literal text)
+**Supersedes in part:** ADR 0032 (**Body model**: the fixed schema gains a node; **Markdown**: tables, front matter and HTML blocks are no longer imported as literal text)
 **Refines:** ADR 0029 (Consequences: "an explicit future repair or compatible reimport path" is now built for format upgrades)
 
 ## Context
@@ -48,8 +48,8 @@ Opening cannot run inside the transaction, because it is an asynchronous capabil
 - **Rollout.** An Installation on an older build pauses a Document that gains a Preserved Block, with ADR 0029's read-only warning, until it updates. Release notes must say so.
 - **Existing Documents are not rewritten.** Existing literal-text tables stay literal until a revision of them is merged.
 - **Concurrent inserts above front matter can pause a Document.** If two Installations add front matter concurrently, or one adds it while another inserts a first block, the converged tree is schema-invalid on every Installation. Re-evaluation does not cure this, because the tree still fails. A local merge against a stale base is refused before it appends, so this needs a real concurrent race. The editor must also refuse a local step that puts a block above front matter.
-- **Task lists, images, inline HTML, footnotes and reference definitions stay literal text.** They belong to later workstreams.
-- **Line endings and first-line indentation are normalised.** A source is byte-exact apart from those two, and `markdown-contract.md` records both.
+- **Task lists, images, inline HTML and a footnote marker with no definition stay literal text.** They belong to later workstreams. A reference definition, which includes a footnote definition, resolves into the link that uses it, and one that no link uses is dropped, as before this decision.
+- **A source's normalisations are the ones `markdown-contract.md` lists.** A source is byte-exact apart from those.
 
 ## Evidence
 

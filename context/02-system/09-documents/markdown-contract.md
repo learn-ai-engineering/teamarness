@@ -66,7 +66,7 @@ For every body, the export SHALL satisfy three guarantees:
 
 1. **Fixed point.** Export, then import, then export again gives the same bytes.
 2. **Canonical round trip.** Import of the export gives exactly the body's canonical form. For a body that Markdown can carry, the canonical form is the body itself.
-3. **No content loss.** Every content character survives export and import. Only whitespace at the edges of a line is normalised.
+3. **No content loss.** Every content character survives export and import. Only whitespace at the edges of a line is normalised. The one exception is on import: a reference definition that no link uses is dropped (see Normalisations).
 
 ### Preserved Blocks
 
@@ -78,7 +78,7 @@ A **Preserved Block** keeps Markdown that the editor cannot carry as its exact s
 
 The stored source has no container prefix (`> `, list indent) and no final line ending. The writer adds the prefix back.
 
-A source is **sound** when it re-imports as the same Preserved Block in every place it can move to: after a list, inside a blockquote, as the first block of a list item, and after a paragraph in a list item, with another block following each time. Front matter is checked at the top of the document only.
+A source is **sound** when it re-imports as the same Preserved Block in every place it can move to: after a list, inside a blockquote, as the first block of a list item, and after a paragraph in a list item, with another block following each time. Front matter is checked at the top of the document only. A source that reads as deeper nesting than a revision may have is not sound, because import never walks a syntax tree that deep.
 
 Import SHALL fall back to literal text for a construct that is not sound, so content is never lost. An HTML block becomes one literal paragraph. A table becomes what its lines are without the table extension. An opening `---` block is read without the front matter extension, so two horizontal rules stay rules. An unclosed `<!-- comment` is the common case of an HTML block that falls back, because it would swallow whatever follows it. Export treats a stored source that is not sound the same way: a concurrent edit can leave one, and it exports as one literal paragraph.
 
@@ -94,13 +94,14 @@ The canonical form makes only these changes. Content always wins over formatting
 - **A list item's empty leading paragraph** is not written when other blocks follow it. Import restores it.
 - **Soft line breaks** import as spaces.
 - **Trailing hard breaks** at the end of a paragraph are dropped, and a hard break inside a heading imports as nothing.
-- **Unsupported Markdown is literal text.** Task lists, images, inline HTML, footnotes and reference definitions import as the characters the author wrote, escaped on export, so nothing an author wrote is lost. Entities import as the characters they name.
-- **A Preserved Block's edges and line endings.** `\r\n` and `\r` in a source become `\n`. The first line loses its indentation, and trailing blank lines are dropped. Export puts a blank line between a Preserved Block and the next block.
+- **Unsupported Markdown is literal text.** Task lists, images, inline HTML and a footnote marker with no definition import as the characters the author wrote, escaped on export, so nothing an author wrote is lost. Entities import as the characters they name.
+- **Reference definitions are consumed.** A definition that a link uses resolves into that link, which imports as an inline link. A definition that no link uses is dropped, and its text is lost. A footnote definition such as `[^1]: note` is a reference definition to the parser, so `a[^1]` with that definition exports as `a[^1](note)`.
+- **A Preserved Block's edges and line endings.** `\r\n` and `\r` in a source become `\n`. The first line loses its indentation, and trailing blank lines are dropped. Whitespace at the end of the final line stays, as on any other line. Export puts a blank line between a Preserved Block and the next block.
 - **A paragraph line that would make a table.** Hard breaks can put a delimiter row such as `|---|` directly under a line of text. Export writes a backslash before its first character, so the paragraph stays a paragraph.
 - **Reference-style links** import as inline links.
 - **Other syntax forms** import as their canonical equivalents: setext headings, `*` and `+` bullets, `1)` lists, `__bold__`, `_em_`, `~strike~`, indented code, `~~~` fences and two-space hard breaks.
 
-The canonical corpus (`backend/tests/fixtures/markdown-corpus/`) records these normalisations. It has 22 byte-stable canonical documents and 32 agent-style inputs, each with its expected canonical export.
+The canonical corpus (`backend/tests/fixtures/markdown-corpus/`) records these normalisations. It has 22 byte-stable canonical documents and 35 agent-style inputs, each with its expected canonical export.
 
 ### Known gap
 

@@ -2,7 +2,6 @@
 
 **Status:** accepted (2026-10-23)
 **Refines:** ADR 0027 (Documents body import and invalid-history presentation), ADR 0028 (Package checks after qualified local replay).
-**Refined by:** ADR 0042 (compatible reimport path: format-upgrade re-evaluation).
 
 ## Context
 

@@ -47,7 +47,8 @@ export const schema = new Schema({
       toDOM: () => ["pre", ["code", 0]],
     },
     // Source the Backend keeps verbatim. It has no `parseDOM`: the schema never turns Markdown or
-    // HTML into one (R11), and only a copy inside the editor comes back as one (`preserved.ts`).
+    // HTML into one (R11). Only a clipboard frame comes back as one (`preserved.ts`): a copy inside
+    // the editor, or a frame of a known kind from outside it, which reads the same.
     // `isolating` keeps a neighbouring block from joining its text.
     preserved_block: {
       content: "text*",

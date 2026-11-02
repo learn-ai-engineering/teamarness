@@ -54,7 +54,7 @@ fn export_of(markdown: &str) -> String {
 #[test]
 fn the_corpus_has_its_recorded_size() {
     assert_eq!(corpus("canonical").len(), 22);
-    assert_eq!(corpus("agent-style").len(), 32);
+    assert_eq!(corpus("agent-style").len(), 35);
 }
 
 #[test]

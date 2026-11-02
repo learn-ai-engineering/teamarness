@@ -281,6 +281,24 @@ fn text_that_reads_as_a_reference_definition_is_not_lost() {
     assert_eq!(to_markdown(&parse(&md)), md);
 }
 
+/// Whitespace on a source's final line is part of the source, but a blank final line does not
+/// re-import, so that source is not sound. Nothing is lost, and the export is a fixed point.
+#[test]
+fn a_stored_source_with_a_blank_final_line_exports_as_literal_text() {
+    for ending in ["\n", "\n  ", "\n\n"] {
+        let body = vec![Block::Preserved {
+            kind: PreservedKind::Html,
+            source: format!("<div>\nx\n</div>{ending}"),
+        }];
+        let md = to_markdown(&body);
+        assert_eq!(
+            md, "\\<div\\> x \\</div\\>\n",
+            "from a source ending {ending:?}"
+        );
+        assert_eq!(to_markdown(&parse(&md)), md);
+    }
+}
+
 /// Found at 20 000 cases: with duplicate blocks, either copy may survive an edit
 /// to one of them; both alignments change exactly one block.
 #[test]

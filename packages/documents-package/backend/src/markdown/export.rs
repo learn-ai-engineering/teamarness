@@ -38,16 +38,22 @@ pub fn canonical(markdown: &str) -> Result<String, SchemaViolation> {
 /// Inline formatting may nest this much deeper than the block limit in comrak's syntax tree.
 const INLINE_NESTING: usize = 16;
 
+/// The deepest syntax tree import walks. The walk is recursive, and a stack overflow aborts the
+/// process, so every import that can see stored or outside text goes through this bound.
+const MAX_IMPORT_DEPTH: usize = MAX_NESTING + INLINE_NESTING + 1;
+
 /// Imports Markdown from outside the backend: its nesting is checked before any recursive
 /// walk, and the blocks must be writable under the schema.
 pub(super) fn parse_revision(markdown: &str) -> Result<Vec<Block>, SchemaViolation> {
-    let blocks = import(
-        markdown,
-        Recognise::Checked,
-        MAX_NESTING + INLINE_NESTING + 1,
-    )?;
+    let blocks = reimport(markdown)?;
     check_blocks(&blocks)?;
     Ok(blocks)
+}
+
+/// Imports Markdown the backend wrote from stored text, which can read as any nesting. A
+/// [`SchemaViolation::TooDeep`] means the text does not import as what it was written from.
+pub(super) fn reimport(markdown: &str) -> Result<Vec<Block>, SchemaViolation> {
+    import(markdown, Recognise::Checked, MAX_IMPORT_DEPTH)
 }
 
 /// The options that write Markdown, and that import it where nothing is recognised.
@@ -89,7 +95,8 @@ enum Recognise {
     Never,
 }
 
-/// Imports Markdown as blocks. Callers bound its nesting first (see [`parse_revision`]).
+/// Imports Markdown as blocks with no bound on its nesting, for the property suites on Markdown
+/// they generate. The backend uses [`parse_revision`] or [`reimport`].
 pub fn parse(markdown: &str) -> Vec<Block> {
     import(markdown, Recognise::Checked, usize::MAX).expect("the nesting is not bounded here")
 }
@@ -242,8 +249,9 @@ fn block_of<'a>(node: &'a AstNode<'a>, source: &Source) -> Vec<Block> {
                 },
                 // What the same lines are with no table extension.
                 None => {
-                    return import(&loose_lines(node, source), Recognise::Never, usize::MAX)
-                        .expect("the nesting is not bounded here");
+                    let loose = loose_lines(node, source);
+                    return import(&loose, Recognise::Never, MAX_IMPORT_DEPTH)
+                        .unwrap_or_else(|_| vec![literal_paragraph(&loose)]);
                 }
             }
         }
@@ -356,7 +364,7 @@ fn literal_paragraph(text: &str) -> Block {
 /// Whether `source` can be stored as a Preserved Block of `kind`: it re-imports as exactly that
 /// block wherever the block can be moved, and whatever follows it stays out of it.
 fn is_sound(kind: PreservedKind, source: &str) -> bool {
-    if source.contains('\r') || source.trim().is_empty() || source != source.trim_end() {
+    if source.contains('\r') || source.trim().is_empty() {
         return false;
     }
     let block = Block::Preserved {
@@ -395,7 +403,13 @@ fn is_sound(kind: PreservedKind, source: &str) -> bool {
         ],
     };
     contexts.iter().all(|blocks| {
-        import(&serialize_raw(blocks), Recognise::Unchecked, usize::MAX).as_ref() == Ok(blocks)
+        import(
+            &serialize_raw(blocks),
+            Recognise::Unchecked,
+            MAX_IMPORT_DEPTH,
+        )
+        .as_ref()
+            == Ok(blocks)
     })
 }
 
@@ -934,7 +948,9 @@ fn round_trips(content: &[Inline], heading: bool) -> bool {
     } else {
         Block::Paragraph(content.to_vec())
     };
-    let parsed = parse(&serialize_raw(std::slice::from_ref(&block)));
+    let Ok(parsed) = reimport(&serialize_raw(std::slice::from_ref(&block))) else {
+        return false;
+    };
     match (parsed.as_slice(), content.is_empty()) {
         ([], true) => true,
         ([only], _) => *only == block,
