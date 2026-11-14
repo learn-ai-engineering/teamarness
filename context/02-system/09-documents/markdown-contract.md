@@ -109,7 +109,7 @@ The canonical form makes only these changes. Content always wins over formatting
   - The export holds no definition, so a later import adds nothing. The paragraph is ordinary content, and a revision can remove it.
   - A revision that brings the definition back adds no second paragraph when the same links already follow the table.
   - A link with no text uses its URL as its text.
-  - A cell past the header's width is not parsed. Its reference resolves to nothing, so its definition counts as unused and is dropped.
+  - A cell past the header's width is not parsed, so its reference resolves to nothing. If no other link uses the definition, the definition is dropped with its target.
 - **A Preserved Block's edges and line endings.** `\r\n` and `\r` in a source become `\n`. The first line loses its indentation, and trailing blank lines are dropped. Whitespace at the end of the final line stays, as on any other line. Front matter is the exception: whitespace after a delimiter means the block is not front matter, and it imports as it did before Preserved Blocks. Export puts a blank line between a Preserved Block and the next block.
 - **A paragraph line that would make a table.** Hard breaks can put a delimiter row such as `|---|` directly under a line of text. Export writes a backslash before its first character, so the paragraph stays a paragraph.
 - **Reference-style links** import as inline links.
@@ -126,7 +126,7 @@ Three limits can lose the target of a link in imported Markdown. Nothing signals
   - A reference that does not resolve exports as escaped literal text. For example, three uses of a 100-byte URL in a 199-byte document export as one link and two `\[x\]\[r\]`.
   - The first resolved use of a label keeps the target. A label whose first use does not fit counts as unused, so its definition and its target are lost.
   - A table's links paragraph holds only the references that resolved.
-- **A destination the writer cannot carry.** A destination with a space keeps the link's text and loses its target: `a [x](<b c>) d` exports as `a x d`, and `[r]: <b c>` puts only `x` in a table's links paragraph. An inline link in a table that keeps its lines stays in the cell.
+- **A destination the writer cannot carry.** A destination with a space keeps the link's text and loses its target: `a [x](<b c>) d` exports as `a x d`, and `[r]: <b c>` puts only `x` in a table's links paragraph. An inline link in a table that keeps its lines stays in the cell. The fallback applies to the whole paragraph: one destination with a space or a tab also removes the target of every other link and the inline code in that paragraph, including in a table's links paragraph.
 - **A reference past the header's width.** The cell is not parsed, so the reference resolves to nothing. If no other link uses the definition, its target is lost.
 
 ### Known gap

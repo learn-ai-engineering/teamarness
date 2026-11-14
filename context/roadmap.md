@@ -70,11 +70,11 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
-### Filesystem Docs (slice A in progress)
+### Filesystem Docs (slice A closed, slice B next)
 
 Started on 2026-11-01 on branch `don-smith/filesystem_docs`, workstream `filesystem-docs`. The workstream maps a Collection to a folder in both directions, so any editor or CLI agent can edit Documents. It has three slices, and each gets its own plan: A Preserved Blocks, B folder sync, and C Document folders.
 
-Slice A is implemented, and its Verify is pending. Tables, front matter and HTML blocks now survive import and export byte for byte as read-only Preserved Blocks (ADR 0042, `TEAM.SYS.DOCS-R11`, `R13`). After a format upgrade, an Installation re-evaluates once what an older build paused or quarantined (`R05`). An Installation on an older build pauses a Document that gains a Preserved Block until it updates, then recovers, and the release notes must say so. Non-first front matter stays a schema violation, so a real concurrent race can pause a Document that re-evaluation cannot cure. Accepted tech debt is recorded in [DELTA-023](.delta/DELTA-023-preserved-blocks-accepted-tech-debt.md), including the wide-table cost to revisit before wider release, and the decision on dropped Markdown text that slice B needs first.
+Slice A closed on 2026-11-15: it passed Verify on the fourth round and Don's manual checks, including a teammate editing on a second Installation. Tables, front matter and HTML blocks now survive import and export byte for byte as read-only Preserved Blocks (ADR 0042, `TEAM.SYS.DOCS-R11`, `R13`). After a format upgrade, an Installation re-evaluates once what an older build paused or quarantined (`R05`). An Installation on an older build pauses a Document that gains a Preserved Block until it updates, then recovers, and the release notes must say so. Non-first front matter stays a schema violation, so a real concurrent race can pause a Document that re-evaluation cannot cure. Accepted tech debt is recorded in [DELTA-023](.delta/DELTA-023-preserved-blocks-accepted-tech-debt.md), including the wide-table cost to revisit before wider release. Slice B's plan needs two decisions first, because a first sync of a mapped file would otherwise rewrite the author's file: the Markdown text that import drops, and comrak's reference budget (DELTA-023 groups 4 and 8).
 
 **Outcome:** A Member maps a folder and edits Documents from any editor, with tables and front matter intact.
 

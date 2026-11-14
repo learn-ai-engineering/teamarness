@@ -1,19 +1,20 @@
 # DELTA-023 — Preserved Blocks findings accepted as tech debt
 
-**Status:** open (2026-11-03). These findings from Verify of Filesystem Docs slice A are deferred, not fixed. The owner of each group is the follow-up named in it.
+**Status:** open (2026-11-03; updated at slice A Close, 2026-11-15). These findings from Verify of Filesystem Docs slice A are deferred, not fixed. The owner of each group is the follow-up named in it.
 
 Don ruled on these:
 
 - Round 2, 2026-11-02: defer CR2-001 and CR2-002, keep non-first front matter as a schema violation, fix SF2-001 with the links paragraph, and gate slice B on the dropped text.
 - Round 3, 2026-11-03: defer CR3-001 and add it to the slice B gate, and accept the limit on a reference past the header's width.
+- Slice A Close, 2026-11-15: CR2-002 is ordinary tech debt, not part of the slice B gate. Fix the round 4 wording findings at Close, and defer SM4-005 and SM4-006 (group 10).
 
 The other findings are P2 findings that Verify retained without an individual ruling, because a P2 finding does not block.
 
-**Slice B gate.** Three decisions come before the slice B plan: the dropped text (group 4), the reference budget (group 8), and CR2-002 (group 2).
+**Slice B gate.** Two decisions come before the slice B plan: the dropped text (group 4) and the reference budget (group 8).
 
 ## Divergence
 
-Slice A of the Filesystem Docs workstream (`TEAM.SYS.DOCS-R11`, `R13`, ADR 0042) adds Preserved Blocks and upgrade re-evaluation. Verify round 2 confirmed three P1 findings. SF2-001 is fixed, and round 3 confirmed the fix. Round 3 confirmed one more P1 finding, CR3-001. CR3-001 and the other two round 2 findings are recorded below, with the reviews' other retained findings. The finding IDs are those in the workstream's review artifacts, `verify/20261102T041109Z_slice-a-review-1.md`, `verify/20261102T060000Z_slice-a-review-2.md` and `verify/20261103T000000Z_slice-a-review-3.md`. These `verify/` paths are in the `filesystem-docs` workstream folder, not in this repository. An evaluation-only diff that holds the tested fix ideas is `verify/20261102T060000Z_slice-a-candidate-fix.diff`.
+Slice A of the Filesystem Docs workstream (`TEAM.SYS.DOCS-R11`, `R13`, ADR 0042) adds Preserved Blocks and upgrade re-evaluation. Verify round 2 confirmed three P1 findings. SF2-001 is fixed, and round 3 confirmed the fix. Round 3 confirmed one more P1 finding, CR3-001. CR3-001 and the other two round 2 findings are recorded below, with the reviews' other retained findings. The finding IDs are those in the workstream's review artifacts, `verify/20261102T041109Z_slice-a-review-1.md`, `verify/20261102T060000Z_slice-a-review-2.md`, `verify/20261103T000000Z_slice-a-review-3.md` and `verify/20261103T010000Z_slice-a-review-4.md`. These `verify/` paths are in the `filesystem-docs` workstream folder, not in this repository. An evaluation-only diff that holds the tested fix ideas is `verify/20261102T060000Z_slice-a-candidate-fix.diff`.
 
 ### 1. A wide table with short rows costs far more than its bytes (CR2-001, regression)
 
@@ -35,7 +36,7 @@ Follow-up: revisit before wider release.
 - This is not a regression, because the bytes are identical before slice A. No characters are lost. A scan of about 4 600 Markdown files found 0 occurrences. Acceptance criterion A-1 and the contract state the limit.
 - Tested fix idea: trim the two delimiter lines in a view that only comrak sees, and take the source from the original lines. On a scratch copy the whitespace stayed byte-exact.
 
-Follow-up: the slice B gate, because a mapped file can hold this shape.
+Follow-up: ordinary tech debt (Don, 2026-11-15). A mapped file can hold this shape, so slice B's plan can still choose to fix it.
 
 ### 3. Non-first front matter stays a schema violation
 
@@ -47,7 +48,7 @@ Follow-up: reopen if the race is seen in use.
 
 ### 4. Import drops Markdown text in a mapped file (decision needed before slice B)
 
-- Import drops a reference definition that no link uses, including a footnote such as `[^1]: note`. A used one becomes an inline link, so `a[^1]` becomes `a[^1](note)`. The contract names everything else that import drops.
+- Import drops a reference definition that no link uses, including a footnote such as `[^1]: note`. A used one becomes an inline link, so `a[^1]` becomes `a[^1](note)`. The contract lists the other drops that testing has found. The list is not a proof that nothing else is dropped.
 - In slice B, a first sync of a mapped file would delete this text from the author's file.
 - SF2-002: acceptance criterion A-6 was false for one-token definitions. Its wording is amended and now states the real behaviour.
 
@@ -56,7 +57,7 @@ Follow-up: the slice B gate. Don's decision comes before the slice B plan.
 ### 5. Limits of the links paragraph (SF2-001 fix)
 
 - A cell still reads `[x][r]` outside the app, with its target in the next paragraph.
-- A reference in a cell past the header's width is not parsed, so its definition is unused and dropped, and its target is lost (SF3-002). This is a regression: `0119e2d` exports `| a | |---| | b | [x](https://x.test/page) |` for the input in `the_links_paragraph_has_its_stated_limits`. Don accepted the limit on 2026-11-03, and A-6 states it.
+- A reference in a cell past the header's width is not parsed. If no other link uses its definition, the definition is dropped and its target is lost (SF3-002). This is a regression: `0119e2d` exports `| a | |---| | b | [x](https://x.test/page) |` for the input in `the_links_paragraph_has_its_stated_limits`. Don accepted the limit on 2026-11-03, and A-6 states it.
 - A table that has any link pays for one more parse of its own lines. Measured: about 7 percent on 50 ordinary tables with links, and about 10 percent on the wide tables in group 1. A table with no link or image does not pay.
 
 Follow-up: the richer-Markdown workstream, with real table nodes.
@@ -86,7 +87,7 @@ Follow-up: the next Documents workstream.
 - **SM2-008.** `context/.decisions/README.md` cites one supersession three ways.
 - **SM2-009.** The contract's Verification section omits `tests/markdown_hostile_depth.rs`.
 
-Follow-up: slice A Close, or the next Documents workstream.
+Follow-up: the next Documents workstream. Slice A Close did not take these.
 
 ### 8. comrak's reference budget can lose a link target (CR3-001)
 
@@ -118,3 +119,13 @@ Follow-up: the slice B gate.
 - `markdown/mod.rs` says import "drops only what the contract names". The contract's list is what testing has found, so the code comment claims more than the contract does.
 
 Follow-up: the next Documents workstream. CR3-002 and CR3-004 can wait for the richer-Markdown workstream, with real table nodes.
+
+### 10. Verify round 4 findings
+
+Round 4 (`verify/20261103T010000Z_slice-a-review-4.md`) retained eight P2 findings. Slice A Close fixed the wording ones: SM4-001, SM4-002, SM4-003, SM4-004, SF4-002 and CR4-001. These remain:
+
+- **SM4-005.** No test pins the reference budget or the space-destination limits, so a comrak upgrade could change them unnoticed. Fix: add three cases near the limits test in `tests/markdown_corpus.rs`.
+- **SM4-006.** The Agent guide in `backend/src/guide.rs` does not warn that a reference can lose its target. Fix: tell Agents to write inline links.
+- **CR4-001, behaviour.** The contract now states it: one destination with a space or a tab removes every other link target and the inline code in its paragraph. The behaviour itself is part of the dropped text in group 4.
+
+Follow-up: the slice B plan, with the gate decisions.
