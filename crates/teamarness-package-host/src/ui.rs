@@ -140,10 +140,23 @@ pub(crate) fn populate_cache(
         for asset in &manifest.ui.assets {
             copy_file(&temporary, &asset.file)?;
         }
-        make_tree_read_only(&temporary)?;
-        fs::rename(&temporary, &admitted_root).map_err(|_| failure())?;
+        publish_cache(&temporary, &admitted_root, |from, to| fs::rename(from, to))?;
     }
     Ok(cache_record(admitted_root, manifest))
+}
+
+fn publish_cache(
+    temporary: &Path,
+    admitted_root: &Path,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), UiContractFailure> {
+    // macOS can reject renaming a write-disabled directory, even within the
+    // same parent. Seal its contents first, but keep the private staging root
+    // writable through rename. Admission must not succeed until that root is sealed.
+    set_mode(temporary, 0o700)?;
+    make_contents_read_only(temporary)?;
+    rename(temporary, admitted_root).map_err(|_| failure())?;
+    set_mode(admitted_root, 0o500)
 }
 
 /// The cache record an admission would serve, without writing the cache.
@@ -269,11 +282,11 @@ fn verify_cached_file(root: &Path, file: &VerifiedFile) -> Result<(), UiContract
     Ok(())
 }
 
-fn make_tree_read_only(root: &Path) -> Result<(), UiContractFailure> {
+fn make_contents_read_only(root: &Path) -> Result<(), UiContractFailure> {
     for entry in walk_files(root)? {
         set_mode(&entry, if entry.is_dir() { 0o500 } else { 0o400 })?;
     }
-    set_mode(root, 0o500)
+    Ok(())
 }
 
 fn walk_files(root: &Path) -> Result<Vec<PathBuf>, UiContractFailure> {
@@ -299,5 +312,107 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), UiContractFailure> {
 fn failure() -> UiContractFailure {
     UiContractFailure {
         code: PackageErrorCode::UiContractViolation,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct PublicationFixture {
+        _root: tempfile::TempDir,
+        temporary: PathBuf,
+        admitted: PathBuf,
+    }
+
+    impl PublicationFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let temporary = root.path().join("staged");
+            let admitted = root.path().join("admitted");
+            fs::create_dir_all(temporary.join("ui")).unwrap();
+            fs::write(temporary.join("ui/index.js"), b"export const value = 1;").unwrap();
+            fs::write(temporary.join("ui/contract.json"), b"{}").unwrap();
+            Self {
+                _root: root,
+                temporary,
+                admitted,
+            }
+        }
+    }
+
+    impl Drop for PublicationFixture {
+        fn drop(&mut self) {
+            // Restore directory write permission for TempDir's recursive cleanup,
+            // including when a regression assertion unwinds through this fixture.
+            for directory in [&self.temporary, &self.admitted] {
+                let _ = fs::set_permissions(directory, fs::Permissions::from_mode(0o700));
+                let _ =
+                    fs::set_permissions(directory.join("ui"), fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn cache_publication_supports_rename_that_requires_writable_source() {
+        let fixture = PublicationFixture::new();
+        publish_cache(&fixture.temporary, &fixture.admitted, |from, to| {
+            // Model macOS's write-disabled source-directory restriction while
+            // retaining the real filesystem operation and all its side effects.
+            if mode(from) & 0o200 == 0 {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            assert_eq!(mode(from), 0o700);
+            assert_eq!(mode(&from.join("ui")), 0o500);
+            assert_eq!(mode(&from.join("ui/index.js")), 0o400);
+            fs::rename(from, to)
+        })
+        .expect("publication must support a filesystem that requires a writable source");
+
+        assert!(!fixture.temporary.exists());
+        assert_eq!(mode(&fixture.admitted), 0o500);
+        assert_eq!(mode(&fixture.admitted.join("ui")), 0o500);
+        assert_eq!(mode(&fixture.admitted.join("ui/index.js")), 0o400);
+        assert_eq!(mode(&fixture.admitted.join("ui/contract.json")), 0o400);
+        assert_eq!(
+            fs::read(fixture.admitted.join("ui/index.js")).unwrap(),
+            b"export const value = 1;"
+        );
+        assert_eq!(
+            fs::read(fixture.admitted.join("ui/contract.json")).unwrap(),
+            b"{}"
+        );
+    }
+
+    #[test]
+    fn cache_publication_does_not_expose_a_failed_rename() {
+        let fixture = PublicationFixture::new();
+        let error = publish_cache(&fixture.temporary, &fixture.admitted, |_, _| {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code, PackageErrorCode::UiContractViolation);
+        assert!(!fixture.admitted.exists());
+    }
+
+    #[test]
+    fn cache_publication_fails_if_published_root_cannot_be_sealed() {
+        let fixture = PublicationFixture::new();
+        fs::remove_dir_all(fixture.temporary.join("ui")).unwrap();
+        let error = publish_cache(&fixture.temporary, &fixture.admitted, |from, to| {
+            fs::rename(from, to)?;
+            // Model the root disappearing after rename: sealing must fail closed,
+            // rather than returning a usable cache record before permissions settle.
+            fs::remove_dir(to)
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code, PackageErrorCode::UiContractViolation);
+        assert!(!fixture.admitted.exists());
     }
 }

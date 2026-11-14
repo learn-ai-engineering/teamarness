@@ -8401,7 +8401,7 @@ dependencies = [
 
 [[package]]
 name = "teamarness-desktop"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "base64 0.23.1",
  "reqwest",
@@ -8536,6 +8536,7 @@ dependencies = [
  "serde_json",
  "teamarness-package-protocol",
  "teamarness-package-sdk",
+ "teamarness-repo-aware-package",
  "tempfile",
  "tokio",
  "uuid",

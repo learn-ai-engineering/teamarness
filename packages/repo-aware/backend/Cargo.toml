@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Per-repository walk rendezvous for out-of-crate tests, never enabled by normal builds.
+test-hooks = []
+
 [dependencies]
 chrono.workspace = true
 gix.workspace = true
@@ -16,5 +20,6 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+teamarness-repo-aware-package = { path = ".", features = ["test-hooks"] }
 teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk", features = ["testing"] }
 tempfile.workspace = true

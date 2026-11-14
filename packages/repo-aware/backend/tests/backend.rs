@@ -2,12 +2,11 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use teamarness_package_sdk::testing::{Harness, HarnessBuilder, assert_router_matches_contract};
 use teamarness_repo_aware_package::router;
-use teamarness_repo_aware_package::snapshot::SNAPSHOT_INTERRUPTIONS;
+use teamarness_repo_aware_package::snapshot::testing::SnapshotWalkPause;
 
 fn empty() -> serde_json::Value {
     serde_json::json!({})
@@ -151,7 +150,7 @@ async fn unknown_operation_uses_the_sdk_code() {
     harness.shutdown().await.unwrap();
 }
 
-/// Registers a repository large enough that its status walk is still running when cancelled.
+/// Registers a repository with real status items; a per-repository gate controls cancellation.
 async fn start_with_large_repository(data: &Path, repository: &Path) -> (Harness, String) {
     init_large_repo(repository, 3_000);
     let canonical = fs::canonicalize(repository).unwrap();
@@ -171,14 +170,20 @@ async fn start_with_large_repository(data: &Path, repository: &Path) -> (Harness
     (harness, id)
 }
 
+async fn within<T>(event: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(2), future)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {event}"))
+}
+
 // Verifies: TEAM.SYS.REPO-R09
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_a_snapshot_interrupts_the_blocking_walk() {
     let data = tempfile::tempdir().unwrap();
     let checkouts = tempfile::tempdir().unwrap();
-    let (mut harness, id) =
-        start_with_large_repository(data.path(), &checkouts.path().join("large")).await;
-    let before = SNAPSHOT_INTERRUPTIONS.load(Ordering::SeqCst);
+    let repository = checkouts.path().join("large");
+    let (mut harness, id) = start_with_large_repository(data.path(), &repository).await;
+    let mut walk = SnapshotWalkPause::new(&repository);
 
     let pending = harness
         .start_request(
@@ -186,27 +191,25 @@ async fn cancelling_a_snapshot_interrupts_the_blocking_walk() {
             serde_json::json!({ "registrationId": id }),
         )
         .await;
-    // settle: lets the snapshot start walking before it is cancelled.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    within("snapshot walk start", walk.wait_started()).await;
+    // simulated-delay: the observed worker is held, so even a late cancelling caller
+    // cannot accidentally test a snapshot that already completed.
+    tokio::time::sleep(Duration::from_millis(250)).await;
     pending.cancel().await;
-    let error = pending.result().await.unwrap_err();
+    let error = within("cancelled snapshot response", pending.result())
+        .await
+        .unwrap_err();
     assert_eq!(error.code(), "cancelled");
 
-    // No worker is held: an ordinary request is answered while the walk unwinds.
+    // An ordinary request is answered while the cancelled walk is still held.
     let started = Instant::now();
-    harness.request("repo_aware.list", empty()).await.unwrap();
+    within("list response", harness.request("repo_aware.list", empty()))
+        .await
+        .unwrap();
     assert!(started.elapsed() < Duration::from_secs(2));
 
-    // The walk itself observed the interrupt flag rather than running to completion unread.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while SNAPSHOT_INTERRUPTIONS.load(Ordering::SeqCst) == before && Instant::now() < deadline {
-        // poll-interval: the interval of this loop, which is bounded by its own deadline.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(
-        SNAPSHOT_INTERRUPTIONS.load(Ordering::SeqCst) > before,
-        "the cancelled snapshot stopped its gix walk"
-    );
+    walk.release();
+    within("this walk's interrupted return", walk.wait_interrupted()).await;
     harness.shutdown().await.unwrap();
 }
 
@@ -214,8 +217,9 @@ async fn cancelling_a_snapshot_interrupts_the_blocking_walk() {
 async fn suspend_interrupts_an_in_flight_snapshot() {
     let data = tempfile::tempdir().unwrap();
     let checkouts = tempfile::tempdir().unwrap();
-    let (mut harness, id) =
-        start_with_large_repository(data.path(), &checkouts.path().join("suspend")).await;
+    let repository = checkouts.path().join("suspend");
+    let (mut harness, id) = start_with_large_repository(data.path(), &repository).await;
+    let mut walk = SnapshotWalkPause::new(&repository);
 
     let pending = harness
         .start_request(
@@ -223,12 +227,19 @@ async fn suspend_interrupts_an_in_flight_snapshot() {
             serde_json::json!({ "registrationId": id }),
         )
         .await;
-    // settle: lets the snapshot start walking before suspension cancels it.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    harness.suspend().await.unwrap();
-
-    let error = pending.result().await.unwrap_err();
+    within("snapshot walk start", walk.wait_started()).await;
+    // Send without awaiting: suspension may join work that this test deliberately holds.
+    let suspending = harness.start_request("lifecycle.suspend", empty()).await;
+    let error = within("suspended snapshot response", pending.result())
+        .await
+        .unwrap_err();
     assert_eq!(error.code(), "cancelled");
+
+    walk.release();
+    within("this walk's interrupted return", walk.wait_interrupted()).await;
+    within("suspension response", suspending.result())
+        .await
+        .unwrap();
     harness.shutdown().await.unwrap();
 }
 

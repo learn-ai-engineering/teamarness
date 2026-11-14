@@ -1,6 +1,6 @@
 import type { TeamarnessBridge } from "./bridge";
 import { isBridgeError } from "./contracts";
-import type { BridgeErrorCode, Installation, Membership, PrincipalsSnapshot, Workspace } from "./contracts";
+import type { Installation, Membership, PrincipalsSnapshot, ShellErrorCode, Workspace } from "./contracts";
 import { buildShellPresentation, type ShellPresentation } from "./presentation";
 import type { ShellRoute } from "./shell";
 
@@ -11,7 +11,7 @@ export type ShellModel = Readonly<{
   principals: Readonly<Record<string, PrincipalsSnapshot>>;
   activeWorkspaceId: string | null;
   loading: boolean;
-  error: BridgeErrorCode | null;
+  error: ShellErrorCode | null;
   notice: string | null;
   membershipRefreshUnavailable: string | null;
 }>;
@@ -55,7 +55,7 @@ export class ShellController {
   public constructor(
     private readonly bridge: TeamarnessBridge,
     private readonly update: (model: ShellModel) => void,
-    private readonly copy: (value: string) => Promise<void> = (value) => navigator.clipboard.writeText(value),
+    private readonly copy: (value: Promise<string>) => Promise<void> = writeClipboardTextWhenReady,
   ) {}
 
   public snapshot(): ShellModel { return this.model; }
@@ -102,8 +102,17 @@ export class ShellController {
 
   public async copyInvitation(workspaceId: string): Promise<void> {
     await this.perform(async () => {
-      const invitation = await this.bridge.createWorkspaceInvitation(workspaceId);
-      await this.copy(invitation.value);
+      const invitation = this.bridge.createWorkspaceInvitation(workspaceId);
+      const [created, copied] = await Promise.allSettled([
+        invitation,
+        this.copy(invitation.then(({ value }) => value)),
+      ]);
+      // A failed create also fails the copy; report the cause, not its echo.
+      if (created.status === "rejected") throw created.reason;
+      if (copied.status === "rejected") {
+        this.set({ error: "clipboard_write" });
+        return;
+      }
       this.set({ notice: "Workspace Invitation copied. Keep it private." });
     });
   }
@@ -263,6 +272,16 @@ export class ShellController {
     this.model = { ...this.model, ...change };
     this.update(this.model);
   }
+}
+
+/**
+ * Writes text that is still being produced. WebKit only allows a clipboard write
+ * that starts during the user's click, so call this synchronously from the click
+ * and let the write wait for the text.
+ */
+export function writeClipboardTextWhenReady(text: Promise<string>): Promise<void> {
+  const blob = text.then((value) => new Blob([value], { type: "text/plain" }));
+  return navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })]);
 }
 
 const escape = (value: string): string => value

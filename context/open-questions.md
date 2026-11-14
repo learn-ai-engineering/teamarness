@@ -101,9 +101,11 @@ A Member chooses a Unicode Workspace Person Name at create/join and may rename o
 **Owner:** roadmap Phase 5.
 
 
-## Stable release operations (settled policy; deployment gates pending)
+## Stable release operations (delivered; broader qualification remains separate)
 
-ADR 0040 and `TEAM.DEL-R04`–`R06` settle one public source/Actions/releases repository, stable immutable publication, signed-version trust and explicit restart consent. The [release runbook](../docs/releasing.md) describes actual commands and failure behavior. Repository visibility/disclosure, protected main/tags/environment, production-key backup/custody, hosted permissions/anonymous access and real native A→B/isolation observations remain Don/maintainer-owned gates, not answered by fixtures. Lost/compromised keys can require manual reinstall; no automatic revocation, freeze protection or rollback is promised. This does not resolve other open questions.
+ADR 0040 and `TEAM.DEL-R04`–`R06` settle one public source/Actions/releases repository, stable immutable publication, signed-version trust and explicit restart consent. Stable releases through `v0.1.2` are published, protected signing/publication gates have executed successfully, and anonymous metadata is available. Don reports real installed updates to `0.1.1` and `0.1.2` and closes the workstream on 2026-11-02. See the [roadmap outcome and follow-ups](roadmap.md#stable-application-releases-and-updates-released-closed-2026-11-02).
+
+Don/maintainer retains key custody and the [runbook's broader qualification](../docs/releasing.md), including backup restoration and exhaustive native identity/data/process continuity. These are not inferred from the successful basic update or fixtures. Lost/compromised keys can require manual reinstall; no automatic revocation, freeze protection or rollback is promised. This does not resolve other open questions.
 ---
 
 ## TEAM-DQ10 - How Packages offer agent-facing guidance for their Ports

@@ -8,6 +8,9 @@ use serde::Serialize;
 use crate::error::{self, ErrorInfo};
 use crate::state::StateStore;
 
+#[cfg(feature = "test-hooks")]
+pub mod testing;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotHead {
@@ -70,8 +73,10 @@ pub fn normalize_github_url(origin: Option<&str>) -> Option<String> {
 pub static SNAPSHOT_INTERRUPTIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Records one interrupted walk and names the error.
-fn interrupted() -> ErrorInfo {
+fn interrupted(_path: &str) -> ErrorInfo {
     SNAPSHOT_INTERRUPTIONS.fetch_add(1, Ordering::SeqCst);
+    #[cfg(feature = "test-hooks")]
+    testing::interrupted(_path);
     error::SNAPSHOT_INTERRUPTED
 }
 
@@ -164,8 +169,10 @@ pub fn compute_snapshot_impl(
         Ok(iter) => {
             let mut count = 0;
             for item in iter {
+                #[cfg(feature = "test-hooks")]
+                testing::checkpoint(path);
                 if cancel.load(Ordering::SeqCst) {
-                    return Err(interrupted());
+                    return Err(interrupted(path));
                 }
                 if item.is_ok() {
                     count += 1;
@@ -177,7 +184,7 @@ pub fn compute_snapshot_impl(
     };
 
     if cancel.load(Ordering::SeqCst) {
-        return Err(interrupted());
+        return Err(interrupted(path));
     }
 
     let is_clean = status_count == 0;

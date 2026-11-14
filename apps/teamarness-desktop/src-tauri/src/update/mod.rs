@@ -123,14 +123,14 @@ fn stable(value: &str) -> Result<Version, ErrorCategory> {
     Ok(version)
 }
 impl Metadata {
-    fn parse(bytes: &[u8], installed: &Version) -> Result<Self, ErrorCategory> {
+    fn parse(bytes: &[u8], installed: &Version) -> Result<Option<Self>, ErrorCategory> {
         if bytes.len() > config::FEED_LIMIT {
             return Err(ErrorCategory::TooLarge);
         }
         let raw: serde_json::Value =
             serde_json::from_slice(bytes).map_err(|_| ErrorCategory::Metadata)?;
         let version = stable(raw["version"].as_str().ok_or(ErrorCategory::Metadata)?)?;
-        if &version <= installed {
+        if &version < installed {
             return Err(ErrorCategory::Metadata);
         }
         let notes = match raw.get("notes") {
@@ -171,15 +171,19 @@ impl Metadata {
         if signature.is_empty() || signature.len() > 4096 {
             return Err(ErrorCategory::Metadata);
         }
+        // Validate the complete feed before treating the installed release as no update.
+        if &version == installed {
+            return Ok(None);
+        }
         let signature = signature.to_owned();
         let notes = notes.to_owned();
-        Ok(Self {
+        Ok(Some(Self {
             raw,
             version,
             url,
             signature,
             notes,
-        })
+        }))
     }
 }
 
@@ -316,6 +320,7 @@ impl UpdateService {
         });
         let installed = app.package_info().version.clone();
         let metadata = Metadata::parse(&serde_json::to_vec(&raw).unwrap(), &installed)
+            .expect("probe metadata must be valid")
             .expect("probe version must be newer");
         let verifier = OfficialVerifier(
             app.updater_builder()
@@ -471,7 +476,9 @@ impl UpdateService {
             return Ok(None);
         };
         let installed = stable(&self.inner.lock().unwrap().snapshot.installed_version)?;
-        let metadata = Metadata::parse(&feed, &installed)?;
+        let Some(metadata) = Metadata::parse(&feed, &installed)? else {
+            return Ok(None);
+        };
         self.publish(|snapshot| {
             snapshot.state = State::Downloading;
             snapshot.candidate_version = Some(metadata.version.to_string());
