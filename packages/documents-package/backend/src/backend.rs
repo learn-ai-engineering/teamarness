@@ -1842,16 +1842,27 @@ async fn reopen_unopened_edits(
     context: &Context<DocumentsActive>,
     document: &str,
 ) -> Result<(), BackendError> {
-    let hub = context.state().hub.clone();
+    reopen_unopened(context.state(), context.cancellation(), document).await
+}
+
+/// [`reopen_unopened_edits`] without a request. The store read runs on the blocking pool,
+/// raced against `cancellation`.
+async fn reopen_unopened(
+    active: &DocumentsActive,
+    cancellation: &CancellationToken,
+    document: &str,
+) -> Result<(), BackendError> {
+    let hub = active.hub.clone();
     if hub.with_body(document, |body| body.unopened()) == 0 {
         return Ok(());
     }
-    let store = context.state().store.clone();
+    let store = active.store.clone();
     let id = document.to_owned();
-    let rows = context
-        .blocking(move |_| store.body_records(Some(&id)).map_err(|_| storage_failed()))
-        .await?;
-    let unopened = import_edit_rows(&context.state().log, &hub, &rows).await?;
+    let rows = teamarness_package_sdk::blocking(cancellation, move |_| {
+        store.body_records(Some(&id)).map_err(|_| storage_failed())
+    })
+    .await?;
+    let unopened = import_edit_rows(&active.log, &hub, &rows).await?;
     let changed = hub.with_body(document, |body| {
         let changed = body.unopened() != unopened;
         body.set_unopened(unopened);
@@ -2087,10 +2098,21 @@ async fn append_as(
     record: DomainRecord,
     principal: Option<&str>,
 ) -> Result<JsonValue, BackendError> {
+    append_record(context.state(), context.cancellation(), record, principal).await
+}
+
+/// [`append_as`] without a request: appends `record` to the record log, signed as `principal`
+/// or this Installation, and projects it. The projection runs on the blocking pool, raced
+/// against `cancellation`.
+async fn append_record(
+    active: &DocumentsActive,
+    cancellation: &CancellationToken,
+    record: DomainRecord,
+    principal: Option<&str>,
+) -> Result<JsonValue, BackendError> {
     let purpose = record.kind();
     let canonical = record.encode();
-    let appended = context
-        .state()
+    let appended = active
         .log
         .append_with_principal(purpose, &canonical, principal)
         .await
@@ -2101,30 +2123,24 @@ async fn append_as(
             }
             capability_error(purpose, cause)
         })?;
-    let state = context.state().clone();
+    let hub = active.hub.clone();
+    let changes = active.changes.clone();
     let id = appended.record_id.as_str().to_owned();
-    let ingested = context
-        .blocking(move |_| {
-            state
-                .hub
-                .ingest_record(
-                    appended.record_id.as_str(),
-                    appended.order_key.as_str(),
-                    &appended.author,
-                    purpose,
-                    &appended.signature,
-                    &canonical,
-                    &appended.sealed_record,
-                    None,
-                    &|| {
-                        state
-                            .changes
-                            .send_modify(|revision| *revision = revision.saturating_add(1))
-                    },
-                )
-                .map_err(|_| storage_failed())
-        })
-        .await?;
+    let ingested = teamarness_package_sdk::blocking(cancellation, move |_| {
+        hub.ingest_record(
+            appended.record_id.as_str(),
+            appended.order_key.as_str(),
+            &appended.author,
+            purpose,
+            &appended.signature,
+            &canonical,
+            &appended.sealed_record,
+            None,
+            &|| changes.send_modify(|revision| *revision = revision.saturating_add(1)),
+        )
+        .map_err(|_| storage_failed())
+    })
+    .await?;
     match ingested.result {
         IngestResult::Applied | IngestResult::Duplicate => {}
         IngestResult::Deferred(_) => return Err(error("documents.deferred", true)),
@@ -4515,10 +4531,10 @@ mod tests {
             drop(store);
             let connection = rusqlite::Connection::open(&path).unwrap();
             if old_version == 4 {
-                connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; PRAGMA user_version=4;").unwrap();
+                connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; PRAGMA user_version=4;").unwrap();
             } else {
                 connection
-                    .execute_batch("DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; PRAGMA user_version=5;")
+                    .execute_batch("DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; PRAGMA user_version=5;")
                     .unwrap();
             }
             drop(connection);
@@ -4566,7 +4582,7 @@ mod tests {
         rusqlite::Connection::open(path)
             .unwrap()
             .execute_batch(
-                "ALTER TABLE metadata DROP COLUMN format_generation; PRAGMA user_version=8;",
+                "ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; PRAGMA user_version=8;",
             )
             .unwrap();
     }
@@ -5142,7 +5158,7 @@ mod tests {
             ).unwrap();
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; PRAGMA user_version=4;").unwrap();
+        connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; PRAGMA user_version=4;").unwrap();
         drop(connection);
         let access = Arc::new(AtomicBool::new(false));
         let gained = access.clone();
@@ -5289,7 +5305,7 @@ mod tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; PRAGMA user_version=4;")
             .unwrap();
         drop(connection);
         let scripted = ScriptedCapability::new().calls(move |method, payload| match method {

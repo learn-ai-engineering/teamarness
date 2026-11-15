@@ -146,7 +146,7 @@ mod store_tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; PRAGMA user_version=4;")
             .unwrap();
         drop(connection);
         let store = DocumentStore::open(&path).unwrap();
@@ -351,7 +351,7 @@ mod store_tests {
                 ).unwrap();
             }
             let connection = rusqlite::Connection::open(&path).unwrap();
-            connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; PRAGMA user_version=4;").unwrap();
+            connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; PRAGMA user_version=4;").unwrap();
             drop(connection);
             let store = DocumentStore::open(&path).unwrap();
             let mut rows = store.identity_candidates().unwrap();
@@ -410,7 +410,7 @@ mod store_tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; PRAGMA user_version=4;")
             .unwrap();
         drop(connection);
         let store = DocumentStore::open(&path).unwrap();
@@ -1468,13 +1468,72 @@ mod store_tests {
             let store = DocumentStore::open(&path).unwrap();
             assert_eq!(store.format_generation().unwrap(), 0);
             assert_eq!(store.cursor().unwrap().as_deref(), Some("kept"));
-            assert_eq!(version(), 9);
+            assert_eq!(version(), 10, "it migrates on to the latest schema");
+        }
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a v9 database gains the empty folder sync tables with its
+    // data intact, and reopening changes nothing.
+    #[test]
+    fn migration_0010_from_v9() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(concat!(
+                    include_str!("../migrations/0001_documents.sql"),
+                    include_str!("../migrations/0002_edit_targets.sql"),
+                    include_str!("../migrations/0003_comments.sql"),
+                    include_str!("../migrations/0004_comment_time.sql"),
+                    include_str!("../migrations/0005_edit_identity_index.sql"),
+                    include_str!("../migrations/0006_import_failure.sql"),
+                    include_str!("../migrations/0007_schema_violation.sql"),
+                    include_str!("../migrations/0008_comment_history.sql"),
+                    include_str!("../migrations/0009_format_generation.sql"),
+                ))
+                .unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO comment_history_state(singleton,epoch,revision) VALUES(1,'old',0);
+                     UPDATE metadata SET cursor='kept',format_generation=3 WHERE singleton=1;",
+                )
+                .unwrap();
+            connection.pragma_update(None, "user_version", 9).unwrap();
+        }
+        let version = || -> i64 {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        for round in 0..2 {
+            let store = DocumentStore::open(&path).unwrap();
+            assert_eq!(version(), 10);
+            assert_eq!(store.cursor().unwrap().as_deref(), Some("kept"));
+            assert_eq!(store.format_generation().unwrap(), 3);
+            assert_eq!(store.comment_head().unwrap().0, "old");
+            if round == 0 {
+                assert!(store.folder_mappings().unwrap().is_empty());
+                store
+                    .set_folder_mapping(&store::mappings::FolderMapping {
+                        collection_id: hex(64, 1),
+                        root_path: "/notes".to_owned(),
+                        state: store::mappings::MappingState::Active,
+                        created_at: 1,
+                    })
+                    .unwrap();
+            } else {
+                assert_eq!(store.folder_mappings().unwrap().len(), 1, "reopen keeps it");
+            }
+            assert!(store.mapped_files(&hex(64, 1)).unwrap().is_empty());
+            assert!(store.refused_files(&hex(64, 1)).unwrap().is_empty());
         }
     }
 
     // Verifies: TEAM.SYS.DOCS-R05 — a build refuses a database from a newer schema and leaves it
-    // unchanged. A v8 build refuses a v9 database through this same check; only the version
-    // numbers differ, because no v8 build can run in this test.
+    // unchanged. A v9 build refuses a v10 database through this same check; only the version
+    // numbers differ, because no v9 build can run in this test.
     #[test]
     fn a_newer_schema_is_refused_unchanged() {
         let directory = tempfile::tempdir().unwrap();
@@ -1482,7 +1541,7 @@ mod store_tests {
         DocumentStore::open(&path).unwrap();
         rusqlite::Connection::open(&path)
             .unwrap()
-            .pragma_update(None, "user_version", 10)
+            .pragma_update(None, "user_version", 11)
             .unwrap();
         assert!(matches!(
             DocumentStore::open(&path),
@@ -1492,7 +1551,7 @@ mod store_tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     // Verifies: TEAM.SYS.DOCS-R07 — a thread is its root and every nested reply in creation

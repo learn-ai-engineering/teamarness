@@ -1,3 +1,4 @@
+pub(crate) mod mappings;
 pub(crate) mod migration;
 pub(crate) mod projection;
 
@@ -24,6 +25,8 @@ pub enum StoreError {
     Lock,
     UnsupportedSchema,
     UncertainOutcome,
+    /// A write broke a uniqueness rule or named a parent that does not exist.
+    Conflict,
 }
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
