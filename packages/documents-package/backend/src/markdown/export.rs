@@ -46,7 +46,7 @@ const MAX_IMPORT_DEPTH: usize = MAX_NESTING + INLINE_NESTING + 1;
 /// Imports Markdown from outside the backend: its nesting is checked before any recursive
 /// walk, and the blocks must be writable under the schema.
 pub(super) fn parse_revision(markdown: &str) -> Result<Vec<Block>, SchemaViolation> {
-    let blocks = reimport(markdown)?;
+    let blocks = import(markdown, Recognise::Checked, MAX_IMPORT_DEPTH, true)?;
     check_blocks(&blocks)?;
     Ok(blocks)
 }
@@ -54,7 +54,7 @@ pub(super) fn parse_revision(markdown: &str) -> Result<Vec<Block>, SchemaViolati
 /// Imports Markdown the backend wrote from stored text, which can read as any nesting. A
 /// [`SchemaViolation::TooDeep`] means the text does not import as what it was written from.
 pub(super) fn reimport(markdown: &str) -> Result<Vec<Block>, SchemaViolation> {
-    import(markdown, Recognise::Checked, MAX_IMPORT_DEPTH)
+    import(markdown, Recognise::Checked, MAX_IMPORT_DEPTH, false)
 }
 
 /// The options that write Markdown, and that import it where nothing is recognised.
@@ -99,23 +99,30 @@ enum Recognise {
 /// Imports Markdown as blocks with no bound on its nesting, for the property suites on Markdown
 /// they generate. The backend uses [`parse_revision`] or [`reimport`].
 pub fn parse(markdown: &str) -> Vec<Block> {
-    import(markdown, Recognise::Checked, usize::MAX).expect("the nesting is not bounded here")
+    import(markdown, Recognise::Checked, usize::MAX, true).expect("the nesting is not bounded here")
 }
 
 fn import(
     markdown: &str,
     recognise: Recognise,
     max_depth: usize,
+    budget: bool,
 ) -> Result<Vec<Block>, SchemaViolation> {
     if recognise == Recognise::Never {
+        let text = Cow::Borrowed(markdown);
         let arena = Arena::new();
-        let root = parse_document(&arena, markdown, &options());
+        let root = parse_document(&arena, &text, &options());
         check_depth(root, max_depth)?;
-        return Ok(blocks_of(root, &Source::new(markdown, recognise)));
+        return Ok(blocks_of(root, &Source::new(&text, recognise)));
     }
-    let source = Source::new(markdown, recognise);
+    let text = if budget {
+        with_budget(markdown, front_matter_end(markdown))
+    } else {
+        Cow::Borrowed(markdown)
+    };
+    let source = Source::new(&text, recognise);
     let arena = Arena::new();
-    let root = parse_document(&arena, markdown, &import_options(true));
+    let root = parse_document(&arena, &text, &import_options(true));
     check_depth(root, max_depth)?;
     let opening_is_literal = recognise == Recognise::Checked
         && root.first_child().is_some_and(|first| {
@@ -126,10 +133,96 @@ fn import(
         return Ok(blocks_of(root, &source));
     }
     // What opened the document is not front matter after all, such as two horizontal rules.
+    let text = if budget {
+        with_budget(markdown, 0)
+    } else {
+        Cow::Borrowed(markdown)
+    };
+    let source = Source::new(&text, recognise);
     let arena = Arena::new();
-    let root = parse_document(&arena, markdown, &import_options(false));
+    let root = parse_document(&arena, &text, &import_options(false));
     check_depth(root, max_depth)?;
     Ok(blocks_of(root, &source))
+}
+
+/// The most comrak's reference budget can be.
+const REFERENCE_BUDGET: usize = 100_000;
+
+/// Where front matter ends, if the text opens with it.
+fn front_matter_end(markdown: &str) -> usize {
+    let bom = if markdown.starts_with('\u{feff}') {
+        3
+    } else {
+        0
+    };
+    if !markdown.contains("]:") || !markdown[bom..].starts_with(FRONT_MATTER_DELIMITER) {
+        return 0;
+    }
+    let arena = Arena::new();
+    let root = parse_document(&arena, markdown, &import_options(true));
+    root.first_child()
+        .map_or(0, |first| match &first.data.borrow().value {
+            NodeValue::FrontMatter(literal) => bom + literal.len(),
+            _ => 0,
+        })
+}
+
+/// Comrak stops resolving references once the URLs and titles they repeat exceed the size of
+/// the text it parsed, up to [`REFERENCE_BUDGET`]. One line of spaces where a block cannot be
+/// open gives every text the full budget and changes no parse. The line goes after a byte order
+/// mark, which only counts on the first line, and after front matter, which must open the text.
+/// Parsing and source lines both read the returned text.
+fn with_budget(markdown: &str, after: usize) -> Cow<'_, str> {
+    let body = markdown.len() - after;
+    if !markdown.contains("]:") || body == 0 || body >= REFERENCE_BUDGET {
+        return Cow::Borrowed(markdown);
+    }
+    let at = if after == 0 && markdown.starts_with('\u{feff}') {
+        3
+    } else {
+        after
+    };
+    let mut padded = String::with_capacity(markdown.len() + REFERENCE_BUDGET);
+    padded.push_str(&markdown[..at]);
+    padded.extend(std::iter::repeat_n(' ', REFERENCE_BUDGET - body));
+    padded.push('\n');
+    padded.push_str(&markdown[at..]);
+    Cow::Owned(padded)
+}
+
+/// The number of each ordered list item's marker, as written. Export numbers the items from
+/// their list's start, so the numbers are syntax and not text. The caller has already imported
+/// `markdown` within the nesting bound; this walk does not recurse.
+pub(super) fn item_numbers(markdown: &str) -> Vec<&str> {
+    let lines = source_lines(markdown);
+    let arena = Arena::new();
+    let root = parse_document(&arena, markdown, &import_options(true));
+    let mut numbers = Vec::new();
+    for node in root.descendants() {
+        let data = node.data.borrow();
+        let NodeValue::Item(item) = &data.value else {
+            continue;
+        };
+        if item.list_type != ListType::Ordered {
+            continue;
+        }
+        let position = data.sourcepos.start;
+        let marker = position
+            .line
+            .checked_sub(1)
+            .and_then(|line| lines.get(line))
+            .and_then(|line| line.get(position.column.checked_sub(1)?..));
+        if let Some(marker) = marker {
+            let digits = marker.len()
+                - marker
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .len();
+            if digits > 0 {
+                numbers.push(&marker[..digits]);
+            }
+        }
+    }
+    numbers
 }
 
 /// Refuses a syntax tree deeper than `max_depth`, without recursion.
@@ -251,7 +344,7 @@ fn block_of<'a>(node: &'a AstNode<'a>, source: &Source) -> Vec<Block> {
                     source: text,
                 }],
                 // What the same lines are with no table extension.
-                None => import(&lines, Recognise::Never, MAX_IMPORT_DEPTH)
+                None => import(&lines, Recognise::Never, MAX_IMPORT_DEPTH, false)
                     .unwrap_or_else(|_| vec![literal_paragraph(&lines)]),
             };
             blocks.extend(links_paragraph(node, &lines, source));
@@ -481,6 +574,7 @@ fn is_sound(kind: PreservedKind, source: &str) -> bool {
             &serialize_raw(blocks),
             Recognise::Unchecked,
             MAX_IMPORT_DEPTH,
+            false,
         )
         .as_ref()
             == Ok(blocks)

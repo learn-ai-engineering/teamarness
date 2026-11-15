@@ -76,6 +76,8 @@ This guarantee covers a body. Import of Markdown from outside does not keep all 
 - a link with no text, outside a table that keeps its lines. The exception is a reference in a table that falls back to literal text: the links paragraph still holds its URL;
 - a link target, under the [limits on link targets](#limits-on-link-targets).
 
+The [loss check](#loss-check) tells a caller whether an import of outside Markdown loses text, without depending on this list.
+
 ### Preserved Blocks
 
 A **Preserved Block** keeps Markdown that the editor cannot carry as its exact source lines. Import recognises three constructs on every path, and export writes the source byte for byte:
@@ -119,15 +121,29 @@ The canonical corpus (`backend/tests/fixtures/markdown-corpus/`) records these n
 
 ### Limits on link targets
 
-Three limits can lose the target of a link in imported Markdown. Nothing signals the loss. `context/.delta/DELTA-023-preserved-blocks-accepted-tech-debt.md` records the evidence.
+Three limits can lose the target of a link in imported Markdown. Import does not signal the loss; the [loss check](#loss-check) reports it. `context/.delta/DELTA-023-preserved-blocks-accepted-tech-debt.md` records the evidence.
 
-- **Comrak's reference budget.** On each successful lookup of a definition, comrak 0.57.0 charges the bytes of the URL and the title against a budget. The budget is the body's size in bytes, up to 100 000, and front matter does not count towards it. The budget cannot be configured.
+- **Comrak's reference budget.** On each successful lookup of a definition, comrak 0.57.0 charges the bytes of the URL and the title against a budget. Comrak sets the budget to the size of the text it parses, up to 100 000 bytes, and the budget cannot be configured. Import of a revision (`canonical`, `merge`) therefore parses the text with one added line of spaces, after any byte order mark and front matter, so every text that holds `]:` gets the full 100 000 bytes. The line is blank, so it changes no parse and no source line of a Preserved Block, and it goes where no block can be open, so an unclosed fence gains no lines. Front matter does not reduce the budget, and reusing a definition in a short text costs nothing extra: three uses of a 100-byte URL in a 199-byte document all resolve, and repeated revises of an export with its definitions back do not grow the Document.
+  - The 100 000 bytes are a cap, and a text can still reach it. For example, 1 001 uses of a 100-byte URL resolve 1 000.
   - A lookup that does not fit resolves to nothing and charges nothing, so a later, shorter URL can still resolve.
-  - A reference that does not resolve exports as escaped literal text. For example, three uses of a 100-byte URL in a 199-byte document export as one link and two `\[x\]\[r\]`.
+  - A reference that does not resolve exports as escaped literal text, such as `\[x\]\[r\]`.
   - The first resolved use of a label keeps the target. A label whose first use does not fit counts as unused, so its definition and its target are lost.
   - A table's links paragraph holds only the references that resolved.
 - **A destination the writer cannot carry.** A destination with a space keeps the link's text and loses its target: `a [x](<b c>) d` exports as `a x d`, and `[r]: <b c>` puts only `x` in a table's links paragraph. An inline link in a table that keeps its lines stays in the cell. The fallback applies to the whole paragraph: one destination with a space or a tab also removes the target of every other link and the inline code in that paragraph, including in a table's links paragraph.
 - **A reference past the header's width.** The cell is not parsed, so the reference resolves to nothing. If no other link uses the definition, its target is lost.
+
+### Loss check
+
+`lost_tokens(markdown)` reports the text that importing `markdown` from outside would lose. Folder sync refuses to import a file for which it reports anything, so an author's file is never rewritten without that text.
+
+- A **token** is a maximal run of Unicode alphanumeric characters.
+- The check compares the tokens of the input with the tokens of `canonical(input)`. Each token SHALL appear in the export at least as often as in the input, less the occurrences that are syntax import consumes:
+  - one occurrence for each time the token appears inside a reference label: a definition `[label]:`, a full reference `][label]` or a collapsed reference `[label][]`. A resolved reference link loses its label and keeps its text and target;
+  - one occurrence for each ordered list item whose marker is that number. Export numbers the items from their list's start, so `1.` `1.` `1.` becomes `1.` `2.` `3.`.
+- The result is the missing tokens, each once, in input order, at most 8. It is empty when nothing is lost. A schema violation is the error `canonical` gives.
+- The check is **conservative**: it reports some changes that lose no meaning. An entity such as `&copy;` imports as `©`, so it reports `copy`. The author writes the character instead.
+- The check compares counts, not positions. A resolved reference repeats its target's tokens once per use, so those repeats can cover a lost target that has the same tokens. A reference past the budget is reported through the tokens of its target that appear nowhere else.
+- A file that Teamarness wrote is Canonical Markdown, and the check never reports a token for it.
 
 ### Known gap
 
@@ -189,5 +205,6 @@ These are the accepted merge semantics:
   - P9: a Preserved Block source of any shape exports stably, with no content lost.
   - P10: a table's link through a reference definition keeps its target, and bringing the definition back changes nothing.
 - The `CASES` environment variable sets the scale, with a default of 3 000. Merge properties run a third of it. The long run is `CASES=60000 cargo test -p teamarness-documents-package --release --test markdown_properties`.
-- `backend/tests/markdown_corpus.rs` checks the corpus.
+- `backend/tests/markdown_corpus.rs` checks the corpus, the reference budget and its cap, the space-destination limits, and the loss check on every corpus file. The corpus files whose import drops text are listed in that test with the tokens the check reports.
+- `backend/src/markdown/loss.rs` unit tests check the loss check's tokens, labels, list numbers and reported drops. Property `the_loss_check_passes_canonical_markdown` checks that the check passes any exported body.
 - `packages/documents-package/fixtures/merge-scenarios.json` is the shared merge scenario table. The backend runs it against `merge`, and the Documents port system test runs it through `document.revise`.

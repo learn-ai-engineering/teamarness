@@ -9172,6 +9172,7 @@ mod tests {
             format!("{} KiB Port value bound", ports::PORT_PAYLOAD_BYTES / 1024),
             format!("more than {} IDs", ports::MAX_VERSION_IDS),
             "baseVersion set to the returned version".into(),
+            "Write inline links".into(),
             "documents.collection_archived".into(),
             "documents.principal_not_bound".into(),
             "Host-derived actor".into(),

@@ -1,16 +1,17 @@
 # DELTA-023 — Preserved Blocks findings accepted as tech debt
 
-**Status:** open (2026-11-03; updated at slice A Close, 2026-11-15). These findings from Verify of Filesystem Docs slice A are deferred, not fixed. The owner of each group is the follow-up named in it.
+**Status:** open (2026-11-03; updated at slice A Close and in slice B Phase 1, 2026-11-15). These findings from Verify of Filesystem Docs slice A are deferred, not fixed. The owner of each group is the follow-up named in it.
 
 Don ruled on these:
 
 - Round 2, 2026-11-02: defer CR2-001 and CR2-002, keep non-first front matter as a schema violation, fix SF2-001 with the links paragraph, and gate slice B on the dropped text.
 - Round 3, 2026-11-03: defer CR3-001 and add it to the slice B gate, and accept the limit on a reference past the header's width.
 - Slice A Close, 2026-11-15: CR2-002 is ordinary tech debt, not part of the slice B gate. Fix the round 4 wording findings at Close, and defer SM4-005 and SM4-006 (group 10).
+- Slice B plan, 2026-11-15: gate 1 (group 4), refuse lossy mapped files through a loss check; gate 2 (group 8), adopt the budget prototype with tests.
 
 The other findings are P2 findings that Verify retained without an individual ruling, because a P2 finding does not block.
 
-**Slice B gate.** Two decisions come before the slice B plan: the dropped text (group 4) and the reference budget (group 8).
+**Slice B gate.** Decided 2026-11-15 and implemented in slice B Phase 1: the dropped text (group 4) and the reference budget (group 8).
 
 ## Divergence
 
@@ -52,7 +53,9 @@ Follow-up: reopen if the race is seen in use.
 - In slice B, a first sync of a mapped file would delete this text from the author's file.
 - SF2-002: acceptance criterion A-6 was false for one-token definitions. Its wording is amended and now states the real behaviour.
 
-Follow-up: the slice B gate. Don's decision comes before the slice B plan.
+**Decided (Don, 2026-11-15): refuse lossy files.** `markdown::lost_tokens` (`packages/documents-package/backend/src/markdown/loss.rs`) reports the tokens an import would lose, and folder sync refuses a mapped file for which it reports any. The file stays byte-identical. Import itself still drops this text; the check is what keeps it out of an author's file. The Markdown contract defines the check and its conservatism.
+
+Follow-up: none for slice B beyond calling the check from folder sync (slice B Phase 4).
 
 ### 5. Limits of the links paragraph (SF2-001 fix)
 
@@ -106,7 +109,9 @@ Follow-up: the next Documents workstream. Slice A Close did not take these.
   - The verifier ran it on 4 699 real files, 72 edge cases, 40 000 fuzz documents and the package suites. No expected output changed, and both regressions went away.
   - It is not checked by fmt or clippy, and it has no new tests. The 100 KB cap stays reachable.
 
-Follow-up: the slice B gate.
+**Decided (Don, 2026-11-15): prototype adopted.** Slice B Phase 1 lands it in `markdown/export.rs` (`with_budget`, `front_matter_end`), checked by fmt and clippy, with tests in `tests/markdown_corpus.rs` for budget reuse, front matter, growth, an unclosed fence with `]:` and the 100 000-byte cap. Both regressions are gone. A reference past the cap still loses its target; the loss check reports it for a mapped file.
+
+Follow-up: none.
 
 ### 9. Other Verify round 3 findings
 
@@ -124,8 +129,8 @@ Follow-up: the next Documents workstream. CR3-002 and CR3-004 can wait for the r
 
 Round 4 (`verify/20261103T010000Z_slice-a-review-4.md`) retained eight P2 findings. Slice A Close fixed the wording ones: SM4-001, SM4-002, SM4-003, SM4-004, SF4-002 and CR4-001. These remain:
 
-- **SM4-005.** No test pins the reference budget or the space-destination limits, so a comrak upgrade could change them unnoticed. Fix: add three cases near the limits test in `tests/markdown_corpus.rs`.
-- **SM4-006.** The Agent guide in `backend/src/guide.rs` does not warn that a reference can lose its target. Fix: tell Agents to write inline links.
+- **SM4-005. Fixed in slice B Phase 1.** Three tests near the limits test in `tests/markdown_corpus.rs` pin the 100 000-byte cap and the space-destination behaviour.
+- **SM4-006. Fixed in slice B Phase 1.** The Agent guide in `backend/src/guide.rs` tells Agents to write inline links, not reference definitions.
 - **CR4-001, behaviour.** The contract now states it: one destination with a space or a tab removes every other link target and the inline code in its paragraph. The behaviour itself is part of the dropped text in group 4.
 
-Follow-up: the slice B plan, with the gate decisions.
+Follow-up: CR4-001's behaviour stays with group 4: the loss check refuses a mapped file that hits it.

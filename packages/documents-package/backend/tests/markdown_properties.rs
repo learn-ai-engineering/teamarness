@@ -7,7 +7,7 @@ use proptest::prelude::*;
 use teamarness_documents_package::markdown::testing::{canonicalize, parse};
 use teamarness_documents_package::markdown::{
     Block, Inline, Link, MAX_NESTING, Marks, MergeError, Merged, PreservedKind, SchemaViolation,
-    export, merge, read_tree, write_tree,
+    export, lost_tokens, merge, read_tree, write_tree,
 };
 
 mod common;
@@ -66,6 +66,13 @@ proptest! {
         let md = to_markdown(&body);
         let squash = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
         prop_assert_eq!(squash(plain_text(&parse(&md))), squash(plain_text(&body)), "markdown was:\n{}", md);
+    }
+
+    /// The loss check passes Canonical Markdown: a file Teamarness wrote is never refused.
+    #[test]
+    fn the_loss_check_passes_canonical_markdown(body in document(word_text().boxed(), false)) {
+        let md = to_markdown(&body);
+        prop_assert_eq!(lost_tokens(&md), Ok(Vec::new()), "markdown was:\n{}", md);
     }
 
     /// Every generated Preserved Block is sound wherever it sits, so the suites above and below
