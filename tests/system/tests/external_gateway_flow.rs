@@ -58,11 +58,26 @@ async fn install(host: &PackageHost, directory: PathBuf, identity: &str) {
     .await
     .unwrap();
 }
+async fn catalog(host: &PackageHost, mount: &UiMountId) -> Vec<Value> {
+    let mut rows = Vec::new();
+    let mut cursor = Value::Null;
+    for _ in 0..4 {
+        let mut input = json!({});
+        if !cursor.is_null() {
+            input["cursor"] = cursor;
+        }
+        let page = ui(host, mount, "external-gateway.catalog.page", input).await;
+        rows.extend(page["contracts"].as_array().unwrap().iter().cloned());
+        cursor = page["nextCursor"].clone();
+        if cursor.is_null() {
+            return rows;
+        }
+    }
+    panic!("fixture catalog exceeded four bounded pages");
+}
 async fn select(host: &PackageHost, mount: &UiMountId, contract: &str, port: &str) {
-    let page = ui(host, mount, "external-gateway.catalog.page", json!({})).await;
-    let row = page["contracts"]
-        .as_array()
-        .unwrap()
+    let rows = catalog(host, mount).await;
+    let row = rows
         .iter()
         .find(|row| row["contract"] == contract)
         .expect("offered contract");
@@ -477,6 +492,156 @@ fn consumer(root: &Path, identity: &str, major: u16, declared: bool) {
         serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R12, TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires freshly built TEAMARNESS_EXTERNAL_GATEWAY_PACKAGE_DIR; run scripts/verify-external-gateway.mjs"]
+async fn http_catalog_follows_exact_cursors_past_empty_page_without_gateway_rebuild() {
+    const SELECTED: &str = support::harness::QUALIFICATION;
+    const FILLER: &str = "dev.example.pagination-provider";
+    let directory = gateway_directory();
+    let manifest_before = fs::read(directory.join("teamarness.package.json")).unwrap();
+    let manifest: Value = serde_json::from_slice(&manifest_before).unwrap();
+    let artifact_paths = [
+        manifest["backends"][0]["path"].as_str().unwrap(),
+        manifest["ui"]["entrypoint"]["path"].as_str().unwrap(),
+        manifest["ui"]["contract"]["path"].as_str().unwrap(),
+    ];
+    let before: Vec<_> = artifact_paths
+        .iter()
+        .map(|path| digest(&fs::read(directory.join(path)).unwrap()))
+        .collect();
+    let root = tempfile::tempdir().unwrap();
+    let profile = root.path().canonicalize().unwrap();
+    let application = stage_backlog(&profile);
+    let core = open_core(Addressing::Loopback, &profile.join("core")).await;
+    let workspace = core
+        .create_workspace("HTTP catalog pagination")
+        .unwrap()
+        .id();
+    let key = PackageInstanceKey::new(
+        GATEWAY.parse().unwrap(),
+        WorkspaceId::new(workspace.to_string()).unwrap(),
+    );
+    let host = open_host(&application, profile.join("host"), core.clone()).await;
+    install(&host, directory.clone(), GATEWAY).await;
+    let gateway = open_mount(&host, &key).await;
+    let (port, bearer) = endpoint(&host, &gateway).await;
+    assert!(
+        catalog(&host, &gateway)
+            .await
+            .iter()
+            .all(|row| row["contract"] != SELECTED)
+    );
+
+    // Each Provider stays within the 32-contract admission bound. Together they
+    // force actual Host pagination; these discovery-only filler routes stay off.
+    let filler = profile.join("filler");
+    provider(&filler);
+    update_ports(&filler, |ports| {
+        let template = ports["contracts"][0].clone();
+        ports["contracts"] = (0..32)
+            .map(|index| {
+                let mut contract = template.clone();
+                contract["identity"] = format!("dev.example.page-{index:02}").into();
+                contract
+            })
+            .collect::<Vec<_>>()
+            .into();
+    });
+    let path = filler.join("teamarness.package.json");
+    let mut filler_manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    filler_manifest["identity"] = FILLER.into();
+    fs::write(path, serde_json::to_vec(&filler_manifest).unwrap()).unwrap();
+    install(&host, filler, FILLER).await;
+    let selected = profile.join("selected");
+    provider(&selected);
+    install(&host, selected, SELECTED).await;
+    let rows = catalog(&host, &gateway).await;
+    assert!(rows.len() > 32, "must exercise real Host continuation");
+    for index in 0..32 {
+        assert!(rows.iter().any(
+            |row| row["contract"] == format!("dev.example.page-{index:02}")
+                && row["selected"] == false
+        ));
+    }
+    assert!(
+        rows.iter()
+            .position(|row| row["contract"] == SELECTED)
+            .unwrap()
+            >= 32
+    );
+    select(&host, &gateway, SELECTED, "sample.read").await;
+
+    let first = http(port, &bearer, "/v1/contracts", None).await;
+    assert_eq!(first.0, 200);
+    assert_eq!(
+        first.1["contracts"],
+        json!([]),
+        "disabled first page must not leak metadata"
+    );
+    assert!(
+        first.1["nextCursor"].is_string(),
+        "empty page is not completion"
+    );
+    let mut cursor = first.1["nextCursor"].clone();
+    let mut cursors = std::collections::BTreeSet::new();
+    let mut discovered = Vec::new();
+    for _ in 0..3 {
+        let exact_cursor = cursor.as_str().expect("nonterminal cursor");
+        assert!(
+            cursors.insert(exact_cursor.to_owned()),
+            "cursor must advance"
+        );
+        // Use the returned string verbatim: no synthetic cursor or client repair.
+        let page = http(
+            port,
+            &bearer,
+            &format!("/v1/contracts?cursor={exact_cursor}"),
+            None,
+        )
+        .await;
+        assert_eq!(page.0, 200, "returned HTTP cursor must be usable");
+        discovered.extend(page.1["contracts"].as_array().unwrap().iter().cloned());
+        cursor = page.1["nextCursor"].clone();
+        if cursor.is_null() {
+            break;
+        }
+    }
+    assert!(
+        cursor.is_null(),
+        "fixture catalog must terminate within four pages"
+    );
+    assert_eq!(
+        discovered.len(),
+        1,
+        "only the explicitly selected contract is exposed"
+    );
+    assert_eq!(discovered[0]["contract"], SELECTED);
+    assert_eq!(discovered[0]["major"], 3);
+    assert_eq!(
+        http(
+            port,
+            &bearer,
+            "/v1/call",
+            Some(call(SELECTED, 3, "sample.read", json!({"offset":7})))
+        )
+        .await,
+        (
+            200,
+            json!({"result":{"answer":42,"actor":{"kind":"person","identity":core.public_identity().to_string()}}})
+        )
+    );
+    assert_eq!(
+        fs::read(directory.join("teamarness.package.json")).unwrap(),
+        manifest_before
+    );
+    for (path, expected) in artifact_paths.iter().zip(before) {
+        assert_eq!(digest(&fs::read(directory.join(path)).unwrap()), expected);
+    }
+    shutdown(host).await;
+    core.shutdown().await.unwrap();
 }
 
 // Verifies: TEAM.SYS.PKG-R02, TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R12, TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14

@@ -141,7 +141,9 @@ No normal profile or sibling Agent repository is used. Provenance records source
 lockfile, vendor and artifact digests, never bearer values or Package data contents.
 
 Real processes qualify Backlog paging/reads/guide/errors; live unknown multi-contract
-Providers and schema changes; major-2 compatibility; membership and caller authority;
+Providers and schema changes; HTTP catalog discovery across more than 32 offered
+contracts, following exact returned cursors past an empty filtered page to completion
+without rebuilding the gateway; major-2 compatibility; membership and caller authority;
 and listener/token isolation, pause/recovery, restart/reload, removal/reinstall and port
 conflicts. Canonical membership loss stops an idle listener and all existing route
 connections, including static guidance and primed schemas; retained enabled setup does
@@ -152,6 +154,11 @@ separately prove unchanged Host overload and its earlier
 SDK timeout, disconnect ownership and no replay. The gateway's twelve slots count
 outstanding SDK operations, not twelve simultaneous Provider executions. SDK terminals
 release slots; a timeout does not establish that native Provider work stopped.
+
+Gateway revocation applies at final local admission, not SDK writer enqueue. A read
+admitted before revoke, regeneration or a permission change may still wait inside the
+SDK, hand off and finish afterward. Later admissions use current policy. Use the
+external agent's own stop control to stop its work; revocation is not cancellation.
 
 These automated proofs do not replace Don's native settings/token/lifecycle observations
 or an actual outside coding agent following onboarding. Run manual checks only in a
