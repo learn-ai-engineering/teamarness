@@ -82,6 +82,23 @@ pub(crate) fn scan(root: &Path) -> io::Result<Scan> {
     Ok(scan)
 }
 
+/// The folders directly in `root` whose name does not start with `.`, sorted. Unlike [`scan`],
+/// it reads no file, so the settings listing can call it often. A missing or unreadable root
+/// has none.
+pub(crate) fn subfolders(root: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut folders: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    folders.sort();
+    folders
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::codec::{sha256, temp_name};
@@ -135,6 +152,8 @@ mod tests {
         assert_eq!(scan.subfolders, ["folder.md", "sub"]);
         assert!(scan.symlinks.is_empty());
         assert!(scan.unreadable.is_empty());
+        assert_eq!(subfolders(path), scan.subfolders);
+        assert!(subfolders(&path.join("missing")).is_empty());
     }
 
     #[cfg(unix)]

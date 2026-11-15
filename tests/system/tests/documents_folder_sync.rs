@@ -286,6 +286,7 @@ async fn poll(timeout: Duration, mut ready: impl AsyncFnMut() -> bool) -> Option
         if ready().await {
             return Some(start.elapsed());
         }
+        // poll-interval: bounded by `timeout` above.
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     None
@@ -422,7 +423,7 @@ async fn a_mapped_folder_and_its_collection_follow_each_other() {
             .is_some(),
         "Bob's edit did not reach Alice's file"
     );
-    // Long enough for an echo import to reach Bob, if Alice made one.
+    // negative-wait: long enough for an echo import to reach Bob, if Alice made one.
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(
         bob.writers(&plan).await,
@@ -463,7 +464,7 @@ async fn a_mapped_folder_and_its_collection_follow_each_other() {
         .is_some(),
         "the 51 new files did not become Documents on Bob"
     );
-    // Let Alice's folder settle before it stops.
+    // settle: let Alice's folder sync finish its last pass before it stops.
     tokio::time::sleep(Duration::from_secs(1)).await;
     alice.stop().await;
     for index in 1..51 {
@@ -556,6 +557,7 @@ async fn a_mapped_folder_and_its_collection_follow_each_other() {
         .is_some(),
         "the file after the refused ones was not imported"
     );
+    // negative-wait: no Document may appear for the refused files.
     tokio::time::sleep(Duration::from_millis(500)).await;
     for title in ["lossy", "huge"] {
         assert!(

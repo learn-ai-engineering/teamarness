@@ -2,8 +2,8 @@
 //! and the files folder sync refused.
 //!
 //! This state belongs to this Installation and is never replicated. Every write is one SQLite
-//! transaction, so a crash leaves either the old state or the new one. Phase 4 of slice B (the
-//! reconciler) is the first caller; until then only the tests below use it.
+//! transaction, so a crash leaves either the old state or the new one. The folder sync
+//! reconciler and the `documents.mapping.*` requests use it.
 
 use rusqlite::{OptionalExtension, Row, TransactionBehavior, params};
 
@@ -235,6 +235,28 @@ impl DocumentStore {
             )
             .map_err(write_error)?;
         transaction.commit().map_err(rerr)
+    }
+
+    /// Sets the state of the mapping of `collection_id`, only while its root is still
+    /// `root_path`. Nothing else changes. Returns whether that mapping was found.
+    ///
+    /// A reconcile that read a mapping saves its state with this, so a root that was changed or
+    /// cleared while it ran is never written back.
+    pub fn set_folder_mapping_state(
+        &self,
+        collection_id: &str,
+        root_path: &str,
+        state: MappingState,
+    ) -> Result<bool, StoreError> {
+        let inner = lock(&self.inner)?;
+        let updated = inner
+            .conn
+            .execute(
+                "UPDATE folder_mappings SET state=?3 WHERE collection_id=?1 AND root_path=?2",
+                params![collection_id, root_path, state.as_str()],
+            )
+            .map_err(rerr)?;
+        Ok(updated > 0)
     }
 
     /// Drops the mapping of `collection_id` with its file state and refusals. The files on disk
@@ -601,6 +623,49 @@ mod tests {
         paused.state = MappingState::Paused;
         f.store.set_folder_mapping(&paused).unwrap();
         assert_eq!(f.store.folder_mapping("c1").unwrap(), Some(paused));
+    }
+
+    #[test]
+    fn a_state_update_never_reverts_a_changed_or_cleared_root() {
+        let f = fixture();
+        f.store.set_folder_mapping(&mapping("c1", "/a", 1)).unwrap();
+        f.store
+            .upsert_mapped_file(&file("d1", "c1", "Plan"))
+            .unwrap();
+        assert!(
+            f.store
+                .set_folder_mapping_state("c1", "/a", MappingState::Unavailable)
+                .unwrap()
+        );
+        let saved = f.store.folder_mapping("c1").unwrap().unwrap();
+        assert_eq!(saved.state, MappingState::Unavailable);
+        assert_eq!(saved.root_path, "/a");
+        assert_eq!(
+            f.store.mapped_files("c1").unwrap().len(),
+            1,
+            "children kept"
+        );
+
+        // A reconcile that read `/a` must not touch the mapping once it moved to `/b`.
+        f.store.set_folder_mapping(&mapping("c1", "/b", 1)).unwrap();
+        assert!(
+            !f.store
+                .set_folder_mapping_state("c1", "/a", MappingState::Paused)
+                .unwrap()
+        );
+        assert_eq!(
+            f.store.folder_mapping("c1").unwrap(),
+            Some(mapping("c1", "/b", 1))
+        );
+
+        // Nor recreate it once cleared.
+        f.store.clear_folder_mapping("c1").unwrap();
+        assert!(
+            !f.store
+                .set_folder_mapping_state("c1", "/b", MappingState::Active)
+                .unwrap()
+        );
+        assert_eq!(f.store.folder_mapping("c1").unwrap(), None);
     }
 
     #[test]

@@ -133,3 +133,18 @@ img.ProseMirror-separator { display: inline !important; border: none !important;
   .comments-panel { position: absolute; z-index: 4; top: 0; bottom: 0; right: 0; width: min(var(--right-width), 75%); box-shadow: -5px 0 15px #0004; }
   .right-resizer { position: absolute; z-index: 5; top: 0; bottom: 0; right: min(var(--right-width), 75%); }
 }
+
+/* The settings view (Configuration tab): folder mappings. */
+.documents-settings.teamarness-page { height: 100%; overflow: auto; }
+.mapping-collections, .mapping-refused-list, .mapping-files, .mapping-reformatted, .mapping-subfolders { margin: 0; padding-left: 1.2rem; }
+.mapping-collections { list-style: none; padding: 0; display: grid; gap: .6rem; }
+.mapping-collection { display: grid; gap: .3rem; justify-items: start; border: 1px solid var(--teamarness-color-border); border-radius: var(--teamarness-radius-control, 6px); padding: .6rem .8rem; }
+.mapping-collection-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: .6rem; }
+.mapping-state { color: var(--teamarness-color-text-muted); font-size: .85rem; }
+.mapping-collection[data-state="unavailable"] .mapping-state { color: var(--teamarness-color-danger); }
+.mapping-path, .mapping-report code, .mapping-refused code { font-family: var(--teamarness-font-mono); overflow-wrap: anywhere; }
+.mapping-counts, .mapping-git { margin: 0; font-size: .85rem; }
+.mapping-detail { color: var(--teamarness-color-text-muted); }
+.mapping-report:empty, .documents-settings [hidden], .documents-settings .teamarness-notice:empty { display: none; }
+.mapping-report h4 { margin: .6rem 0 .2rem; }
+.mapping-git-confirm { display: flex; gap: .5rem; align-items: flex-start; }

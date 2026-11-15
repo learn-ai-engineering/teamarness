@@ -60,6 +60,48 @@ export type DocumentRequest = {
   readonly "documentId": RecordId;
 };
 
+export type FolderMapping = {
+  readonly "counts": {
+    readonly "files": number;
+    readonly "refused": number;
+    readonly "subfolders": number;
+  };
+  readonly "gitRoot": string | null;
+  readonly "path": string;
+  readonly "refused": readonly MappingRefusal[];
+  readonly "state": "active" | "unavailable" | "paused";
+  readonly "subfolders": readonly string[];
+};
+
+export type MappingDraft = {
+  readonly "collectionId"?: RecordId;
+  readonly "name"?: string;
+  readonly "path"?: string;
+};
+
+export type MappingRefusal = {
+  readonly "detail"?: string;
+  readonly "name": string;
+  readonly "reason": "lossy" | "too_large" | "not_utf8" | "schema_violation" | "merge_refused" | "symlink" | "title_too_long" | "name_collision_unresolved" | "unreadable";
+};
+
+export type MappingReport = {
+  readonly "counts": {
+    readonly "files": number;
+    readonly "reformatted": number;
+    readonly "refused": number;
+    readonly "subfolders": number;
+  };
+  readonly "files": readonly {
+    readonly "bytes": number;
+    readonly "name": string;
+  }[];
+  readonly "gitRoot": string | null;
+  readonly "reformatted": readonly string[];
+  readonly "refused": readonly MappingRefusal[];
+  readonly "subfolders": readonly string[];
+};
+
 export type Name = string;
 
 export type Names = {
@@ -202,13 +244,32 @@ export type DocumentsContract = {
       }; readonly response: {
         readonly "requestId": RequestId;
       } };
-    readonly "documents.mapping.set": { readonly request: {
+    readonly "documents.mapping.clear": { readonly request: CollectionRequest; readonly response: {
+        readonly "cleared": boolean;
         readonly "collectionId": RecordId;
+      } };
+    readonly "documents.mapping.draft.get": { readonly request: Record<string, never>; readonly response: MappingDraft };
+    readonly "documents.mapping.draft.set": { readonly request: MappingDraft; readonly response: Record<string, never> };
+    readonly "documents.mapping.list": { readonly request: Record<string, never>; readonly response: {
+        readonly "collections": readonly ({
+          readonly "archived": boolean;
+          readonly "collectionId": RecordId;
+          readonly "mapping": FolderMapping | null;
+          readonly "name": string;
+        })[];
+      } };
+    readonly "documents.mapping.set": { readonly request: {
+        readonly "collectionId"?: RecordId;
+        readonly "confirmGit"?: boolean;
+        readonly "dryRun"?: boolean;
+        readonly "newCollectionName"?: Name;
         readonly "path": string;
       }; readonly response: {
-        readonly "collectionId": RecordId;
+        readonly "collectionId": RecordId | null;
         readonly "direction": "export" | "import" | "unchanged";
+        readonly "dryRun": boolean;
         readonly "path": string;
+        readonly "report"?: MappingReport;
       } };
     readonly "documents.place.get": { readonly request: Record<string, never>; readonly response: Place };
     readonly "documents.place.set": { readonly request: Place; readonly response: Record<string, never> };

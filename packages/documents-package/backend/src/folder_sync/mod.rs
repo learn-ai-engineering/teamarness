@@ -14,5 +14,5 @@ mod reconcile;
 mod scan;
 pub(crate) mod watch;
 
-pub(crate) use mapping::set_mapping;
+pub(crate) use mapping::{SetOptions, clear_mapping, list_mappings, set_mapping};
 pub(crate) use reconcile::FolderSync;

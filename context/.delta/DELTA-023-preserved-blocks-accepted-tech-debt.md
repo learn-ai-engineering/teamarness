@@ -1,6 +1,6 @@
 # DELTA-023 — Preserved Blocks findings accepted as tech debt
 
-**Status:** open (2026-11-03; updated at slice A Close and in slice B Phase 1, 2026-11-15). These findings from Verify of Filesystem Docs slice A are deferred, not fixed. The owner of each group is the follow-up named in it.
+**Status:** open (2026-11-03; updated at slice A Close and in slice B Phase 1, 2026-11-15, and in slice B Phase 6, 2026-11-16). These findings from Verify of Filesystem Docs slice A are deferred, not fixed. The owner of each group is the follow-up named in it.
 
 Don ruled on these:
 
@@ -37,7 +37,7 @@ Follow-up: revisit before wider release.
 - This is not a regression, because the bytes are identical before slice A. No characters are lost. A scan of about 4 600 Markdown files found 0 occurrences. Acceptance criterion A-1 and the contract state the limit.
 - Tested fix idea: trim the two delimiter lines in a view that only comrak sees, and take the source from the original lines. On a scratch copy the whitespace stayed byte-exact.
 
-Follow-up: ordinary tech debt (Don, 2026-11-15). A mapped file can hold this shape, so slice B's plan can still choose to fix it.
+Follow-up: ordinary tech debt (Don, 2026-11-15). Slice B did not fix it. A mapped file with this shape loses no token, so the loss check lets it through and it imports restructured, as in the app.
 
 ### 3. Non-first front matter stays a schema violation
 
@@ -55,7 +55,9 @@ Follow-up: reopen if the race is seen in use.
 
 **Decided (Don, 2026-11-15): refuse lossy files.** `markdown::lost_tokens` (`packages/documents-package/backend/src/markdown/loss.rs`) reports the tokens an import would lose, and folder sync refuses a mapped file for which it reports any. The file stays byte-identical. Import itself still drops this text; the check is what keeps it out of an author's file. The Markdown contract defines the check and its conservatism.
 
-Follow-up: none for slice B beyond calling the check from folder sync (slice B Phase 4).
+Done in slice B: the reconciler calls the check before every import and pre-check, and the settings view's pre-mapping report lists each lossy file with a sample of its lost tokens (ADR 0041, `TEAM.SYS.DOCS-R14`). The check also exempts ordered-list item numbers, because export renumbers `1.` `1.` `1.` as `1.` `2.` `3.`.
+
+Follow-up: none.
 
 ### 5. Limits of the links paragraph (SF2-001 fix)
 

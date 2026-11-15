@@ -2,7 +2,7 @@
 
 Prefix: `TEAM.SYS.DOCS`
 
-The Documents Package (`dev.teamarness.documents`) provides Workspace Collections, Documents, and Comments. See ADR 0027, ADR 0032 and ADR 0033.
+The Documents Package (`dev.teamarness.documents`) provides Workspace Collections, Documents, and Comments. See ADR 0027, ADR 0032, ADR 0033 and ADR 0041.
 
 ## TEAM.SYS.DOCS-R01 — Package Boundary
 
@@ -79,7 +79,6 @@ Unknown append outcomes SHALL preserve exact live retry bytes and an unsaved cue
 
 These are not delivered:
 
-- folder mapping;
 - formatting beyond the baseline body schema (R13), such as editable or rendered tables, images, task lists or underline. Tables, front matter and HTML blocks are kept only as read-only Preserved Blocks (R11, R13);
 - exact text-range Comment anchors (Comments quote excerpts, R07);
 - document-level permissions beyond Canonical Membership;
@@ -125,3 +124,27 @@ A Preserved Block (R11) SHALL show its source read-only in a monospace frame lab
 Undo and redo SHALL be per person: `LoroUndoPlugin` on Mod-z, Shift-Mod-z and Mod-y, and the toolbar's Undo and Redo, SHALL revert only the session's own changes, never another Member's, another view's or a port revision's, within the bounds of R09. Typing SHALL undo in bursts: consecutive plain-text insertion, backspace and delete within one textblock SHALL be one undo step, which ends at an idle gap of 750 ms, at any other change (such as a paste, a structural change or a mark), at a selection jump, at an undo or redo, and before an import of another peer's changes, so no step spans another peer's change. Each other local change SHALL be its own undo step (the undo manager merges nothing by time), except that the pieces of a split paste SHALL be one step. A burst SHALL grow only while its undo still fits one record (R09). The undo history SHALL hold at most 500 steps, dropping the oldest. A change too large to undo in one record is not undoable (R09); recovering from one is left to a future way to view earlier Document versions and copy from them. Undoing an agent's or another Member's edits is out of scope. `prosemirror-history` SHALL NOT be used.
 
 The editor SHALL run within the frame policy of ADR 0031: its styles come from the declared stylesheet asset, it injects no `<style>` element, and it writes no inline style markup (CSSOM property writes only). Its behaviour in real browsers under that policy SHALL be checked by `npm run verify:documents-editor` (frame scenarios in WebKit and Chromium), which is outside `npm test` because it downloads browsers. Known frame-policy divergences are recorded in [DELTA-014](../../.delta/DELTA-014-package-ui-frame-form-and-select-behaviour.md). Accepted gaps in the editor's size estimates and undo budget are recorded in [DELTA-013](../../.delta/DELTA-013-documents-editor-accepted-tech-debt.md).
+
+## TEAM.SYS.DOCS-R14 — Folder Mapping
+
+A Member SHALL be able to map a Collection to a folder of Markdown files on their Installation, so that a file and its Document follow each other (ADR 0041). Mappings SHALL belong to one Installation and SHALL never be replicated.
+
+**Configuration.** The Documents settings view (the Shell's **Configuration** tab, manifest `ui.views: ["settings"]`) SHALL list every Collection with its mapping state (`active`, `unavailable` or `paused`), its absolute path, its file counts, the subfolders that are not synced yet, and its refused files with their reasons. A Member SHALL be able to map a Collection to an absolute path, create a Collection from a folder, and unmap a Collection. Unmapping SHALL leave every file on disk. The path, name and Collection the Member has not sent yet SHALL survive a Package switch, held in Backend memory only. The view SHALL refresh on `documents.changes`.
+
+**Pre-mapping report.** Before a mapping is saved, the Member SHALL be shown a report of the folder (`documents.mapping.set` with `dryRun`), which SHALL change nothing. It SHALL list the files that will be imported; the files that will be refused, with reasons; the files whose bytes are not Canonical Markdown, which the first write-back reformats; the subfolders that are not synced yet; and the git working tree the folder is inside, if any.
+
+**Mapping rules.** A mapped path SHALL be absolute, exist, be a folder, lie outside the Package Data Directory, and neither equal, contain nor sit inside another mapping's root. If the folder holds no file to sync, the Collection SHALL be exported to it. If the Collection holds no Document, the folder SHALL be imported into it. If both hold content, the mapping SHALL be refused. A path inside a git working tree SHALL be refused until the Member confirms a warning (`confirmGit`). Each refusal SHALL return `documents.mapping_refused` with a `reason`: `not_absolute`, `not_found`, `not_a_directory`, `unreadable`, `inside_data_directory`, `overlapping_mapping`, `not_empty` or `git_working_tree`.
+
+**What is synced.** Folder sync SHALL sync only regular files directly in the root whose name ends in lowercase `.md` and does not start with `.`. It SHALL never follow a symbolic link, never write outside the root, and never import a subfolder.
+
+**Export.** After an export mapping, each Document of the Collection SHALL exist as `<name>.md`, and its bytes SHALL equal the Document's Canonical Markdown.
+
+**Import.** An edit to a mapped file, whether made while Teamarness runs or while it is closed, SHALL be imported as the local Person's Markdown revision of the version the file was last written from (R05, R11), so concurrent edits elsewhere in the Document survive. A new `.md` file SHALL create a Document. A deleted file SHALL archive its Document. A file rename, detected by content hash, SHALL rename the Document. A bulk change of 50 files SHALL import with no corruption and no duplication.
+
+**Write-back.** A remote or in-app edit SHALL update the mapped file and keep the bytes of unchanged top-level blocks. An external edit that is not yet imported SHALL never be overwritten: it SHALL be imported first. The first sync of a file SHALL never rewrite it. A Document rename SHALL rename its file. An archive SHALL remove the file, after importing any unimported edit, and a restore SHALL write it again. Teamarness's own file writes SHALL never be imported as revisions.
+
+**No lost text.** A file whose import would lose text SHALL NOT be imported. It SHALL stay byte-identical on disk and SHALL be listed as refused (`lossy`) with a sample of the lost tokens. The loss check (`markdown::lost_tokens`, `markdown-contract.md`) compares alphanumeric tokens and exempts reference labels and ordered-list item numbers. A file over the R09 bounds (`too_large`), one that is not UTF-8 (`not_utf8`), one the schema cannot hold (`schema_violation`), one whose merge is refused (`merge_refused`), a symbolic link (`symlink`), a name too long for a title (`title_too_long`) and a name that collides ignoring case (`name_collision_unresolved`) SHALL be refused the same way, and none SHALL leave a partial or empty Document. The same bytes SHALL NOT be retried until the file changes.
+
+**Safety.** A missing or unreadable root SHALL mark the mapping `unavailable` and SHALL archive nothing. An archived Collection SHALL pause its mapping and leave its files, and a restore SHALL resume it. An import or write-back interrupted by a crash or quit SHALL never duplicate content when it is retried: an import's request ID SHALL be derived from the Document, the base version and the file hash and checked for inclusion before staging, and a write-back SHALL record the hash and version it is about to write before it renames the file.
+
+**Verification gap.** The watcher is exercised on macOS and, in CI, on Linux through `tests/system/tests/documents_folder_sync.rs` only. Windows is not qualified. A save from a real editor is a manual check.

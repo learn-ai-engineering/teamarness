@@ -737,6 +737,8 @@ pub struct DocumentsActive {
     data_directory: PathBuf,
     /// Where the UI last was: held in memory only, so it lasts while the Backend runs.
     place: Mutex<Place>,
+    /// The settings view's unsent mapping form, held in memory like `place`.
+    mapping_draft: Mutex<MappingDraft>,
 }
 
 /// The UI's remembered place: the selected Collection, the open Document and its scroll offset.
@@ -788,12 +790,34 @@ struct CollectionRenameRequest {
 struct CollectionRequest {
     collection_id: String,
 }
-/// Maps a Collection to a folder on this Installation (slice B's minimal form: no dry run yet).
+/// Maps a Collection, or a new Collection named `new_collection_name`, to a folder on this
+/// Installation. Exactly one of the two is given. A dry run returns the pre-mapping report and
+/// changes nothing; a folder inside a git working tree is mapped only with `confirm_git`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MappingSetRequest {
-    collection_id: String,
+    #[serde(default)]
+    collection_id: Option<String>,
+    #[serde(default)]
+    new_collection_name: Option<String>,
     path: String,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    confirm_git: bool,
+}
+
+/// The settings view's unsent mapping form, held in memory like [`Place`]: it survives a
+/// Package switch but never a Backend restart.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MappingDraft {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    collection_id: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1225,6 +1249,7 @@ pub(crate) fn router_configured(
                 folder_sync_enabled,
                 data_directory,
                 place: Mutex::new(Place::default()),
+                mapping_draft: Mutex::new(MappingDraft::default()),
             })
         }
     })
@@ -1343,30 +1368,49 @@ pub(crate) fn router_configured(
         },
     )
     .request(
+        "documents.mapping.list",
+        |context: Context<DocumentsActive>, _: Empty| async move {
+            let state = context.state().clone();
+            context
+                .blocking(move |_| folder_sync::list_mappings(&state.store))
+                .await
+        },
+    )
+    .request(
         "documents.mapping.set",
         |context: Context<DocumentsActive>, request: MappingSetRequest| async move {
+            set_mapping(&context, request).await
+        },
+    )
+    .request(
+        "documents.mapping.clear",
+        |context: Context<DocumentsActive>, request: CollectionRequest| async move {
             require_collection(&context, &request.collection_id).await?;
             let state = context.state().clone();
             let collection = request.collection_id.clone();
-            let (root, direction) = context
-                .blocking(move |_| {
-                    folder_sync::set_mapping(
-                        &state.store,
-                        &state.data_directory,
-                        &collection,
-                        &request.path,
-                    )
-                })
+            let cleared = context
+                .blocking(move |_| folder_sync::clear_mapping(&state.store, &collection))
                 .await?;
-            // The folder sync session sees the new mapping as a catalog change.
+            // The folder sync session stops watching the folder on the next catalog change.
             context
                 .state()
                 .changes
                 .send_modify(|revision| *revision = revision.saturating_add(1));
-            Ok(json!({
-                "collectionId": request.collection_id, "path": root,
-                "direction": direction.as_str(),
-            }))
+            Ok(json!({ "collectionId": request.collection_id, "cleared": cleared }))
+        },
+    )
+    .request(
+        "documents.mapping.draft.get",
+        |context: Context<DocumentsActive>, _: Empty| async move {
+            let draft = recover(&context.state().mapping_draft).clone();
+            serde_json::to_value(draft).map_err(|_| storage_failed())
+        },
+    )
+    .request(
+        "documents.mapping.draft.set",
+        |context: Context<DocumentsActive>, draft: MappingDraft| async move {
+            *recover(&context.state().mapping_draft) = draft;
+            Ok(json!({}))
         },
     )
     .request(
@@ -1704,6 +1748,75 @@ pub(crate) fn router_configured(
             ports::comment_add(&context, signer, request).await
         },
     )
+}
+
+/// `documents.mapping.set`: checks the folder, then reports (dry run) or maps it, creating the
+/// Collection first for "Create Collection from folder".
+async fn set_mapping(
+    context: &Context<DocumentsActive>,
+    request: MappingSetRequest,
+) -> Result<JsonValue, BackendError> {
+    let author = context.state().installation.clone();
+    let (existing, create) = match (request.collection_id, request.new_collection_name) {
+        (Some(collection), None) => {
+            require_collection(context, &collection).await?;
+            (Some(collection), None)
+        }
+        (None, Some(name)) => (
+            None,
+            Some(DomainRecord::collection_create(&author, &name).map_err(domain_error)?),
+        ),
+        _ => return Err(invalid_request()),
+    };
+    let options = folder_sync::SetOptions {
+        dry_run: request.dry_run,
+        confirm_git: request.confirm_git,
+    };
+    let plan = |collection: Option<String>| {
+        let state = context.state().clone();
+        let path = request.path.clone();
+        context.blocking(move |_| {
+            folder_sync::set_mapping(
+                &state.store,
+                &state.data_directory,
+                collection.as_deref(),
+                &path,
+                options,
+            )
+        })
+    };
+    // A new Collection is checked as an empty one before it is created, so a refused folder
+    // leaves no Collection behind.
+    let planned = plan(existing.clone()).await?;
+    if options.dry_run {
+        return Ok(json!({
+            "collectionId": existing, "path": planned.root,
+            "direction": planned.direction.as_str(), "dryRun": true,
+            "report": planned.report.map(|report| report.to_json()),
+        }));
+    }
+    let (collection, planned) = match (existing, create) {
+        (Some(collection), _) => (collection, planned),
+        (None, Some(record)) => {
+            let created = append(context, record).await?;
+            let collection = created["id"]
+                .as_str()
+                .ok_or_else(storage_failed)?
+                .to_owned();
+            let planned = plan(Some(collection.clone())).await?;
+            (collection, planned)
+        }
+        (None, None) => return Err(invalid_request()),
+    };
+    // The folder sync session sees the new mapping as a catalog change.
+    context
+        .state()
+        .changes
+        .send_modify(|revision| *revision = revision.saturating_add(1));
+    Ok(json!({
+        "collectionId": collection, "path": planned.root,
+        "direction": planned.direction.as_str(), "dryRun": false,
+    }))
 }
 
 async fn require_collection(

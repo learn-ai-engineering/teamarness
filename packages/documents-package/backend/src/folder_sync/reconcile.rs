@@ -144,9 +144,9 @@ enum Imported {
 }
 
 /// A file's bytes as read now. `bytes` is `None` when the file is over [`MAX_FILE_BYTES`].
-struct FileContent {
-    hash: FileHash,
-    bytes: Option<Vec<u8>>,
+pub(super) struct FileContent {
+    pub(super) hash: FileHash,
+    pub(super) bytes: Option<Vec<u8>>,
 }
 
 /// The pieces folder sync needs from one activation. Cheap to clone; every clone shares one
@@ -332,6 +332,7 @@ impl FolderSync {
                 let collection = collection.to_owned();
                 self.store(move |store| store.clear_refused_file(&collection, &refusal.rel_path))
                     .await?;
+                self.announce();
             }
         }
 
@@ -1066,6 +1067,8 @@ impl FolderSync {
         Ok(Some(mapping))
     }
 
+    /// Sets the state of `mapping`, only while it still has the root this reconcile read: a
+    /// mapping changed or cleared meanwhile is left as it now is.
     async fn set_state(
         &self,
         mapping: &FolderMapping,
@@ -1074,12 +1077,21 @@ impl FolderSync {
         if mapping.state == state {
             return Ok(());
         }
-        let next = FolderMapping {
-            state,
-            ..mapping.clone()
-        };
-        self.store(move |store| store.set_folder_mapping(&next))
-            .await
+        let collection = mapping.collection_id.clone();
+        let root = mapping.root_path.clone();
+        if self
+            .store(move |store| store.set_folder_mapping_state(&collection, &root, state))
+            .await?
+        {
+            self.announce();
+        }
+        Ok(())
+    }
+
+    /// Tells the settings view that mapping state, counts or refusals changed.
+    fn announce(&self) {
+        self.changes
+            .send_modify(|revision| *revision = revision.saturating_add(1));
     }
 
     async fn mapped_files(&self, collection: &str) -> Result<Vec<MappedFile>, BackendError> {
@@ -1139,6 +1151,7 @@ impl FolderSync {
         }
         self.store(move |store| store.set_refused_file(&refusal))
             .await?;
+        self.announce();
         outcome.refused += 1;
         Ok(())
     }
@@ -1323,7 +1336,7 @@ fn checked_text(bytes: Option<Vec<u8>>) -> Result<String, (Refusal, Option<Strin
 /// The pre-check of a new file, before any record is written: [`checked_text`], canonical
 /// text within [`MAX_TEXT_BYTES`], a title within [`MAX_TITLE`], and a dry-run merge against
 /// `genesis` whose one record fits [`MAX_UPDATE`]. Returns the title and the text.
-fn precheck(
+pub(super) fn precheck(
     rel: &str,
     bytes: Option<Vec<u8>>,
     genesis: &[u8],
@@ -1374,7 +1387,7 @@ fn merge_refusal(cause: &BackendError) -> Option<(Refusal, String)> {
 
 /// Reads `path` without following a link: `None` when it is missing or not a regular file. A
 /// file over [`MAX_FILE_BYTES`] is hashed but not kept.
-fn read_file(path: &Path) -> io::Result<Option<FileContent>> {
+pub(super) fn read_file(path: &Path) -> io::Result<Option<FileContent>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(cause) if cause.kind() == io::ErrorKind::NotFound => return Ok(None),
