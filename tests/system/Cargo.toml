@@ -51,6 +51,10 @@ name = "backlog-port-consumer-under-test"
 path = "src/bin/backlog_port_consumer.rs"
 
 [[bin]]
+name = "person-port-consumer-under-test"
+path = "src/bin/person_port_consumer.rs"
+
+[[bin]]
 name = "generic-port-consumer-under-test"
 path = "src/bin/generic_port_consumer.rs"
 

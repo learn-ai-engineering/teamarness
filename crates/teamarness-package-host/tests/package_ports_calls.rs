@@ -367,7 +367,7 @@ async fn a_bound_consumer_presents_an_agent_actor_and_an_unbound_one_its_person(
 // Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
 #[tokio::test]
 async fn exact_scoped_calls_activate_provider_and_validate_request() {
-    for access in ["declared", "agent"] {
+    for access in ["declared", "agent", "person"] {
         exact_scoped_calls_activate_provider_and_validate_request_for_access(access).await;
     }
 }
@@ -375,11 +375,11 @@ async fn exact_scoped_calls_activate_provider_and_validate_request() {
 async fn exact_scoped_calls_activate_provider_and_validate_request_for_access(access: &str) {
     let fixture = common::Fixture::node_with_capabilities(
         &[("provider", "com.example.provider"), ("consumer", "com.example.consumer")],
-        &[serde_json::json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+        &[serde_json::json!({"identity":"teamarness.package-ports","major":if access == "person" {3} else {2},"minMinor":0,"maxMinor":0})],
     ).await;
     declare(&fixture, "provider", true);
     declare(&fixture, "consumer", false);
-    let actors = common::prepare_agent_ports(&fixture, &["com.example.consumer"]);
+    let actors = common::prepare_port_access(&fixture, &["com.example.consumer"], access);
     let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
         .await
         .unwrap();
@@ -398,7 +398,7 @@ async fn exact_scoped_calls_activate_provider_and_validate_request_for_access(ac
         .key
         .clone();
     let mount = mount(&host, consumer).await;
-    common::enable_agent_ports(&host, &mount, 1).await;
+    common::enable_port_access(&host, &mount, 1, access).await;
     let available = request(
         &host,
         &mount,

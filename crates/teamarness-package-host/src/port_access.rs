@@ -318,6 +318,7 @@ pub(crate) struct SubscriptionLease {
     provider: PackageInstanceKey,
     contract: String,
     binding: Option<String>,
+    person_identity: Option<String>,
     enabled: bool,
     access: String,
     generation: u64,
@@ -365,6 +366,12 @@ impl PortBroker {
             enabled: input["access"] == "person"
                 || (route.actor["kind"] == "agent" && route.schemas.has_guide(&contract)),
             binding: route.actor["principal"].as_str().map(str::to_owned),
+            person_identity: (input["access"] == "person").then(|| {
+                route.actor["identity"]
+                    .as_str()
+                    .expect("Person actor")
+                    .to_owned()
+            }),
             contract,
             delivery: Arc::new(crate::protocol::PortStreamLease::default()),
         });
@@ -406,6 +413,9 @@ impl PortBroker {
     /// Called inside the same operation gate as the durable local binding transition.
     pub(crate) fn reconcile_binding(&self, key: &PackageInstanceKey, actor: &Value) {
         self.revoke_subscriptions(|lease| {
+            if lease.key == *key && lease.access == "person" && actor["kind"] == "agent" {
+                return Some(PackageErrorCode::PortActorModeInvalid);
+            }
             if lease.key != *key
                 || lease.binding.is_none()
                 || lease.binding.as_deref() == actor["principal"].as_str()
@@ -419,6 +429,34 @@ impl PortBroker {
             })
         });
     }
+    /// Recheck idle Person leases on canonical membership notifications, failing closed
+    /// when Core cannot establish current membership.
+    pub(crate) fn reconcile_person(&self, core: &CoreRuntime, key: &PackageInstanceKey) {
+        let current = teamarness_core::WorkspaceId::from_str(key.workspace_id.as_str())
+            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)
+            .and_then(|workspace| {
+                core.workspace_person(workspace, core.public_identity())
+                    .map_err(crate::capability::binding_error)
+            });
+        let identity = core.public_identity().to_string();
+        self.revoke_subscriptions(|lease| {
+            if lease.key != *key || lease.access != "person" {
+                return None;
+            }
+            match &current {
+                Ok(Some(_)) if lease.person_identity.as_deref() == Some(identity.as_str()) => None,
+                Ok(_) => Some(PackageErrorCode::PersonNotCurrent),
+                Err(code) => Some(*code),
+            }
+        });
+    }
+
+    pub(crate) fn revoke_person(&self, key: &PackageInstanceKey, code: PackageErrorCode) {
+        self.revoke_subscriptions(|lease| {
+            (lease.key == *key && lease.access == "person").then_some(code)
+        });
+    }
+
     pub(crate) fn revoke_consumer(
         &self,
         key: &PackageInstanceKey,

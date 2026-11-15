@@ -258,6 +258,14 @@ where
 
 /// Give broker safety examples a real guide-bearing contract and bound Agent callers.
 pub fn prepare_agent_ports(fixture: &Fixture, consumers: &[&str]) -> serde_json::Value {
+    prepare_port_access(fixture, consumers, "agent")
+}
+
+pub fn prepare_port_access(
+    fixture: &Fixture,
+    consumers: &[&str],
+    access: &str,
+) -> serde_json::Value {
     let root = fixture.config.application_root().join("provider");
     let ports = root.join("ports.json");
     if ports.exists() {
@@ -278,6 +286,10 @@ pub fn prepare_agent_ports(fixture: &Fixture, consumers: &[&str]) -> serde_json:
     }
     let mut actors = serde_json::Map::new();
     for workspace in fixture.core.list_workspaces().unwrap() {
+        if access == "person" {
+            actors.insert(workspace.id().to_string(), serde_json::json!({"kind":"person","identity":fixture.core.public_identity().to_string()}));
+            continue;
+        }
         let agent = fixture
             .core
             .add_agent(workspace.id(), "Broker safety Agent")
@@ -308,11 +320,24 @@ pub async fn enable_agent_ports(
     mount: &teamarness_package_host::UiMountId,
     major: u16,
 ) {
+    enable_port_access(host, mount, major, "agent").await;
+}
+
+pub async fn enable_port_access(
+    host: &PackageHost,
+    mount: &teamarness_package_host::UiMountId,
+    major: u16,
+    access: &str,
+) {
+    let mut arguments = serde_json::json!({"contract":"com.example.messages","major":major});
+    if access == "person" {
+        arguments["access"] = access.into();
+    }
     let outcome = host.execute(PackageHostCommand::UiRequest(teamarness_package_host::UiRequest {
         mount: mount.clone(),
         request: teamarness_package_host::UiRequestId::new("enable-safety-contract").unwrap(),
         operation: "fixture.capability".into(),
-        payload: serde_json::from_value(serde_json::json!({"capability":"teamarness.package-ports","method":"enable","arguments":{"contract":"com.example.messages","major":major}})).unwrap(),
+        payload: serde_json::from_value(serde_json::json!({"capability":"teamarness.package-ports","method":"enable","arguments":arguments})).unwrap(),
     })).await.unwrap();
     let teamarness_package_host::PackageHostOutcome::UiResponse { payload } = outcome else {
         panic!("enable response")

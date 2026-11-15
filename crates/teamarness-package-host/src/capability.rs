@@ -944,6 +944,8 @@ impl GenerationCapabilities {
                         core.bind_agent_package(workspace, id, &package)
                             .map_err(binding_error)?;
                         if let Some(broker) = broker.upgrade() {
+                            // The bind is durable even if the following presentation lookup fails.
+                            broker.revoke_person(&key, PackageErrorCode::PortActorModeInvalid);
                             broker
                                 .reconcile_binding(&key, &crate::port_access::actor(&core, &key)?);
                         }
@@ -1114,24 +1116,30 @@ impl GenerationCapabilities {
                     if ended.borrow().is_some() || *cancelled.borrow() {
                         break;
                     }
-                    tokio::select! {
-                        change = changes.changed() => if change.is_err() { break; },
+                    let notification_closed = tokio::select! {
+                        change = changes.changed() => change.is_err(),
                         _ = ended.changed() => break,
                         _ = cancelled.changed() => break,
-                    }
+                    };
                     let Some(broker) = broker.upgrade() else {
                         break;
                     };
                     if weak.strong_count() == 0 {
                         break;
                     }
+                    if notification_closed {
+                        broker.revoke_person(&key, PackageErrorCode::CapabilityUnavailable);
+                        break;
+                    }
                     let core = core.clone();
                     let key = key.clone();
                     let _ = authority
                         .run(&limiter, Arc::new(AtomicBool::new(false)), move || {
-                            if let Ok(actor) = crate::port_access::actor(&core, &key) {
-                                broker.reconcile_binding(&key, &actor);
+                            match crate::port_access::actor(&core, &key) {
+                                Ok(actor) => broker.reconcile_binding(&key, &actor),
+                                Err(code) => broker.revoke_person(&key, code),
                             }
+                            broker.reconcile_person(&core, &key);
                         })
                         .await;
                 }
@@ -1817,6 +1825,9 @@ async fn run_port_query(
                 Err(StreamEnd::Host(PackageErrorCode::PortNotEnabled)) => break "port_not_enabled",
                 Err(StreamEnd::Host(PackageErrorCode::AgentNotBound)) => break "agent_not_bound",
                 Err(StreamEnd::Host(PackageErrorCode::AgentBindingChanged)) => break "agent_binding_changed",
+                Err(StreamEnd::Host(PackageErrorCode::PortActorModeInvalid)) => break "port_actor_mode_invalid",
+                Err(StreamEnd::Host(PackageErrorCode::PersonNotCurrent)) => break "person_not_current",
+                Err(StreamEnd::Host(PackageErrorCode::CapabilityUnavailable)) => break "capability_unavailable",
                 Err(_) => break "provider_exited",
             },
         }
