@@ -96,6 +96,10 @@ impl PackageHost {
                 report.tiers.clone(),
                 report.team_providers.clone(),
                 report.personal_providers.clone(),
+                report.admissions.iter().map(|admission| {
+                    let manifest = &admission.manifest;
+                    (manifest.identity.clone(), serde_json::json!({"identity":manifest.identity,"version":manifest.version.to_string(),"displayName":manifest.display_name,"description":manifest.description}))
+                }).collect(),
             ),
             crate::port_access::PortAccess::new(store.clone()),
         );

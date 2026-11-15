@@ -65,6 +65,263 @@ async fn call(host: &PackageHost, mount: &UiMountId, method: &str, arguments: Va
     }
 }
 
+// Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R12, TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn single_summary_accepts_exact_byte_bound_and_refuses_next_byte() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[
+            ("provider", "dev.example.provider"),
+            ("consumer", "dev.example.consumer"),
+        ],
+        &[json!({"identity":"teamarness.package-ports","major":3,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    let root = fixture.config.application_root().join("provider");
+    let bytes=serde_json::to_vec(&json!({"schemaVersion":1,"$defs":{},"contracts":[{"identity":"dev.example.only","major":1,"minor":0,"description":"Contract","ports":[{"name":"value.read","kind":"query","description":"Read","request":true,"response":true}]}]})).unwrap();
+    fs::write(root.join("ports.json"), &bytes).unwrap();
+    let path = root.join("teamarness.package.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["portContract"] = json!({"path":"ports.json","sha256":common::digest(&bytes)});
+    manifest["activation"] = "on_demand".into();
+    manifest["presentation"] = json!({"displayName":"Provider"});
+    // Digest/revision values vary, but their encoded lengths are fixed. Versions have
+    // strict semver grammar and no separate small string bound in the manifest.
+    let baseline = json!({"contracts":[{"contract":"dev.example.only","major":1,"minor":0,"description":"Contract","available":true,"enabled":false,"enabledMajor":null,"metadataSha256":"0".repeat(64),"provider":{"identity":"dev.example.provider","version":"1.0.0-a","displayName":"Provider","description":null},"guideEligibility":"missing","routeRevision":"0".repeat(64)}]});
+    let padding = 32 * 1024 - serde_json::to_vec(&baseline).unwrap().len();
+    let version = format!("1.0.0-{}", "a".repeat(padding + 1));
+    for (version, expected_bytes) in [
+        (version.clone(), Some(32 * 1024)),
+        (format!("{version}a"), None),
+    ] {
+        manifest["version"] = version.into();
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+            .await
+            .unwrap();
+        assert!(
+            host.snapshot()
+                .await
+                .packages
+                .iter()
+                .any(|package| package.identity.as_str() == "dev.example.provider")
+        );
+        let target = mount(&host, "dev.example.consumer").await;
+        let result = call(&host, &target, "available", json!({"access":"person"})).await;
+        if let Some(expected_bytes) = expected_bytes {
+            assert_eq!(result["result"]["contracts"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                serde_json::to_vec(&result["result"]).unwrap().len(),
+                expected_bytes
+            );
+        } else {
+            assert_eq!(result["error"], "port_unavailable", "{result}");
+        }
+        host.execute(PackageHostCommand::Shutdown(
+            teamarness_package_host::ShutdownHost,
+        ))
+        .await
+        .unwrap();
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R12, TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn person_metadata_is_complete_bounded_and_revisions_bind_scope_snapshot_and_generation() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[
+            ("provider", "dev.example.provider"),
+            ("consumer", "dev.example.consumer"),
+            ("other", "dev.example.other"),
+        ],
+        &[json!({"identity":"teamarness.package-ports","major":3,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    declarations(&fixture);
+    let root = fixture.config.application_root();
+    let mut document: Value =
+        serde_json::from_slice(&fs::read(root.join("provider/ports.json")).unwrap()).unwrap();
+    for contract in document["contracts"].as_array_mut().unwrap() {
+        contract["description"] = "Metadata".into();
+    }
+    for number in 30..31 {
+        let mut contract = document["contracts"][0].clone();
+        contract["identity"] = json!(format!("dev.example.contract{number:02}"));
+        document["contracts"].as_array_mut().unwrap().push(contract);
+    }
+    let bytes = serde_json::to_vec(&document).unwrap();
+    fs::write(root.join("provider/ports.json"), &bytes).unwrap();
+    let path = root.join("provider/teamarness.package.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["portContract"]["sha256"] = common::digest(&bytes).into();
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let mut other_document = document.clone();
+    other_document["contracts"] = json!([{"identity":"dev.example.z","major":1,"minor":0,"description":"Another Provider","ports":[{"name":"value.read","kind":"query","description":"Read","request":true,"response":true}]}]);
+    let other_bytes = serde_json::to_vec(&other_document).unwrap();
+    fs::write(root.join("other/ports.json"), &other_bytes).unwrap();
+    let other_path = root.join("other/teamarness.package.json");
+    let mut other_manifest: Value =
+        serde_json::from_slice(&fs::read(&other_path).unwrap()).unwrap();
+    other_manifest["portContract"] =
+        json!({"path":"ports.json","sha256":common::digest(&other_bytes)});
+    fs::write(other_path, serde_json::to_vec(&other_manifest).unwrap()).unwrap();
+    fixture
+        .core
+        .create_workspace("Person metadata scope")
+        .unwrap();
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let target = mount(&host, "dev.example.consumer").await;
+    let first = call(&host, &target, "available", json!({"access":"person"})).await;
+    assert_eq!(
+        first["result"]["contracts"].as_array().unwrap().len(),
+        32,
+        "{first}"
+    );
+    let mut page = first["result"].clone();
+    let mut count = 0;
+    loop {
+        assert!(serde_json::to_vec(&page).unwrap().len() <= 32 * 1024);
+        assert!(page["contracts"].as_array().unwrap().len() <= 32);
+        count += page["contracts"].as_array().unwrap().len();
+        let Some(cursor) = page.get("nextCursor") else {
+            break;
+        };
+        page = call(
+            &host,
+            &target,
+            "available",
+            json!({"access":"person","cursor":cursor}),
+        )
+        .await["result"]
+            .clone();
+    }
+    assert_eq!(count, 33);
+    let row = first["result"]["contracts"][0].clone();
+    let input = json!({"access":"person","contract":row["contract"],"major":row["major"],"metadataSha256":row["metadataSha256"],"offset":0,"routeRevision":row["routeRevision"]});
+    let mut offset = 0;
+    let mut bytes = Vec::new();
+    loop {
+        let mut request = input.clone();
+        request["offset"] = offset.into();
+        let response = call(&host, &target, "describe", request).await;
+        let chunk = &response["result"];
+        assert_eq!(chunk["offset"], offset, "{response}");
+        let decoded = STANDARD.decode(chunk["data"].as_str().unwrap()).unwrap();
+        if offset == 0 {
+            assert_eq!(decoded.len(), 64 * 1024);
+        }
+        assert!(decoded.len() <= 64 * 1024);
+        bytes.extend(decoded);
+        let Some(next) = chunk.get("nextOffset") else {
+            assert_eq!(bytes.len() as u64, chunk["totalBytes"].as_u64().unwrap());
+            break;
+        };
+        offset = next.as_u64().unwrap();
+    }
+    assert_eq!(common::digest(&bytes), row["metadataSha256"]);
+    let described: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(described["$defs"], document["$defs"]);
+    let mut expected_ports = document["contracts"][0]["ports"]
+        .as_array()
+        .unwrap()
+        .clone();
+    expected_ports.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    assert_eq!(described["contracts"][0]["ports"], json!(expected_ports));
+    let other = mount(&host, "dev.example.other").await;
+    assert_eq!(
+        call(&host, &other, "describe", input.clone()).await["error"],
+        "port_catalog_changed"
+    );
+    let mut declared = input.clone();
+    declared["access"] = "declared".into();
+    assert_eq!(
+        call(&host, &target, "describe", declared).await["error"],
+        "port_catalog_changed"
+    );
+    let key = host
+        .snapshot()
+        .await
+        .instances
+        .iter()
+        .find(|instance| {
+            instance.key.package_identity.as_str() == "dev.example.consumer"
+                && instance.mount_state.is_none()
+        })
+        .unwrap()
+        .key
+        .clone();
+    let PackageHostOutcome::UiMountOpened { mount: second, .. } = host
+        .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(key)))
+        .await
+        .unwrap()
+    else {
+        panic!("mount")
+    };
+    assert_eq!(
+        call(&host, &second, "describe", input.clone()).await["error"],
+        "port_catalog_changed"
+    );
+    let mut wrong_major = input.clone();
+    wrong_major["major"] = 2.into();
+    assert_eq!(
+        call(&host, &target, "describe", wrong_major).await["error"],
+        "port_version_mismatch"
+    );
+    assert!(
+        host.snapshot()
+            .await
+            .instances
+            .iter()
+            .filter(|instance| instance.key.package_identity.as_str() == "dev.example.provider")
+            .all(|instance| instance.process_generation.is_none())
+    );
+    let _ = host
+        .execute(PackageHostCommand::UiRequest(UiRequest {
+            mount: target.clone(),
+            request: UiRequestId::new("person-generation-abort").unwrap(),
+            operation: "fixture.abort".into(),
+            payload: serde_json::from_value(json!({})).unwrap(),
+        }))
+        .await;
+    common::eventually(
+        std::time::Duration::from_secs(8),
+        "Person consumer generation replaced",
+        || async {
+            host.snapshot().await.instances.iter().any(|instance| {
+                instance.key.package_identity.as_str() == "dev.example.consumer"
+                    && instance
+                        .process_generation
+                        .is_some_and(|generation| generation >= 2)
+            })
+        },
+    )
+    .await;
+    let replacement = mount(&host, "dev.example.consumer").await;
+    assert_eq!(
+        call(&host, &replacement, "describe", input.clone()).await["error"],
+        "port_catalog_changed"
+    );
+    host.execute(PackageHostCommand::Shutdown(
+        teamarness_package_host::ShutdownHost,
+    ))
+    .await
+    .unwrap();
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let target = mount(&host, "dev.example.consumer").await;
+    assert_eq!(
+        call(&host, &target, "describe", input).await["error"],
+        "port_catalog_changed"
+    );
+    host.execute(PackageHostCommand::Shutdown(
+        teamarness_package_host::ShutdownHost,
+    ))
+    .await
+    .unwrap();
+}
+
 // Verifies: TEAM.SYS.PKG-R12, TEAM.SYS.PKG-R13
 #[tokio::test]
 async fn declared_metadata_is_complete_bounded_scoped_and_does_not_activate_provider() {

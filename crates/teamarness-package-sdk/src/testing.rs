@@ -41,6 +41,7 @@ pub struct HarnessBuilder {
     data_directory: Option<PathBuf>,
     capabilities: BTreeMap<String, ScriptedCapability>,
     minors: BTreeMap<String, u16>,
+    majors: BTreeMap<String, u16>,
 }
 
 impl HarnessBuilder {
@@ -56,6 +57,7 @@ impl HarnessBuilder {
             data_directory: None,
             capabilities: BTreeMap::new(),
             minors: BTreeMap::new(),
+            majors: BTreeMap::new(),
         }
     }
 
@@ -103,13 +105,26 @@ impl HarnessBuilder {
     /// Grants one Semantic Capability at the negotiated `minor` the Host would report.
     #[must_use]
     pub fn capability_minor(
-        mut self,
+        self,
         identity: &str,
         scripted: ScriptedCapability,
         minor: u16,
     ) -> Self {
+        self.capability_version(identity, scripted, 1, minor)
+    }
+
+    /// Grants an explicit negotiated major/minor; legacy builders retain major 1.
+    #[must_use]
+    pub fn capability_version(
+        mut self,
+        identity: &str,
+        scripted: ScriptedCapability,
+        major: u16,
+        minor: u16,
+    ) -> Self {
         self.capabilities.insert(identity.to_owned(), scripted);
         self.minors.insert(identity.to_owned(), minor);
+        self.majors.insert(identity.to_owned(), major);
         self
     }
 
@@ -145,7 +160,10 @@ impl HarnessBuilder {
                 object([
                     ("identity", JsonValue::String(identity.clone())),
                     ("grant", JsonValue::String(grant_for(identity))),
-                    ("major", JsonValue::from(1_u64)),
+                    (
+                        "major",
+                        JsonValue::from(u64::from(self.majors.get(identity).copied().unwrap_or(1))),
+                    ),
                     (
                         "minor",
                         JsonValue::from(u64::from(self.minors.get(identity).copied().unwrap_or(0))),

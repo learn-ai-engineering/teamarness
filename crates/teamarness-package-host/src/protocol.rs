@@ -1490,6 +1490,9 @@ fn ui_stream_code(code: PackageErrorCode) -> &'static str {
         PackageErrorCode::UiContractViolation => "ui_contract_violation",
         PackageErrorCode::EventLagged => "event_lagged",
         PackageErrorCode::PortEventInvalid => "port_event_invalid",
+        PackageErrorCode::PortActorModeInvalid => "port_actor_mode_invalid",
+        PackageErrorCode::PersonNotCurrent => "person_not_current",
+        PackageErrorCode::PortGuideRequired => "port_guide_required",
         PackageErrorCode::PortNotEnabled => "port_not_enabled",
         PackageErrorCode::AgentNotBound => "agent_not_bound",
         PackageErrorCode::AgentBindingChanged => "agent_binding_changed",
@@ -1529,6 +1532,9 @@ pub(crate) fn capability_code(code: PackageErrorCode) -> &'static str {
         PackageErrorCode::Overloaded => "overloaded",
         PackageErrorCode::PortUnavailable => "port_unavailable",
         PackageErrorCode::PortCatalogChanged => "port_catalog_changed",
+        PackageErrorCode::PortActorModeInvalid => "port_actor_mode_invalid",
+        PackageErrorCode::PersonNotCurrent => "person_not_current",
+        PackageErrorCode::PortGuideRequired => "port_guide_required",
         PackageErrorCode::PortNotEnabled => "port_not_enabled",
         PackageErrorCode::AgentNotBound => "agent_not_bound",
         PackageErrorCode::AgentBindingChanged => "agent_binding_changed",
@@ -1931,6 +1937,28 @@ fn empty_object() -> Value {
 
 #[cfg(test)]
 mod tests {
+    // Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R13
+    #[test]
+    fn person_refusals_keep_their_codes_on_calls_and_stream_terminals() {
+        for (code, wire) in [
+            (
+                crate::PackageErrorCode::PortActorModeInvalid,
+                "port_actor_mode_invalid",
+            ),
+            (
+                crate::PackageErrorCode::PersonNotCurrent,
+                "person_not_current",
+            ),
+            (
+                crate::PackageErrorCode::PortGuideRequired,
+                "port_guide_required",
+            ),
+        ] {
+            assert_eq!(super::capability_code(code), wire);
+            assert_eq!(super::ui_stream_code(code), wire);
+        }
+    }
+
     use super::{
         Duration, MAX_ID_BYTES, MAX_UI_PAYLOAD_BYTES, StreamEnd, TERMINAL_ERROR_BYTES, WireFailure,
         package_owned_error, start, stream_end,

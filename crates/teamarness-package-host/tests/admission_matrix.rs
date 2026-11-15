@@ -18,6 +18,7 @@ pub use teamarness_package_host::{
 pub struct AuthoringCatalogEntry {
     package: PackageCatalogEntry,
     capabilities: Vec<InspectedCapability>,
+    compatibility_warnings: Vec<String>,
     provided: Vec<teamarness_package_contract::port_contract::ProvidedContract>,
     definitions: serde_json::Map<String, serde_json::Value>,
     consumed: Vec<teamarness_package_contract::manifest::ConsumedContract>,

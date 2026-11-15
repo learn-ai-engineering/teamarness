@@ -305,6 +305,7 @@ impl From<InspectedPackage> for InspectedPackageDto {
 #[serde(rename_all = "camelCase")]
 pub struct PackageAuthoringEntryDto {
     identity: String,
+    compatibility_warnings: Vec<String>,
     capabilities: Vec<InspectedCapabilityDto>,
     provided: Vec<ProvidedPortContractDto>,
     consumed: Vec<ConsumedPortAvailabilityDto>,
@@ -332,6 +333,7 @@ impl From<AuthoringCatalogEntry> for PackageAuthoringEntryDto {
         let availability = value.availability;
         Self {
             identity: value.package.identity.into(),
+            compatibility_warnings: value.compatibility_warnings,
             capabilities: value
                 .capabilities
                 .into_iter()
@@ -773,6 +775,8 @@ mod tests {
         };
         let consumed = sample["consumed"].as_array().unwrap();
         let entry = AuthoringCatalogEntry {
+            compatibility_warnings: serde_json::from_value(sample["compatibilityWarnings"].clone())
+                .unwrap(),
             package: PackageCatalogEntry {
                 identity: sample["identity"].as_str().unwrap().parse().unwrap(),
                 version: "0.2.0".into(),

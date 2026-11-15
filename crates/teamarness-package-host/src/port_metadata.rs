@@ -16,6 +16,86 @@ const PAGE_BYTES: usize = MAX_UI_PAYLOAD_BYTES / 8;
 const CHUNK_BYTES: usize = MAX_UI_PAYLOAD_BYTES / 4;
 
 impl PortBroker {
+    fn route_revision(
+        snapshot: &PortSnapshot,
+        state: &crate::port_access::AccessState,
+        access: &str,
+        route: (&str, u16, &str, &PackageIdentity),
+    ) -> String {
+        let bytes = serde_json::to_vec(&json!([
+            state.scope,
+            access,
+            route.0,
+            route.1,
+            route.2,
+            route.3
+        ]))
+        .expect("route scope");
+        let mut hash = Sha256::new();
+        hash.update(b"teamarness.package-ports.route-revision/v3\0");
+        hash.update(snapshot.revision());
+        hash.update(bytes);
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    pub(crate) fn check_route_revision(
+        &self,
+        snapshot: &PortSnapshot,
+        caller: &PackageIdentity,
+        input: &Map<String, Value>,
+        state: &crate::port_access::AccessState,
+    ) -> Result<(), PackageErrorCode> {
+        let Some(revision) = input.get("routeRevision") else {
+            return Ok(());
+        };
+        let contract = input["contract"]
+            .as_str()
+            .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
+        let access = input["access"]
+            .as_str()
+            .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
+        let (provider, major, metadata) = if access == "declared" {
+            let metadata = Self::declared_metadata(snapshot, caller, contract)?;
+            let route = snapshot
+                .route_of(caller, contract)
+                .ok_or(PackageErrorCode::PortUnavailable)?;
+            (
+                route
+                    .provider
+                    .clone()
+                    .ok_or(PackageErrorCode::PortUnavailable)?,
+                snapshot
+                    .consumed_of(caller)
+                    .iter()
+                    .find(|declaration| declaration.identity == contract)
+                    .ok_or(PackageErrorCode::PortUnavailable)?
+                    .major,
+                metadata,
+            )
+        } else {
+            let (provider, schemas, major, _) =
+                snapshot.dynamic_contract(caller, contract, access == "agent")?;
+            let metadata = schemas
+                .project_metadata(contract, None)
+                .map_err(|_| PackageErrorCode::PortUnavailable)?;
+            (provider, major, metadata)
+        };
+        if revision.as_str()
+            != Some(&Self::route_revision(
+                snapshot,
+                state,
+                access,
+                (contract, major, &metadata.sha256, &provider),
+            ))
+        {
+            return Err(PackageErrorCode::PortCatalogChanged);
+        }
+        Ok(())
+    }
+
     fn declared_metadata(
         snapshot: &PortSnapshot,
         caller: &PackageIdentity,
@@ -94,11 +174,12 @@ impl PortBroker {
         workspace: &WorkspaceId,
         input: &Map<String, Value>,
         state: &crate::port_access::AccessState,
+        wire_major: u16,
     ) -> Result<Value, PackageErrorCode> {
         if input.len() != 2 + usize::from(input.contains_key("cursor"))
             || !matches!(
                 input.get("access").and_then(Value::as_str),
-                Some("declared" | "agent")
+                Some("declared" | "agent" | "person")
             )
         {
             return Err(PackageErrorCode::CapabilityRequestInvalid);
@@ -139,7 +220,11 @@ impl PortBroker {
             snapshot
                 .providers_for(snapshot.tier_of(caller))
                 .keys()
-                .filter(|c| snapshot.agent_contract(caller, c).is_ok())
+                .filter(|c| {
+                    snapshot
+                        .dynamic_contract(caller, c, access == "agent")
+                        .is_ok()
+                })
                 .cloned()
                 .chain(state.selections.keys().cloned())
                 .collect()
@@ -173,7 +258,7 @@ impl PortBroker {
                     description,
                 )
             } else if let Ok((provider, schemas, major, minor)) =
-                snapshot.agent_contract(caller, contract)
+                snapshot.dynamic_contract(caller, contract, access == "agent")
             {
                 let description = schemas
                     .contracts
@@ -188,7 +273,15 @@ impl PortBroker {
                     description,
                 )
             } else {
-                (None, None, state.selections[contract], None, None)
+                let provider = if wire_major == 3 {
+                    snapshot
+                        .providers_for(snapshot.tier_of(caller))
+                        .get(contract)
+                        .cloned()
+                } else {
+                    None
+                };
+                (provider, None, state.selections[contract], None, None)
             };
             let available = metadata.is_some()
                 && self.provider_available(workspace, provider.as_ref()).await
@@ -198,7 +291,32 @@ impl PortBroker {
                         .get(contract)
                         .is_none_or(|saved| *saved == major));
             let enabled_major = state.selections.get(contract);
-            rows.push(json!({"contract":contract,"major":major,"minor":minor,"description":description,"available":available,"enabled":enabled_major.is_some(),"enabledMajor":enabled_major,"metadataSha256":metadata.map(|m| m.sha256)}));
+            let mut row = json!({"contract":contract,"major":major,"minor":minor,"description":description,"available":available,"enabled":enabled_major.is_some(),"enabledMajor":enabled_major,"metadataSha256":metadata.as_ref().map(|m| &m.sha256)});
+            if wire_major == 3 {
+                row["provider"] = provider
+                    .as_ref()
+                    .and_then(|identity| snapshot.presentations.get(identity))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                row["guideEligibility"] = json!(match provider
+                    .as_ref()
+                    .and_then(|identity| snapshot.provided_contracts(identity))
+                {
+                    Some(schemas) if schemas.has_guide(contract) => "eligible",
+                    Some(_) => "missing",
+                    None => "unavailable",
+                });
+                row["routeRevision"] = match (&provider, &metadata) {
+                    (Some(provider), Some(metadata)) => json!(Self::route_revision(
+                        &snapshot,
+                        state,
+                        access,
+                        (contract, major, &metadata.sha256, provider)
+                    )),
+                    _ => Value::Null,
+                };
+            }
+            rows.push(row);
             let mut candidate = json!({"contracts":rows});
             if index + 1 < remaining.len() {
                 candidate["nextCursor"] =
@@ -209,6 +327,9 @@ impl PortBroker {
                 .len()
                 > PAGE_BYTES
             {
+                if rows.len() == 1 {
+                    return Err(PackageErrorCode::PortUnavailable);
+                }
                 break;
             }
             page = candidate;
@@ -225,11 +346,13 @@ impl PortBroker {
         workspace: &WorkspaceId,
         input: &Map<String, Value>,
         state: &crate::port_access::AccessState,
+        wire_major: u16,
     ) -> Result<Value, PackageErrorCode> {
-        if input.len() != 5
+        if input.len()
+            != 5 + usize::from(wire_major == 3) + usize::from(input.contains_key("routeRevision"))
             || !matches!(
                 input.get("access").and_then(Value::as_str),
-                Some("declared" | "agent")
+                Some("declared" | "agent" | "person")
             )
         {
             return Err(PackageErrorCode::CapabilityRequestInvalid);
@@ -249,12 +372,14 @@ impl PortBroker {
             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
         // One snapshot for the whole chunk.
         let snapshot = self.snapshot();
-        let (metadata, provider) = if input["access"] == "agent" {
-            if state.actor["kind"] != "agent" {
+        self.check_route_revision(&snapshot, caller, input, state)?;
+        let (metadata, provider) = if input["access"] != "declared" {
+            if input["access"] == "agent" && state.actor["kind"] != "agent" {
                 return Err(PackageErrorCode::AgentNotBound);
             }
-            let (provider, schemas, _, _) =
-                snapshot.agent_contract(caller, contract).map_err(|code| {
+            let (provider, schemas, _, _) = snapshot
+                .dynamic_contract(caller, contract, input["access"] == "agent")
+                .map_err(|code| {
                     if state.selections.contains_key(contract) {
                         PackageErrorCode::PortUnavailable
                     } else {
@@ -274,6 +399,13 @@ impl PortBroker {
                 .and_then(|r| r.provider.clone());
             (metadata, provider)
         };
+        if wire_major == 3 {
+            let described: Value = serde_json::from_slice(&metadata.bytes)
+                .map_err(|_| PackageErrorCode::PortUnavailable)?;
+            if input["major"] != described["contracts"][0]["major"] {
+                return Err(PackageErrorCode::PortVersionMismatch);
+            }
+        }
         if !self.provider_available(workspace, provider.as_ref()).await {
             return Err(PackageErrorCode::PortUnavailable);
         }

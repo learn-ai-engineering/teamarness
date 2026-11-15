@@ -71,8 +71,8 @@ pub struct ContractSummary {
 /// A Package's opaque, generation-scoped capability grant, never a Provider selector.
 #[derive(Clone)]
 pub struct PortClient {
-    capabilities: CapabilityClient,
-    grant: String,
+    pub(crate) capabilities: CapabilityClient,
+    pub(crate) grant: String,
 }
 
 impl PortClient {
@@ -236,15 +236,33 @@ impl PortClient {
         contract: &str,
         metadata_sha256: &str,
     ) -> Result<CompiledPortContracts, BackendError> {
-        if !crate::capabilities::is_lower_hex(metadata_sha256, 64) {
+        self.describe_request(serde_json::json!({"access":access,"contract":contract,"metadataSha256":metadata_sha256})).await
+    }
+
+    /// Shared complete-metadata assembly; callers supply their version-specific method fields.
+    pub(crate) async fn describe_request(
+        &self,
+        mut request: JsonValue,
+    ) -> Result<CompiledPortContracts, BackendError> {
+        let contract = request["contract"]
+            .as_str()
+            .ok_or_else(invalid_request)?
+            .to_owned();
+        let metadata_sha256 = request["metadataSha256"]
+            .as_str()
+            .ok_or_else(invalid_request)?
+            .to_owned();
+        if !crate::capabilities::is_lower_hex(&metadata_sha256, 64) {
             return Err(invalid_request());
         }
         let mut bytes = Vec::new();
         let mut total = None;
         loop {
-            let response = self.capabilities.call(&self.grant, "describe", serde_json::json!({
-                "access":access,"contract":contract,"metadataSha256":metadata_sha256,"offset":bytes.len()
-            })).await?;
+            request["offset"] = bytes.len().into();
+            let response = self
+                .capabilities
+                .call(&self.grant, "describe", request.clone())
+                .await?;
             if response
                 .get("nextOffset")
                 .is_some_and(|v| v.as_u64().is_none())

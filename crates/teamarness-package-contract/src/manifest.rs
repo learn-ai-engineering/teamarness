@@ -354,6 +354,19 @@ const fn unsupported(rule: &'static str) -> ContractError {
     ContractError::new(ContractErrorCode::ManifestUnsupported, rule)
 }
 
+/// Parses the exact semantic version used in manifests and Provider summaries.
+///
+/// # Errors
+/// Returns `manifest.version_not_strict` for noncanonical or malformed versions.
+pub fn parse_package_version(value: &str) -> Result<Version, ContractError> {
+    let version = Version::parse(value)
+        .map_err(|_| unsupported("manifest.version_not_strict").at("/version"))?;
+    if version.to_string() != value {
+        return Err(unsupported("manifest.version_not_strict").at("/version"));
+    }
+    Ok(version)
+}
+
 /// Applies every manifest rule that needs no file access.
 ///
 /// Declared sizes and digests are checked for shape only, so a project source whose assembler has
@@ -379,11 +392,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<ManifestDocument, ContractError> {
         )
         .at("/identity"));
     }
-    let version = Version::parse(&document.version)
-        .map_err(|_| unsupported("manifest.version_not_strict").at("/version"))?;
-    if version.to_string() != document.version {
-        return Err(unsupported("manifest.version_not_strict").at("/version"));
-    }
+    let version = parse_package_version(&document.version)?;
     validate_presentation(&document.presentation)?;
     validate_range(document.protocol, "manifest.protocol_unsupported")
         .map_err(|error| error.at("/protocol"))?;

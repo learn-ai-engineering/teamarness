@@ -1,3 +1,4 @@
+import fixture from "../contracts/fixtures/package-bridge.json";
 import type { Channel } from "@tauri-apps/api/core";
 import { describe, expect, it } from "vitest";
 import { createTauriPackageHostTransport, createTauriPackageManagementBridge, createTauriPackageShellBridge } from "./package-bridge";
@@ -70,6 +71,17 @@ describe("desktop Tauri Package transport", () => {
 });
 
 describe("desktop Tauri Package management bridge", () => {
+  it("preserves warning and empty-warning catalog results through the typed invoke seam", async () => {
+    for (const compatibilityWarnings of [fixture.authoringCatalog[0]!.compatibilityWarnings, []]) {
+      const expected = fixture.authoringCatalog.map((entry) => ({ ...entry, compatibilityWarnings }));
+      const bridge = createTauriPackageManagementBridge((async (command: string) => {
+        expect(command).toBe("package_authoring_catalog");
+        return expected;
+      }) as never);
+      expect(await bridge.authoringCatalog()).toBe(expected);
+      expect((await bridge.authoringCatalog())[0]!.compatibilityWarnings).toEqual(compatibilityWarnings);
+    }
+  });
   it("calls the Shell-only management commands with their camelCase inputs", async () => {
     const calls: Array<readonly [string, unknown]> = [];
     const bridge = createTauriPackageManagementBridge((async (command: string, input: unknown) => {

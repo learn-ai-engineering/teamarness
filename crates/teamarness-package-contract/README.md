@@ -16,6 +16,7 @@ and no Core here.
 
 | Module | Rules |
 |---|---|
+| `capability_versions` | supported family-major/minor metadata and nonfatal superseded-major warnings; package-ports 2.0 and 3.0 coexist with no scheduled removal |
 | `identity` | the lowercase reverse-DNS Package Identity grammar |
 | `json` | strict JSON parsing: duplicate object keys are rejected |
 | `manifest` | `teamarness.package.json`: structure, identity, strict semantic version, display name, protocol range, extensions, capabilities, paths, sizes, digests and UI totals |

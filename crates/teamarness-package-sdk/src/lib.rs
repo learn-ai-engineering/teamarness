@@ -16,6 +16,7 @@ mod lifecycle;
 mod parent_lifeline;
 pub mod port_observation;
 pub mod ports;
+pub mod ports_v3;
 mod priority_writer;
 mod reader;
 mod router;

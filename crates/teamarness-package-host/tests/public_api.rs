@@ -378,6 +378,9 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::PortNotEnabled,
         PackageErrorCode::AgentNotBound,
         PackageErrorCode::AgentBindingChanged,
+        PackageErrorCode::PortActorModeInvalid,
+        PackageErrorCode::PersonNotCurrent,
+        PackageErrorCode::PortGuideRequired,
         PackageErrorCode::PortUngranted,
         PackageErrorCode::PortRequestInvalid,
         PackageErrorCode::PortResponseInvalid,
@@ -388,7 +391,7 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::StaleMount,
         PackageErrorCode::EventLagged,
     ];
-    assert_eq!(codes.len(), 67);
+    assert_eq!(codes.len(), 70);
     for code in codes {
         match code {
             PackageErrorCode::InvalidRegistration
@@ -448,6 +451,9 @@ fn snapshots_and_errors_expose_only_host_values() {
             | PackageErrorCode::PortNotEnabled
             | PackageErrorCode::AgentNotBound
             | PackageErrorCode::AgentBindingChanged
+            | PackageErrorCode::PortActorModeInvalid
+            | PackageErrorCode::PersonNotCurrent
+            | PackageErrorCode::PortGuideRequired
             | PackageErrorCode::PortUnavailable
             | PackageErrorCode::PortUngranted
             | PackageErrorCode::PortRequestInvalid

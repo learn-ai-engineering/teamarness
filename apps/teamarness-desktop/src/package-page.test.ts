@@ -96,6 +96,7 @@ function snapshot(change: Partial<PackageHostSnapshot> = {}): PackageHostSnapsho
 const catalog: readonly PackageAuthoringEntry[] = [
   {
     identity: AGENT,
+    compatibilityWarnings: [],
     capabilities: [{ identity: "teamarness.workspace-context", major: 1, minMinor: 0, maxMinor: 0 }],
     provided: [{ identity: "com.example.answers", major: 1, minor: 2, description: "Answers for other Packages" }],
     consumed: [
@@ -105,11 +106,12 @@ const catalog: readonly PackageAuthoringEntry[] = [
   },
   {
     identity: TEAM,
+    compatibilityWarnings: [],
     capabilities: [{ identity: "teamarness.package-ports", major: 2, minMinor: 0, maxMinor: 0 }],
     provided: [{ identity: "dev.teamarness.conversations", major: 1, minor: 1, description: "Conversations" }],
     consumed: [],
   },
-  { identity: BARE, capabilities: [], provided: [], consumed: [] },
+  { identity: BARE, compatibilityWarnings: [], capabilities: [], provided: [], consumed: [] },
 ];
 
 type Behavior = Partial<Pick<PackageManagementBridge, "authoringCatalog" | "restartPackage" | "remove" | "reload" | "restart">>;
@@ -194,6 +196,19 @@ const between = (html: string, from: string, to: string): string => {
 };
 
 describe("Package page layout", () => {
+  // Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R19
+  it("shows escaped nonfatal capability compatibility warnings and omits empty warnings", async () => {
+    const warning = "capability.superseded_major: teamarness.package-ports major 2 remains supported <not an admission failure>";
+    for (const warnings of [[warning], []]) {
+      const test = harness(snapshot(), { authoringCatalog: async () => catalog.map((entry) => ({ ...entry, compatibilityWarnings: warnings })) });
+      await test.open(AGENT);
+      expect(test.html().includes("Compatibility warnings")).toBe(warnings.length !== 0);
+      if (warnings.length) {
+        expect(test.html()).toContain("major 2 remains supported &lt;not an admission failure&gt;");
+        expect(test.html()).not.toContain("<not an admission failure>");
+      }
+    }
+  });
   const declaring = (packages: PackageHostSnapshot["packages"]): PackageHostSnapshot["packages"] =>
     packages.map((entry) => entry.identity === AGENT ? { ...entry, views: ["settings"] } : entry);
 
@@ -473,6 +488,7 @@ describe("Package page", () => {
     }, {
       authoringCatalog: async () => [{
         identity: AGENT,
+        compatibilityWarnings: [],
         capabilities: [{ identity: hostile, major: 1, minMinor: 0, maxMinor: 0 }],
         provided: [{ identity: hostile, major: 1, minor: 0, description: hostile }],
         consumed: [{ identity: hostile, major: 1, minMinor: 0, maxMinor: 0, required: true, provider: hostile, minor: 0, unavailable: null }],

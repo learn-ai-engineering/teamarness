@@ -10,6 +10,10 @@ use teamarness_package_host::{
 const CONTRACT: &str = "com.example.messages";
 
 async fn fixture() -> common::Fixture {
+    fixture_major(2).await
+}
+
+async fn fixture_major(major: u16) -> common::Fixture {
     let fixture = common::Fixture::node_with_capabilities(
         &[
             ("provider", "com.example.provider"),
@@ -17,7 +21,7 @@ async fn fixture() -> common::Fixture {
             ("other", "com.example.other"),
         ],
         &[
-            json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0}),
+            json!({"identity":"teamarness.package-ports","major":major,"minMinor":0,"maxMinor":0}),
             json!({"identity":"teamarness.agent-binding","major":1,"minMinor":0,"maxMinor":0}),
         ],
     )
@@ -45,6 +49,398 @@ async fn fixture() -> common::Fixture {
         fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     }
     fixture
+}
+
+// Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R05, TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn person_discovers_explicitly_selects_and_queries_without_agent_authority() {
+    let fixture = fixture_major(3).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].id();
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let consumer = mount(&host, "com.example.consumer", &workspace.to_string()).await;
+    let available = call(&host, &consumer, "available", json!({"access":"person"})).await;
+    let rows = available["result"]["contracts"]
+        .as_array()
+        .expect("Person catalog");
+    assert_eq!(rows.len(), 2, "{available}");
+    let row = rows.iter().find(|row| row["contract"] == CONTRACT).unwrap();
+    assert_eq!(row["enabled"], false);
+    assert_eq!(row["provider"]["identity"], "com.example.provider");
+    assert_eq!(row["guideEligibility"], "eligible");
+    let revision = row["routeRevision"].clone();
+    assert_eq!(revision.as_str().unwrap().len(), 64);
+    let ordinary = rows
+        .iter()
+        .find(|row| row["contract"] == "com.example.ordinary")
+        .unwrap();
+    assert_eq!(ordinary["available"], true);
+    assert_eq!(ordinary["guideEligibility"], "missing");
+    let describe = call(&host, &consumer, "describe", json!({"access":"person","contract":CONTRACT,"major":1,"metadataSha256":row["metadataSha256"],"offset":0,"routeRevision":revision})).await;
+    assert!(describe["result"]["data"].is_string(), "{describe}");
+    assert_eq!(
+        call(
+            &host,
+            &consumer,
+            "enable",
+            json!({"access":"person","contract":"com.example.ordinary","major":1})
+        )
+        .await["error"],
+        "port_guide_required"
+    );
+    assert_eq!(
+        call(
+            &host,
+            &consumer,
+            "invoke",
+            invoke("person", "message.list", "query", json!({}))
+        )
+        .await["error"],
+        "port_not_enabled"
+    );
+    let enabled = call(
+        &host,
+        &consumer,
+        "enable",
+        json!({"access":"person","contract":CONTRACT,"major":1,"routeRevision":revision}),
+    )
+    .await;
+    assert_eq!(
+        enabled["result"],
+        json!({"access":"person","contract":CONTRACT,"major":1,"enabled":true})
+    );
+    let mut input = invoke("person", "message.list", "query", json!({}));
+    input["routeRevision"] = revision.clone();
+    let response = call(&host, &consumer, "invoke", input.clone()).await;
+    assert_eq!(response["result"]["accepted"], true, "{response}");
+    assert_eq!(
+        response["result"]["actor"],
+        json!({"kind":"person","identity":fixture.core.public_identity().to_string()})
+    );
+    let mut observations = host.observe_ports();
+    input["routeRevision"] = json!("0".repeat(64));
+    assert_eq!(
+        call(&host, &consumer, "invoke", input.clone()).await["error"],
+        "port_catalog_changed"
+    );
+    let rejected = tokio::time::timeout(Duration::from_secs(2), observations.recv())
+        .await
+        .expect("stale route refusal observation")
+        .unwrap();
+    assert_eq!(rejected.stage, teamarness_package_host::PortStage::Rejected);
+    assert_eq!(rejected.code, Some("port_catalog_changed"));
+    assert_eq!(
+        rejected.provider_id, None,
+        "revision refusal must precede Provider enqueue"
+    );
+    assert_eq!(rejected.provider_generation, None);
+    let other = mount(&host, "com.example.other", &workspace.to_string()).await;
+    assert_eq!(
+        call(
+            &host,
+            &other,
+            "enable",
+            json!({"access":"person","contract":CONTRACT,"major":1,"routeRevision":revision})
+        )
+        .await["error"],
+        "port_catalog_changed"
+    );
+    assert_eq!(
+        call(
+            &host,
+            &consumer,
+            "invoke",
+            invoke("agent", "message.list", "query", json!({}))
+        )
+        .await["error"],
+        "agent_not_bound"
+    );
+    assert_eq!(
+        call(
+            &host,
+            &consumer,
+            "disable",
+            json!({"access":"person","contract":CONTRACT})
+        )
+        .await["result"]["enabled"],
+        false
+    );
+    assert_eq!(
+        call(
+            &host,
+            &consumer,
+            "invoke",
+            invoke("person", "message.list", "query", json!({}))
+        )
+        .await["error"],
+        "port_not_enabled"
+    );
+    let agent = fixture.core.add_agent(workspace, "Bound").unwrap();
+    fixture
+        .core
+        .bind_agent_package(workspace, agent, "com.example.consumer")
+        .unwrap();
+    assert_eq!(
+        call(&host, &consumer, "available", json!({"access":"person"})).await["error"],
+        "port_actor_mode_invalid"
+    );
+    for (method, input) in [
+        (
+            "enable",
+            json!({"access":"person","contract":CONTRACT,"major":1}),
+        ),
+        ("disable", json!({"access":"person","contract":CONTRACT})),
+        (
+            "describe",
+            json!({"access":"person","contract":CONTRACT,"major":1,"metadataSha256":row["metadataSha256"],"offset":0}),
+        ),
+        (
+            "invoke",
+            invoke("person", "message.list", "query", json!({})),
+        ),
+    ] {
+        assert_eq!(
+            call(&host, &consumer, method, input).await["error"],
+            "port_actor_mode_invalid",
+            "{method}"
+        );
+    }
+    shutdown(&host).await;
+}
+
+// Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R05, TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn person_selections_preserve_agent_rows_and_are_scoped_durable_and_removable_without_provider()
+ {
+    let fixture = fixture_major(3).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].id();
+    let second = fixture
+        .core
+        .create_workspace("Person isolation")
+        .unwrap()
+        .id();
+    let agent = fixture
+        .core
+        .add_agent(workspace, "Existing selection")
+        .unwrap();
+    fixture
+        .core
+        .bind_agent_package(workspace, agent, "com.example.consumer")
+        .unwrap();
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let consumer = mount(&host, "com.example.consumer", &workspace.to_string()).await;
+    assert_eq!(
+        call(
+            &host,
+            &consumer,
+            "enable",
+            json!({"access":"agent","contract":CONTRACT,"major":1})
+        )
+        .await["result"]["enabled"],
+        true
+    );
+    fixture
+        .core
+        .unbind_agent_package(workspace, "com.example.consumer")
+        .unwrap();
+    let rows = call(&host, &consumer, "available", json!({"access":"person"})).await;
+    assert!(
+        rows["result"]["contracts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["enabled"] == false)
+    );
+    assert_eq!(
+        call(
+            &host,
+            &consumer,
+            "enable",
+            json!({"access":"person","contract":CONTRACT,"major":2})
+        )
+        .await["error"],
+        "port_version_mismatch"
+    );
+    assert_eq!(
+        call(
+            &host,
+            &consumer,
+            "enable",
+            json!({"access":"person","contract":CONTRACT,"major":1})
+        )
+        .await["result"]["enabled"],
+        true
+    );
+    for (package, target_workspace) in [
+        ("com.example.other", workspace),
+        ("com.example.consumer", second),
+    ] {
+        let target = mount(&host, package, &target_workspace.to_string()).await;
+        assert_eq!(
+            call(
+                &host,
+                &target,
+                "invoke",
+                invoke("person", "message.list", "query", json!({}))
+            )
+            .await["error"],
+            "port_not_enabled"
+        );
+    }
+    shutdown(&host).await;
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let consumer = mount(&host, "com.example.consumer", &workspace.to_string()).await;
+    assert_eq!(
+        call(
+            &host,
+            &consumer,
+            "invoke",
+            invoke("person", "message.list", "query", json!({}))
+        )
+        .await["result"]["accepted"],
+        true
+    );
+    shutdown(&host).await;
+    fs::remove_dir_all(fixture.config.application_root().join("provider")).unwrap();
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let consumer = mount(&host, "com.example.consumer", &workspace.to_string()).await;
+    let unavailable = call(&host, &consumer, "available", json!({"access":"person"})).await;
+    assert_eq!(
+        unavailable["result"]["contracts"],
+        json!([{"contract":CONTRACT,"major":1,"minor":null,"description":null,"available":false,"enabled":true,"enabledMajor":1,"metadataSha256":null,"provider":null,"guideEligibility":"unavailable","routeRevision":null}])
+    );
+    assert_eq!(
+        call(
+            &host,
+            &consumer,
+            "disable",
+            json!({"access":"person","contract":CONTRACT})
+        )
+        .await["result"]["enabled"],
+        false
+    );
+    let connection =
+        rusqlite::Connection::open(fixture._private.join("packages/package-host.sqlite3")).unwrap();
+    for (table, expected) in [("agent_port_selections", 1), ("person_port_selections", 0)] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, expected, "{table}");
+    }
+    shutdown(&host).await;
+}
+
+// Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn person_authority_requires_current_local_membership_without_fallback() {
+    let fixture = fixture_major(3).await;
+    let manager = common::open_core(fixture._root.path().join("person-manager")).await;
+    let workspace = manager.create_workspace("Person membership").unwrap().id();
+    fixture
+        .core
+        .join_workspace(&common::invite(&manager, workspace).await)
+        .await
+        .unwrap();
+    common::introduce(&fixture.core, &manager);
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let target = mount(&host, "com.example.consumer", &workspace.to_string()).await;
+    assert_eq!(
+        call(
+            &host,
+            &target,
+            "enable",
+            json!({"access":"person","contract":CONTRACT,"major":1})
+        )
+        .await["result"]["enabled"],
+        true
+    );
+    manager
+        .revoke_member(workspace, fixture.core.public_identity())
+        .unwrap();
+    // Exercise accepted canonical removal directly; this test qualifies Host authority,
+    // not delivery to a peer that the manager has just revoked.
+    for operation in manager.export_membership_operations_for_tests(workspace) {
+        fixture
+            .core
+            .apply_membership_operation_for_tests(&operation)
+            .unwrap();
+    }
+    assert!(
+        fixture
+            .core
+            .workspace_person(workspace, fixture.core.public_identity())
+            .unwrap()
+            .is_none()
+    );
+    for (method, input) in [
+        ("available", json!({"access":"person"})),
+        (
+            "enable",
+            json!({"access":"person","contract":CONTRACT,"major":1}),
+        ),
+        ("disable", json!({"access":"person","contract":CONTRACT})),
+        (
+            "invoke",
+            invoke("person", "message.list", "query", json!({})),
+        ),
+    ] {
+        assert_eq!(
+            call(&host, &target, method, input).await["error"],
+            "person_not_current",
+            "{method}"
+        );
+    }
+    shutdown(&host).await;
+    manager.shutdown().await.unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn negotiated_major_two_refuses_person_selection_and_revision_fields() {
+    let fixture = fixture().await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].id();
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let target = mount(&host, "com.example.consumer", &workspace.to_string()).await;
+    for (method, input) in [
+        ("available", json!({"access":"person"})),
+        (
+            "enable",
+            json!({"access":"agent","contract":CONTRACT,"major":1}),
+        ),
+        ("disable", json!({"access":"agent","contract":CONTRACT})),
+        (
+            "invoke",
+            json!({"access":"declared","contract":CONTRACT,"major":1,"port":"message.list","kind":"query","request":{},"routeRevision":"a".repeat(64)}),
+        ),
+    ] {
+        assert_eq!(
+            call(&host, &target, method, input).await["error"],
+            "capability_request_invalid",
+            "{method}"
+        );
+    }
+    assert!(
+        host.snapshot()
+            .await
+            .instances
+            .iter()
+            .filter(|instance| instance.key.package_identity.as_str() == "com.example.provider")
+            .all(|instance| instance.process_generation.is_none())
+    );
+    shutdown(&host).await;
 }
 
 async fn mount(host: &PackageHost, package: &str, workspace: &str) -> UiMountId {

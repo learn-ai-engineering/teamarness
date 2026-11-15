@@ -19,7 +19,7 @@ const inspectedKeys = {
   homepage: true, capabilities: true, provided: true, consumed: true, kind: true,
 } satisfies Record<keyof InspectedPackage, true>;
 const authoringKeys = {
-  identity: true, capabilities: true, provided: true, consumed: true,
+  identity: true, compatibilityWarnings: true, capabilities: true, provided: true, consumed: true,
 } satisfies Record<keyof PackageAuthoringEntry, true>;
 const consumedAvailabilityKeys = {
   identity: true, major: true, minMinor: true, maxMinor: true, required: true, provider: true, minor: true,
@@ -112,6 +112,8 @@ it("reads routed and unavailable consumed Ports from the authoring catalog", () 
   const [entry] = catalog;
   expect(entry).toBeDefined();
   expectKeys(entry!, authoringKeys);
+  expect(Object.keys(entry!)).toHaveLength(Object.keys(authoringKeys).length);
+  expect(entry!.compatibilityWarnings).toEqual(["capability.superseded_major: teamarness.package-ports major 2 remains supported; a newer major is available"]);
   for (const consumed of entry!.consumed) {
     expectKeys(consumed, consumedAvailabilityKeys);
     expect(Object.keys(consumed)).toHaveLength(Object.keys(consumedAvailabilityKeys).length);

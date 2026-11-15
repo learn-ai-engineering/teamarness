@@ -40,6 +40,32 @@ struct Report {
 }
 
 impl Report {
+    fn capabilities(
+        &mut self,
+        requirements: &[teamarness_package_contract::manifest::CapabilityRequirement],
+    ) {
+        use teamarness_package_contract::capability_versions::{
+            SUPPORTED_VERSIONS, compatibility_warnings,
+        };
+        self.notes.extend(compatibility_warnings(requirements));
+        for requirement in requirements {
+            if !SUPPORTED_VERSIONS.iter().any(|version| {
+                version.family == requirement.family
+                    && version.major == requirement.major
+                    && version.min_minor <= requirement.max_minor
+                    && requirement.min_minor <= version.max_minor
+            }) {
+                self.push(
+                    MANIFEST_NAME,
+                    ContractError::new(
+                        ContractErrorCode::ManifestUnsupported,
+                        "capability.version_unsupported",
+                    ),
+                );
+            }
+        }
+    }
+
     fn push(&mut self, file: &str, error: ContractError) {
         self.errors.push(Reported {
             file: file.to_owned(),
@@ -181,6 +207,7 @@ fn validate_source(root: &Path) -> Report {
         Ok(bytes) => match parse_manifest(&bytes) {
             Err(error) => report.push(MANIFEST_NAME, error),
             Ok(document) => {
+                report.capabilities(&document.capabilities);
                 if let Some(path) = document.port_contract_path() {
                     let bytes = read_source_port(root, path);
                     match bytes {
@@ -232,6 +259,7 @@ fn validate_directory(root: &Path, target: &str, smoke_requested: bool) -> Repor
             return report;
         }
     };
+    report.capabilities(&loaded.capabilities);
     if let Err(error) = compile_ui_contract(&loaded.ui.contract.bytes) {
         report.push(&loaded.ui.contract.relative_path.clone(), error);
         return report;

@@ -89,6 +89,14 @@ On a Port, `ports::PortActor` is the Host-derived actor: `Person { identity }` f
 
 `CapabilityClient` calls a negotiated grant and method. The caller supplies only method fields, not Package, Workspace, Installation, Core signing context, or transport selectors. `CapabilitySubscription::recv` validates contiguous decimal sequences and returns one credit after consumption; `recv_with_credit` hands the credit to the caller so it can be released after the work is committed.
 
+## Person-authorized dynamic Ports
+
+Declare `teamarness.package-ports` major 3 for explicit Person access, then construct `ports_v3::PortClientV3::from_initialization(initialization, capabilities)`. A missing grant returns `package.capability_not_granted`; a negotiated major other than 3 returns `package.capability_version_unsupported`. There is no silent declared/Agent fallback. Legacy `ports::PortClient` and `PortAccess` remain source and wire compatible with major 2; both Host majors remain supported without a scheduled removal.
+
+`available(PortAccessV3::Person, cursor)` returns one bounded `PortPageV3`, including Provider presentation, `GuideEligibility`, metadata digest and route revision. Keep traversal bounded. Guide-less Providers are visible but Person enablement requires a conforming guide. Construct `PortContractRef { access, contract, major, route_revision }` from the observed summary. Pass it to `describe`, `enable`, `command`, `query`, `live_query`, or `subscribe_event`. `disable(access, contract)` removes even an unavailable selection without a route precondition. `describe` checks complete chunks, digest, schemas, exact contract identity and major through the same internal assembler as major 2.
+
+The Host requires an unbound caller and current local Person; it derives the actor. `port_actor_mode_invalid`, `person_not_current`, `port_guide_required`, and `port_catalog_changed` remain explicit Host refusals. A route revision is an optimistic precondition, not a Provider selector. Do not retry tool calls automatically after a stale revision or uncertain outcome. Phase-2 stream and authority-transition qualification remains a separate gate.
+
 ## Testing a Backend without frames
 
 The `testing` feature adds a harness that serves a Backend over in-memory pipes and speaks the protocol for the test:
@@ -104,6 +112,8 @@ harness.activate().await?;
 let answer = harness.request("example.read", json!({})).await?;
 harness.shutdown().await?;
 ```
+
+`HarnessBuilder::capability_version(identity, scripted, major, minor)` advertises an explicit negotiated version. Existing `capability` and `capability_minor` still default to major 1. Use the explicit builder for honest major-3 initialization tests.
 
 `ScriptedCapability` answers capability calls and streams with credit, `PendingRequest` cancels an in-flight request, and `assert_router_matches_contract` fails when the router and `ui-contract.json` do not declare the same operations.
 

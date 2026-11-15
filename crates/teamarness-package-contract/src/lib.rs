@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod capability_versions;
 pub mod error;
 pub mod identity;
 pub mod json;

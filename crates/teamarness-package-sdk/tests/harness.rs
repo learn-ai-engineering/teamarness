@@ -14,6 +14,42 @@ use teamarness_package_sdk::{BackendError, Empty, Router, RouterOperations, even
 
 const CAPABILITY: &str = "dev.teamarness.fixture-capability";
 
+// Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R06
+#[tokio::test]
+async fn capability_version_preserves_legacy_builder_defaults() {
+    let router = Router::stateless().request("fixture.versions", |context, _: Empty| async move {
+        let versions: Vec<_> = [
+            "dev.example.default",
+            "dev.example.minor",
+            "teamarness.package-ports",
+        ]
+        .into_iter()
+        .map(|identity| {
+            let grant = context.initialization().capability(identity).unwrap();
+            serde_json::json!([grant.major, grant.minor])
+        })
+        .collect();
+        Ok(serde_json::json!({"versions":versions}))
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut harness = HarnessBuilder::new(router.into_backend())
+        .data_directory(directory.path())
+        .capability("dev.example.default", ScriptedCapability::new())
+        .capability_minor("dev.example.minor", ScriptedCapability::new(), 7)
+        .capability_version("teamarness.package-ports", ScriptedCapability::new(), 3, 2)
+        .start()
+        .await;
+    harness.activate().await.unwrap();
+    assert_eq!(
+        harness
+            .request("fixture.versions", serde_json::json!({}))
+            .await
+            .unwrap(),
+        serde_json::json!({"versions":[[1,0],[1,7],[3,2]]})
+    );
+    harness.shutdown().await.unwrap();
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Add {

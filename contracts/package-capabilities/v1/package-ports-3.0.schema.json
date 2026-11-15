@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teamarness.dev/contracts/package-capabilities/v1/package-ports-3.0.schema.json",
+  "title": "Package Ports capability 3.0",
+  "description": "Explicit Person and Agent selection namespaces and scope-bound route preconditions. Byte bounds, digest coherence, eligibility and authorization are semantic checks described in README.md. The v1 directory names the collection, not the capability major.",
+  "$defs": {
+    "access": {"enum": ["declared", "agent", "person"]},
+    "selectionAccess": {"enum": ["agent", "person"]},
+    "contract": {"type": "string", "minLength": 3, "maxLength": 128, "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$"},
+    "major": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "cursor": {"type": "string", "minLength": 1, "maxLength": 2048},
+    "offset": {"type": "integer", "minimum": 0, "maximum": 1048575},
+    "port": {"type": "string", "maxLength": 128, "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)*$"},
+    "provider": {
+      "type": "object", "additionalProperties": false,
+      "required": ["identity", "version", "displayName", "description"],
+      "properties": {
+        "identity": {"type": "string", "minLength": 3, "maxLength": 128, "pattern": "^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"},
+        "version": {"type": "string", "minLength": 5},
+        "displayName": {"type": "string", "minLength": 1, "maxLength": 128},
+        "description": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 1024}, {"type": "null"}]}
+      }
+    },
+    "summary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "major", "minor", "description", "available", "enabled", "enabledMajor", "metadataSha256", "provider", "guideEligibility", "routeRevision"],
+      "properties": {
+        "contract": {"$ref": "#/$defs/contract"},
+        "major": {"$ref": "#/$defs/major"},
+        "minor": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": 65535}, {"type": "null"}]},
+        "description": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 512}, {"type": "null"}]},
+        "available": {"type": "boolean"},
+        "enabled": {"type": "boolean"},
+        "enabledMajor": {"anyOf": [{"$ref": "#/$defs/major"}, {"type": "null"}]},
+        "metadataSha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "provider": {"anyOf": [{"$ref": "#/$defs/provider"}, {"type": "null"}]},
+        "guideEligibility": {"enum": ["eligible", "missing", "unavailable"]},
+        "routeRevision": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]}
+      }
+    },
+    "availableCall": {
+      "type": "object", "additionalProperties": false, "required": ["method", "access"],
+      "properties": {"method": {"const": "available"}, "access": {"$ref": "#/$defs/access"}, "cursor": {"$ref": "#/$defs/cursor"}},
+      "examples": [{"method": "available", "access": "person"}]
+    },
+    "availableResult": {
+      "type": "object", "additionalProperties": false, "required": ["contracts"],
+      "properties": {"contracts": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/summary"}}, "nextCursor": {"$ref": "#/$defs/cursor"}},
+      "examples": [{"contracts": [{"contract": "dev.example.metadata", "major": 1, "minor": 2, "description": "Metadata", "available": true, "enabled": false, "enabledMajor": null, "metadataSha256": "0de9112f997e9a8350b7bef09d9331815451382033e418f3954c614a42fdbbc7", "provider": {"identity": "dev.example.provider", "version": "1.0.0", "displayName": "Example Provider", "description": null}, "guideEligibility": "missing", "routeRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]
+    },
+    "describeCall": {
+      "type": "object", "additionalProperties": false, "required": ["method", "access", "contract", "major", "metadataSha256", "offset"],
+      "properties": {
+        "method": {"const": "describe"}, "access": {"$ref": "#/$defs/access"}, "contract": {"$ref": "#/$defs/contract"}, "major": {"$ref": "#/$defs/major"},
+        "metadataSha256": {"$ref": "#/$defs/sha256"}, "offset": {"$ref": "#/$defs/offset"}, "routeRevision": {"$ref": "#/$defs/sha256"}
+      },
+      "examples": [{"method": "describe", "access": "person", "contract": "dev.example.metadata", "major": 1, "metadataSha256": "0de9112f997e9a8350b7bef09d9331815451382033e418f3954c614a42fdbbc7", "offset": 0, "routeRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]
+    },
+    "describeResult": {
+      "type": "object", "additionalProperties": false, "required": ["metadataSha256", "totalBytes", "offset", "data"],
+      "properties": {
+        "metadataSha256": {"$ref": "#/$defs/sha256"}, "totalBytes": {"type": "integer", "minimum": 1, "maximum": 1048576}, "offset": {"$ref": "#/$defs/offset"},
+        "data": {"type": "string", "minLength": 4, "maxLength": 87384, "contentEncoding": "base64", "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"}, "nextOffset": {"$ref": "#/$defs/offset"}
+      },
+      "examples": [{"metadataSha256": "0de9112f997e9a8350b7bef09d9331815451382033e418f3954c614a42fdbbc7", "totalBytes": 267, "offset": 0, "data": "eyJzY2hlbWFWZXJzaW9uIjoxLCIkZGVmcyI6eyJ0ZXh0Ijp7InR5cGUiOiJzdHJpbmcifX0sImNvbnRyYWN0cyI6W3siaWRlbnRpdHkiOiJkZXYuZXhhbXBsZS5tZXRhZGF0YSIsIm1ham9yIjoxLCJtaW5vciI6MiwiZGVzY3JpcHRpb24iOiJNZXRhZGF0YSIsInBvcnRzIjpbeyJuYW1lIjoidmFsdWUucmVhZCIsImtpbmQiOiJxdWVyeSIsImRlc2NyaXB0aW9uIjoiUmVhZCIsInJlcXVlc3QiOnRydWUsInJlc3BvbnNlIjp7IiRyZWYiOiIjLyRkZWZzL3RleHQifX1dfV19"}]
+    },
+    "enableCall": {
+      "type": "object", "additionalProperties": false, "required": ["method", "access", "contract", "major"],
+      "properties": {"method": {"const": "enable"}, "access": {"$ref": "#/$defs/selectionAccess"}, "contract": {"$ref": "#/$defs/contract"}, "major": {"$ref": "#/$defs/major"}, "routeRevision": {"$ref": "#/$defs/sha256"}},
+      "examples": [{"method": "enable", "access": "person", "contract": "dev.example.messages", "major": 1}]
+    },
+    "enableResult": {
+      "type": "object", "additionalProperties": false, "required": ["access", "contract", "major", "enabled"],
+      "properties": {"access": {"$ref": "#/$defs/selectionAccess"}, "contract": {"$ref": "#/$defs/contract"}, "major": {"$ref": "#/$defs/major"}, "enabled": {"const": true}},
+      "examples": [{"access": "person", "contract": "dev.example.messages", "major": 1, "enabled": true}]
+    },
+    "disableCall": {
+      "type": "object", "additionalProperties": false, "required": ["method", "access", "contract"],
+      "properties": {"method": {"const": "disable"}, "access": {"$ref": "#/$defs/selectionAccess"}, "contract": {"$ref": "#/$defs/contract"}},
+      "examples": [{"method": "disable", "access": "person", "contract": "dev.example.messages"}]
+    },
+    "disableResult": {
+      "type": "object", "additionalProperties": false, "required": ["access", "contract", "enabled"],
+      "properties": {"access": {"$ref": "#/$defs/selectionAccess"}, "contract": {"$ref": "#/$defs/contract"}, "enabled": {"const": false}},
+      "examples": [{"access": "person", "contract": "dev.example.messages", "enabled": false}]
+    },
+    "invokeCall": {
+      "type": "object", "additionalProperties": false, "required": ["method", "access", "contract", "major", "port", "kind", "request"],
+      "properties": {"method": {"const": "invoke"}, "access": {"$ref": "#/$defs/access"}, "contract": {"$ref": "#/$defs/contract"}, "major": {"$ref": "#/$defs/major"}, "port": {"$ref": "#/$defs/port"}, "kind": {"enum": ["command", "query"]}, "request": true, "routeRevision": {"$ref": "#/$defs/sha256"}},
+      "examples": [{"method": "invoke", "access": "person", "contract": "dev.example.messages", "major": 1, "port": "message.read", "kind": "query", "request": {}}]
+    },
+    "queryStream": {
+      "type": "object", "additionalProperties": false, "required": ["grant", "access", "contract", "major", "port", "kind", "request"],
+      "properties": {"grant": {"type": "string", "minLength": 1}, "access": {"$ref": "#/$defs/access"}, "contract": {"$ref": "#/$defs/contract"}, "major": {"$ref": "#/$defs/major"}, "port": {"$ref": "#/$defs/port"}, "kind": {"const": "query"}, "request": true, "routeRevision": {"$ref": "#/$defs/sha256"}},
+      "examples": [{"grant": "opaque", "access": "person", "contract": "dev.example.messages", "major": 1, "port": "message.watch", "kind": "query", "request": {}}]
+    },
+    "eventStream": {
+      "type": "object", "additionalProperties": false, "required": ["grant", "access", "contract", "major", "port", "kind"],
+      "properties": {"grant": {"type": "string", "minLength": 1}, "access": {"$ref": "#/$defs/access"}, "contract": {"$ref": "#/$defs/contract"}, "major": {"$ref": "#/$defs/major"}, "port": {"$ref": "#/$defs/port"}, "kind": {"const": "event"}, "routeRevision": {"$ref": "#/$defs/sha256"}},
+      "examples": [{"grant": "opaque", "access": "person", "contract": "dev.example.messages", "major": 1, "port": "message.changed", "kind": "event"}]
+    },
+    "errorCodes": {"enum": ["capability_request_invalid", "capability_unavailable", "capability_version_unsupported", "port_catalog_changed", "port_unavailable", "ungranted_port", "port_version_mismatch", "port_not_enabled", "agent_not_bound", "agent_binding_changed", "port_actor_mode_invalid", "person_not_current", "port_guide_required", "port_request_invalid", "port_response_invalid", "port_event_invalid", "port_subscriber_overflow", "overloaded", "outcome_unknown", "provider_exited", "provider_error", "event_lagged", "deadline_exceeded", "cancelled"]}
+  }
+}

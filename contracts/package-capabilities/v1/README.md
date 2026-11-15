@@ -12,9 +12,29 @@ A different shape is a **new family**, declared and negotiated beside the existi
 
 See ADR 0018, Package seam versioning, for the policy, including the deprecation window intended for the first breaking change.
 
+## `teamarness.package-ports` 3.0
+
+The closed [3.0 schema](package-ports-3.0.schema.json) adds Person access beside unchanged 2.0. Both majors remain supported with no removal scheduled here (ADR 0041). Negotiation matches family, then major, then the highest common minor. A grant's major controls wire validation. Unknown families return `capability_unavailable`; unsupported majors return `capability_version_unsupported`. Process Protocol 1.0, UI Host version, and Provider contract versions do not change.
+
+`available` accepts `access: declared | agent | person` and an optional cursor. Major-3 summaries retain every major-2 field and require:
+
+- `provider`: `{identity, version, displayName, description}`, with nullable description; null for a missing Provider.
+- `guideEligibility`: `eligible`, `missing`, or `unavailable`. Guide-less admitted Providers are visible to Person callers but cannot be enabled.
+- `routeRevision`: a 64-character lowercase hex opaque precondition; null when no route is offered.
+
+`describe` additionally requires the contract `major`. `describe`, `enable`, `invoke`, query streams, and event streams accept optional `routeRevision`. The Host derives it from one immutable snapshot and the exact Installation, Workspace, caller, process generation, view, contract, offered major, metadata digest, and Provider. It is neither a route selector nor an authorization grant. A mismatch returns `port_catalog_changed` before Provider enqueue. Do not retry tool calls automatically; consumers may perform bounded metadata rediscovery.
+
+`enable` requires `access: agent | person`, contract and major; `disable` requires access and contract, without a route precondition. Selection acknowledgements include access. Person selections default empty in their own durable namespace; Agent rows are not imported. An unavailable selection remains removable.
+
+Person requests require an unbound Instance and current local Workspace Person. The Host derives that Person through Core. Bound callers receive `port_actor_mode_invalid`; missing current membership receives `person_not_current`; guide-less Person enablement receives `port_guide_required`. Agent requests still require their binding and never fall back to Person. Actor, Workspace and Provider selectors remain forbidden. Commands, ordinary queries, live queries and events share the broker; an external read-only product must enforce its own restrictions.
+
+Page/chunk/document limits and digest rules below are unchanged: 32 rows and 32 KiB per page, 64 KiB decoded per chunk, 1 MiB complete metadata, exact reachable definitions, and the existing 256 KiB Port value bound. An individually oversized summary is refused, not silently omitted. The [independent golden](package-ports-3.0.golden.json) pins complete guide-less discovery/description bytes.
+
+Use SDK `ports_v3::PortClientV3::from_initialization`, `PortAccessV3`, and `PortContractRef`. Construction requires a negotiated 3.x grant and never downgrades. `available` returns one bounded typed page; consumers own traversal budgets. `describe` shares the complete chunk/digest/schema assembler with the legacy client. Generic author and Package-page warnings identify supported but superseded major 2; warnings are absent from process grants and major-2 responses. Phase-2 authority/lifecycle stress qualification remains separate from phase-1 query and metadata evidence.
+
 ## `teamarness.package-ports` 2.0
 
-The closed [2.0 wire schema](package-ports-2.0.schema.json) defines the final request and result shapes, with examples under each definition. Family versions are independent of this `v1` collection, Package Process 1.0, and each Provider's Port Contract version. The Host offers only capability 2.0. Major-1 manifests fail negotiation with `capability_version_unsupported` and must be rebuilt; there is no legacy dispatcher (ADR 0035).
+The closed [2.0 wire schema](package-ports-2.0.schema.json) defines the final request and result shapes, with examples under each definition. Family versions are independent of this `v1` collection, Package Process 1.0, and each Provider's Port Contract version. The Host offers 2.0 alongside 3.0 without changing this wire contract. Major-1 manifests fail negotiation with `capability_version_unsupported` and must be rebuilt; there is no legacy dispatcher (ADR 0035).
 
 **Repository qualification:** complete metadata, durable self-scoped settings, shared dispatch and lifecycle revocation are exercised by Host integration tests. The source-built [generic consumer](../../../tests/system/src/bin/generic_port_consumer.rs) has no Provider dependencies or consumed-Port manifest. Its [system proof](../../../tests/system/tests/agent_port_discovery.rs) discovers Conversations, validates complete schemas, loads its guide after explicit enablement, posts as the bound Agent and reconciles after reconnect. This is scripted interface evidence, not a release, external harness rebuild, real-model compatibility or Steward UI qualification.
 

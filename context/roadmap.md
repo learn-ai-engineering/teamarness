@@ -70,6 +70,14 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### External Gateway (phase 1 complete; lifecycle qualification pending)
+
+Started in workstream `external-gateway` on branch `don-smith/external_gateway`. The standalone Personal Package will expose selected read-only Workspace Ports to external coding agents through one authenticated localhost endpoint per Workspace. Backlog is the first real Provider qualification; a newly installed eligible Provider must appear without rebuilding the gateway. Runtime guides are required, Packages and tools are explicitly enabled, and all independently revocable tokens share one configured scope. Conversations, external writes, MCP, and LAN access are excluded from the initial delivery.
+
+[ADR 0041](.decisions/0041-person-authorized-dynamic-package-ports.md), accepted 2026-11-15, adds Person-authorized automatic discovery through package-ports 3.0 while retaining unchanged 2.0 support. Calls act as the local Workspace Person without an Agent Binding or installed Agent Package. The Host owns generic discovery and authority; the gateway owns HTTP, tokens, and external tool policy. The accepted six-phase plan is in Implement. Phase 1 implements major-3 wire contracts, Person discovery/selection/query access, scoped route preconditions, the SDK client, and generic compatibility diagnostics. Required contract/Host/SDK suites, full workspace checks, and the local app/DMG bundle gate pass. The earlier full-check failure exposed a concurrent Core directory-admission race; accepted correction C1 is committed as `71aa0eb` with passing checks. Phase-2 authority transitions, stream revocation, live discovery stress, and the standalone gateway remain pending; this is not full gateway qualification.
+
+**Next:** phase 2 authority/lifecycle and live-discovery qualification, then establish the clean Host SDK revision before creating the standalone Package. Dedicated Documents and Exhibits qualification, future writes and gateway-origin attribution remain follow-ups.
+
 ### Backlog Package (complete, verified locally)
 
 Implemented on 2026-11-01 on branch `don-smith/add_backlog_package`, workstream `backlog-package`, and fast-forwarded into local `main`. The new bundled Team Package `dev.teamarness.backlog` holds Epics and Tickets for the Workspace (`TEAM.SYS.BACKLOG-R01` to `R10`).

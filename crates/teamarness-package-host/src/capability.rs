@@ -371,6 +371,8 @@ impl GenerationCapabilities {
                 .ok_or(PackageErrorCode::CapabilityRequestInvalid)
                 .map_err(CapabilityFailure::certain)?;
             let method = string_field(object, "method").map_err(CapabilityFailure::certain)?;
+            validate_port_wire(bound.descriptor.major, false, object)
+                .map_err(CapabilityFailure::certain)?;
             let broker = self
                 .broker
                 .upgrade()
@@ -389,6 +391,7 @@ impl GenerationCapabilities {
                                 &self.scope.workspace_id,
                                 object,
                                 &state,
+                                bound.descriptor.major,
                             )
                             .await
                     } else {
@@ -398,13 +401,14 @@ impl GenerationCapabilities {
                                 &self.scope.workspace_id,
                                 object,
                                 &state,
+                                bound.descriptor.major,
                             )
                             .await
                     };
                     result.map_err(CapabilityFailure::certain)
                 }
                 "enable" | "disable" => self
-                    .port_selection(&broker, method, object)
+                    .port_selection(&broker, method, object, bound.descriptor.major)
                     .await
                     .map_err(CapabilityFailure::certain),
                 "invoke" => {
@@ -430,11 +434,13 @@ impl GenerationCapabilities {
                     broker
                         .pause_command_authorized(&self.scope.package_identity, object)
                         .await;
+                    let mut dispatch = object.clone();
+                    dispatch.remove("routeRevision");
                     broker
                         .call(
                             &self.scope.package_identity,
                             route,
-                            object,
+                            &dispatch,
                             started,
                             consumer_id,
                             self.generation,
@@ -513,11 +519,15 @@ impl GenerationCapabilities {
             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
         let grant = self.bound_grant(Some(string_field(object, "grant")?))?;
         if grant.descriptor.kind == CapabilityKind::PackagePorts {
+            validate_port_wire(grant.descriptor.major, true, object)?;
             let broker = self
                 .broker
                 .upgrade()
                 .ok_or(PackageErrorCode::CapabilityUnavailable)?;
             let route = self.authorize_port(&broker, object).await?;
+            let mut normalized = object.clone();
+            normalized.remove("routeRevision");
+            let object = &normalized;
             #[cfg(feature = "test-hooks")]
             broker
                 .pause_port_work(&self.scope.package_identity, false)
@@ -1006,9 +1016,10 @@ impl GenerationCapabilities {
         broker: &Arc<crate::broker::PortBroker>,
         object: &Map<String, Value>,
     ) -> Result<crate::port_access::AccessState, PackageErrorCode> {
+        let person = object.get("access").and_then(Value::as_str) == Some("person");
         let agent = match object.get("access").and_then(Value::as_str) {
             Some("agent") => true,
-            Some("declared") => false,
+            Some("declared" | "person") => false,
             _ => return Err(PackageErrorCode::CapabilityRequestInvalid),
         };
         broker
@@ -1016,6 +1027,8 @@ impl GenerationCapabilities {
                 self.core.clone(),
                 self.instance_key(),
                 &self.authority,
+                self.generation,
+                person,
                 move |_, _, state| {
                     if agent && state.actor["kind"] != "agent" {
                         return Err(PackageErrorCode::AgentNotBound);
@@ -1056,6 +1069,8 @@ impl GenerationCapabilities {
                 self.core.clone(),
                 key.clone(),
                 &self.authority,
+                self.generation,
+                object.get("access").and_then(Value::as_str) == Some("person"),
                 move |broker, _, state| {
                     broker.reconcile_binding(&resolved_key, &state.actor);
                     let mut route = broker.resolve_access(
@@ -1130,21 +1145,24 @@ impl GenerationCapabilities {
         broker: &Arc<crate::broker::PortBroker>,
         method: &str,
         object: &Map<String, Value>,
+        wire_major: u16,
     ) -> Result<Value, PackageErrorCode> {
         let enable = method == "enable";
-        exact_fields(
-            object,
-            if enable {
-                &["method", "contract", "major"]
-            } else {
-                &["method", "contract"]
-            },
-        )?;
+        if wire_major == 2 {
+            exact_fields(
+                object,
+                if enable {
+                    &["method", "contract", "major"]
+                } else {
+                    &["method", "contract"]
+                },
+            )?;
+        }
         let contract = string_field(object, "contract")?.to_owned();
         if !teamarness_package_contract::identity::is_valid_package_identity(&contract) {
             return Err(PackageErrorCode::CapabilityRequestInvalid);
         }
-        let major = if enable {
+        let _major = if enable {
             Some(
                 object
                     .get("major")
@@ -1161,8 +1179,8 @@ impl GenerationCapabilities {
                 self.core.clone(),
                 self.instance_key(),
                 &self.authority,
-                contract,
-                major,
+                self.generation,
+                object.clone(),
             )
             .await
     }
@@ -1446,8 +1464,76 @@ impl crate::protocol::CapabilityHandler for GenerationCapabilities {
     }
 }
 
+fn validate_port_wire(
+    major: u16,
+    stream: bool,
+    input: &Map<String, Value>,
+) -> Result<(), PackageErrorCode> {
+    if major == 2 {
+        if input.contains_key("routeRevision")
+            || input.get("access").and_then(Value::as_str) == Some("person")
+            || (matches!(
+                input.get("method").and_then(Value::as_str),
+                Some("enable" | "disable")
+            ) && input.contains_key("access"))
+        {
+            return Err(PackageErrorCode::CapabilityRequestInvalid);
+        }
+        return Ok(());
+    }
+    static VALIDATORS: std::sync::OnceLock<BTreeMap<&'static str, jsonschema::Validator>> =
+        std::sync::OnceLock::new();
+    let validators = VALIDATORS.get_or_init(|| {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../contracts/package-capabilities/v1/package-ports-3.0.schema.json"
+        ))
+        .expect("major-3 schema");
+        [
+            "availableCall",
+            "describeCall",
+            "enableCall",
+            "disableCall",
+            "invokeCall",
+            "queryStream",
+            "eventStream",
+        ]
+        .into_iter()
+        .map(|name| {
+            (
+                name,
+                jsonschema::validator_for(
+                    &json!({"$defs":schema["$defs"],"$ref":format!("#/$defs/{name}")}),
+                )
+                .expect("major-3 wire validator"),
+            )
+        })
+        .collect()
+    });
+    let name = if stream {
+        if input.get("kind").and_then(Value::as_str) == Some("event") {
+            "eventStream"
+        } else {
+            "queryStream"
+        }
+    } else {
+        match input.get("method").and_then(Value::as_str) {
+            Some("available") => "availableCall",
+            Some("describe") => "describeCall",
+            Some("enable") => "enableCall",
+            Some("disable") => "disableCall",
+            Some("invoke") => "invokeCall",
+            _ => return Err(PackageErrorCode::CapabilityRequestInvalid),
+        }
+    };
+    if validators[name].is_valid(&Value::Object(input.clone())) {
+        Ok(())
+    } else {
+        Err(PackageErrorCode::CapabilityRequestInvalid)
+    }
+}
+
 struct Registry {
-    descriptors: BTreeMap<&'static str, Descriptor>,
+    descriptors: BTreeMap<&'static str, BTreeMap<u16, Descriptor>>,
 }
 
 impl Registry {
@@ -1490,13 +1576,18 @@ impl Registry {
             max_minor: 0,
             kind: CapabilityKind::Signing,
         });
-        registry.register(Descriptor {
-            family: CapabilityFamily::new("teamarness.package-ports"),
-            major: 2,
-            min_minor: 0,
-            max_minor: 0,
-            kind: CapabilityKind::PackagePorts,
-        });
+        for version in teamarness_package_contract::capability_versions::SUPPORTED_VERSIONS
+            .iter()
+            .filter(|version| version.family == "teamarness.package-ports")
+        {
+            registry.register(Descriptor {
+                family: CapabilityFamily::new(version.family),
+                major: version.major,
+                min_minor: version.min_minor,
+                max_minor: version.max_minor,
+                kind: CapabilityKind::PackagePorts,
+            });
+        }
         registry.register(Descriptor {
             family: CapabilityFamily::new(crate::content_views::FAMILY),
             major: 1,
@@ -1515,8 +1606,14 @@ impl Registry {
     }
 
     fn register(&mut self, descriptor: Descriptor) {
-        self.descriptors
-            .insert(descriptor.family.name(), descriptor);
+        let versions = self
+            .descriptors
+            .entry(descriptor.family.name())
+            .or_default();
+        assert!(
+            versions.insert(descriptor.major, descriptor).is_none(),
+            "duplicate capability family-major"
+        );
     }
 
     /// Selects one version of the requested family, or says why it cannot.
@@ -1529,13 +1626,13 @@ impl Registry {
         &self,
         requirement: &CapabilityRequirement,
     ) -> Result<(Descriptor, u16), PackageErrorCode> {
-        let descriptor = *self
+        let versions = self
             .descriptors
             .get(requirement.family.as_str())
             .ok_or(PackageErrorCode::CapabilityUnavailable)?;
-        if descriptor.major != requirement.major {
-            return Err(PackageErrorCode::CapabilityVersionUnsupported);
-        }
+        let descriptor = *versions
+            .get(&requirement.major)
+            .ok_or(PackageErrorCode::CapabilityVersionUnsupported)?;
         let low = descriptor.min_minor.max(requirement.min_minor);
         let high = descriptor.max_minor.min(requirement.max_minor);
         if low > high {
@@ -2950,6 +3047,34 @@ mod tests {
         }
     }
 
+    // Verifies: TEAM.SYS.PKG-R03
+    #[test]
+    fn supported_major_metadata_matches_every_production_descriptor() {
+        let registry = Registry::production();
+        let versions = teamarness_package_contract::capability_versions::SUPPORTED_VERSIONS;
+        assert_eq!(
+            registry
+                .descriptors
+                .values()
+                .map(BTreeMap::len)
+                .sum::<usize>(),
+            versions.len()
+        );
+        for version in versions {
+            let (descriptor, minor) = registry
+                .negotiate(&requirement(
+                    version.family,
+                    version.major,
+                    version.min_minor,
+                    version.max_minor,
+                ))
+                .unwrap();
+            assert_eq!(descriptor.min_minor, version.min_minor);
+            assert_eq!(descriptor.max_minor, version.max_minor);
+            assert_eq!(minor, version.max_minor);
+        }
+    }
+
     #[test]
     fn record_log_v11_negotiates_without_changing_v10_consumers() {
         let registry = Registry::production();
@@ -3032,7 +3157,7 @@ mod tests {
     }
 
     #[test]
-    fn package_ports_only_negotiates_the_current_major() {
+    fn package_ports_negotiates_both_supported_majors_without_legacy_fallback() {
         let registry = Registry::production();
         assert_eq!(
             registry
@@ -3047,6 +3172,39 @@ mod tests {
                 .0
                 .major,
             2
+        );
+    }
+
+    // Verifies: TEAM.SYS.PKG-R03
+    #[test]
+    #[should_panic(expected = "duplicate capability family-major")]
+    fn registry_rejects_duplicate_family_major() {
+        let mut registry = Registry::production();
+        registry.register(Descriptor {
+            family: CapabilityFamily::new("teamarness.package-ports"),
+            major: 2,
+            min_minor: 0,
+            max_minor: 0,
+            kind: CapabilityKind::PackagePorts,
+        });
+    }
+
+    // Verifies: TEAM.SYS.PKG-R03
+    #[test]
+    fn package_ports_major_three_negotiates_alongside_major_two() {
+        let registry = Registry::production();
+        for major in [2, 3] {
+            let (descriptor, minor) = registry
+                .negotiate(&requirement("teamarness.package-ports", major, 0, 0))
+                .unwrap();
+            assert_eq!(descriptor.major, major);
+            assert_eq!(minor, 0);
+        }
+        assert_eq!(
+            registry
+                .negotiate(&requirement("teamarness.package-ports", 4, 0, 0))
+                .unwrap_err(),
+            PackageErrorCode::CapabilityVersionUnsupported
         );
     }
 

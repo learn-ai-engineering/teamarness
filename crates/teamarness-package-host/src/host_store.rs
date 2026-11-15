@@ -17,6 +17,12 @@ pub(crate) struct HostStore {
     connection: Connection,
 }
 
+pub(crate) struct PortSelectionScope<'a> {
+    pub(crate) installation: &'a str,
+    pub(crate) workspace: &'a str,
+    pub(crate) package: &'a str,
+}
+
 /// The one Package Host store, shared by every Package in a Host.
 ///
 /// Opening runs directory checks, permission changes and the migration batch,
@@ -106,22 +112,36 @@ impl HostStore {
         connection
             .execute_batch(include_str!("../migrations/0003_agent_port_selections.sql"))
             .map_err(fault!(storage_failure()))?;
+        connection
+            .execute_batch(include_str!(
+                "../migrations/0004_person_port_selections.sql"
+            ))
+            .map_err(fault!(storage_failure()))?;
         Ok(Self { connection })
     }
 
     pub(crate) fn port_selections(
         &self,
-        installation: &str,
-        workspace: &str,
-        package: &str,
+        scope: PortSelectionScope<'_>,
+        person: bool,
     ) -> Result<std::collections::BTreeMap<String, u16>, HostStoreFailure> {
+        let PortSelectionScope {
+            installation,
+            workspace,
+            package,
+        } = scope;
+        let table = if person {
+            "person_port_selections"
+        } else {
+            "agent_port_selections"
+        };
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT contract_identity, major FROM agent_port_selections
+            .prepare(&format!(
+                "SELECT contract_identity, major FROM {table}
                  WHERE installation_identity = ?1 AND workspace_id = ?2 AND package_identity = ?3
-                 ORDER BY contract_identity",
-            )
+                 ORDER BY contract_identity"
+            ))
             .map_err(fault!(storage_failure()))?;
         statement
             .query_map(params![installation, workspace, package], |row| {
@@ -134,22 +154,33 @@ impl HostStore {
 
     pub(crate) fn select_port(
         &self,
-        installation: &str,
-        workspace: &str,
-        package: &str,
+        scope: PortSelectionScope<'_>,
         contract: &str,
         major: Option<u16>,
+        person: bool,
     ) -> Result<(), HostStoreFailure> {
+        let PortSelectionScope {
+            installation,
+            workspace,
+            package,
+        } = scope;
+        let table = if person {
+            "person_port_selections"
+        } else {
+            "agent_port_selections"
+        };
         if let Some(major) = major {
-            self.connection.execute("INSERT INTO agent_port_selections(installation_identity, workspace_id,
+            self.connection.execute(&format!("INSERT INTO {table}(installation_identity, workspace_id,
                     package_identity, contract_identity, major) VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(installation_identity, workspace_id, package_identity, contract_identity)
-                 DO UPDATE SET major = excluded.major", params![installation, workspace, package, contract, major]).map_err(fault!(storage_failure()))?;
+                 DO UPDATE SET major = excluded.major"), params![installation, workspace, package, contract, major]).map_err(fault!(storage_failure()))?;
         } else {
             self.connection
                 .execute(
-                    "DELETE FROM agent_port_selections WHERE installation_identity = ?1
-                 AND workspace_id = ?2 AND package_identity = ?3 AND contract_identity = ?4",
+                    &format!(
+                        "DELETE FROM {table} WHERE installation_identity = ?1
+                 AND workspace_id = ?2 AND package_identity = ?3 AND contract_identity = ?4"
+                    ),
                     params![installation, workspace, package, contract],
                 )
                 .map_err(fault!(storage_failure()))?;
@@ -366,5 +397,87 @@ fn ensure_private_directory(path: &Path) -> Result<(), HostStoreFailure> {
 const fn storage_failure() -> HostStoreFailure {
     HostStoreFailure {
         code: PackageErrorCode::DataDirectoryUnavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R05, TEAM.SYS.PKG-R13
+    #[test]
+    fn person_migration_preserves_agent_rows_and_separates_every_durable_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let packages = directory.path().join("packages");
+        fs::create_dir(&packages).unwrap();
+        let legacy = Connection::open(packages.join("package-host.sqlite3")).unwrap();
+        legacy
+            .execute_batch(include_str!("../migrations/0003_agent_port_selections.sql"))
+            .unwrap();
+        legacy.execute("INSERT INTO agent_port_selections VALUES ('installation-a','workspace-a','caller-a','dev.example.contract',1)",[]).unwrap();
+        drop(legacy);
+        let scope = || PortSelectionScope {
+            installation: "installation-a",
+            workspace: "workspace-a",
+            package: "caller-a",
+        };
+        let store = HostStore::open(directory.path()).unwrap();
+        assert_eq!(
+            store
+                .port_selections(scope(), false)
+                .unwrap()
+                .get("dev.example.contract"),
+            Some(&1)
+        );
+        assert!(store.port_selections(scope(), true).unwrap().is_empty());
+        store
+            .select_port(scope(), "dev.example.contract", Some(3), true)
+            .unwrap();
+        for (installation, workspace, package) in [
+            ("installation-b", "workspace-a", "caller-a"),
+            ("installation-a", "workspace-b", "caller-a"),
+            ("installation-a", "workspace-a", "caller-b"),
+        ] {
+            assert!(
+                store
+                    .port_selections(
+                        PortSelectionScope {
+                            installation,
+                            workspace,
+                            package
+                        },
+                        true
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        drop(store);
+        let store = HostStore::open(directory.path()).unwrap();
+        assert_eq!(
+            store
+                .port_selections(scope(), true)
+                .unwrap()
+                .get("dev.example.contract"),
+            Some(&3)
+        );
+        assert_eq!(
+            store
+                .port_selections(scope(), false)
+                .unwrap()
+                .get("dev.example.contract"),
+            Some(&1)
+        );
+        store
+            .select_port(scope(), "dev.example.contract", None, true)
+            .unwrap();
+        assert!(store.port_selections(scope(), true).unwrap().is_empty());
+        assert_eq!(
+            store
+                .port_selections(scope(), false)
+                .unwrap()
+                .get("dev.example.contract"),
+            Some(&1)
+        );
     }
 }

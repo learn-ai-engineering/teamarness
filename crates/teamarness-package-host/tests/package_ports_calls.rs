@@ -110,6 +110,88 @@ async fn request(
     serde_json::to_value(payload).unwrap()
 }
 
+// Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn person_queries_preserve_provider_values_and_host_actor_and_refuse_actor_selectors() {
+    use serde_json::json;
+    let fixture = common::Fixture::node_with_capabilities(
+        &[
+            ("provider", "com.example.provider"),
+            ("consumer", "com.example.consumer"),
+        ],
+        &[json!({"identity":"teamarness.package-ports","major":3,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    declare(&fixture, "provider", true);
+    declare(&fixture, "consumer", false);
+    declare_non_object_ports(&fixture);
+    let root = fixture.config.application_root().join("provider");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("ports.json")).unwrap()).unwrap();
+    document["contracts"][0]["ports"].as_array_mut().unwrap().push(json!({"name":"runtime.guide","kind":"query","description":"Guide","request":{"type":"object","additionalProperties":false},"response":{"type":"object","properties":{"markdown":{"type":"string","maxLength":100}},"required":["markdown"],"additionalProperties":false}}));
+    let bytes = serde_json::to_vec(&document).unwrap();
+    fs::write(root.join("ports.json"), &bytes).unwrap();
+    let path = root.join("teamarness.package.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["portContract"]["sha256"] = common::digest(&bytes).into();
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let key = host
+        .snapshot()
+        .await
+        .instances
+        .iter()
+        .find(|instance| instance.key.package_identity.as_str() == "com.example.consumer")
+        .unwrap()
+        .key
+        .clone();
+    let target = mount(&host, key).await;
+    let enabled=request(&host,&target,"person-enable","fixture.capability",json!({"capability":"teamarness.package-ports","method":"enable","arguments":{"access":"person","contract":"com.example.messages","major":2}})).await;
+    assert_eq!(enabled["result"]["enabled"], true, "{enabled}");
+    let expected_actor =
+        json!({"kind":"person","identity":fixture.core.public_identity().to_string()});
+    let mut arguments = json!({"access":"person","contract":"com.example.messages","major":2,"kind":"query","port":"message.list","request":{}});
+    let answer = request(
+        &host,
+        &target,
+        "person-list",
+        "fixture.capability",
+        json!({"capability":"teamarness.package-ports","method":"invoke","arguments":arguments}),
+    )
+    .await;
+    assert_eq!(
+        answer["result"],
+        json!({"accepted":true,"actor":expected_actor})
+    );
+    for port in ["message.title", "message.marker"] {
+        arguments["port"] = port.into();
+        let answer=request(&host,&target,port,"fixture.capability",json!({"capability":"teamarness.package-ports","method":"invoke","arguments":arguments})).await;
+        let expected = if port == "message.title" {
+            json!("hello")
+        } else {
+            json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":"literal"})
+        };
+        assert_eq!(answer["result"]["$teamarnessPortEnvelope"], 1);
+        assert_eq!(
+            answer["result"]["$teamarnessPortValue"], expected,
+            "{port}: {answer}"
+        );
+    }
+    for selector in ["actor", "workspaceId", "provider"] {
+        let mut forged = arguments.clone();
+        forged[selector] = expected_actor.clone();
+        assert_eq!(request(&host,&target,selector,"fixture.capability",json!({"capability":"teamarness.package-ports","method":"invoke","arguments":forged})).await["error"],"capability_request_invalid");
+    }
+    host.execute(PackageHostCommand::Shutdown(
+        teamarness_package_host::ShutdownHost,
+    ))
+    .await
+    .unwrap();
+}
+
 // Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
 #[tokio::test]
 async fn concurrent_first_calls_share_on_demand_provider_activation() {

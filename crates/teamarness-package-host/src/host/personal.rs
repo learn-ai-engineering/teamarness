@@ -831,6 +831,7 @@ impl PackageHost {
                             routes: package.routes.clone(),
                             consumed: manifest.consumed_ports.clone(),
                             contracts: manifest.port_contract.clone(),
+                            presentation: serde_json::json!({"identity":manifest.identity,"version":manifest.version.to_string(),"displayName":manifest.display_name,"description":manifest.description}),
                         },
                     )
                 })
