@@ -116,6 +116,48 @@ cargo test -p teamarness-system-tests --test agent_port_discovery --locked
 
 The consumer has no Provider-specific manifest or adapter. The script discovers complete metadata, explicitly enables Conversations, validates and loads its guide, posts with Host-derived Agent attribution, and reconciles after reconnect. Host safety tests exercise both access views. This proves repository interfaces, not a real-model loop or the standalone Agent UI. The optional `agent_reply_flow` tests require a freshly rebuilt external Package Directory; their default ignored status is not a pass. See the [author guide](docs/package-author-guide.md#act-as-a-workspace-agent).
 
+## Standalone External Gateway qualification
+
+The External Gateway is a separate Personal Package, not an application Package or a
+source dependency of this repository. It uses package-ports 3.0 as the current unbound
+Person; no Agent Package, binding or model configuration is needed. Major-2 consumers
+remain supported alongside it, with no removal scheduled by this workstream.
+
+From this repository, explicitly supply a **clean, committed** gateway source project:
+
+```sh
+node scripts/verify-external-gateway.mjs --project /absolute/path/to/external-gateway
+cargo test -p teamarness-system-tests --test person_port_discovery --locked
+cargo test -p teamarness-system-tests --test agent_port_discovery --locked
+```
+
+The runner verifies SDK ancestry and exact canonical vendor trees, runs the complete
+locked gateway checks/build and validates assembled bytes, then executes all ignored
+`external_gateway_flow` cases with `TEAMARNESS_EXTERNAL_GATEWAY_PACKAGE_DIR`. Missing
+artifacts/environment, zero executed tests or any failed check fail qualification.
+Default Host tests deliberately ignore these external cases; that is not a pass.
+Only the supplied directory is installed, into disposable loopback-only test profiles.
+No normal profile or sibling Agent repository is used. Provenance records source,
+lockfile, vendor and artifact digests, never bearer values or Package data contents.
+
+Real processes qualify Backlog paging/reads/guide/errors; live unknown multi-contract
+Providers and schema changes; major-2 compatibility; membership and caller authority;
+and listener/token isolation, pause/recovery, restart/reload, removal/reinstall and port
+conflicts. Canonical membership loss stops an idle listener and all existing route
+connections, including static guidance and primed schemas; retained enabled setup does
+not restart while membership is absent. A separate bound-caller control still proves
+Person refusal without actor fallback. The gateway observes the existing membership
+1.0 capability; this does not change other Packages’ lifecycle. Controlled reads
+separately prove unchanged Host overload and its earlier
+SDK timeout, disconnect ownership and no replay. The gateway's twelve slots count
+outstanding SDK operations, not twelve simultaneous Provider executions. SDK terminals
+release slots; a timeout does not establish that native Provider work stopped.
+
+These automated proofs do not replace Don's native settings/token/lifecycle observations
+or an actual outside coding agent following onboarding. Run manual checks only in a
+named development profile (`npm run dev -- external-gateway-verify`), using local secret
+handling; never retain bearer values in screenshots, commands or verification artifacts.
+
 ## Checks
 
 Run all repository checks from the repository root:
