@@ -202,6 +202,14 @@ export type DocumentsContract = {
       }; readonly response: {
         readonly "requestId": RequestId;
       } };
+    readonly "documents.mapping.set": { readonly request: {
+        readonly "collectionId": RecordId;
+        readonly "path": string;
+      }; readonly response: {
+        readonly "collectionId": RecordId;
+        readonly "direction": "export" | "import" | "unchanged";
+        readonly "path": string;
+      } };
     readonly "documents.place.get": { readonly request: Record<string, never>; readonly response: Place };
     readonly "documents.place.set": { readonly request: Place; readonly response: Record<string, never> };
     readonly "documents.snapshot": { readonly request: Record<string, never>; readonly response: Snapshot };

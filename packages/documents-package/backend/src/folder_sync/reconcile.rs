@@ -1418,7 +1418,7 @@ fn rename_file(root: &Path, from: &str, to: &str) -> io::Result<()> {
 
 fn log_refused_write(document: &str, refused: &WriteRefused) {
     let cause = match refused {
-        WriteRefused::Changed { .. } => "changed".to_owned(),
+        WriteRefused::Changed { found } => format!("changed:present={}", found.is_some()),
         WriteRefused::OutsideRoot => "outside_root".to_owned(),
         WriteRefused::NotADirectory => "not_a_directory".to_owned(),
         WriteRefused::Symlink => "symlink".to_owned(),
@@ -1430,4 +1430,4 @@ fn log_refused_write(document: &str, refused: &WriteRefused) {
 
 #[cfg(test)]
 #[path = "reconcile_tests.rs"]
-mod tests;
+pub(super) mod tests;

@@ -252,6 +252,8 @@ fn resolve(root: &Path, rel: &Path) -> Result<(PathBuf, String), WriteRefused> {
 
 /// The nearest folder at or above `path` that contains `.git` (a folder, or the file a linked
 /// worktree has), so a caller can warn that a mapped folder is inside a git working tree.
+// The settings requests (slice B Phase 6) are its first caller outside tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn git_ancestor(path: &Path) -> Option<PathBuf> {
     path.ancestors()
         .find(|ancestor| fs::symlink_metadata(ancestor.join(".git")).is_ok())

@@ -922,6 +922,50 @@
         "type": "object",
         "additionalProperties": false
       }
+    },
+    "documents.mapping.set": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "collectionId",
+          "path"
+        ],
+        "properties": {
+          "collectionId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "collectionId",
+          "path",
+          "direction"
+        ],
+        "properties": {
+          "collectionId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "path": {
+            "type": "string"
+          },
+          "direction": {
+            "enum": [
+              "export",
+              "import",
+              "unchanged"
+            ]
+          }
+        }
+      }
     }
   },
   "subscriptions": {

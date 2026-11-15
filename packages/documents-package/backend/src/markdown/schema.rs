@@ -801,7 +801,12 @@ pub(super) fn read_runs(text: &LoroText) -> Result<Vec<Inline>, SchemaViolation>
         .into_iter()
         .filter_map(|delta| match delta {
             TextDelta::Insert { insert, attributes } => {
-                Some(marks_of(attributes.as_ref()).map(|marks| Inline::Text(insert, marks)))
+                // The map type is pinned: with `notify` in a build, objc2's `IntoIterator` impls
+                // make inferring it overflow.
+                Some(
+                    marks_of::<HashMap<String, LoroValue, _>>(attributes.as_ref())
+                        .map(|marks| Inline::Text(insert, marks)),
+                )
             }
             _ => None,
         })

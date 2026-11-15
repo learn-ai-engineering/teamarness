@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -727,6 +728,13 @@ pub struct DocumentsActive {
     session: Mutex<Option<Session>>,
     hub: BodyHub,
     flusher: Mutex<Option<Session>>,
+    /// The folder sync session, started and stopped beside the flusher.
+    folder_sync: Mutex<Option<Session>>,
+    /// Whether this activation runs folder sync. Only reconciler tests, which drive it
+    /// directly, turn it off.
+    folder_sync_enabled: bool,
+    /// This Package's data directory, which no mapped folder may be inside.
+    data_directory: PathBuf,
     /// Where the UI last was: held in memory only, so it lasts while the Backend runs.
     place: Mutex<Place>,
 }
@@ -779,6 +787,13 @@ struct CollectionRenameRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CollectionRequest {
     collection_id: String,
+}
+/// Maps a Collection to a folder on this Installation (slice B's minimal form: no dry run yet).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MappingSetRequest {
+    collection_id: String,
+    path: String,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1119,6 +1134,14 @@ pub fn router() -> Router<DocumentsActive> {
 ///
 /// Only a test passes an observer; the shipped router passes `None`.
 pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<DocumentsActive> {
+    router_configured(observer, true)
+}
+
+/// The Backend, publishing what each activation built, with folder sync on or off.
+pub(crate) fn router_configured(
+    observer: Option<ActivationObserver>,
+    folder_sync_enabled: bool,
+) -> Router<DocumentsActive> {
     Router::new(move |activation| {
         let observer = observer.clone();
         let initialization = activation.initialization().clone();
@@ -1126,6 +1149,7 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         let cancellation = activation.cancellation().clone();
         async move {
             let directory = initialization.data_directory().path().to_owned();
+            let data_directory = directory.clone();
             let store = teamarness_package_sdk::blocking(&cancellation, move |_| {
                 DocumentStore::open(directory.join("documents.sqlite3"))
                     .map_err(|_| storage_failed())
@@ -1185,6 +1209,8 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             }
             let session = start_session(&store, &log, &sync, &changes, &hub);
             let flusher = start_flusher(&log, &hub, &changes, installation.clone());
+            let folder_sync = folder_sync_enabled
+                .then(|| start_folder_sync(&log, &hub, &changes, installation.clone()));
             Ok(DocumentsActive {
                 store,
                 log,
@@ -1195,16 +1221,21 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 session: Mutex::new(Some(session)),
                 hub,
                 flusher: Mutex::new(Some(flusher)),
+                folder_sync: Mutex::new(folder_sync),
+                folder_sync_enabled,
+                data_directory,
                 place: Mutex::new(Place::default()),
             })
         }
     })
     .on_suspend(|state: Arc<DocumentsActive>| async move {
+        stop_folder_sync(&state).await;
         stop_session(&state).await;
         stop_flusher(&state).await;
         Ok(())
     })
     .on_resume(|state: Arc<DocumentsActive>| async move {
+        stop_folder_sync(&state).await;
         stop_session(&state).await;
         stop_flusher(&state).await;
         let replay_store = state.store.clone();
@@ -1233,9 +1264,19 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             .flusher
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(flusher);
+        if state.folder_sync_enabled {
+            let folder_sync = start_folder_sync(
+                &state.log,
+                &state.hub,
+                &state.changes,
+                state.installation.clone(),
+            );
+            *recover(&state.folder_sync) = Some(folder_sync);
+        }
         Ok(())
     })
     .on_dispose(|state: Arc<DocumentsActive>| async move {
+        stop_folder_sync(&state).await;
         stop_session(&state).await;
         stop_flusher(&state).await;
         Ok(())
@@ -1299,6 +1340,33 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             let record = DomainRecord::collection_restore(&author, &request.collection_id)
                 .map_err(domain_error)?;
             append(&context, record).await
+        },
+    )
+    .request(
+        "documents.mapping.set",
+        |context: Context<DocumentsActive>, request: MappingSetRequest| async move {
+            require_collection(&context, &request.collection_id).await?;
+            let state = context.state().clone();
+            let collection = request.collection_id.clone();
+            let (root, direction) = context
+                .blocking(move |_| {
+                    folder_sync::set_mapping(
+                        &state.store,
+                        &state.data_directory,
+                        &collection,
+                        &request.path,
+                    )
+                })
+                .await?;
+            // The folder sync session sees the new mapping as a catalog change.
+            context
+                .state()
+                .changes
+                .send_modify(|revision| *revision = revision.saturating_add(1));
+            Ok(json!({
+                "collectionId": request.collection_id, "path": root,
+                "direction": direction.as_str(),
+            }))
         },
     )
     .request(
@@ -3050,6 +3118,35 @@ async fn submit_update(
     Ok(json!({ "revision": staged.revision.to_string(), "requestId": request_id }))
 }
 
+/// Starts the folder sync session: it waits for the qualified replay, reconciles every mapping,
+/// then follows file, body and catalog changes ([`folder_sync::watch::run`]).
+fn start_folder_sync(
+    log: &RecordLog,
+    hub: &BodyHub,
+    changes: &watch::Sender<u64>,
+    author: String,
+) -> Session {
+    let cancellation = CancellationToken::new();
+    let sync = folder_sync::FolderSync::new(log, hub, changes, author, cancellation.clone());
+    let task = tokio::spawn(folder_sync::watch::run(
+        sync,
+        hub.clone(),
+        hub.events.subscribe(),
+        changes.subscribe(),
+        cancellation.clone(),
+    ));
+    Session { cancellation, task }
+}
+
+/// Cancels the folder sync session and waits for it, so no reconcile outlives the activation.
+async fn stop_folder_sync(state: &DocumentsActive) {
+    let session = recover(&state.folder_sync).take();
+    if let Some(session) = session {
+        session.cancellation.cancel();
+        let _ = session.task.await;
+    }
+}
+
 async fn stop_flusher(state: &DocumentsActive) {
     let flusher = state
         .flusher
@@ -3727,6 +3824,15 @@ mod tests {
         start_as(directory, scripted, ALICE).await
     }
 
+    /// An activation whose folder sync session never starts, for tests that drive the
+    /// reconciler directly.
+    pub(super) async fn start_without_folder_sync(
+        directory: &std::path::Path,
+        scripted: ScriptedCapability,
+    ) -> Session {
+        start_configured(directory, scripted, ALICE, false).await
+    }
+
     /// An activation on the Installation whose Person is `installation`, granted record-log 1.1
     /// as the manifest requires.
     async fn start_as(
@@ -3734,16 +3840,26 @@ mod tests {
         scripted: ScriptedCapability,
         installation: &str,
     ) -> Session {
+        start_configured(directory, scripted, installation, true).await
+    }
+
+    async fn start_configured(
+        directory: &std::path::Path,
+        scripted: ScriptedCapability,
+        installation: &str,
+        folder_sync: bool,
+    ) -> Session {
         let observer: ActivationObserver = Arc::new(Mutex::new(None));
-        let mut harness =
-            HarnessBuilder::new(router_observing(Some(observer.clone())).into_backend())
-                .package_identity("dev.teamarness.documents")
-                .installation(installation, installation)
-                .data_directory(directory)
-                .capability_minor(RECORD_LOG, scripted.clone(), 1)
-                .capability("teamarness.principals", ScriptedCapability::new())
-                .start()
-                .await;
+        let mut harness = HarnessBuilder::new(
+            router_configured(Some(observer.clone()), folder_sync).into_backend(),
+        )
+        .package_identity("dev.teamarness.documents")
+        .installation(installation, installation)
+        .data_directory(directory)
+        .capability_minor(RECORD_LOG, scripted.clone(), 1)
+        .capability("teamarness.principals", ScriptedCapability::new())
+        .start()
+        .await;
         harness.activate().await.unwrap();
         let handles = observer
             .lock()

@@ -13,18 +13,17 @@ use teamarness_package_sdk::testing::ScriptedCapability;
 use teamarness_package_sdk::{BackendError, CancellationToken};
 
 use super::super::codec::sha256;
-use super::super::{FolderSync, Outcome, Refusal};
-use super::{Crash, request_id, title_of};
+use super::{Crash, FolderSync, Outcome, Refusal, request_id, title_of};
 use crate::backend::tests::{
     ALICE, Session, Writer, deliver, hex, qualify_empty_history, remote_edit, session_update,
-    start, submit, wait_until,
+    start_without_folder_sync, submit, wait_until,
 };
 use crate::store::DocumentView;
 use crate::store::mappings::{FolderMapping, MappedFile, MappingState, RefusedFile};
 
 /// A record log that signs every append as Alice, keeps it, and opens what it kept, so an
 /// inclusion check can read a request back.
-fn remembering_log() -> ScriptedCapability {
+pub(in crate::backend::folder_sync) fn remembering_log() -> ScriptedCapability {
     let records = Arc::new(Mutex::new(HashMap::<String, (u64, String, String)>::new()));
     let next = Arc::new(AtomicU64::new(100));
     ScriptedCapability::new().calls(move |method, payload| match method {
@@ -85,7 +84,7 @@ impl Fixture {
     async fn new() -> Self {
         let data = tempfile::tempdir().unwrap();
         let folder = tempfile::tempdir().unwrap();
-        let mut session = start(data.path(), remembering_log()).await;
+        let mut session = start_without_folder_sync(data.path(), remembering_log()).await;
         qualify_empty_history(&session).await;
         let collection = session
             .harness
