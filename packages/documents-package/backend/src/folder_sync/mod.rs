@@ -1,21 +1,20 @@
 //! Folder sync: a Collection mapped to a folder of Markdown files on this Installation.
 //!
-//! This module is pure so far. It holds the file codec (names, hashes, safe atomic writes and
-//! the splice writer) and the flat folder scan. It has no Backend state. The reconciler
-//! (slice B Phase 4) and the watcher (Phase 5) build on it.
+//! It holds the file codec (names, hashes, safe atomic writes and the splice writer), the flat
+//! folder scan, and the reconciler that applies the file-to-Document and Document-to-file rules
+//! crash-safely ([`FolderSync`]). The watcher (slice B Phase 5) drives the reconciler.
 //!
 //! Folder sync never follows a symbolic link, never writes outside the mapped root, and never
 //! overwrites a file whose bytes it has not seen.
 
-// Phase 4 of slice B (the reconciler) is the first caller outside tests and removes this allow.
-// Until then the codec and the scan, and their re-exports below, are only used by their tests.
-#![allow(dead_code, unused_imports)]
+// The reconciler's first caller outside tests is the watcher and lifecycle task (slice B Phase 5),
+// and the settings requests (Phase 6) are the first callers of `git_ancestor`. Until then only
+// the tests reach them, so the shipped build allows what it does not use yet. The test build
+// allows nothing.
+#![cfg_attr(not(test), allow(dead_code, unused_imports))]
 
 mod codec;
+mod reconcile;
 mod scan;
 
-pub(crate) use codec::{
-    TEMP_SUFFIX, WriteRefused, file_name, git_ancestor, name_key, sha256, splice, unique_name,
-    write_atomic,
-};
-pub(crate) use scan::{Scan, ScannedFile, scan};
+pub(crate) use reconcile::{FolderSync, Outcome, Refusal};

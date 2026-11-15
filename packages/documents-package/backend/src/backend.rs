@@ -1854,17 +1854,27 @@ async fn reopen_unopened(
     cancellation: &CancellationToken,
     document: &str,
 ) -> Result<(), BackendError> {
-    let hub = active.hub.clone();
+    reopen_document(&active.log, &active.hub, cancellation, document).await
+}
+
+/// [`reopen_unopened`] from the record log and the body hub alone, as folder sync holds them.
+async fn reopen_document(
+    log: &RecordLog,
+    hub: &BodyHub,
+    cancellation: &CancellationToken,
+    document: &str,
+) -> Result<(), BackendError> {
+    let hub = hub.clone();
     if hub.with_body(document, |body| body.unopened()) == 0 {
         return Ok(());
     }
-    let store = active.store.clone();
+    let store = hub.store.clone();
     let id = document.to_owned();
     let rows = teamarness_package_sdk::blocking(cancellation, move |_| {
         store.body_records(Some(&id)).map_err(|_| storage_failed())
     })
     .await?;
-    let unopened = import_edit_rows(&active.log, &hub, &rows).await?;
+    let unopened = import_edit_rows(log, &hub, &rows).await?;
     let changed = hub.with_body(document, |body| {
         let changed = body.unopened() != unopened;
         body.set_unopened(unopened);
@@ -2112,10 +2122,30 @@ async fn append_record(
     record: DomainRecord,
     principal: Option<&str>,
 ) -> Result<JsonValue, BackendError> {
+    append_domain_record(
+        &active.log,
+        &active.hub,
+        &active.changes,
+        cancellation,
+        record,
+        principal,
+    )
+    .await
+}
+
+/// [`append_record`] from the record log, the body hub and the change counter alone, as folder
+/// sync holds them.
+async fn append_domain_record(
+    log: &RecordLog,
+    hub: &BodyHub,
+    changes: &watch::Sender<u64>,
+    cancellation: &CancellationToken,
+    record: DomainRecord,
+    principal: Option<&str>,
+) -> Result<JsonValue, BackendError> {
     let purpose = record.kind();
     let canonical = record.encode();
-    let appended = active
-        .log
+    let appended = log
         .append_with_principal(purpose, &canonical, principal)
         .await
         .map_err(|cause| {
@@ -2125,8 +2155,8 @@ async fn append_record(
             }
             capability_error(purpose, cause)
         })?;
-    let hub = active.hub.clone();
-    let changes = active.changes.clone();
+    let hub = hub.clone();
+    let changes = changes.clone();
     let id = appended.record_id.as_str().to_owned();
     let ingested = teamarness_package_sdk::blocking(cancellation, move |_| {
         hub.ingest_record(
@@ -3519,13 +3549,13 @@ mod tests {
     use teamarness_package_sdk::testing::{Harness, HarnessBuilder, ScriptedCapability};
 
     const RECORD_LOG: &str = "teamarness.synchronization.immutable-record-log";
-    const ALICE: &str = "alice";
+    pub(super) const ALICE: &str = "alice";
     /// A Workspace Agent's Principal ID and signing key, as the Host derives them.
     const AGENT_PRINCIPAL: &str =
         "a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7";
     const AGENT_KEY: &str = "4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f";
 
-    fn hex(length: usize, seed: u64) -> String {
+    pub(super) fn hex(length: usize, seed: u64) -> String {
         format!("{seed:0length$x}")
     }
 
@@ -3540,7 +3570,7 @@ mod tests {
 
     /// Another Installation's editor of one Document: each write revises the whole body to the
     /// given Markdown and returns the one update, from a fresh peer, that its record carries.
-    struct Writer {
+    pub(super) struct Writer {
         body: DocumentBody,
     }
 
@@ -3553,13 +3583,13 @@ mod tests {
         }
 
         /// A writer of a Document this activation holds, starting from its current body.
-        fn of(handles: &ActivationHandles, document: &str) -> Self {
+        pub(super) fn of(handles: &ActivationHandles, document: &str) -> Self {
             Self {
                 body: handles.bodies.lock().unwrap()[document].writer_copy(),
             }
         }
 
-        fn write(&mut self, markdown: &str) -> Vec<u8> {
+        pub(super) fn write(&mut self, markdown: &str) -> Vec<u8> {
             let base = self.body.frontiers();
             assert!(
                 self.body
@@ -3575,7 +3605,7 @@ mod tests {
 
     /// What one UI session would submit: the body's Markdown revised to `markdown`, as one
     /// update from a fresh session peer.
-    fn session_update(
+    pub(super) fn session_update(
         handles: &ActivationHandles,
         document: &str,
         markdown: &str,
@@ -3587,7 +3617,7 @@ mod tests {
     }
 
     /// Submits a session update through the one local write path, as Alice's Installation.
-    async fn submit(
+    pub(super) async fn submit(
         handles: &ActivationHandles,
         document: &str,
         request_id: &str,
@@ -3684,13 +3714,16 @@ mod tests {
         })
     }
 
-    struct Session {
-        harness: Harness,
-        handles: ActivationHandles,
-        scripted: ScriptedCapability,
+    pub(super) struct Session {
+        pub(super) harness: Harness,
+        pub(super) handles: ActivationHandles,
+        pub(super) scripted: ScriptedCapability,
     }
 
-    async fn start(directory: &std::path::Path, scripted: ScriptedCapability) -> Session {
+    pub(super) async fn start(
+        directory: &std::path::Path,
+        scripted: ScriptedCapability,
+    ) -> Session {
         start_as(directory, scripted, ALICE).await
     }
 
@@ -3724,7 +3757,7 @@ mod tests {
         }
     }
 
-    async fn wait_until(mut ready: impl FnMut() -> bool, what: &str) {
+    pub(super) async fn wait_until(mut ready: impl FnMut() -> bool, what: &str) {
         for _ in 0..600 {
             if ready() {
                 return;
@@ -3734,7 +3767,7 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
-    async fn qualify_empty_history(session: &Session) {
+    pub(super) async fn qualify_empty_history(session: &Session) {
         let stream = session.scripted.stream();
         tokio::time::timeout(Duration::from_secs(2), stream.opened())
             .await
@@ -7029,7 +7062,12 @@ mod tests {
     }
 
     /// An edit record from another Installation's author, carrying `update`.
-    fn remote_edit(document: &str, author: &str, seed: u64, update: Vec<u8>) -> JsonValue {
+    pub(super) fn remote_edit(
+        document: &str,
+        author: &str,
+        seed: u64,
+        update: Vec<u8>,
+    ) -> JsonValue {
         record_frame(
             seed,
             author,
@@ -7045,7 +7083,7 @@ mod tests {
     }
 
     /// Delivers `frame` on the record log stream.
-    async fn deliver(session: &Session, frame: JsonValue) {
+    pub(super) async fn deliver(session: &Session, frame: JsonValue) {
         assert!(session.scripted.stream().send(frame).await);
     }
 
