@@ -26,6 +26,8 @@ use crate::store::{
     DocumentStore, ImportClassifier, IngestResult, Ingested, Reevaluation, StoreError,
 };
 
+#[path = "folder_sync/mod.rs"]
+mod folder_sync;
 #[path = "guide.rs"]
 mod guide;
 #[path = "ports.rs"]

@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 base64.workspace = true
+caseless.workspace = true
 comrak.workspace = true
 getrandom.workspace = true
 loro.workspace = true
@@ -16,6 +17,7 @@ serde_json.workspace = true
 sha2.workspace = true
 teamarness-package-sdk = { path = "../../../crates/teamarness-package-sdk" }
 tokio.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

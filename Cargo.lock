@@ -8425,6 +8425,7 @@ name = "teamarness-documents-package"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "caseless",
  "comrak",
  "getrandom 0.4.3",
  "loro",
@@ -8437,6 +8438,7 @@ dependencies = [
  "teamarness-package-sdk",
  "tempfile",
  "tokio",
+ "unicode-normalization",
 ]
 
 [[package]]
