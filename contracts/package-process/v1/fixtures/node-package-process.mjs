@@ -485,7 +485,9 @@ async function serve() {
           if (frame.payload.port === "message.idle_watch") {
             // Kept open until explicit close or process lifecycle loss.
           } else if (frame.payload.port === "message.title_watch") {
-            send({ kind: "event", streamId: frame.id, sequence: "1", payload: { $teamarnessPortEnvelope: 1, $teamarnessPortValue: [1, 2] } });
+            for (let sequence = 1; sequence <= (frame.payload.request.count ?? 1); sequence += 1) {
+              send({ kind: "event", streamId: frame.id, sequence: String(sequence), payload: { $teamarnessPortEnvelope: 1, $teamarnessPortValue: [1, 2] } });
+            }
           } else if (frame.payload.port === "message.marker_watch") {
             send({ kind: "event", streamId: frame.id, sequence: "1", payload: { $teamarnessPortEnvelope: 1,
               $teamarnessPortValue: { $teamarnessPortEnvelope: 1, $teamarnessPortValue: "literal" } } });
@@ -499,7 +501,7 @@ async function serve() {
             if (packageIdentity !== "com.example.invalid") send({ kind: "event", streamId: frame.id, sequence: "2", payload: { order: 2 } });
           }
           if (frame.payload.port !== "message.idle_watch") {
-            send({ kind: "stream_close", streamId: frame.id, code: "completed" });
+            send({ kind: "stream_close", streamId: frame.id, code: frame.payload.request.code ?? "completed" });
             uiStreams.delete(frame.id);
           }
         }
@@ -700,7 +702,7 @@ async function serve() {
         if (frame.payload.confirmed) pendingConfirmed.set(portQueryStream, frame.id);
         send({ ...(frame.payload.confirmed ? { requireReady: true } : {}), kind: "stream_open", id: portQueryStream, topic: "capability.stream", initialCredit: 32,
           payload: { grant: capabilityGrants.get("teamarness.package-ports"),
-            access: frame.payload.access ?? "declared", major: frame.payload.major ?? 1, contract: frame.payload.contract ?? "com.example.messages", port: frame.payload.port ?? "message.watch", kind: "query", request: {} } });
+            access: frame.payload.access ?? "declared", major: frame.payload.major ?? 1, contract: frame.payload.contract ?? "com.example.messages", port: frame.payload.port ?? "message.watch", kind: "query", request: frame.payload.request ?? {} } });
         if (!frame.payload.confirmed) send({ kind: "response", id: frame.id, payload: { opened: true } });
       } else if (frame.kind === "request" && frame.operation === "fixture.port_query_emit") {
         for (const [streamId, stream] of uiStreams) {
@@ -764,6 +766,10 @@ async function serve() {
             ...(frame.payload.padding ? { padding: frame.payload.padding } : {})
           } });
           emitted += 1;
+          if (frame.payload.closeCode) {
+            send({ kind: "stream_close", streamId, code: frame.payload.closeCode });
+            providerEventStreams.delete(streamId);
+          }
         }
         send({ kind: "response", id: frame.id, payload: { emitted } });
       } else if (frame.kind === "request" && frame.operation === "fixture.port_event_stats") {

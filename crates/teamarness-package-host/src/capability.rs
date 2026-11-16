@@ -1804,19 +1804,19 @@ async fn run_port_query(
     let mut terminal = query.receiver.terminal();
     let mut credit = MAX_STREAM_CREDIT;
     let mut sequence = 0;
-    let reason = loop {
+    let reason: std::borrow::Cow<'static, str> = loop {
         if *cancelled.borrow() || !drain_commands(&mut commands, &mut credit).await {
-            break "closed";
+            break "closed".into();
         }
         if credit == 0 {
             if let Some(code) = revocation.as_ref().and_then(|watch| *watch.borrow()) {
-                break crate::protocol::capability_code(code);
+                break crate::protocol::capability_code(code).into();
             }
             if let Some(end) = terminal.borrow().clone() {
                 break match end {
-                    StreamEnd::Completed => "completed",
-                    StreamEnd::Host(code) => crate::protocol::capability_code(code),
-                    _ => "provider_exited",
+                    StreamEnd::Completed => "completed".into(),
+                    StreamEnd::Host(code) => crate::protocol::capability_code(code).into(),
+                    StreamEnd::Package(error) => error.code.into(),
                 };
             }
         }
@@ -1827,10 +1827,10 @@ async fn run_port_query(
                 else { std::future::pending::<()>().await; }
             }, if credit == 0 => {},
             _ = terminal.changed(), if credit == 0 => {},
-            change = cancelled.changed() => if change.is_err() || *cancelled.borrow() { break "closed"; },
+            change = cancelled.changed() => if change.is_err() || *cancelled.borrow() { break "closed".into(); },
             command = commands.recv() => match command {
                 Some(StreamCommand::Credit(amount)) => credit += amount,
-                Some(StreamCommand::Close) | None => break "closed",
+                Some(StreamCommand::Close) | None => break "closed".into(),
             },
             event = query.receiver.changed(), if credit > 0 => match event {
                 Ok(event) => {
@@ -1838,28 +1838,21 @@ async fn run_port_query(
                     credit -= 1;
                     let value = match serde_json::to_value(event.payload) {
                         Ok(value) => value,
-                        Err(_) => break "port_event_invalid",
+                        Err(_) => break "port_event_invalid".into(),
                     };
-                    if output.event(&id, sequence, value).await.is_err() { break "process_exited"; }
-                    if query.client.credit(&query.id, 1).await.is_err() { break "process_exited"; }
+                    if output.event(&id, sequence, value).await.is_err() { break "process_exited".into(); }
+                    if query.client.credit(&query.id, 1).await.is_err() { break "process_exited".into(); }
                 }
-                Err(StreamEnd::Completed) => break "completed",
-                Err(StreamEnd::Host(PackageErrorCode::PortEventInvalid)) => break "port_event_invalid",
-                Err(StreamEnd::Host(PackageErrorCode::Overloaded)) => break "overloaded",
-                Err(StreamEnd::Host(PackageErrorCode::PortNotEnabled)) => break "port_not_enabled",
-                Err(StreamEnd::Host(PackageErrorCode::AgentNotBound)) => break "agent_not_bound",
-                Err(StreamEnd::Host(PackageErrorCode::AgentBindingChanged)) => break "agent_binding_changed",
-                Err(StreamEnd::Host(PackageErrorCode::PortActorModeInvalid)) => break "port_actor_mode_invalid",
-                Err(StreamEnd::Host(PackageErrorCode::PersonNotCurrent)) => break "person_not_current",
-                Err(StreamEnd::Host(PackageErrorCode::CapabilityUnavailable)) => break "capability_unavailable",
-                Err(_) => break "provider_exited",
+                Err(StreamEnd::Completed) => break "completed".into(),
+                Err(StreamEnd::Host(code)) => break crate::protocol::capability_code(code).into(),
+                Err(StreamEnd::Package(error)) => break error.code.into(),
             },
         }
     };
     let _ = query.client.stream_close(&query.id).await;
     output.retire(&id).await;
     streams.lock().await.remove(&id);
-    let _ = output.close(&id, reason).await;
+    let _ = output.close(&id, &reason).await;
 }
 
 #[allow(clippy::too_many_arguments)]

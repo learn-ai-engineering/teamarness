@@ -23,7 +23,7 @@ fn declare(fixture: &common::Fixture, directory: &str, provider: bool) {
                 "event":{"type":"object","properties":{"order":{"type":"integer"},"padding":{"type":"string"}},
                     "required":["order"],"additionalProperties":false}},
                 {"name":"message.title_watch","kind":"query","description":"Streaming arbitrary values",
-                    "request":{"type":"object","additionalProperties":false},"event":{}}
+                    "request":{"type":"object","properties":{"count":{"type":"integer"},"code":{"type":"string"}},"additionalProperties":false},"event":{}}
             ]}]})).unwrap();
         fs::write(root.join("ports.json"), &bytes).unwrap();
         manifest["portContract"] = json!({"path":"ports.json","sha256":common::digest(&bytes)});
@@ -1652,4 +1652,193 @@ async fn confirmed_setup_budget_includes_on_demand_activation_and_nested_provide
     ))
     .await
     .unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn confirmed_query_preserves_provider_terminal_with_remaining_and_exhausted_credit() {
+    for count in [1, 32] {
+        for code in [
+            "proof.stream_failed",
+            "completed",
+            "overloaded",
+            "cancelled",
+        ] {
+            let fixture = common::Fixture::node_with_capabilities(
+                &[("provider", "com.example.provider"), ("consumer", "com.example.consumer")],
+                &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+            ).await;
+            for (dir, provider) in [("provider", true), ("consumer", false)] {
+                declare(&fixture, dir, provider);
+                process_minor(&fixture, dir, 0, 1);
+            }
+            let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+                .await
+                .unwrap();
+            let key = host
+                .snapshot()
+                .await
+                .instances
+                .iter()
+                .find(|i| i.key.package_identity.as_str() == "com.example.consumer")
+                .unwrap()
+                .key
+                .clone();
+            let c = mount(&host, key).await;
+            assert_eq!(request(&host, &c, "open", "fixture.port_open",
+                json!({"confirmed":true,"port":"message.title_watch","request":{"count":count,"code":code}})).await["opened"], true);
+            common::eventually(Duration::from_secs(4), "query terminal follows accepted values without more credit", || async {
+                !request(&host, &c, "terminal", "fixture.port_events", json!({})).await["closeCode"].is_null()
+            }).await;
+            assert_eq!(
+                request(
+                    &host,
+                    &c,
+                    "terminal-values",
+                    "fixture.port_events",
+                    json!({})
+                )
+                .await,
+                json!({"events":vec![json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":[1,2]});count],"closeCode":code}),
+                "count={count}, code={code}"
+            );
+            let provider_key = host
+                .snapshot()
+                .await
+                .instances
+                .iter()
+                .find(|i| i.key.package_identity.as_str() == "com.example.provider")
+                .unwrap()
+                .key
+                .clone();
+            let provider = mount(&host, provider_key).await;
+            assert_eq!(
+                request(
+                    &host,
+                    &provider,
+                    "still-live",
+                    "fixture.port_query_stats",
+                    json!({})
+                )
+                .await["active"],
+                0,
+                "Provider terminal is stream-local, not a process exit"
+            );
+            host.execute(PackageHostCommand::Shutdown(
+                teamarness_package_host::ShutdownHost,
+            ))
+            .await
+            .unwrap();
+        }
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn shared_events_drain_values_before_provider_terminal_and_release_upstream() {
+    for code in [
+        "proof.stream_failed",
+        "completed",
+        "overloaded",
+        "cancelled",
+    ] {
+        let fixture = common::Fixture::node_with_capabilities(
+            &[
+                ("provider", "com.example.provider"),
+                ("a", "com.example.consumer-a"),
+                ("b", "com.example.consumer-b"),
+            ],
+            &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+        )
+        .await;
+        for (dir, provider) in [("provider", true), ("a", false), ("b", false)] {
+            declare(&fixture, dir, provider);
+            process_minor(&fixture, dir, 0, 1);
+        }
+        let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+            .await
+            .unwrap();
+        let mut observations = host.observe_ports();
+        let snapshot = host.snapshot().await;
+        let key = |identity: &str| {
+            snapshot
+                .instances
+                .iter()
+                .find(|i| i.key.package_identity.as_str() == identity)
+                .unwrap()
+                .key
+                .clone()
+        };
+        let a = mount(&host, key("com.example.consumer-a")).await;
+        let b = mount(&host, key("com.example.consumer-b")).await;
+        for c in [&a, &b] {
+            assert_eq!(
+                request(
+                    &host,
+                    c,
+                    "open",
+                    "fixture.port_event_open",
+                    json!({"confirmed":true})
+                )
+                .await["opened"],
+                true
+            );
+        }
+        let p = mount(&host, key("com.example.provider")).await;
+        assert_eq!(stats(&host, &p, 1).await["opens"], 1);
+        assert_eq!(
+            request(
+                &host,
+                &p,
+                "emit",
+                "fixture.port_event_emit",
+                json!({"order":1,"closeCode":code})
+            )
+            .await["emitted"],
+            1
+        );
+        for c in [&a, &b] {
+            common::eventually(
+                Duration::from_secs(4),
+                "shared Provider terminal follows accepted value",
+                || async { !events(&host, c, 1).await["closeCode"].is_null() },
+            )
+            .await;
+        }
+        for c in [&a, &b] {
+            assert_eq!(
+                events(&host, c, 2).await,
+                json!({"events":[{"order":1}],"closeCode":code}),
+                "code={code}"
+            );
+        }
+        let closed: Vec<_> = std::iter::from_fn(|| observations.try_recv().ok())
+            .filter(|event| event.stage == teamarness_package_host::PortStage::Closed)
+            .collect();
+        assert_eq!(closed.len(), 2);
+        let diagnostic = if code == "proof.stream_failed" {
+            "provider_error"
+        } else {
+            code
+        };
+        assert!(closed.iter().all(|event| event.code == Some(diagnostic)));
+        // A fresh explicit subscription opens a fresh upstream, not a dead shared entry.
+        assert_eq!(
+            request(
+                &host,
+                &a,
+                "reopen",
+                "fixture.port_event_open",
+                json!({"confirmed":true})
+            )
+            .await["opened"],
+            true
+        );
+        assert_eq!(stats(&host, &p, 2).await["opens"], 2);
+        host.execute(PackageHostCommand::Shutdown(
+            teamarness_package_host::ShutdownHost,
+        ))
+        .await
+        .unwrap();
+    }
 }

@@ -1,4 +1,5 @@
 //! One validated Provider event stream fans out into independently bounded Consumer streams.
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -58,7 +59,7 @@ struct Upstream {
 
 struct Subscriber {
     events: mpsc::Sender<QueuedEvent>,
-    terminal: watch::Sender<Option<&'static str>>,
+    terminal: watch::Sender<Option<Cow<'static, str>>>,
     bytes: Arc<Semaphore>,
     lease: Option<Arc<crate::port_access::SubscriptionLease>>,
 }
@@ -72,7 +73,7 @@ struct QueuedEvent {
 
 pub(crate) struct EventSubscription {
     events: mpsc::Receiver<QueuedEvent>,
-    terminal: watch::Receiver<Option<&'static str>>,
+    terminal: watch::Receiver<Option<Cow<'static, str>>>,
     key: EventKey,
     subscriber: u64,
     consumer_package: String,
@@ -182,7 +183,9 @@ impl PortBroker {
             }
             if !entry.closing {
                 for (_, subscriber) in std::mem::take(&mut entry.subscribers) {
-                    subscriber.terminal.send_replace(Some("provider_exited"));
+                    subscriber
+                        .terminal
+                        .send_replace(Some("provider_exited".into()));
                 }
                 entry.closing = true;
                 entry.stopped.notify_one();
@@ -297,7 +300,9 @@ impl PortBroker {
             );
             if let Some(old) = old {
                 for (_, subscriber) in old.subscribers {
-                    subscriber.terminal.send_replace(Some("provider_exited"));
+                    subscriber
+                        .terminal
+                        .send_replace(Some("provider_exited".into()));
                 }
                 old.stopped.notify_one();
             }
@@ -407,7 +412,7 @@ impl PortBroker {
                 outcome_uncertain: false,
             })
         };
-        let reason = loop {
+        let reason: Cow<'static, str> = loop {
             if !revoked && let Some(code) = revocation.as_ref().and_then(|watch| *watch.borrow()) {
                 let mut registry = self.events.lock().await;
                 if let Some(upstream) = registry.streams.get_mut(&subscription.key) {
@@ -415,7 +420,7 @@ impl PortBroker {
                     {
                         subscriber
                             .terminal
-                            .send_replace(Some(crate::protocol::capability_code(code)));
+                            .send_replace(Some(crate::protocol::capability_code(code).into()));
                     }
                     if upstream.subscribers.is_empty() {
                         upstream.closing = true;
@@ -425,14 +430,22 @@ impl PortBroker {
                 revoked = true;
             }
             if *cancelled.borrow() {
-                break "closed";
+                break "closed".into();
             }
             // A revoked consumer cannot keep scarce permits by withholding credit.
             if revoked && credit == 0 {
-                break subscription.terminal.borrow().unwrap_or("closed");
+                break subscription
+                    .terminal
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| "closed".into());
             }
             if subscription.events.is_closed() && subscription.events.is_empty() {
-                break subscription.terminal.borrow().unwrap_or("provider_exited");
+                break subscription
+                    .terminal
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| "provider_exited".into());
             }
             tokio::select! {
                 biased;
@@ -440,10 +453,10 @@ impl PortBroker {
                     if let Some(watch) = &mut revocation { let _ = watch.changed().await; }
                     else { std::future::pending::<()>().await; }
                 }, if !revoked => {},
-                change = cancelled.changed() => if change.is_err() || *cancelled.borrow() { break "closed"; },
+                change = cancelled.changed() => if change.is_err() || *cancelled.borrow() { break "closed".into(); },
                 command = commands.recv() => match command {
                     Some(StreamCommand::Credit(amount)) => credit += amount,
-                    Some(StreamCommand::Close) | None => break "closed",
+                    Some(StreamCommand::Close) | None => break "closed".into(),
                 },
                 event = subscription.events.recv(), if credit > 0 => match event {
                     Some(event) => {
@@ -451,13 +464,13 @@ impl PortBroker {
                         self.pause_port_work(&subscription.consumer_package.parse().expect("admitted consumer"), true).await;
                         sequence += 1;
                         credit -= 1;
-                        if output.event(&id, sequence, event.payload).await.is_err() { break "process_exited"; }
+                        if output.event(&id, sequence, event.payload).await.is_err() { break "process_exited".into(); }
                         observation(PortStage::Event, None);
                     }
-                    None => break subscription.terminal.borrow().unwrap_or("provider_exited"),
+                    None => break subscription.terminal.borrow().clone().unwrap_or_else(|| "provider_exited".into()),
                 },
                 _ = subscription.terminal.changed(), if subscription.terminal.borrow().is_none() => {
-                    if subscription.events.is_empty() { break subscription.terminal.borrow().unwrap_or("provider_exited"); }
+                    if subscription.events.is_empty() { break subscription.terminal.borrow().clone().unwrap_or_else(|| "provider_exited".into()); }
                 },
             }
         };
@@ -474,8 +487,13 @@ impl PortBroker {
         }
         drop(registry);
         output.retire(&id).await;
-        observation(PortStage::Closed, Some(reason));
-        let _ = output.close(&id, reason).await;
+        // Diagnostics use a static category; the owned Provider code only goes on the wire.
+        let diagnostic_code = match &reason {
+            Cow::Borrowed(code) => *code,
+            Cow::Owned(_) => "provider_error",
+        };
+        observation(PortStage::Closed, Some(diagnostic_code));
+        let _ = output.close(&id, &reason).await;
     }
 }
 
@@ -492,20 +510,20 @@ async fn run_upstream(
     done: watch::Sender<bool>,
     token: u64,
 ) {
-    let reason = loop {
+    let reason: Cow<'static, str> = loop {
         tokio::select! {
-            _ = stopped.notified() => break "closed",
+            _ = stopped.notified() => break "closed".into(),
             event = upstream.receiver.changed() => match event {
                 Ok(event) => {
                     let payload = match serde_json::to_value(event.payload) {
                         Ok(payload) => payload,
-                        Err(_) => break "port_event_invalid",
+                        Err(_) => break "port_event_invalid".into(),
                     };
                     let bytes = match serde_json::to_vec(&payload) {
                         Ok(bytes) => bytes.len(),
-                        Err(_) => break "port_event_invalid",
+                        Err(_) => break "port_event_invalid".into(),
                     };
-                    let Ok(bytes) = u32::try_from(bytes) else { break "port_event_invalid" };
+                    let Ok(bytes) = u32::try_from(bytes) else { break "port_event_invalid".into() };
                     let mut guard = registry.lock().await;
                     if let Some(entry) = guard.streams.get_mut(&key).filter(|entry| entry.token == token) {
                         let mut failed = Vec::new();
@@ -516,7 +534,7 @@ async fn run_upstream(
                         }
                         for (id, reason) in failed {
                             if let Some(subscriber) = entry.subscribers.remove(&id) {
-                                subscriber.terminal.send_replace(Some(reason));
+                                subscriber.terminal.send_replace(Some(reason.into()));
                             }
                         }
                         if entry.subscribers.is_empty() {
@@ -525,11 +543,11 @@ async fn run_upstream(
                         }
                     }
                     drop(guard);
-                    if upstream.client.credit(&upstream.id, 1).await.is_err() { break "provider_exited"; }
+                    if upstream.client.credit(&upstream.id, 1).await.is_err() { break "provider_exited".into(); }
                 }
-                Err(StreamEnd::Completed) => break "completed",
-                Err(StreamEnd::Host(PackageErrorCode::PortEventInvalid)) => break "port_event_invalid",
-                Err(_) => break "provider_exited",
+                Err(StreamEnd::Completed) => break "completed".into(),
+                Err(StreamEnd::Host(code)) => break crate::protocol::capability_code(code).into(),
+                Err(StreamEnd::Package(error)) => break error.code.into(),
             },
         }
     };
@@ -542,7 +560,7 @@ async fn run_upstream(
         && let Some(entry) = guard.streams.remove(&key)
     {
         for (_, subscriber) in entry.subscribers {
-            subscriber.terminal.send_replace(Some(reason));
+            subscriber.terminal.send_replace(Some(reason.clone()));
         }
     }
     done.send_replace(true);
