@@ -281,11 +281,11 @@ impl FolderSync {
         for file in self.mapped_files(collection).await? {
             if let Some(intent) = self.relocation(&file.document_id).await?
                 && !self
-                    .resume_relocation(&root, &file, &intent, outcome)
+                    .resume_relocation(&root, &file, &intent, false, outcome)
                     .await?
             {
-                blocked_paths.insert(intent.source_path);
-                blocked_paths.insert(intent.destination_path);
+                blocked_paths.insert(name_key(&intent.source_path));
+                blocked_paths.insert(name_key(&intent.destination_path));
                 blocked_documents.insert(file.document_id);
             }
         }
@@ -341,7 +341,7 @@ impl FolderSync {
             .collect();
         // Protected prefixes are not absence, including symlink-replaced directories.
         for file in &files {
-            if scanned.protects(&file.rel_path) {
+            if scanned.protects(&file.rel_path) || blocked_paths.contains(&file.name_key) {
                 blocked_documents.insert(file.document_id.clone());
             }
         }
@@ -350,7 +350,7 @@ impl FolderSync {
             .files
             .iter()
             .filter(|file| {
-                !mapped.contains(file.rel.as_str()) && !blocked_paths.contains(&file.rel)
+                !mapped.contains(file.rel.as_str()) && !blocked_paths.contains(&name_key(&file.rel))
             })
             .collect();
 
@@ -381,7 +381,7 @@ impl FolderSync {
             {
                 blocked_documents.insert(file.document_id.clone());
                 for target in candidates {
-                    blocked_paths.insert(target.rel.clone());
+                    blocked_paths.insert(name_key(&target.rel));
                     self.refuse(
                         collection,
                         &target.rel,
@@ -394,7 +394,7 @@ impl FolderSync {
                 }
             }
         }
-        new_files.retain(|file| !blocked_paths.contains(&file.rel));
+        new_files.retain(|file| !blocked_paths.contains(&name_key(&file.rel)));
 
         for link in &scanned.symlinks {
             if link.ends_with(EXTENSION) {
@@ -462,7 +462,7 @@ impl FolderSync {
         for refusal in refused {
             if !present.contains(refusal.rel_path.as_str())
                 && !scanned.protects(&refusal.rel_path)
-                && !blocked_paths.contains(&refusal.rel_path)
+                && !blocked_paths.contains(&name_key(&refusal.rel_path))
             {
                 let collection = collection.to_owned();
                 self.store(move |store| store.clear_refused_file(&collection, &refusal.rel_path))
@@ -838,7 +838,7 @@ impl FolderSync {
             .await?
             .ok_or_else(storage_failed)?;
         if self
-            .resume_relocation(Path::new(&mapping.root_path), file, &intent, outcome)
+            .resume_relocation(Path::new(&mapping.root_path), file, &intent, false, outcome)
             .await?
         {
             outcome.renamed += 1;
@@ -882,6 +882,22 @@ impl FolderSync {
                 .await?
         };
         if let Some(file) = &state
+            && folder_of(&file.rel_path)
+                .split('/')
+                .any(|part| part.ends_with(super::codec::TEMP_SUFFIX))
+        {
+            self.refuse(
+                &file.collection_id,
+                &file.rel_path,
+                None,
+                Refusal::InvalidFolder,
+                Some("Tracked path is excluded by the reserved temporary suffix".to_owned()),
+                outcome,
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(file) = &state
             && let Some(intent) = self.relocation(document).await?
         {
             let Some(mapping) = self.mapping(&file.collection_id).await? else {
@@ -889,7 +905,7 @@ impl FolderSync {
             };
             if mapping.state != MappingState::Active
                 || !self
-                    .resume_relocation(Path::new(&mapping.root_path), file, &intent, outcome)
+                    .resume_relocation(Path::new(&mapping.root_path), file, &intent, false, outcome)
                     .await?
             {
                 return Ok(());
@@ -1179,7 +1195,7 @@ impl FolderSync {
             folder_of(&file.rel_path).to_owned()
         };
         let taken = self
-            .taken(root, &file.collection_id, &folder, Some(&file.name_key))
+            .taken(root, &file.collection_id, &folder, Some(&file.rel_path))
             .await?;
         let name = relative_name(
             &folder,
@@ -1200,11 +1216,26 @@ impl FolderSync {
             operation_id: operation_id()?,
             local_move: false,
         };
+        if self
+            .relocation_conflicts(root, &file, &intent, false)
+            .await?
+        {
+            self.refuse(
+                &file.collection_id,
+                &intent.destination_path,
+                None,
+                Refusal::NameCollisionUnresolved,
+                Some("relocation blocked".to_owned()),
+                outcome,
+            )
+            .await?;
+            return Ok(file);
+        }
         let saved = intent.clone();
         self.store(move |store| store.begin_relocation(&saved))
             .await?;
         if self
-            .resume_relocation(root, &file, &intent, outcome)
+            .resume_relocation(root, &file, &intent, true, outcome)
             .await?
         {
             outcome.moved += 1;
@@ -1304,18 +1335,94 @@ impl FolderSync {
         .await
     }
 
+    /// Check both durable ownership and actual basename entries before movement or adoption.
+    /// Only recovery may count the destination itself as the moved file.
+    async fn relocation_conflicts(
+        &self,
+        root: &Path,
+        file: &MappedFile,
+        intent: &FileRelocation,
+        allow_destination: bool,
+    ) -> Result<bool, BackendError> {
+        let key = name_key(&intent.destination_path);
+        if self
+            .mapped_files(&file.collection_id)
+            .await?
+            .iter()
+            .any(|other| other.document_id != file.document_id && other.name_key == key)
+        {
+            return Ok(true);
+        }
+        let root = root.to_path_buf();
+        let source = intent.source_path.clone();
+        let destination = intent.destination_path.clone();
+        self.blocking(move || {
+            if super::codec::resolve(&root, Path::new(&destination)).is_err() {
+                return Ok(true);
+            }
+            let folder = folder_of(&destination);
+            let Ok(entries) = fs::read_dir(root.join(folder)) else {
+                return Ok(true);
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return Ok(true);
+                };
+                let rel = relative_name(folder, &entry.file_name().to_string_lossy());
+                if name_key(&rel) == key
+                    && rel != source
+                    && !(allow_destination && rel == destination)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
+    }
+
     /// A retained intent reserves both paths. Changed or unsafe bytes are refused, never
     /// interpreted as a new file or a deletion while completion remains uncertain.
+    /// Only the invocation that saved a remote intent may move its source: after restart,
+    /// matching source bytes could be a recreation of a file already moved before a crash.
     async fn resume_relocation(
         &self,
         root: &Path,
         file: &MappedFile,
         intent: &FileRelocation,
+        newly_planned: bool,
         outcome: &mut Outcome,
     ) -> Result<bool, BackendError> {
         let target = self.read(root, &intent.destination_path).await?;
         let source = self.read(root, &intent.source_path).await?;
+        let allow_destination = source.is_none()
+            || self
+                .same_entry(root, &intent.source_path, &intent.destination_path)
+                .await?;
+        if self
+            .relocation_conflicts(root, file, intent, allow_destination)
+            .await?
+        {
+            if newly_planned {
+                // This invocation has not attempted movement. Persisted intents never use
+                // this evidence: an old source could have been recreated after a crash.
+                let id = file.document_id.clone();
+                self.store(move |store| store.cancel_relocation(&id))
+                    .await?;
+            }
+            self.refuse(
+                &file.collection_id,
+                &intent.destination_path,
+                None,
+                Refusal::NameCollisionUnresolved,
+                Some("relocation blocked".to_owned()),
+                outcome,
+            )
+            .await?;
+            return Ok(false);
+        }
         if !intent.local_move
+            && newly_planned
             && source
                 .as_ref()
                 .is_some_and(|content| content.hash == intent.expected_hash)
@@ -1386,7 +1493,9 @@ impl FolderSync {
                 self.crash_point(Crash::PlacementAppended)?;
             }
             let title = title_of(&intent.destination_path);
-            if current.title.as_deref() != Some(title.as_str()) {
+            if title_of(&intent.source_path) != title
+                && current.title.as_deref() != Some(title.as_str())
+            {
                 self.append(
                     DomainRecord::document_rename(&self.author, &file.document_id, &title)
                         .map_err(|_| storage_failed())?,
@@ -1556,8 +1665,12 @@ impl FolderSync {
             .await?
             .into_iter()
             .filter(|file| name_key(folder_of(&file.rel_path)) == name_key(folder))
+            .filter(|file| own != Some(file.rel_path.as_str()))
             .map(|file| name_key(file.rel_path.rsplit('/').next().unwrap_or(&file.rel_path)))
             .collect();
+        let own = own
+            .filter(|own| folder_of(own) == folder)
+            .map(|own| own.rsplit('/').next().unwrap_or(own).to_owned());
         let root = root.join(folder);
         let entries = self
             .blocking(move || {
@@ -1565,6 +1678,7 @@ impl FolderSync {
                     .map(|entries| {
                         entries
                             .filter_map(Result::ok)
+                            .filter(|entry| own.as_deref() != entry.file_name().to_str())
                             .map(|entry| name_key(&entry.file_name().to_string_lossy()))
                             .collect::<Vec<_>>()
                     })
@@ -1572,9 +1686,6 @@ impl FolderSync {
             })
             .await?;
         taken.extend(entries);
-        if let Some(own) = own {
-            taken.remove(&name_key(own.rsplit('/').next().unwrap_or(own)));
-        }
         Ok(taken)
     }
 

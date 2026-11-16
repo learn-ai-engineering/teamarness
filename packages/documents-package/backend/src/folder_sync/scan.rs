@@ -114,6 +114,10 @@ fn scan_directory(root: &Path, parent: &str, mode: ScanMode, scan: &mut Scan) ->
         let rel = relative(&lossy);
         if let Some(original) = evicted_name(&lossy) {
             scan.evicted.push(relative(original));
+            if mode == ScanMode::Recursive {
+                scan.protected
+                    .push((relative(original), "unreadable".to_owned()));
+            }
             continue;
         }
         if mode == ScanMode::Recursive
@@ -128,6 +132,9 @@ fn scan_directory(root: &Path, parent: &str, mode: ScanMode, scan: &mut Scan) ->
             continue;
         }
         if lossy.starts_with('.') || lossy.ends_with(TEMP_SUFFIX) {
+            if mode == ScanMode::Recursive && lossy.ends_with(TEMP_SUFFIX) {
+                scan.protected.push((rel, "invalid_folder".to_owned()));
+            }
             continue;
         }
         let Ok(file_type) = entry.file_type() else {

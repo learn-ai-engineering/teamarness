@@ -209,6 +209,19 @@ impl DocumentStore {
         Ok(())
     }
 
+    /// Cancels only an attempt the caller knows has not reached filesystem movement.
+    pub(crate) fn cancel_relocation(&self, document: &str) -> Result<(), StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .execute(
+                "DELETE FROM file_relocations WHERE document_id=?1",
+                [document],
+            )
+            .map_err(rerr)?;
+        Ok(())
+    }
+
     /// Adopts the new path and clears the intent in one transaction, preserving body state.
     pub(crate) fn finish_relocation(
         &self,

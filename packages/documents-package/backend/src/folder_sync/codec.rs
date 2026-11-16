@@ -244,6 +244,9 @@ pub(crate) fn resolve(root: &Path, rel: &Path) -> Result<(PathBuf, String), Writ
     }
     let mut folder = root.to_path_buf();
     for part in folders {
+        if part.to_string_lossy().ends_with(TEMP_SUFFIX) {
+            return Err(WriteRefused::OutsideRoot);
+        }
         let key = name_key(&part.to_string_lossy());
         if fs::read_dir(&folder)?
             .collect::<Result<Vec<_>, _>>()?
@@ -268,6 +271,7 @@ pub(crate) fn resolve(root: &Path, rel: &Path) -> Result<(PathBuf, String), Writ
 
 pub(crate) fn representable_folder_segment(part: &str) -> bool {
     !part.starts_with('.')
+        && !part.ends_with(TEMP_SUFFIX)
         && !part.ends_with(['.', ' '])
         && part.len() <= 255
         && !part

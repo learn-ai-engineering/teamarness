@@ -1592,3 +1592,521 @@ async fn recursive_collection_move_preserves_folder_and_imports_source_bytes() {
     assert!(!fixture.root.join("Sub").exists());
     fixture.shutdown().await;
 }
+
+// Verifies: TEAM.SYS.DOCS-R14.
+#[tokio::test]
+async fn recursive_markdown_directory_placeholder_protects_descendants_with_sentinel() {
+    let fixture = Fixture::new().await;
+    fixture.recursive();
+    fs::create_dir_all(fixture.root.join("Plans.md/deep")).unwrap();
+    fixture.write("Plans.md/deep/Note.md", "Nested.\n");
+    fixture.write("Sentinel.md", "Sentinel.\n");
+    fixture.folder().await;
+    let document = fixture.titled("Note").id;
+    let before = fixture.state(&document).unwrap();
+    fs::remove_dir_all(fixture.root.join("Plans.md")).unwrap();
+    fixture.write(".Plans.md.icloud", "placeholder");
+    let count = fixture.appends();
+    assert_eq!(fixture.folder().await.archived, 0);
+    assert_eq!(fixture.state(&document).unwrap(), before);
+    assert!(!fixture.titled("Note").archived);
+    assert_eq!(fixture.appends(), count);
+    let fixture = fixture.restart().await;
+    assert_eq!(fixture.folder().await.archived, 0);
+    assert_eq!(fixture.state(&document).unwrap(), before);
+    assert_eq!(fixture.text(&document), "Nested.\n");
+    fixture.shutdown().await;
+}
+
+// Verifies: TEAM.SYS.DOCS-R14, TEAM.SYS.DOCS-R15.
+#[tokio::test]
+async fn recursive_reserved_suffix_refuses_export_placement_and_enable_without_mutation() {
+    for existing in [false, true] {
+        let mut fixture = Fixture::new().await;
+        let document = fixture.document("Note", "Safe.\n").await;
+        if existing {
+            fixture.reconcile(&document).await;
+        }
+        fixture
+            .place(&document, "Parent/Scratch.teamarness-tmp")
+            .await;
+        let state = fixture.state(&document);
+        let count = fixture.appends();
+        let mapping = fixture.mapping();
+        let refusals = fixture.refusals();
+        let preview = fixture
+            .request(
+                "documents.mapping.enable-recursive",
+                json!({"collectionId": fixture.collection, "dryRun": true}),
+            )
+            .await;
+        assert_eq!(preview["report"]["blocked"], true);
+        let refused = fixture
+            .session
+            .harness
+            .request(
+                "documents.mapping.enable-recursive",
+                json!({"collectionId": fixture.collection}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.details()["reason"], "relocation_blocked");
+        assert_eq!(fixture.mapping(), mapping);
+        assert_eq!(fixture.state(&document), state);
+        assert_eq!(fixture.refusals(), refusals);
+        assert_eq!(fixture.appends(), count);
+        assert!(!fixture.root.join("Parent").exists());
+        fixture.recursive();
+        fixture.reconcile(&document).await;
+        assert_eq!(fixture.state(&document), state);
+        assert_eq!(
+            fixture.titled("Note").folder,
+            "Parent/Scratch.teamarness-tmp"
+        );
+        assert!(!fixture.root.join("Parent/Scratch.teamarness-tmp").exists());
+        assert!(
+            fixture
+                .refusals()
+                .iter()
+                .any(|r| r.reason == "invalid_folder")
+        );
+        if existing {
+            assert_eq!(fixture.read("Note.md"), "Safe.\n");
+        }
+        fixture.shutdown().await;
+    }
+}
+
+// Verifies: TEAM.SYS.DOCS-R14.
+#[tokio::test]
+async fn recursive_reserved_suffix_protects_existing_tracked_prefix_without_import() {
+    let mut fixture = Fixture::new().await;
+    fixture.recursive();
+    fs::create_dir_all(fixture.root.join("Parent/Scratch")).unwrap();
+    fixture.write("Parent/Scratch/Note.md", "Safe.\n");
+    fixture.write("Sentinel.md", "Sentinel.\n");
+    fixture.folder().await;
+    let document = fixture.titled("Note").id;
+    fixture
+        .place(&document, "Parent/Scratch.teamarness-tmp")
+        .await;
+    // Seed an association written by the affected version, without relying on unsafe export.
+    let mut state = fixture.state(&document).unwrap();
+    fs::rename(
+        fixture.root.join("Parent/Scratch"),
+        fixture.root.join("Parent/Scratch.teamarness-tmp"),
+    )
+    .unwrap();
+    state.rel_path = "Parent/Scratch.teamarness-tmp/Note.md".to_owned();
+    state.name_key = super::super::codec::name_key(&state.rel_path);
+    fixture
+        .session
+        .handles
+        .store
+        .upsert_mapped_file(&state)
+        .unwrap();
+    fixture.write(
+        "Parent/Scratch.teamarness-tmp/Unmanaged.md",
+        "Never import.\n",
+    );
+    let count = fixture.appends();
+    assert_eq!(fixture.folder().await.archived, 0);
+    assert_eq!(fixture.state(&document).unwrap(), state);
+    assert!(!fixture.titled("Note").archived);
+    assert_eq!(fixture.documents().len(), 2);
+    assert_eq!(fixture.appends(), count);
+    assert_eq!(fixture.read(&state.rel_path), "Safe.\n");
+    let fixture = fixture.restart().await;
+    assert_eq!(fixture.folder().await.archived, 0);
+    assert_eq!(fixture.state(&document).unwrap(), state);
+    fixture.shutdown().await;
+}
+
+// Verifies: TEAM.SYS.DOCS-R14, TEAM.SYS.DOCS-R15.
+#[tokio::test]
+async fn recursive_parent_only_moves_preserve_sanitized_and_suffixed_titles_after_restart() {
+    for (title, basename) in [("A/B", "A-B.md"), ("Note", "Note (2).md")] {
+        for interrupted in [false, true] {
+            let mut fixture = Fixture::new().await;
+            fixture.recursive();
+            if title == "Note" {
+                let first = fixture.document("Note", "Other.\n").await;
+                fixture.reconcile(&first).await;
+            }
+            let document = fixture.document(title, "Original.\n").await;
+            fixture.reconcile(&document).await;
+            assert_eq!(fixture.state(&document).unwrap().rel_path, basename);
+            let before = fixture.state(&document).unwrap();
+            fs::create_dir(fixture.root.join("Parent")).unwrap();
+            fs::rename(
+                fixture.root.join(basename),
+                fixture.root.join("Parent").join(basename),
+            )
+            .unwrap();
+            let count = fixture.appends();
+            if interrupted {
+                fixture.sync.crash_at(Crash::PlacementAppended);
+                assert_eq!(
+                    fixture
+                        .sync
+                        .reconcile_folder(&fixture.collection)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    "documents.test_crash"
+                );
+                fixture = fixture.restart().await;
+            }
+            fixture.folder().await;
+            let moved = fixture
+                .documents()
+                .into_iter()
+                .find(|d| d.id == document)
+                .unwrap();
+            assert_eq!(moved.title.as_deref(), Some(title));
+            assert_eq!(moved.folder, "Parent");
+            if !interrupted {
+                assert_eq!(fixture.appends(), count + 1, "only placement is appended");
+            } else {
+                assert_eq!(
+                    fixture.appends(),
+                    0,
+                    "recovery appends no rename or duplicate placement"
+                );
+            }
+            let state = fixture.state(&document).unwrap();
+            assert_eq!(state.base_version, before.base_version);
+            assert_eq!(state.written_hash, before.written_hash);
+            assert_eq!(fixture.read(&state.rel_path), "Original.\n");
+            fs::rename(fixture.root.join("Parent"), fixture.root.join("Renamed")).unwrap();
+            fixture.folder().await;
+            let moved = fixture
+                .documents()
+                .into_iter()
+                .find(|d| d.id == document)
+                .unwrap();
+            assert_eq!(moved.title.as_deref(), Some(title));
+            assert_eq!(moved.folder, "Renamed");
+            fixture.settled().await;
+            fixture.shutdown().await;
+        }
+    }
+}
+
+// Verifies: TEAM.SYS.DOCS-R14.
+#[tokio::test]
+async fn recursive_relocation_checks_tracked_alias_before_movement() {
+    tracked_alias_relocation(false).await;
+}
+
+#[tokio::test]
+async fn recursive_relocation_checks_tracked_alias_during_recovery() {
+    tracked_alias_relocation(true).await;
+}
+
+async fn tracked_alias_relocation(already_moved: bool) {
+    let mut fixture = Fixture::new().await;
+    fixture.recursive();
+    fs::create_dir(fixture.root.join("Target")).unwrap();
+    fixture.write("Note.md", "Source.\n");
+    fixture.write("Target/note.md", "Other owner.\n");
+    fixture.write("Sentinel.md", "Sentinel.\n");
+    fixture.folder().await;
+    let document = fixture.titled("Note").id;
+    let other = fixture.titled("note").id;
+    let sentinel = fixture.titled("Sentinel").id;
+    let before = fixture.state(&document).unwrap();
+    let other_before = fixture.state(&other).unwrap();
+    fixture.place(&document, "Target").await;
+    // Real-store witness: the alias owner remains tracked after its disk entry was
+    // removed, before the next scan. This does not assume alias-distinct storage.
+    fs::remove_file(fixture.root.join("Target/note.md")).unwrap();
+    if already_moved {
+        let intent = crate::store::mappings::FileRelocation {
+            document_id: document.clone(),
+            source_path: "Note.md".into(),
+            destination_path: "Target/Note.md".into(),
+            expected_hash: before.written_hash.unwrap(),
+            operation_id: [7; 16],
+            local_move: false,
+        };
+        fixture
+            .session
+            .handles
+            .store
+            .begin_relocation(&intent)
+            .unwrap();
+        fs::rename(
+            fixture.root.join("Note.md"),
+            fixture.root.join("Target/Note.md"),
+        )
+        .unwrap();
+        fixture = fixture.restart().await;
+        fixture.write("Sentinel.md", "Sentinel edited.\n");
+        fixture.folder().await;
+        assert_eq!(fixture.text(&sentinel), "Sentinel edited.\n");
+        assert_eq!(fixture.state(&other).unwrap(), other_before);
+        assert!(!fixture.titled("note").archived);
+        assert_eq!(fixture.read("Target/Note.md"), "Source.\n");
+    } else {
+        fixture.reconcile(&document).await;
+        assert_eq!(fixture.read("Note.md"), "Source.\n");
+        assert!(!fixture.root.join("Target/Note.md").exists());
+    }
+    assert_eq!(fixture.state(&document).unwrap(), before);
+    assert_eq!(fixture.text(&document), "Source.\n");
+    assert_eq!(fixture.text(&other), "Other owner.\n");
+    assert!(
+        fixture
+            .refusals()
+            .iter()
+            .any(|r| r.reason == "name_collision_unresolved")
+    );
+    fixture.shutdown().await;
+}
+
+// Verifies: TEAM.SYS.DOCS-R14.
+#[tokio::test]
+async fn recursive_refused_remote_move_yields_to_latest_placement_and_source_edit_after_restart() {
+    for next in ["Allowed", ""] {
+        for restart_before_edit in [false, true] {
+            let mut fixture = Fixture::new().await;
+            fixture.recursive();
+            fixture.write("Note.md", "First.\n");
+            fixture.folder().await;
+            let document = fixture.titled("Note").id;
+            fs::create_dir(fixture.root.join("Blocked")).unwrap();
+            fixture.write("Blocked/Note.md", "Unrelated.\n");
+            fixture.place(&document, "Blocked").await;
+            fixture.reconcile(&document).await;
+            assert_eq!(fixture.read("Note.md"), "First.\n");
+            if restart_before_edit {
+                fixture = fixture.restart().await;
+            }
+            fixture.write("Note.md", "First.\n\nLater.\n");
+            fixture.place(&document, next).await;
+            if !restart_before_edit {
+                fixture = fixture.restart().await;
+            }
+            fixture.reconcile(&document).await;
+            assert_eq!(fixture.text(&document), "First.\n\nLater.\n");
+            let expected = if next.is_empty() {
+                "Note.md"
+            } else {
+                "Allowed/Note.md"
+            };
+            assert_eq!(fixture.state(&document).unwrap().rel_path, expected);
+            assert_eq!(fixture.read(expected), "First.\n\nLater.\n");
+            assert_eq!(fixture.read("Blocked/Note.md"), "Unrelated.\n");
+            assert_eq!(fixture.documents().len(), 1);
+            assert!(
+                fixture
+                    .session
+                    .handles
+                    .store
+                    .file_relocation(&document)
+                    .unwrap()
+                    .is_none()
+            );
+            fixture.folder().await;
+            fixture.settled().await;
+            fixture.shutdown().await;
+        }
+    }
+}
+
+// Verifies: TEAM.SYS.DOCS-R14.
+#[tokio::test]
+async fn recursive_completed_move_with_recreated_source_remains_uncertain_after_restart() {
+    for remove_target in [false, true] {
+        let mut fixture = Fixture::new().await;
+        fixture.recursive();
+        fixture.write("Note.md", "Original.\n");
+        fixture.write("Sentinel.md", "Sentinel.\n");
+        fixture.folder().await;
+        let document = fixture.titled("Note").id;
+        let before = fixture.state(&document).unwrap();
+        fixture.place(&document, "Moved").await;
+        fixture.sync.crash_at(Crash::FileRelocated);
+        assert_eq!(
+            fixture
+                .sync
+                .reconcile_document(&document)
+                .await
+                .unwrap_err()
+                .code(),
+            "documents.test_crash"
+        );
+        fixture.write("Note.md", "Original.\n");
+        if remove_target {
+            fs::remove_file(fixture.root.join("Moved/Note.md")).unwrap();
+        } else {
+            fixture.write("Moved/Note.md", "Changed after crash.\n");
+        }
+        fixture.place(&document, "Latest").await;
+        let fixture = fixture.restart().await;
+        fixture.folder().await;
+        assert_eq!(fixture.state(&document).unwrap(), before);
+        assert_eq!(fixture.read("Note.md"), "Original.\n");
+        assert_eq!(fixture.text(&document), "Original.\n");
+        assert!(
+            fixture
+                .session
+                .handles
+                .store
+                .file_relocation(&document)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!fixture.root.join("Latest").exists());
+        assert_eq!(fixture.documents().len(), 2);
+        fixture.shutdown().await;
+    }
+}
+
+// Verifies: TEAM.SYS.DOCS-R14.
+#[tokio::test]
+async fn recursive_refused_remote_move_uses_new_placement_without_source_edit() {
+    let mut fixture = Fixture::new().await;
+    fixture.recursive();
+    fixture.write("Note.md", "Original.\n");
+    fixture.folder().await;
+    let document = fixture.titled("Note").id;
+    let before = fixture.state(&document).unwrap();
+    fs::create_dir(fixture.root.join("Blocked")).unwrap();
+    fixture.write("Blocked/note.md", "Unrelated.\n");
+    fixture.place(&document, "Blocked").await;
+    fixture.reconcile(&document).await;
+    assert_eq!(fixture.state(&document).unwrap(), before);
+    assert_eq!(fixture.read("Blocked/note.md"), "Unrelated.\n");
+    assert!(
+        fixture
+            .session
+            .handles
+            .store
+            .file_relocation(&document)
+            .unwrap()
+            .is_none()
+    );
+    let mut fixture = fixture.restart().await;
+    fixture.place(&document, "Allowed").await;
+    fixture.folder().await;
+    assert_eq!(fixture.read("Allowed/Note.md"), "Original.\n");
+    assert_eq!(
+        fixture.state(&document).unwrap().base_version,
+        before.base_version
+    );
+    assert_eq!(fixture.read("Blocked/note.md"), "Unrelated.\n");
+    fixture.settled().await;
+    fixture.shutdown().await;
+}
+
+// Verifies: TEAM.SYS.DOCS-R14.
+#[tokio::test]
+async fn recursive_reserved_suffix_direct_document_preserves_legacy_state_and_bytes() {
+    for pending in [false, true] {
+        let mut fixture = Fixture::new().await;
+        fixture.recursive();
+        fixture.write("Note.md", "Original.\n");
+        fixture.folder().await;
+        let document = fixture.titled("Note").id;
+        fixture.place(&document, "Scratch.teamarness-tmp").await;
+        let mut state = fixture.state(&document).unwrap();
+        fs::create_dir(fixture.root.join("Scratch.teamarness-tmp")).unwrap();
+        fs::rename(
+            fixture.root.join("Note.md"),
+            fixture.root.join("Scratch.teamarness-tmp/Note.md"),
+        )
+        .unwrap();
+        state.rel_path = "Scratch.teamarness-tmp/Note.md".into();
+        state.name_key = super::super::codec::name_key(&state.rel_path);
+        if pending {
+            state.pending_write_hash = Some(sha256(b"Outside.\n"));
+            state.pending_write_version = state.base_version.clone();
+        }
+        fixture
+            .session
+            .handles
+            .store
+            .upsert_mapped_file(&state)
+            .unwrap();
+        fixture.write(&state.rel_path, "Outside.\n");
+        let count = fixture.appends();
+        assert_eq!(fixture.reconcile(&document).await.archived, 0);
+        assert_eq!(fixture.text(&document), "Original.\n");
+        assert_eq!(fixture.state(&document).unwrap(), state);
+        assert_eq!(fixture.appends(), count);
+        assert_eq!(fixture.read(&state.rel_path), "Outside.\n");
+        assert!(
+            fixture
+                .refusals()
+                .iter()
+                .any(|r| r.reason == "invalid_folder")
+        );
+        fixture
+            .request("documents.document.archive", json!({"documentId":document}))
+            .await;
+        fixture.reconcile(&document).await;
+        assert_eq!(fixture.state(&document).unwrap(), state);
+        assert_eq!(fixture.read(&state.rel_path), "Outside.\n");
+        fixture
+            .request("documents.document.restore", json!({"documentId":document}))
+            .await;
+        fixture.reconcile(&document).await;
+        assert_eq!(fixture.state(&document).unwrap(), state);
+        assert_eq!(fixture.text(&document), "Original.\n");
+        fixture.shutdown().await;
+    }
+}
+
+// Verifies: TEAM.SYS.DOCS-R14.
+#[tokio::test]
+async fn recursive_reserved_suffix_uncertain_relocation_is_not_adopted_or_cleared() {
+    let mut fixture = Fixture::new().await;
+    fixture.recursive();
+    fixture.write("Note.md", "Original.\n");
+    fixture.write("Sentinel.md", "Sentinel.\n");
+    fixture.folder().await;
+    let document = fixture.titled("Note").id;
+    fixture.place(&document, "Scratch.teamarness-tmp").await;
+    let state = fixture.state(&document).unwrap();
+    let intent = crate::store::mappings::FileRelocation {
+        document_id: document.clone(),
+        source_path: "Note.md".into(),
+        destination_path: "Scratch.teamarness-tmp/Note.md".into(),
+        expected_hash: state.written_hash.unwrap(),
+        operation_id: [9; 16],
+        local_move: false,
+    };
+    fixture
+        .session
+        .handles
+        .store
+        .begin_relocation(&intent)
+        .unwrap();
+    fs::create_dir(fixture.root.join("Scratch.teamarness-tmp")).unwrap();
+    fs::rename(
+        fixture.root.join("Note.md"),
+        fixture.root.join(&intent.destination_path),
+    )
+    .unwrap();
+    let fixture = fixture.restart().await;
+    fixture.reconcile(&document).await;
+    assert_eq!(fixture.state(&document).unwrap(), state);
+    assert_eq!(
+        fixture
+            .session
+            .handles
+            .store
+            .file_relocation(&document)
+            .unwrap()
+            .unwrap(),
+        intent
+    );
+    assert_eq!(fixture.folder().await.archived, 0);
+    assert_eq!(fixture.state(&document).unwrap(), state);
+    assert_eq!(fixture.read(&intent.destination_path), "Original.\n");
+    assert_eq!(fixture.text(&document), "Original.\n");
+    assert!(!fixture.refusals().is_empty());
+    fixture.shutdown().await;
+}
