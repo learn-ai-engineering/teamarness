@@ -572,6 +572,7 @@ impl InstanceActor {
         schemas: Arc<CompiledPortContracts>,
         contract: String,
         port: String,
+        setup: Option<crate::protocol::ConfirmedSetup>,
     ) -> Result<PortQueryStream, WireFailure> {
         self.activate().await?;
         let (process, id, generation) = {
@@ -602,6 +603,7 @@ impl InstanceActor {
                 contract,
                 port,
                 None,
+                setup,
             )
             .await?;
         Ok(PortQueryStream {
@@ -614,6 +616,7 @@ impl InstanceActor {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // Carry the caller's setup budget through the existing route.
     pub(crate) async fn port_query_stream(
         self: &Arc<Self>,
         payload: PackageValue,
@@ -622,6 +625,7 @@ impl InstanceActor {
         port: String,
         permits: RoutePermits,
         lease: Option<Arc<crate::port_access::SubscriptionLease>>,
+        setup: Option<crate::protocol::ConfirmedSetup>,
     ) -> Result<PortQueryStream, WireFailure> {
         self.activate().await?;
         let (process, id, generation) = {
@@ -652,6 +656,7 @@ impl InstanceActor {
                 contract,
                 port,
                 lease.as_ref().map(|lease| lease.delivery.clone()),
+                setup,
             )
             .await?;
         Ok(PortQueryStream {

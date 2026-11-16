@@ -149,6 +149,8 @@ struct StreamState {
     /// Whether this side has stopped serving the stream but has not yet
     /// observed the `stream_close` that ends it.
     retired: bool,
+    require_ready: bool,
+    ready: bool,
 }
 
 /// The one classifier both peers run over every frame, in both directions.
@@ -158,6 +160,7 @@ struct StreamState {
 /// same race came to be fatal on one side and silent on the other.
 #[derive(Debug, Default)]
 pub struct ContractState {
+    selected_version: Option<crate::ProtocolVersion>,
     pending: BTreeMap<String, Direction>,
     /// IDs that received their one terminal frame. A second is fatal.
     answered: Tombstones,
@@ -188,6 +191,7 @@ impl ContractState {
             FrameKind::StreamOpen => self
                 .observe_stream_open(direction, frame)
                 .map(|()| Verdict::Deliver),
+            FrameKind::StreamReady => self.observe_stream_ready(direction, frame),
             FrameKind::Event => self.observe_event(direction, frame),
             FrameKind::Credit => self.observe_credit(direction, frame),
             FrameKind::StreamClose => self.observe_stream_close(frame),
@@ -227,14 +231,33 @@ impl ContractState {
         }
     }
 
-    fn observe_version(&self, frame: &Frame) -> Result<(), ProtocolError> {
-        let major = frame
+    /// The selected process version, if initialization has been observed.
+    pub fn selected_version(&self) -> Option<crate::ProtocolVersion> {
+        self.selected_version
+    }
+
+    fn observe_version(&mut self, frame: &Frame) -> Result<(), ProtocolError> {
+        let protocol = frame
             .field("protocol")
-            .and_then(Value::as_object)
-            .and_then(|value| value.get("major"))
-            .and_then(Value::as_u64)
             .ok_or_else(|| ProtocolError::new("malformed_frame"))?;
-        if major != 1 {
+        let major = protocol["major"].as_u64().unwrap_or_default();
+        let minor = protocol["minor"].as_u64().unwrap_or(u64::MAX);
+        if major != 1 || minor > 1 {
+            return Err(ProtocolError::new("incompatible_version"));
+        }
+        let version = crate::ProtocolVersion::new(major as u16, minor as u16);
+        if self
+            .selected_version
+            .is_some_and(|selected| selected != version)
+        {
+            return Err(ProtocolError::new("incompatible_version"));
+        }
+        self.selected_version = Some(version);
+        Ok(())
+    }
+
+    fn require_confirmation_version(&self) -> Result<(), ProtocolError> {
+        if self.selected_version != Some(crate::ProtocolVersion::new(1, 1)) {
             return Err(ProtocolError::new("incompatible_version"));
         }
         Ok(())
@@ -323,6 +346,10 @@ impl ContractState {
         direction: Direction,
         frame: &Frame,
     ) -> Result<(), ProtocolError> {
+        let require_ready = frame.field("requireReady").is_some();
+        if require_ready {
+            self.require_confirmation_version()?;
+        }
         let id = id(frame, "id")?;
         validate_origin(id, direction)?;
         if self.streams.contains_key(id) || self.closed_streams.contains(id) {
@@ -343,9 +370,38 @@ impl ContractState {
                 credit,
                 last_sequence: 0,
                 retired: false,
+                require_ready,
+                ready: false,
             },
         );
         Ok(())
+    }
+
+    fn observe_stream_ready(
+        &mut self,
+        direction: Direction,
+        frame: &Frame,
+    ) -> Result<Verdict, ProtocolError> {
+        self.require_confirmation_version()?;
+        let stream_id = id(frame, "streamId")?;
+        if self.closed_streams.contains(stream_id) {
+            return Ok(self.ignore_stream_frame());
+        }
+        let stream = self
+            .streams
+            .get_mut(stream_id)
+            .ok_or_else(|| ProtocolError::new("unknown_stream"))?;
+        if stream.sender != direction {
+            return Err(ProtocolError::new("unknown_stream"));
+        }
+        if stream.retired {
+            return Ok(self.ignore_stream_frame());
+        }
+        if !stream.require_ready || stream.ready {
+            return Err(ProtocolError::new("unexpected_stream_ready"));
+        }
+        stream.ready = true;
+        Ok(Verdict::Deliver)
     }
 
     fn observe_event(
@@ -366,6 +422,9 @@ impl ContractState {
         }
         if stream.retired {
             return Ok(self.ignore_stream_frame());
+        }
+        if stream.require_ready && !stream.ready {
+            return Err(ProtocolError::new("stream_not_ready"));
         }
         if stream.credit == 0 {
             return Err(ProtocolError::new("credit_violation"));

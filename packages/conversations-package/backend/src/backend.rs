@@ -1239,6 +1239,7 @@ mod session_tests {
         let observer: ActivationObserver = Arc::new(Mutex::new(None));
         let mut harness =
             HarnessBuilder::new(router_observing(Some(observer.clone())).into_backend())
+                .process_minor(1)
                 .package_identity("dev.teamarness.conversations")
                 .installation(ALICE, "Alice")
                 .data_directory(directory)
@@ -1527,7 +1528,7 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn ports_share_ui_post_and_read_only_page_and_invalidate_live() {
+    async fn confirmed_ports_share_ui_post_and_read_only_page_and_invalidate_live() {
         let directory = tempfile::tempdir().unwrap();
         let mut session = start(directory.path(), scripted_log()).await;
         let envelope = |port: &str, actor: JsonValue, request: JsonValue| {
@@ -1549,7 +1550,7 @@ mod session_tests {
             .clone();
         let mut events = session
             .harness
-            .subscribe(
+            .subscribe_confirmed(
                 "teamarness.port.event.v1",
                 envelope("messages.changed", person.clone(), json!({})),
             )

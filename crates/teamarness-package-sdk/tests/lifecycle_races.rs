@@ -65,6 +65,14 @@ impl Backend for Fixture {
                     .call("Z3JhbnQx", "get", JsonValue::Object(Default::default()))
                     .await;
             }
+            if request.operation == "fixture.confirmed_open" {
+                let mut stream = request
+                    .capabilities
+                    .subscribe_confirmed("Z3JhbnQx", serde_json::json!({"method":"subscribe"}))
+                    .await?;
+                stream.close().await;
+                return Ok(serde_json::json!({"opened":true}));
+            }
             if request.operation == "fixture.capability_stream" {
                 let mut arguments = JsonValue::Object(Default::default());
                 let object = arguments.as_object_mut().unwrap();
@@ -406,4 +414,102 @@ async fn an_answer_for_a_call_that_never_existed_ends_the_session() {
     drop(host_write);
     drop(host_read);
     let _ = &mut host;
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn confirmed_consumer_waits_for_quiet_setup_and_reports_opening_refusal() {
+    for refusal in [false, true] {
+        let (mut host_read, mut host_write, service, mut host) = start();
+        let initialize = INITIALIZE.replace("\"minor\":0", "\"minor\":1");
+        host.observe_to_package(&initialize);
+        write_json(&mut host_write, &initialize).await;
+        host.observe_from_package(&read_frame(&mut host_read).await);
+        let request = r#"{"kind":"request","id":"h:open","operation":"fixture.confirmed_open","deadlineUnixMs":"9007199254740998","payload":{}}"#;
+        host.observe_to_package(request);
+        write_json(&mut host_write, request).await;
+        let open = read_frame(&mut host_read).await;
+        host.observe_from_package(&open);
+        assert_eq!(open.kind(), FrameKind::StreamOpen);
+        assert_eq!(open.field("requireReady"), Some(&JsonValue::Bool(true)));
+        let id = open.field("id").unwrap().as_str().unwrap();
+        // negative-wait: enqueue alone cannot complete the confirmed Consumer API.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read_frame(&mut host_read))
+                .await
+                .is_err()
+        );
+        let answer = if refusal {
+            serde_json::json!({"kind":"stream_close","streamId":id,"code":"fixture.setup_refused"})
+        } else {
+            serde_json::json!({"kind":"stream_ready","streamId":id})
+        }
+        .to_string();
+        host.observe_to_package(&answer);
+        write_json(&mut host_write, &answer).await;
+        let terminal = loop {
+            let frame = read_frame(&mut host_read).await;
+            host.observe_from_package(&frame);
+            if matches!(frame.kind(), FrameKind::Response | FrameKind::Error) {
+                break frame;
+            }
+        };
+        if refusal {
+            assert_eq!(terminal.kind(), FrameKind::Error);
+            assert_eq!(terminal.field("code").unwrap(), "fixture.setup_refused");
+        } else {
+            assert_eq!(terminal.kind(), FrameKind::Response);
+            assert_eq!(
+                terminal.field("payload").unwrap(),
+                &serde_json::json!({"opened":true})
+            );
+        }
+        write_json(&mut host_write, r#"{"kind":"shutdown","reason":"test"}"#).await;
+        loop {
+            if read_frame(&mut host_read).await.kind() == FrameKind::ShutdownAck {
+                break;
+            }
+        }
+        service.await.unwrap().unwrap();
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn cancelling_pending_confirmation_closes_its_route_and_ignores_late_ready() {
+    let (mut host_read, mut host_write, service, mut host) = start();
+    let initialize = INITIALIZE.replace("\"minor\":0", "\"minor\":1");
+    host.observe_to_package(&initialize);
+    write_json(&mut host_write, &initialize).await;
+    host.observe_from_package(&read_frame(&mut host_read).await);
+    let request = r#"{"kind":"request","id":"h:open","operation":"fixture.confirmed_open","deadlineUnixMs":"9007199254740998","payload":{}}"#;
+    host.observe_to_package(request);
+    write_json(&mut host_write, request).await;
+    let open = read_frame(&mut host_read).await;
+    host.observe_from_package(&open);
+    let id = open.field("id").unwrap().as_str().unwrap();
+    let cancel = r#"{"kind":"cancel","id":"h:cancel","targetId":"h:open"}"#;
+    host.observe_to_package(cancel);
+    write_json(&mut host_write, cancel).await;
+    let mut closed = false;
+    let mut answered = false;
+    while !closed || !answered {
+        let frame = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut host_read))
+            .await
+            .unwrap();
+        host.observe_from_package(&frame);
+        closed |= frame.kind() == FrameKind::StreamClose && frame.field("streamId").unwrap() == id;
+        answered |= frame.kind() == FrameKind::Error && frame.field("code").unwrap() == "cancelled";
+    }
+    let late = serde_json::json!({"kind":"stream_ready","streamId":id}).to_string();
+    host.observe_to_package(&late);
+    write_json(&mut host_write, &late).await;
+    write_json(&mut host_write, r#"{"kind":"ping","nonce":"cHJvYmU"}"#).await;
+    assert_eq!(read_frame(&mut host_read).await.kind(), FrameKind::Pong);
+    write_json(&mut host_write, r#"{"kind":"shutdown","reason":"test"}"#).await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::ShutdownAck
+    );
+    service.await.unwrap().unwrap();
 }

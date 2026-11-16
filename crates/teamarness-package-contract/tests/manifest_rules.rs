@@ -127,7 +127,7 @@ fn rejects_non_strict_versions() {
 fn rejects_unsupported_protocol_ranges() {
     for protocol in [
         json!({"major": 2, "minMinor": 0, "maxMinor": 0}),
-        json!({"major": 1, "minMinor": 1, "maxMinor": 2}),
+        json!({"major": 1, "minMinor": 2, "maxMinor": 3}),
         json!({"major": 0, "minMinor": 0, "maxMinor": 0}),
         json!({"major": 1, "minMinor": 2, "maxMinor": 1}),
     ] {
@@ -565,4 +565,17 @@ fn a_loaded_package_directory_carries_its_declared_views() {
     .unwrap();
     let loaded = load_package_directory(root.path(), TARGET).unwrap();
     assert_eq!(loaded.ui.views, vec![UiView::Settings]);
+}
+
+// Verifies: TEAM.SYS.PKG-R04
+#[test]
+fn selects_highest_supported_process_intersection_at_admission() {
+    for (min, max, selected) in [(0, 0, 0), (0, 1, 1), (1, 1, 1), (0, 7, 1), (1, 7, 1)] {
+        let value = manifest(json!({"protocol":{"major":1,"minMinor":min,"maxMinor":max}}));
+        let admitted = parse_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            admitted.protocol.select_protocol().unwrap(),
+            teamarness_package_protocol::ProtocolVersion::new(1, selected)
+        );
+    }
 }

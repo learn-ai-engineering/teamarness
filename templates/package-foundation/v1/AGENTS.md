@@ -96,6 +96,13 @@ A Package Data Directory belongs to one Package Identity, Workspace, and Install
 
 Keep lifecycle operations bounded. The vendored SDK handles the Package Process Protocol and control-frame machinery: build a `Router`, register typed handlers, and let the activation hook produce the state those handlers share. Do not hand-write protocol frames.
 
+For confirmed setup, require selected process 1.1 and use `subscribe_confirmed`, or
+`PortClientV3::live_query_confirmed` or `subscribe_event_confirmed`. An enqueue-only
+subscription does not prove the listener is ready. A Provider subscription handler
+must register its listener and initialize change filters before returning its
+receiver. The SDK sends requested ready after that return, before values. Preserve
+1.0 compatibility and refuse unsupported confirmation without a fake ready.
+
 ### Validate before you build
 
 `npm run validate` applies Package Admission's manifest and UI contract rules to this project and prints the host's verdict, with the rule that failed and where. Run it after every contract or manifest change, before building. `npm run build` assembles `dist/` and then runs the same rules against the assembled Package Directory, with a Backend smoke launch.

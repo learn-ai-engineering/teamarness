@@ -12,7 +12,7 @@ JSON integers that may exceed JavaScript's safe integer range are decimal string
 
 ## Version and limits
 
-Version 1 selects one exact major and the highest minor supported by both peers. Version 1.0 fixes these limits:
+Version 1 selects one exact major and the highest minor supported by both peers. Versions 1.0 and 1.1 use these limits:
 
 | Limit | Value |
 |---|---:|
@@ -67,6 +67,36 @@ The Host delivers a declared command as an unmounted `request` with operation `t
 The Port Contract `major` is independent of Package Process Protocol 1.0; a compatible declared major greater than 1 uses the same frame operations. Process `response` and `event` payloads must be objects. A Port request value can use any JSON root because it is nested under `request` in the Provider envelope. Encode a Port value that is not an object, or is itself exactly the reserved two-field shape, as `{"$teamarnessPortEnvelope":1,"$teamarnessPortValue":<schema value>}`. The Rust Provider SDK wraps every Port response and event at its router, including objects, so an envelope-shaped object is unambiguous. A direct process adapter may send an ordinary object unwrapped, but must wrap an object equal to the reserved shape. The Host validates the logical value against the Port schema and preserves an event's transport object when forwarding it. Host-to-Consumer capability frames likewise wrap non-objects and the reserved-shape object. A Consumer unwraps one layer only. The shape is transport, never an actor or grant claim. `EventSender::send_port_value` accepts non-object Port events; `send` still requires object UI events. A Port event may contain a logical 256 KiB value plus the fixed envelope overhead within the separate wire and queue bounds. No process frame rule changes.
 
 The Host admits at most 8 simultaneous Port routes to one Provider generation, below the published 32 Host-to-Package request/SDK-stream slots; aggregate route and byte permits are reserved before dispatch, separately from UI/lifecycle traffic. The Host's aggregate byte bound holds four maximum request/response pairs (8 MiB), and each live query holds its permits until its stream ends. Rejection is `overloaded`, not a session-fatal frame classifier verdict. `ContractState` remains the only wire frame classifier. A writer-accepted command can have an uncertain outcome; the Host never retries it. Event fan-out has independent global/per-Provider stream, subscriber, event-count and queued-byte limits derived from the process frame, writer and credit constants; see `contracts/package-capabilities/v1/README.md`. No event stream uses a UI mount. Its Host-to-Consumer output remains within normal stream credit, and each bounded subscriber queue accepts ordered validated events without waiting for peer credit. Overflow ends only that subscriber with `port_subscriber_overflow` after already accepted events; a shared byte shortage returns stream-local `overloaded`. A schema-invalid event closes its affected stream with `port_event_invalid`, and old streams are revoked on Provider replacement. The SDK's inbound `event_lagged` also retires only its affected stream, not the process session.
+
+## Confirmed stream setup (1.1)
+
+Process 1.1 adds opt-in `stream_open.requireReady:true` and the closed control frame
+`{"kind":"stream_ready","streamId":"<existing stream ID>"}`. Neither is legal
+under selected process 1.0. An open without `requireReady` retains enqueue-only
+semantics on either version. Admission and launch select the highest common
+minor in the Host's supported range 1.0–1.1.
+
+For a confirmed open, the receiver acknowledges exactly once after registering
+its listener, before sending any value or established completion. A setup refusal
+sends `stream_close` without ready. Ready consumes neither credit nor sequence.
+The shared classifier rejects wrong-direction, unsolicited, or duplicate ready
+on a live stream and values before requested readiness. Existing bounded stream
+retirement and tombstones apply to late ready frames too.
+
+For Provider Ports, the SDK acknowledges only after `backend.subscribe` returns
+its registered `EventSubscription`. Handlers must not defer listener registration
+or initial change-filter setup past that return. The Host requests Provider
+confirmation, installs the Consumer route and lease (and event subscriber), then
+acknowledges the Consumer before forwarding values. Confirmed event subscribers
+share one confirmed upstream. A 1.0 Provider or an existing unconfirmed upstream
+refuses confirmed setup with `capability_version_unsupported`; ordinary calls and
+unconfirmed streams remain available. Ready carries no actor or authority claim.
+
+The Host uses one 20-second confirmed-setup budget, including activation; nested
+confirmation waits use only its remaining time. Expiry reports `deadline_exceeded`.
+Cancellation and late completion close pending routes and listeners. Activation
+already in progress retains ownership until it settles. Readiness means listening
+at setup, not permanent availability, durable history, or replay.
 
 ## Streams and credit
 

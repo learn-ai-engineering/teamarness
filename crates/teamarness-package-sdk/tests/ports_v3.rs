@@ -208,3 +208,78 @@ async fn person_client_rejects_missing_extra_and_malformed_catalog_fields() {
         );
     }
 }
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn confirmed_port_methods_preserve_shape_values_and_selected_version_refusal() {
+    for minor in [0, 1] {
+        for query in [false, true] {
+            let scripted = ScriptedCapability::new();
+            let router =
+                Router::stateless().request("fixture.open", move |context, _: Empty| async move {
+                    assert_eq!(context.initialization().protocol().major, 1);
+                    let client = PortClientV3::from_initialization(
+                        context.initialization(),
+                        context.capabilities().clone(),
+                    )?;
+                    let route = PortContractRef {
+                        access: PortAccessV3::Person,
+                        contract: CONTRACT,
+                        major: 1,
+                        route_revision: Some(REVISION),
+                    };
+                    let mut subscription = if query {
+                        client
+                            .live_query_confirmed(route, "value.watch", json!([null, 42]))
+                            .await?
+                    } else {
+                        client
+                            .subscribe_event_confirmed(route, "value.changed")
+                            .await?
+                    };
+                    let value = subscription.recv().await.unwrap()?;
+                    subscription.close().await;
+                    Ok(json!({"value":value}))
+                });
+            let directory = tempfile::tempdir().unwrap();
+            let mut harness = HarnessBuilder::new(router.into_backend())
+                .process_minor(minor)
+                .data_directory(directory.path())
+                .capability_version("teamarness.package-ports", scripted.clone(), 3, 0)
+                .start()
+                .await;
+            harness.activate().await.unwrap();
+            let pending = harness.start_request("fixture.open", json!({})).await;
+            if minor == 0 {
+                assert_eq!(
+                    pending.result().await.unwrap_err().code(),
+                    "capability_version_unsupported"
+                );
+                assert!(scripted.recorded_opens().is_empty());
+            } else {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    scripted.stream().opened(),
+                )
+                .await
+                .unwrap();
+                let mut expected = json!({"access":"person","contract":CONTRACT,"major":1,"routeRevision":REVISION,"port":if query {"value.watch"} else {"value.changed"},"kind":if query {"query"} else {"event"}});
+                if query {
+                    expected["request"] = json!([null, 42]);
+                }
+                let mut actual = scripted.recorded_opens()[0].clone();
+                assert!(actual.as_object_mut().unwrap().remove("grant").is_some());
+                assert_eq!(actual, expected);
+                let value = json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":null});
+                assert!(
+                    scripted
+                        .stream()
+                        .send(json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":value}))
+                        .await
+                );
+                assert_eq!(pending.result().await.unwrap(), json!({"value":value}));
+            }
+            harness.shutdown().await.unwrap();
+        }
+    }
+}

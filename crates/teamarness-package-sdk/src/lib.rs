@@ -35,7 +35,8 @@ pub use blocking::blocking;
 pub use cancellation::CancellationToken;
 pub use capability::{CapabilityClient, CapabilitySubscription, StreamCredit};
 pub use initialization::{
-    CapabilityGrant, DataDirectory, Initialization, InstallationInfo, PackageInfo, WorkspaceInfo,
+    CapabilityGrant, DataDirectory, Initialization, InstallationInfo, PackageInfo, ProcessProtocol,
+    WorkspaceInfo,
 };
 pub use lifecycle::LifecycleOperation;
 pub use router::{Activation, ActivationKind, Context, Empty, Router, RouterOperations};

@@ -18,7 +18,7 @@
 //! | `manifest.description` | `manifest_malformed` | the description is empty, padded, long or has control characters other than newline |
 //! | `manifest.author` | `manifest_malformed` | the author is empty, long or has control characters |
 //! | `manifest.homepage` | `manifest_malformed` | the homepage is not an absolute `https:` URL of at most 2048 characters |
-//! | `manifest.protocol_unsupported` | `manifest_unsupported` | the protocol range is invalid or excludes 1.0 |
+//! | `manifest.protocol_unsupported` | `manifest_unsupported` | the protocol range is invalid or has no intersection with 1.0–1.1 |
 //! | `manifest.extension_key` | `manifest_malformed` | an extension key is not a Package Identity |
 //! | `manifest.capability_identity` | `manifest_malformed` | a capability identity is malformed |
 //! | `manifest.capability_duplicate` | `manifest_malformed` | a capability is requested twice |
@@ -60,8 +60,10 @@ use crate::port_contract::{CompiledPortContracts, PortKind, compile_port_contrac
 
 /// The manifest file name inside a Package Directory.
 pub const MANIFEST_NAME: &str = "teamarness.package.json";
-/// The Package Process Protocol version the Host speaks.
-pub const SUPPORTED_PROTOCOL: (u16, u16) = (1, 0);
+/// The highest Package Process Protocol version the Host speaks.
+pub const SUPPORTED_PROTOCOL: (u16, u16) = (1, 1);
+/// The lowest supported process minor.
+pub const MIN_PROTOCOL_MINOR: u16 = 0;
 
 /// Maximum declared contract dependencies in one manifest.
 pub const MAX_CONSUMED_CONTRACTS: usize = 64;
@@ -171,6 +173,26 @@ pub struct VersionRange {
     pub major: u16,
     pub min_minor: u16,
     pub max_minor: u16,
+}
+
+impl VersionRange {
+    /// The highest process version common to this range and the Host.
+    pub fn select_protocol(
+        self,
+    ) -> Result<
+        teamarness_package_protocol::ProtocolVersion,
+        teamarness_package_protocol::ProtocolError,
+    > {
+        use teamarness_package_protocol::{ProtocolRange, negotiate_version};
+        negotiate_version(
+            ProtocolRange::new(
+                SUPPORTED_PROTOCOL.0,
+                MIN_PROTOCOL_MINOR,
+                SUPPORTED_PROTOCOL.1,
+            )?,
+            ProtocolRange::new(self.major, self.min_minor, self.max_minor)?,
+        )
+    }
 }
 
 /// A file whose bytes matched their declared size and digest.
@@ -396,10 +418,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<ManifestDocument, ContractError> {
     validate_presentation(&document.presentation)?;
     validate_range(document.protocol, "manifest.protocol_unsupported")
         .map_err(|error| error.at("/protocol"))?;
-    if document.protocol.major != SUPPORTED_PROTOCOL.0
-        || !(document.protocol.min_minor..=document.protocol.max_minor)
-            .contains(&SUPPORTED_PROTOCOL.1)
-    {
+    if document.protocol.select_protocol().is_err() {
         return Err(unsupported("manifest.protocol_unsupported").at("/protocol"));
     }
     validate_extensions(&document.extensions)?;

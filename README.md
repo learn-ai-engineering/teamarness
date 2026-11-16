@@ -303,6 +303,14 @@ Start with [Build your first Package with an agent](docs/build-your-first-packag
 
 The application build composes the Reference, Tutorial, Conversations, Repo-aware, Documents, Exhibits, and Backlog Packages into one verified index. Agent is built independently and installed as a Personal Package. Run `npm run build` to build every bundled Package's Backend, UI entrypoint, declared assets, and manifest digests; it preserves the installation-local Reference Package copy used by development.
 
+Package Process Protocol 1.0 remains supported. Opt-in process 1.1 confirmed
+subscriptions return only after Provider listener setup and Host Consumer
+registration; legacy nonconfirming Providers refuse clearly. Existing enqueue-only
+SDK methods do not acquire this guarantee. Source-built Backlog, Documents, and
+Conversations declare 1.0–1.1 support. External Providers must rebuild with the
+compatible SDK and declare 1.1 before offering confirmed streams. This upstream
+prerequisite does not yet deliver the standalone gateway's full-access HTTP surface.
+
 The protocol and supported Rust tooling have separate contracts:
 
 - [`contracts/package-process/v1/README.md`](contracts/package-process/v1/README.md) is the normative language-neutral process protocol.

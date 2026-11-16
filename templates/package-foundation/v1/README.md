@@ -21,9 +21,16 @@ npm run build
 
 ## Authoring provenance
 
-This project was generated from foundation template version `2`. It records Package Process Protocol `1.0` and UI host version `1` in `teamarness-authoring.json`, together with the creating checkout's revision (`sdkRevision`, and whether that checkout was dirty) and a digest of every vendored tree (`vendorDigests`).
+This project was generated from foundation template version `2`. Its manifest allows Package Process Protocol `1.0`–`1.1`. It records the highest supported process version `1.1` and UI host version `2` in `teamarness-authoring.json`, together with the creating checkout's revision (`sdkRevision`, and whether that checkout was dirty) and a digest of every vendored tree (`vendorDigests`).
 
 The Rust and TypeScript SDK sources under `vendor/teamarness/` are copied from that checkout, with their license metadata and source notices preserved. Their dependencies are explicit and locked in `Cargo.lock` and `package-lock.json`. `npm run check:vendor` recomputes the digests, so an edited vendored file is reported by this project's own tests; from a Teamarness checkout, `npm run create:package -- --vendor-report <project>` compares this project with that checkout without changing it.
+
+Confirmed subscriptions require selected process 1.1 on the Consumer and Provider.
+Use the explicit confirmed SDK methods when opening success must mean listening;
+existing subscription methods remain enqueue-only. A Provider handler must register
+its listener and initialize change filters before returning its receiver. An older
+Provider must rebuild with a compatible SDK and declare 1.1 support; the Host
+refuses unsupported confirmation rather than silently downgrading.
 
 There is no supported in-place SDK upgrade yet. Fixes to Teamarness SDK source do not reach this generated copy automatically; regenerate from a compatible checkout when the authoring policy instructs you to do so.
 

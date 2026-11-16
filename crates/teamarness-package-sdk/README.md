@@ -87,6 +87,13 @@ On a Port, `ports::PortActor` is the Host-derived actor: `Person { identity }` f
 
 `record_log::run_session` drives a synchronized record log for a Package: it subscribes from the cursor the sink has committed, ingests each record, and only then returns credit, so a record whose ingest fails is redelivered rather than skipped. It resets the cursor once on `cursor_invalid`, reports state and warning events to the sink, and backs off on a retryable failure until its cancellation token fires.
 
+`Initialization::protocol()` retains the exact selected process version.
+`CapabilityClient::subscribe_confirmed` requires selected process 1.1 and returns
+only after the correlated `stream_ready`, or an opening error. It uses a separate
+confirmation result, never a first domain value. Pending subscriptions retain
+close/drop cleanup; Host setup has a 20-second budget, and the SDK's 21-second
+fallback bounds a missing Host terminal. `subscribe` remains enqueue-only.
+
 `CapabilityClient` calls a negotiated grant and method. The caller supplies only method fields, not Package, Workspace, Installation, Core signing context, or transport selectors. `CapabilitySubscription::recv` validates contiguous decimal sequences and returns one credit after consumption; `recv_with_credit` hands the credit to the caller so it can be released after the work is committed.
 
 ## Person-authorized dynamic Ports
@@ -94,6 +101,20 @@ On a Port, `ports::PortActor` is the Host-derived actor: `Person { identity }` f
 Declare `teamarness.package-ports` major 3 for explicit Person access, then construct `ports_v3::PortClientV3::from_initialization(initialization, capabilities)`. A missing grant returns `package.capability_not_granted`; a negotiated major other than 3 returns `package.capability_version_unsupported`. There is no silent declared/Agent fallback. Legacy `ports::PortClient` and `PortAccess` remain source and wire compatible with major 2; both Host majors remain supported without a scheduled removal.
 
 `available(PortAccessV3::Person, cursor)` returns one bounded `PortPageV3`, including Provider presentation, `GuideEligibility`, metadata digest and route revision. Keep traversal bounded. Guide-less Providers are visible but Person enablement requires a conforming guide. Construct `PortContractRef { access, contract, major, route_revision }` from the observed summary. Pass it to `describe`, `enable`, `command`, `query`, `live_query`, or `subscribe_event`. `disable(access, contract)` removes even an unavailable selection without a route precondition. `describe` checks complete chunks, digest, schemas, exact contract identity and major through the same internal assembler as major 2.
+
+`live_query_confirmed` and `subscribe_event_confirmed` provide the same Port
+interfaces with confirmed setup. They require selected process 1.1 and never
+silently downgrade. The Host confirms both Provider registration and its Consumer
+route before returning success. A legacy Provider or an unconfirmed shared
+upstream returns `capability_version_unsupported`, not fabricated readiness.
+
+A Provider subscription handler must register its listener and initialize any
+change-filter baseline before returning `EventSubscription`. The dispatcher
+sends requested ready only after that return, before draining values. A handler
+refusal closes before ready. Backlog, Documents, and Conversations source
+manifests allow process 1.0–1.1; older external Providers must rebuild with this
+SDK and declare 1.1 support to offer confirmed streams. Port and capability
+versions, actor derivation, and unconfirmed APIs are unchanged.
 
 The Host requires an unbound caller and current local Person; it derives the actor. `port_actor_mode_invalid`, `person_not_current`, `port_guide_required`, and `port_catalog_changed` remain explicit Host refusals. A route revision is an optimistic precondition, not a Provider selector. Do not retry tool calls automatically after a stale revision or uncertain outcome.
 
@@ -114,6 +135,10 @@ harness.activate().await?;
 let answer = harness.request("example.read", json!({})).await?;
 harness.shutdown().await?;
 ```
+
+`HarnessBuilder::process_minor(1)` selects process 1.1 (the default remains 1.0).
+A scripted capability registers its stream before sending requested ready; it
+does not invent an event as confirmation.
 
 `HarnessBuilder::capability_version(identity, scripted, major, minor)` advertises an explicit negotiated version. Existing `capability` and `capability_minor` still default to major 1. Use the explicit builder for honest major-3 initialization tests.
 

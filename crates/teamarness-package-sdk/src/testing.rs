@@ -36,6 +36,7 @@ pub struct HarnessBuilder {
     backend: Arc<dyn Backend>,
     package_identity: String,
     package_version: String,
+    process_minor: u16,
     workspace: (String, String),
     installation: (String, String),
     data_directory: Option<PathBuf>,
@@ -52,6 +53,7 @@ impl HarnessBuilder {
             backend,
             package_identity: "dev.teamarness.harness".to_owned(),
             package_version: "1.0.0".to_owned(),
+            process_minor: 0,
             workspace: ("workspace1".to_owned(), "Harness Workspace".to_owned()),
             installation: ("installation1".to_owned(), "Harness".to_owned()),
             data_directory: None,
@@ -59,6 +61,14 @@ impl HarnessBuilder {
             minors: BTreeMap::new(),
             majors: BTreeMap::new(),
         }
+    }
+
+    /// Selects process 1.0 or 1.1, as a real Host handshake does.
+    #[must_use]
+    pub fn process_minor(mut self, minor: u16) -> Self {
+        assert!(minor <= 1, "unsupported process minor");
+        self.process_minor = minor;
+        self
     }
 
     /// The Package identity the Host would report.
@@ -217,7 +227,7 @@ impl HarnessBuilder {
                 "protocol",
                 object([
                     ("major", JsonValue::from(1_u64)),
-                    ("minor", JsonValue::from(0_u64)),
+                    ("minor", JsonValue::from(self.process_minor)),
                 ]),
             ),
             ("capabilities", JsonValue::Array(capabilities)),
@@ -258,6 +268,7 @@ impl HarnessBuilder {
             next_id: AtomicU64::new(1),
             pump,
             service: Some(service),
+            process_minor: self.process_minor,
         }
     }
 }
@@ -269,6 +280,7 @@ pub struct Harness {
     next_id: AtomicU64,
     pump: JoinHandle<()>,
     service: Option<JoinHandle<Result<(), SdkError>>>,
+    process_minor: u16,
 }
 
 impl Harness {
@@ -370,27 +382,68 @@ impl Harness {
         operation: &str,
         payload: JsonValue,
     ) -> Result<HarnessSubscription, BackendError> {
+        self.subscribe_inner(operation, payload, false).await
+    }
+
+    /// Waits for the real Backend handler to return its registered receiver.
+    pub async fn subscribe_confirmed(
+        &mut self,
+        operation: &str,
+        payload: JsonValue,
+    ) -> Result<HarnessSubscription, BackendError> {
+        self.subscribe_inner(operation, payload, true).await
+    }
+
+    async fn subscribe_inner(
+        &mut self,
+        operation: &str,
+        payload: JsonValue,
+        require_ready: bool,
+    ) -> Result<HarnessSubscription, BackendError> {
+        if require_ready && self.process_minor < 1 {
+            return Err(BackendError::new(
+                "capability_version_unsupported",
+                false,
+                empty(),
+            ));
+        }
         let id = self.next("stream");
         let (sender, events) = mpsc::unbounded_channel();
+        let (ready, confirmation) = oneshot::channel();
         self.lock().subscriptions.insert(id.clone(), sender);
-        let frame = object([
-            ("kind", JsonValue::String("stream_open".into())),
-            ("id", JsonValue::String(id.clone())),
-            ("topic", JsonValue::String(operation.to_owned())),
-            ("initialCredit", JsonValue::from(INITIAL_CREDIT)),
-            ("payload", payload),
-        ]);
-        if self.writer.send(&frame).await.is_err() {
-            self.lock().subscriptions.remove(&id);
-            return Err(BackendError::new("host_unavailable", true, empty()));
+        if require_ready {
+            self.lock().ready.insert(id.clone(), ready);
         }
-        Ok(HarnessSubscription {
-            id,
+        let mut subscription = HarnessSubscription {
+            id: id.clone(),
             writer: self.writer.clone(),
             routes: self.routes.clone(),
             events,
             closed: false,
-        })
+            sent: false,
+        };
+        let mut frame = object([
+            ("kind", JsonValue::String("stream_open".into())),
+            ("id", JsonValue::String(id)),
+            ("topic", JsonValue::String(operation.to_owned())),
+            ("initialCredit", JsonValue::from(INITIAL_CREDIT)),
+            ("payload", payload),
+        ]);
+        if require_ready {
+            frame["requireReady"] = true.into();
+        }
+        self.writer
+            .send(&frame)
+            .await
+            .map_err(|_| BackendError::new("host_unavailable", true, empty()))?;
+        subscription.sent = true;
+        if require_ready {
+            tokio::time::timeout(Duration::from_secs(20), confirmation)
+                .await
+                .map_err(|_| BackendError::new("deadline_exceeded", true, empty()))?
+                .map_err(|_| BackendError::new("host_unavailable", true, empty()))??;
+        }
+        Ok(subscription)
     }
 
     /// Sends a control `ping` and returns how long the answer took.
@@ -502,6 +555,7 @@ pub struct HarnessSubscription {
     routes: Arc<Mutex<Routes>>,
     events: mpsc::UnboundedReceiver<Option<Result<JsonValue, BackendError>>>,
     closed: bool,
+    sent: bool,
 }
 
 impl HarnessSubscription {
@@ -518,17 +572,42 @@ impl HarnessSubscription {
             return;
         }
         self.closed = true;
+        lock(&self.routes).ready.remove(&self.id);
         self.routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .subscriptions
             .remove(&self.id);
+        if !self.sent {
+            return;
+        }
         let frame = object([
             ("kind", JsonValue::String("stream_close".into())),
             ("streamId", JsonValue::String(self.id.clone())),
             ("code", JsonValue::String("closed".into())),
         ]);
         let _ = self.writer.send(&frame).await;
+    }
+}
+
+impl Drop for HarnessSubscription {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        let mut routes = lock(&self.routes);
+        routes.ready.remove(&self.id);
+        routes.subscriptions.remove(&self.id);
+        drop(routes);
+        if self.sent {
+            let writer = self.writer.clone();
+            let id = self.id.clone();
+            tokio::spawn(async move {
+                let _ = writer
+                    .send(&serde_json::json!({"kind":"stream_close","streamId":id,"code":"closed"}))
+                    .await;
+            });
+        }
     }
 }
 
@@ -783,6 +862,7 @@ pub fn assert_router_matches_contract(operations: &RouterOperations, contract_js
 
 #[derive(Default)]
 struct Routes {
+    ready: BTreeMap<String, oneshot::Sender<Result<(), BackendError>>>,
     requests: BTreeMap<String, oneshot::Sender<Result<JsonValue, BackendError>>>,
     subscriptions: BTreeMap<String, mpsc::UnboundedSender<Option<Result<JsonValue, BackendError>>>>,
     pings: BTreeMap<String, oneshot::Sender<()>>,
@@ -844,6 +924,13 @@ async fn pump(
                     let _ = sender.send(());
                 }
             }
+            FrameKind::StreamReady => {
+                if let Some(id) = string(&frame, "streamId")
+                    && let Some(ready) = lock(&routes).ready.remove(&id)
+                {
+                    let _ = ready.send(Ok(()));
+                }
+            }
             FrameKind::Event => {
                 let Some(id) = string(&frame, "streamId") else {
                     continue;
@@ -879,6 +966,13 @@ async fn pump(
                     drop(inner);
                     scripted.shared.stream.notify.notify_waiters();
                     continue;
+                }
+                if let Some(ready) = lock(&routes).ready.remove(&id) {
+                    let code = frame
+                        .field("code")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("closed");
+                    let _ = ready.send(Err(BackendError::new(code, false, empty())));
                 }
                 let waiting = lock(&routes).subscriptions.remove(&id);
                 if let Some(sender) = waiting {
@@ -957,6 +1051,14 @@ async fn pump(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(payload);
+                package_streams.insert(id.clone(), scripted.clone());
+                if frame.field("requireReady").is_some() {
+                    // Register first; do not make the sender usable until ready is on
+                    // the wire, so a concurrent test sender cannot overtake it.
+                    let _ = writer
+                        .send(&serde_json::json!({"kind":"stream_ready","streamId":id}))
+                        .await;
+                }
                 *scripted
                     .shared
                     .stream
@@ -969,7 +1071,6 @@ async fn pump(
                     closed: false,
                 };
                 scripted.shared.stream.notify.notify_waiters();
-                package_streams.insert(id, scripted.clone());
             }
             FrameKind::Credit => {
                 let Some(id) = string(&frame, "streamId") else {

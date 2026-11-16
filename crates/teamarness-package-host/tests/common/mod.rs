@@ -158,6 +158,8 @@ pub fn write_node_package_with_capabilities(
             "fixture.saturation": {"request": {}, "event": {}}
         }
     });
+    contract["requests"]["fixture.process_version"] =
+        serde_json::json!({"request":{},"response":{}});
     contract["requests"]["fixture.port_release"] = serde_json::json!({"request":{},"response":{}});
     contract["requests"]["fixture.port_query_stats"] =
         serde_json::json!({"request":{},"response":{}});

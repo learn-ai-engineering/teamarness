@@ -11,7 +11,7 @@ export const INITIAL_STREAM_CREDIT = 32;
 const immutableCapability = `teamarness.synchro${"nization"}.immutable-record-log`;
 const KNOWN_KINDS = new Set([
   "initialize", "initialized", "request", "response", "error", "cancel", "stream_open",
-  "event", "credit", "stream_close", "ping", "pong", "shutdown", "shutdown_ack",
+  "stream_ready", "event", "credit", "stream_close", "ping", "pong", "shutdown", "shutdown_ack",
 ]);
 
 export class ProtocolFailure extends Error {
@@ -52,7 +52,8 @@ function validateFrame(frame) {
     initialized: ["kind", "nonce", "package", "uiContractDigest", "processGeneration", "protocol"],
     request: ["kind", "id", "operation", "grant", "mountId", "deadlineUnixMs", "payload"],
     response: ["kind", "id", "payload"], error: ["kind", "id", "code", "retryable", "outcomeUncertain", "details"],
-    cancel: ["kind", "id", "targetId"], stream_open: ["kind", "id", "topic", "mountId", "initialCredit", "payload"],
+    cancel: ["kind", "id", "targetId"], stream_open: ["kind", "id", "topic", "mountId", "initialCredit", "payload", "requireReady"],
+    stream_ready: ["kind", "streamId"],
     event: ["kind", "streamId", "sequence", "payload"], credit: ["kind", "streamId", "amount"],
     stream_close: ["kind", "streamId", "code"], ping: ["kind", "nonce"], pong: ["kind", "nonce"],
     shutdown: ["kind", "reason"], shutdown_ack: ["kind"],
@@ -83,7 +84,9 @@ function validateFrame(frame) {
     id(frame.id); requiredString("code"); if (typeof frame.retryable !== "boolean") throw new ProtocolFailure("malformed_frame");
   } else if (frame.kind === "cancel") { id(frame.id); id(frame.targetId);
   } else if (frame.kind === "stream_open") {
+    if (frame.requireReady !== undefined && frame.requireReady !== true) throw new ProtocolFailure("malformed_frame");
     id(frame.id); requiredString("topic"); payload(); if (!Number.isInteger(frame.initialCredit)) throw new ProtocolFailure("malformed_frame");
+  } else if (frame.kind === "stream_ready") { id(frame.streamId);
   } else if (frame.kind === "event") { id(frame.streamId); decimal(frame.sequence); payload();
   } else if (frame.kind === "credit") { id(frame.streamId); if (!Number.isInteger(frame.amount)) throw new ProtocolFailure("malformed_frame");
   } else if (frame.kind === "stream_close") { id(frame.streamId);
@@ -157,6 +160,8 @@ class Tombstones {
  * state it names. Everything else throws and is fatal to the generation.
  */
 export class ContractState {
+  #minor = 0;
+  #selected = false;
   #pending = new Map();
   #answered = new Tombstones();
   #abandoned = new Tombstones();
@@ -178,9 +183,12 @@ export class ContractState {
 
   observe(direction, frame) {
     validateDirection(direction, frame);
-    if ((frame.kind === "initialize" || frame.kind === "initialized") && frame.protocol?.major !== 1) {
-      throw new ProtocolFailure("incompatible_version");
+    if (frame.kind === "initialize" || frame.kind === "initialized") {
+      if (frame.protocol?.major !== 1 || ![0, 1].includes(frame.protocol?.minor) || (this.#selected && this.#minor !== frame.protocol.minor)) throw new ProtocolFailure("incompatible_version");
+      this.#minor = frame.protocol.minor;
+      this.#selected = true;
     }
+    if ((frame.kind === "stream_ready" || frame.requireReady !== undefined) && this.#minor < 1) throw new ProtocolFailure("incompatible_version");
     if (frame.kind === "request") {
       if (this.#pending.has(frame.id) || this.#answered.has(frame.id) || this.#abandoned.has(frame.id)) {
         throw new ProtocolFailure("duplicate_id");
@@ -218,12 +226,20 @@ export class ContractState {
         throw new ProtocolFailure("duplicate_id");
       }
       if (frame.initialCredit !== INITIAL_STREAM_CREDIT) throw new ProtocolFailure("credit_violation");
-      this.#streams.set(frame.id, { sender: direction === "host" ? "package" : "host", credit: frame.initialCredit, sequence: 0n, retired: false });
+      this.#streams.set(frame.id, { sender: direction === "host" ? "package" : "host", credit: frame.initialCredit, sequence: 0n, retired: false, requireReady: frame.requireReady === true, ready: false });
+    } else if (frame.kind === "stream_ready") {
+      if (this.#closedStreams.has(frame.streamId)) return IGNORE;
+      const stream = this.#streams.get(frame.streamId);
+      if (!stream || stream.sender !== direction) throw new ProtocolFailure("unknown_stream");
+      if (stream.retired) return IGNORE;
+      if (!stream.requireReady || stream.ready) throw new ProtocolFailure("unexpected_stream_ready");
+      stream.ready = true;
     } else if (frame.kind === "event") {
       if (this.#closedStreams.has(frame.streamId)) return IGNORE;
       const stream = this.#streams.get(frame.streamId);
       if (!stream || stream.sender !== direction) throw new ProtocolFailure("unknown_stream");
       if (stream.retired) return IGNORE;
+      if (stream.requireReady && !stream.ready) throw new ProtocolFailure("stream_not_ready");
       if (stream.credit === 0) throw new ProtocolFailure("credit_violation");
       const sequence = decimal(frame.sequence);
       if (sequence !== stream.sequence + 1n) throw new ProtocolFailure("event_sequence");
@@ -344,6 +360,7 @@ async function serve() {
   let buffer = Buffer.alloc(0);
   let delayedRequest;
   let packageIdentity;
+  let processVersion;
   let capabilitySequence = 0;
   const capabilityGrants = new Map();
   const pendingCapabilityCalls = new Map();
@@ -372,6 +389,8 @@ async function serve() {
   const providerEventStreams = new Map();
   let providerEventOpens = 0;
   let providerEventCloses = 0;
+  const pendingConfirmed = new Map();
+  const heldEventOpens = new Map();
   let lastCommandActor;
   let portCommands = 0;
   const heldPortCommands = [];
@@ -387,6 +406,7 @@ async function serve() {
       buffer = buffer.subarray(length + 4);
       if (frame.kind === "initialize") {
         packageIdentity = frame.package.identity;
+        processVersion = frame.protocol;
         capabilityGrants.clear();
         for (const capability of frame.capabilities) capabilityGrants.set(capability.identity, capability.grant);
         send({ kind: "initialized", nonce: frame.nonce, package: frame.package, uiContractDigest: frame.uiContractDigest, processGeneration: frame.processGeneration, protocol: frame.protocol });
@@ -398,7 +418,12 @@ async function serve() {
         if (packageIdentity?.endsWith(".lifecycle-error")) {
           send({ kind: "error", id: frame.id, code: "fixture.lifecycle", retryable: true, details: {} });
         } else {
-          send({ kind: "response", id: frame.id, payload: { state: operation === "recover" ? "active" : operation } });
+          const answer = { kind: "response", id: frame.id, payload: { state: operation === "recover" ? "active" : operation } };
+          if (operation === "activate" && packageIdentity.endsWith(".delayed-activation.held-provider")) {
+            // simulated-delay: consume five seconds of the same confirmed setup budget.
+            // Health and framing remain responsive; this is not a readiness condition.
+            setTimeout(() => send(answer), 5_000);
+          } else send(answer);
           if (operation === "activate" && capabilityGrants.has("teamarness.workspace-context")) {
             send({ kind: "request", id: "p:fixture-cap", operation: "capability.call", grant: capabilityGrants.get("teamarness.workspace-context"), deadlineUnixMs: frame.deadlineUnixMs, payload: { method: "get" } });
           }
@@ -423,17 +448,40 @@ async function serve() {
         immutableCloseCode = frame.code ?? null;
         immutableStream = undefined;
       } else if (frame.kind === "stream_close" && frame.streamId === portQueryStream) {
+        if (pendingConfirmed.has(frame.streamId)) {
+          send({ kind: "response", id: pendingConfirmed.get(frame.streamId), payload: { opened: false, code: frame.code ?? "closed" } });
+          pendingConfirmed.delete(frame.streamId);
+        }
         portCloseCode = frame.code ?? null;
         portQueryStream = undefined;
+      } else if (frame.kind === "stream_ready" && pendingConfirmed.has(frame.streamId)) {
+        const request = pendingConfirmed.get(frame.streamId);
+        pendingConfirmed.delete(frame.streamId);
+        send({ kind: "response", id: request, payload: { opened: true } });
       } else if (frame.kind === "stream_close" && frame.streamId === portEventStream) {
+        if (pendingConfirmed.has(frame.streamId)) {
+          send({ kind: "response", id: pendingConfirmed.get(frame.streamId), payload: { opened: false, code: frame.code ?? "closed" } });
+          pendingConfirmed.delete(frame.streamId);
+        }
         portEventClose = frame.code ?? null;
         portEventStream = undefined;
       } else if (frame.kind === "stream_open") {
         uiStreams.set(frame.id, { topic: frame.topic, sequence: 0 });
         if (frame.topic === "teamarness.port.event.v1") {
+          if (frame.requireReady && packageIdentity.endsWith(".held-provider")) {
+            heldEventOpens.set(frame.id, frame);
+            continue;
+          }
+          if (frame.requireReady && packageIdentity.endsWith(".refusing-provider")) {
+            send({ kind: "stream_close", streamId: frame.id, code: "fixture.setup_refused" });
+            uiStreams.delete(frame.id);
+            continue;
+          }
           providerEventOpens += 1;
           providerEventStreams.set(frame.id, { sequence: 0, credit: frame.initialCredit });
+          if (frame.requireReady) send({ kind: "stream_ready", streamId: frame.id });
         } else if (frame.topic === "teamarness.port.query.v1") {
+          if (frame.requireReady) send({ kind: "stream_ready", streamId: frame.id });
           if (frame.payload.port === "message.idle_watch") {
             // Kept open until explicit close or process lifecycle loss.
           } else if (frame.payload.port === "message.title_watch") {
@@ -500,6 +548,7 @@ async function serve() {
           }
         }
       } else if (frame.kind === "stream_close" && uiStreams.has(frame.streamId)) {
+        heldEventOpens.delete(frame.streamId);
         if (providerEventStreams.delete(frame.streamId)) providerEventCloses += 1;
         uiStreams.delete(frame.streamId);
       } else if (frame.kind === "request" && frame.operation === "fixture.principals_open") {
@@ -648,10 +697,11 @@ async function serve() {
         portQueryStream = `p:port-query-${capabilitySequence}`;
         portCloseCode = null;
         portEvents.length = 0;
-        send({ kind: "stream_open", id: portQueryStream, topic: "capability.stream", initialCredit: 32,
+        if (frame.payload.confirmed) pendingConfirmed.set(portQueryStream, frame.id);
+        send({ ...(frame.payload.confirmed ? { requireReady: true } : {}), kind: "stream_open", id: portQueryStream, topic: "capability.stream", initialCredit: 32,
           payload: { grant: capabilityGrants.get("teamarness.package-ports"),
             access: frame.payload.access ?? "declared", major: frame.payload.major ?? 1, contract: frame.payload.contract ?? "com.example.messages", port: frame.payload.port ?? "message.watch", kind: "query", request: {} } });
-        send({ kind: "response", id: frame.id, payload: { opened: true } });
+        if (!frame.payload.confirmed) send({ kind: "response", id: frame.id, payload: { opened: true } });
       } else if (frame.kind === "request" && frame.operation === "fixture.port_query_emit") {
         for (const [streamId, stream] of uiStreams) {
           if (stream.topic !== "teamarness.port.query.v1") continue;
@@ -660,6 +710,12 @@ async function serve() {
         }
         send({ kind: "response", id: frame.id, payload: { emitted: true } });
       } else if (frame.kind === "request" && frame.operation === "fixture.port_release") {
+        for (const [id, open] of heldEventOpens) {
+          providerEventOpens += 1;
+          providerEventStreams.set(id, { sequence: 0, credit: open.initialCredit });
+          send({ kind: "stream_ready", streamId: id });
+        }
+        heldEventOpens.clear();
         const released = heldPortCommands.splice(0);
         for (const id of released) send({ kind: "response", id, payload: { accepted: true } });
         send({ kind: "response", id: frame.id, payload: { released: released.length } });
@@ -676,11 +732,12 @@ async function serve() {
         portEventStream = `p:port-event-${capabilitySequence}`;
         portEventEvents.length = 0;
         portEventClose = null;
-        send({ kind: "stream_open", id: portEventStream, topic: "capability.stream", initialCredit: 32,
+        if (frame.payload.confirmed) pendingConfirmed.set(portEventStream, frame.id);
+        send({ ...(frame.payload.confirmed ? { requireReady: true } : {}), kind: "stream_open", id: portEventStream, topic: "capability.stream", initialCredit: 32,
           payload: { grant: frame.payload.grant ?? capabilityGrants.get("teamarness.package-ports"),
             access: frame.payload.access ?? "declared", major: frame.payload.major ?? 1, contract: frame.payload.contract ?? "com.example.messages", port: frame.payload.port ?? "message.created", kind: "event",
             ...(frame.payload.extra ?? {}) } });
-        send({ kind: "response", id: frame.id, payload: { opened: true } });
+        if (!frame.payload.confirmed) send({ kind: "response", id: frame.id, payload: { opened: true } });
       } else if (frame.kind === "request" && frame.operation === "fixture.port_event_events") {
         send({ kind: "response", id: frame.id, payload: frame.payload.summary
           ? { count: portEventEvents.length, lastOrder: portEventEvents.at(-1)?.order ?? null,
@@ -711,7 +768,9 @@ async function serve() {
         send({ kind: "response", id: frame.id, payload: { emitted } });
       } else if (frame.kind === "request" && frame.operation === "fixture.port_event_stats") {
         send({ kind: "response", id: frame.id, payload: { opens: providerEventOpens, closes: providerEventCloses,
-          active: providerEventStreams.size } });
+          active: providerEventStreams.size, pending: heldEventOpens.size } });
+      } else if (frame.kind === "request" && frame.operation === "fixture.process_version") {
+        send({ kind: "response", id: frame.id, payload: processVersion });
       } else if (frame.kind === "request" && frame.operation === "fixture.grant") {
         send({ kind: "response", id: frame.id, payload: { grant: capabilityGrants.get(frame.payload.capability) ?? "missing" } });
       } else if (frame.kind === "request" && frame.operation === "fixture.capability") {

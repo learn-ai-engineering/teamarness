@@ -897,12 +897,12 @@ mod tests {
     // Verifies: TEAM.SYS.BACKLOG-R09 — every change sends at most one empty event, never more
     // events than changes, while the UI snapshot follows the same changes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn backlog_changed_is_empty_and_bounded_by_the_changes() {
+    async fn confirmed_backlog_changed_is_empty_and_bounded_by_the_changes() {
         let directory = tempfile::tempdir().unwrap();
         let mut session = start(directory.path(), &Ledger::default()).await;
         let mut events = session
             .harness
-            .subscribe(
+            .subscribe_confirmed(
                 "teamarness.port.event.v1",
                 json!({
                     "contract": CONTRACT, "major": 1, "minor": 0, "port": "backlog.changed",

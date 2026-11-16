@@ -597,10 +597,14 @@ pub(crate) fn process_template(
         private_data_directory: config.private_data_directory().to_owned(),
         source_label: source_label.to_owned(),
         trust_label: trust_label.to_owned(),
-        protocol: (
-            admission.manifest.protocol.major,
-            admission.manifest.protocol.max_minor,
-        ),
+        protocol: {
+            let selected = admission
+                .manifest
+                .protocol
+                .select_protocol()
+                .expect("admitted process range");
+            (selected.major, selected.minor)
+        },
         activation: admission.manifest.activation,
         capabilities: admission
             .manifest

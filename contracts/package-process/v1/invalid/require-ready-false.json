@@ -1,0 +1,5 @@
+{
+  "mode": "payload",
+  "payload": "{\"kind\":\"stream_open\",\"id\":\"p:bad\",\"topic\":\"capability.stream\",\"initialCredit\":32,\"payload\":{},\"requireReady\":false}",
+  "expectedError": "malformed_frame"
+}

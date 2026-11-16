@@ -311,4 +311,37 @@ impl PortClientV3 {
             .await
             .map(CapabilitySubscription::with_port_values)
     }
+    /// Opens a streaming query after Provider and Host setup, on process 1.1.
+    pub async fn live_query_confirmed(
+        &self,
+        route: PortContractRef<'_>,
+        port: &str,
+        request: Value,
+    ) -> Result<CapabilitySubscription, BackendError> {
+        let mut input = route.request()?;
+        input["port"] = port.into();
+        input["kind"] = "query".into();
+        input["request"] = request;
+        self.client
+            .capabilities
+            .subscribe_confirmed(&self.client.grant, input)
+            .await
+            .map(CapabilitySubscription::with_port_values)
+    }
+
+    /// Opens an event only after Provider and Host setup, on process 1.1.
+    pub async fn subscribe_event_confirmed(
+        &self,
+        route: PortContractRef<'_>,
+        port: &str,
+    ) -> Result<CapabilitySubscription, BackendError> {
+        let mut input = route.request()?;
+        input["port"] = port.into();
+        input["kind"] = "event".into();
+        self.client
+            .capabilities
+            .subscribe_confirmed(&self.client.grant, input)
+            .await
+            .map(CapabilitySubscription::with_port_values)
+    }
 }

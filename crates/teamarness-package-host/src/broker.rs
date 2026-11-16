@@ -745,7 +745,8 @@ impl PortBroker {
         &self,
         route: crate::port_access::ResolvedPort,
         input: &Map<String, Value>,
-    ) -> Result<PortQueryStream, PackageErrorCode> {
+        setup: Option<crate::protocol::ConfirmedSetup>,
+    ) -> Result<PortQueryStream, WireFailure> {
         if input.len() != 7
             || ![
                 "grant", "access", "major", "contract", "port", "kind", "request",
@@ -753,7 +754,7 @@ impl PortBroker {
             .iter()
             .all(|key| input.contains_key(*key))
         {
-            return Err(PackageErrorCode::CapabilityRequestInvalid);
+            return Err(PackageErrorCode::CapabilityRequestInvalid.into());
         }
         let contract = input
             .get("contract")
@@ -764,7 +765,7 @@ impl PortBroker {
             .and_then(Value::as_str)
             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
         if input.get("kind").and_then(Value::as_str) != Some("query") {
-            return Err(PackageErrorCode::PortUngranted);
+            return Err(PackageErrorCode::PortUngranted.into());
         }
         let request = input
             .get("request")
@@ -787,7 +788,7 @@ impl PortBroker {
             .and_then(|entry| entry.ports.iter().find(|entry| entry.name == port))
             .ok_or(PackageErrorCode::PortUngranted)?;
         if descriptor.event.is_none() {
-            return Err(PackageErrorCode::PortUngranted);
+            return Err(PackageErrorCode::PortUngranted.into());
         }
         schemas
             .validate(contract, port, "request", request)
@@ -806,9 +807,9 @@ impl PortBroker {
                 port.to_owned(),
                 permits,
                 lease,
+                setup,
             )
             .await
-            .map_err(|error| error.code)
     }
 }
 

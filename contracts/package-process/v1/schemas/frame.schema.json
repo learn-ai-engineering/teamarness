@@ -10,6 +10,7 @@
     { "$ref": "#/$defs/error" },
     { "$ref": "#/$defs/cancel" },
     { "$ref": "#/$defs/stream_open" },
+    { "$ref": "#/$defs/stream_ready" },
     { "$ref": "#/$defs/event" },
     { "$ref": "#/$defs/credit" },
     { "$ref": "#/$defs/stream_close" },
@@ -154,10 +155,17 @@
       "type": "object",
       "required": ["kind", "id", "topic", "initialCredit", "payload"],
       "properties": {
-        "kind": { "const": "stream_open" }, "id": { "$ref": "#/$defs/id" },
+        "kind": { "const": "stream_open" },
+        "requireReady": { "const": true }, "id": { "$ref": "#/$defs/id" },
         "topic": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
         "mountId": { "$ref": "#/$defs/base64url" }, "initialCredit": { "const": 32 }, "payload": { "type": "object" }
       },
+      "additionalProperties": false
+    },
+    "stream_ready": {
+      "type": "object",
+      "required": ["kind", "streamId"],
+      "properties": { "kind": { "const": "stream_ready" }, "streamId": { "$ref": "#/$defs/id" } },
       "additionalProperties": false
     },
     "event": {

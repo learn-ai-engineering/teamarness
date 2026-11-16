@@ -158,7 +158,7 @@ impl host_protocol::CapabilityHandler for ClosingStream {
         _payload: &'a Value,
         output: HostStreamSender,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<(), host_protocol::WireFailure>> + Send + 'a>,
     > {
         Box::pin(async move {
             tokio::spawn(async move {
@@ -220,7 +220,7 @@ impl host_protocol::CapabilityHandler for LargePage {
         _payload: &'a Value,
         output: HostStreamSender,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<(), host_protocol::WireFailure>> + Send + 'a>,
     > {
         Box::pin(async move {
             tokio::spawn(async move {
@@ -469,9 +469,13 @@ async fn every_in_flight_capability_call_is_answered_behind_a_slow_pipe() {
             _payload: &'a Value,
             _output: HostStreamSender,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<(), host_protocol::WireFailure>>
+                    + Send
+                    + 'a,
+            >,
         > {
-            Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid) })
+            Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid.into()) })
         }
 
         fn add_credit<'a>(
@@ -550,14 +554,18 @@ async fn stalled_port_stream_open_does_not_block_unrelated_ping_or_call() {
             _payload: &'a Value,
             _output: HostStreamSender,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<(), host_protocol::WireFailure>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let entered = self.entered.clone();
             let release = self.release.clone();
             Box::pin(async move {
                 entered.notify_one();
                 release.notified().await;
-                Err(PackageErrorCode::PortUnavailable)
+                Err(PackageErrorCode::PortUnavailable.into())
             })
         }
         fn add_credit<'a>(
@@ -658,7 +666,11 @@ async fn closing_a_pending_port_open_retires_only_that_stream() {
             _payload: &'a Value,
             _output: HostStreamSender,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<(), host_protocol::WireFailure>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let entered = self.entered.clone();
             let release = self.release.clone();
@@ -756,7 +768,11 @@ async fn pending_stream_open_limit_rejects_only_excess_streams() {
             _payload: &'a Value,
             _output: HostStreamSender,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<(), host_protocol::WireFailure>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let entered = self.entered.clone();
             let release = self.release.clone();
@@ -870,9 +886,13 @@ async fn a_late_detached_command_dispatch_keeps_the_timeout_uncertain() {
             _payload: &'a Value,
             _output: HostStreamSender,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<(), host_protocol::WireFailure>>
+                    + Send
+                    + 'a,
+            >,
         > {
-            Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid) })
+            Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid.into()) })
         }
         fn add_credit<'a>(
             &'a self,
@@ -973,9 +993,13 @@ async fn a_capability_answer_that_outlasts_its_deadline_is_answered_overloaded()
             _payload: &'a Value,
             _output: HostStreamSender,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<(), host_protocol::WireFailure>>
+                    + Send
+                    + 'a,
+            >,
         > {
-            Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid) })
+            Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid.into()) })
         }
 
         fn add_credit<'a>(

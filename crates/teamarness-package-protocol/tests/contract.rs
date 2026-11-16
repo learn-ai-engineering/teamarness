@@ -81,7 +81,7 @@ fn observe_sequence(value: &Value) -> Result<(), ProtocolError> {
 #[test]
 fn consumes_every_golden_sequence() {
     let paths = json_files("golden", "jsonl");
-    assert_eq!(paths.len(), 10, "the v1 golden set is intentional");
+    assert_eq!(paths.len(), 11, "the v1 golden set is intentional");
 
     let mut kinds = BTreeSet::new();
     let mut verdicts = 0_usize;
@@ -127,13 +127,14 @@ fn consumes_every_golden_sequence() {
             "shutdown_ack",
             "stream_close",
             "stream_open",
+            "stream_ready",
         ]
         .into_iter()
         .map(str::to_owned)
         .collect()
     );
     assert_eq!(
-        verdicts, 44,
+        verdicts, 61,
         "every frame in the golden corpus declares the verdict it receives"
     );
 }
@@ -141,7 +142,7 @@ fn consumes_every_golden_sequence() {
 #[test]
 fn consumes_every_malformed_fixture_with_its_stable_error() {
     let paths = json_files("invalid", "json");
-    assert_eq!(paths.len(), 19, "the v1 malformed set is intentional");
+    assert_eq!(paths.len(), 28, "the v1 malformed set is intentional");
 
     for path in paths {
         let fixture: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -266,12 +267,12 @@ fn negotiates_the_highest_shared_minor_with_one_exact_major() {
 #[test]
 fn every_schema_is_local_and_every_frame_kind_has_a_schema() {
     let schemas = json_files("schemas", "json");
-    assert_eq!(schemas.len(), 19);
+    assert_eq!(schemas.len(), 20);
     let frame_schema: Value = serde_json::from_slice(
         &fs::read(contract_root().join("schemas/frame.schema.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(frame_schema["oneOf"].as_array().unwrap().len(), 14);
+    assert_eq!(frame_schema["oneOf"].as_array().unwrap().len(), 15);
     // The schema publishes the ID bound every frame's ID fields share, and
     // this crate declares it; both are read here so neither can move alone.
     assert_eq!(

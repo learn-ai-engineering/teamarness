@@ -11,7 +11,7 @@
   "protocol": {
     "major": 1,
     "minMinor": 0,
-    "maxMinor": 0
+    "maxMinor": 1
   },
   "backends": [
     {

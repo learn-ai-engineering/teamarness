@@ -246,3 +246,77 @@ async fn direct_node_process_completes_the_real_host_lifecycle_and_protocol() {
         PackageHostOutcome::Shutdown
     ));
 }
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn admission_and_launch_select_the_highest_supported_process_intersection() {
+    use serde_json::{Value, json};
+    for (min, max, selected) in [
+        (0, 0, Some(0)),
+        (0, 9, Some(1)),
+        (1, 1, Some(1)),
+        (2, 3, None),
+    ] {
+        let fixture = common::Fixture::node(&[("fixture", "dev.teamarness.fixture")]).await;
+        let path = fixture
+            .config
+            .application_root()
+            .join("fixture/teamarness.package.json");
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["protocol"] = json!({"major":1,"minMinor":min,"maxMinor":max});
+        std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+            .await
+            .unwrap();
+        let snapshot = host.snapshot().await;
+        if let Some(minor) = selected {
+            assert_eq!(snapshot.instances.len(), 1);
+            assert_eq!(snapshot.instances[0].lifecycle, LifecycleState::Active);
+            let outcome = host
+                .execute(PackageHostCommand::OpenUiMount(OpenUiMount::main(
+                    snapshot.instances[0].key.clone(),
+                )))
+                .await
+                .unwrap();
+            let PackageHostOutcome::UiMountOpened { mount, .. } = outcome else {
+                panic!("{outcome:?}")
+            };
+            let outcome = host
+                .execute(PackageHostCommand::UiRequest(UiRequest {
+                    mount,
+                    request: UiRequestId::new("version").unwrap(),
+                    operation: "fixture.process_version".into(),
+                    payload: empty(),
+                }))
+                .await
+                .unwrap();
+            let PackageHostOutcome::UiResponse { payload } = outcome else {
+                panic!("{outcome:?}")
+            };
+            assert_eq!(
+                serde_json::to_value(payload).unwrap(),
+                json!({"major":1,"minor":minor})
+            );
+        } else {
+            assert!(
+                snapshot.instances.is_empty(),
+                "nonintersecting range cannot launch"
+            );
+            assert!(
+                snapshot
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code == PackageErrorCode::ManifestUnsupported)
+            );
+            let database = fixture._private.join("packages/package-host.sqlite3");
+            let leases: i64 = rusqlite::Connection::open(database)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM process_leases", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(leases, 0, "refusal precedes launch");
+        }
+        host.execute(PackageHostCommand::Shutdown(ShutdownHost))
+            .await
+            .unwrap();
+    }
+}

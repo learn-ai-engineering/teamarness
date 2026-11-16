@@ -429,3 +429,102 @@ fn assert_router_matches_contract_reports_both_differences() {
         r#"{"requests":{"x.b":{}},"subscriptions":{"y.a":{}}}"#,
     );
 }
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn scripted_capability_confirms_only_after_stream_registration_on_selected_1_1() {
+    for minor in [0, 1] {
+        let router =
+            Router::stateless().request("fixture.confirmed", |context, _: Empty| async move {
+                let grant = context
+                    .initialization()
+                    .capability(CAPABILITY)
+                    .unwrap()
+                    .grant
+                    .clone();
+                let mut subscription = context
+                    .capabilities()
+                    .subscribe_confirmed(&grant, serde_json::json!({"method":"subscribe"}))
+                    .await?;
+                let value = subscription.recv().await.unwrap()?;
+                subscription.close().await;
+                Ok(value)
+            });
+        let directory = tempfile::tempdir().unwrap();
+        let scripted = ScriptedCapability::new();
+        let mut harness = HarnessBuilder::new(router.into_backend())
+            .process_minor(minor)
+            .data_directory(directory.path())
+            .capability(CAPABILITY, scripted.clone())
+            .start()
+            .await;
+        harness.activate().await.unwrap();
+        let pending = harness.start_request("fixture.confirmed", empty()).await;
+        if minor == 0 {
+            assert_eq!(
+                pending.result().await.unwrap_err().code(),
+                "capability_version_unsupported"
+            );
+            assert!(scripted.recorded_opens().is_empty());
+        } else {
+            let stream = scripted.stream();
+            tokio::time::timeout(Duration::from_secs(2), stream.opened())
+                .await
+                .unwrap();
+            assert!(stream.send(serde_json::json!({"order":1})).await);
+            assert_eq!(
+                pending.result().await.unwrap(),
+                serde_json::json!({"order":1})
+            );
+        }
+        harness.shutdown().await.unwrap();
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn confirmed_harness_uses_the_provider_handler_result_not_immediate_fake_ready() {
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let router = Router::stateless().subscription("fixture.held", {
+        let entered = entered.clone();
+        let release = release.clone();
+        move |_, _: Empty| {
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                Err::<teamarness_package_sdk::EventSubscription, _>(BackendError::new(
+                    "fixture.setup_refused",
+                    false,
+                    empty(),
+                ))
+            }
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut harness = HarnessBuilder::new(router.into_backend())
+        .process_minor(1)
+        .data_directory(directory.path())
+        .start()
+        .await;
+    harness.activate().await.unwrap();
+    let open = harness.subscribe_confirmed("fixture.held", empty());
+    tokio::pin!(open);
+    tokio::select! {
+        result = &mut open => panic!("handler did not register: {}", result.is_ok()),
+        _ = entered.notified() => {},
+    }
+    // negative-wait: a held real Provider handler has no acknowledgement yet.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut open)
+            .await
+            .is_err()
+    );
+    release.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(2), open)
+        .await
+        .unwrap();
+    assert_eq!(result.err().unwrap().code(), "fixture.setup_refused");
+}

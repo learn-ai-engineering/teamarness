@@ -47,6 +47,7 @@ pub(super) struct EventRegistry {
 
 struct Upstream {
     generation: u64,
+    confirmed: bool,
     provider_id: String,
     token: u64,
     subscribers: BTreeMap<u64, Subscriber>,
@@ -83,7 +84,17 @@ pub(crate) struct EventSubscription {
     _provider_slot: OwnedSemaphorePermit,
 }
 
+impl EventSubscription {
+    pub(crate) fn check(&self) -> Result<(), PackageErrorCode> {
+        if let Some(lease) = &self.lease {
+            lease.enqueue(|| ())?;
+        }
+        Ok(())
+    }
+}
+
 impl PortBroker {
+    #[allow(clippy::too_many_arguments)] // The shared setup budget adds no new authority seam.
     pub(crate) async fn subscribe_event(
         &self,
         caller: &PackageIdentity,
@@ -92,13 +103,14 @@ impl PortBroker {
         route: crate::port_access::ResolvedPort,
         input: &Map<String, Value>,
         consumer_generation: u64,
-    ) -> Result<EventSubscription, PackageErrorCode> {
+        setup: Option<crate::protocol::ConfirmedSetup>,
+    ) -> Result<EventSubscription, crate::protocol::WireFailure> {
         if input.len() != 6
             || !["grant", "access", "major", "contract", "port", "kind"]
                 .iter()
                 .all(|key| input.contains_key(*key))
         {
-            return Err(PackageErrorCode::CapabilityRequestInvalid);
+            return Err(PackageErrorCode::CapabilityRequestInvalid.into());
         }
         let contract = input
             .get("contract")
@@ -109,7 +121,7 @@ impl PortBroker {
             .and_then(Value::as_str)
             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
         if input.get("kind").and_then(Value::as_str) != Some("event") {
-            return Err(PackageErrorCode::PortUngranted);
+            return Err(PackageErrorCode::PortUngranted.into());
         }
         let crate::port_access::ResolvedPort {
             provider: actor,
@@ -145,7 +157,7 @@ impl PortBroker {
             // A concurrent first subscriber may already be activating the
             // on-demand Provider. Wait on its lifecycle gate rather than
             // treating that in-progress generation as exited.
-            actor.activate().await.map_err(|failure| failure.code)?;
+            actor.activate().await?;
         }
         let open_lock = self
             .event_open_locks
@@ -163,6 +175,9 @@ impl PortBroker {
         let mut registry = self.events.lock().await;
         while let Some(entry) = registry.streams.get_mut(&key) {
             if entry.generation == generation && !entry.closing {
+                if setup.is_some() && !entry.confirmed {
+                    return Err(PackageErrorCode::CapabilityVersionUnsupported.into());
+                }
                 break;
             }
             if !entry.closing {
@@ -198,7 +213,7 @@ impl PortBroker {
             .map(|(_, upstream)| upstream.subscribers.len())
             .sum::<usize>();
         if provider_count >= PROVIDER_SUBSCRIBERS {
-            return Err(PackageErrorCode::Overloaded);
+            return Err(PackageErrorCode::Overloaded.into());
         }
         if !registry.streams.contains_key(&key)
             || registry
@@ -213,7 +228,7 @@ impl PortBroker {
                 .filter(|(other, _)| other.0 == *workspace && other.1 == *actor.identity())
                 .count();
             if provider_streams >= PROVIDER_UPSTREAMS {
-                return Err(PackageErrorCode::Overloaded);
+                return Err(PackageErrorCode::Overloaded.into());
             }
             let stream_slot = self
                 .event_streams
@@ -234,9 +249,14 @@ impl PortBroker {
             .map_err(|_| PackageErrorCode::PortRequestInvalid)?;
             drop(registry);
             let upstream = actor
-                .port_event_stream(payload, schemas, contract.to_owned(), port.to_owned())
-                .await
-                .map_err(|failure| failure.code)?;
+                .port_event_stream(
+                    payload,
+                    schemas,
+                    contract.to_owned(),
+                    port.to_owned(),
+                    setup.clone(),
+                )
+                .await?;
             let generation = actor
                 .snapshot()
                 .await
@@ -244,7 +264,13 @@ impl PortBroker {
                 .unwrap_or_default();
             if upstream.generation != generation {
                 let _ = upstream.client.stream_close(&upstream.id).await;
-                return Err(PackageErrorCode::ProcessExited);
+                return Err(PackageErrorCode::ProcessExited.into());
+            }
+            if let Some(lease) = &lease
+                && let Err(code) = lease.enqueue(|| ())
+            {
+                let _ = upstream.client.stream_close(&upstream.id).await;
+                return Err(code.into());
             }
             let mut reopened = self.events.lock().await;
             let stopped = Arc::new(Notify::new());
@@ -260,6 +286,7 @@ impl PortBroker {
                 key.clone(),
                 Upstream {
                     generation,
+                    confirmed: setup.is_some(),
                     provider_id: upstream.id.clone(),
                     token,
                     subscribers: BTreeMap::new(),

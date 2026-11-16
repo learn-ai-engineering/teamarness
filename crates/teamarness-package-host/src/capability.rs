@@ -510,9 +510,9 @@ impl GenerationCapabilities {
         initial_credit: u64,
         payload: &Value,
         output: HostStreamSender,
-    ) -> Result<(), PackageErrorCode> {
+    ) -> Result<(), crate::protocol::WireFailure> {
         if topic != "capability.stream" || initial_credit != MAX_STREAM_CREDIT {
-            return Err(PackageErrorCode::CapabilityRequestInvalid);
+            return Err(PackageErrorCode::CapabilityRequestInvalid.into());
         }
         let object = payload
             .as_object()
@@ -541,6 +541,7 @@ impl GenerationCapabilities {
                         route,
                         object,
                         self.generation,
+                        output.setup(),
                     )
                     .await?;
                 let (commands, receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
@@ -548,9 +549,18 @@ impl GenerationCapabilities {
                 if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
                     drop(streams);
                     broker.drop_event_subscription(&subscription).await;
-                    return Err(PackageErrorCode::Overloaded);
+                    return Err(PackageErrorCode::Overloaded.into());
                 }
                 drop(streams);
+                let established = match subscription.check() {
+                    Ok(()) => output.ready(&stream_id).await,
+                    Err(code) => Err(code),
+                };
+                if let Err(code) = established {
+                    self.streams.lock().await.remove(&stream_id);
+                    broker.drop_event_subscription(&subscription).await;
+                    return Err(code.into());
+                }
                 broker.record_event_subscription(&subscription, &stream_id);
                 let all_streams = self.streams.clone();
                 let cancelled = self.cancelled.subscribe();
@@ -569,14 +579,28 @@ impl GenerationCapabilities {
                 });
                 return Ok(());
             }
-            let query = broker.query_stream(route, object).await?;
+            let query = broker.query_stream(route, object, output.setup()).await?;
             let (commands, receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
             let mut streams = self.streams.lock().await;
             if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
+                drop(streams);
                 let _ = query.client.stream_close(&query.id).await;
-                return Err(PackageErrorCode::Overloaded);
+                return Err(PackageErrorCode::Overloaded.into());
             }
             drop(streams);
+            let revoked = query
+                .receiver
+                .revocation()
+                .and_then(|watch| *watch.borrow());
+            let established = match revoked {
+                Some(code) => Err(code),
+                None => output.ready(&stream_id).await,
+            };
+            if let Err(code) = established {
+                self.streams.lock().await.remove(&stream_id);
+                let _ = query.client.stream_close(&query.id).await;
+                return Err(code.into());
+            }
             tokio::spawn(run_port_query(
                 stream_id,
                 query,
@@ -614,12 +638,12 @@ impl GenerationCapabilities {
             None
         };
         if after_epoch.is_none() && after_cursor.is_none() && after_profile_cursor.is_none() {
-            return Err(PackageErrorCode::CapabilityRequestInvalid);
+            return Err(PackageErrorCode::CapabilityRequestInvalid.into());
         }
         let (commands, command_receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
         let mut streams = self.streams.lock().await;
         if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
-            return Err(PackageErrorCode::Overloaded);
+            return Err(PackageErrorCode::Overloaded.into());
         }
         drop(streams);
         let core = self.core.clone();
@@ -676,7 +700,7 @@ impl GenerationCapabilities {
             }
             _ => {
                 self.streams.lock().await.remove(&stream_id);
-                return Err(PackageErrorCode::CapabilityRequestInvalid);
+                return Err(PackageErrorCode::CapabilityRequestInvalid.into());
             }
         }
         Ok(())
@@ -1444,7 +1468,7 @@ impl crate::protocol::CapabilityHandler for GenerationCapabilities {
         payload: &'a Value,
         output: HostStreamSender,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<(), crate::protocol::WireFailure>> + Send + 'a>,
     > {
         Box::pin(GenerationCapabilities::open_stream(
             self,
@@ -1862,6 +1886,13 @@ async fn run_principal_stream(
             return;
         }
     };
+    if let Err(code) = output.ready(&stream_id).await {
+        streams.lock().await.remove(&stream_id);
+        let _ = output
+            .close(&stream_id, crate::protocol::capability_code(code))
+            .await;
+        return;
+    }
     let mut sequence = 0_u64;
     let mut reason = "capability_unavailable";
     loop {
@@ -1938,6 +1969,13 @@ async fn run_membership_stream(
             return;
         }
     };
+    if let Err(code) = output.ready(&stream_id).await {
+        streams.lock().await.remove(&stream_id);
+        let _ = output
+            .close(&stream_id, crate::protocol::capability_code(code))
+            .await;
+        return;
+    }
     let mut sequence = 0_u64;
     loop {
         if *cancelled.borrow() {
@@ -2192,6 +2230,13 @@ async fn run_record_stream(
             return;
         }
     };
+    if let Err(code) = output.ready(&stream_id).await {
+        streams.lock().await.remove(&stream_id);
+        let _ = output
+            .close(&stream_id, crate::protocol::capability_code(code))
+            .await;
+        return;
+    }
     // Page and availability reads advance the subscription's read cursor. Keep
     // notifications independent so a health change between reads cannot be lost.
     let mut changes = subscription.changes();
@@ -3272,7 +3317,7 @@ mod tests {
         );
         assert_eq!(
             teamarness_package_contract::manifest::SUPPORTED_PROTOCOL,
-            (1, 0),
+            (1, 1),
             "adding a capability family must not move the Package Process Protocol version"
         );
         // The lifecycle contract and the UI bridge are declared elsewhere and unchanged: a UI

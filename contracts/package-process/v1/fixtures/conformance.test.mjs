@@ -126,7 +126,7 @@ function initializeFixture(send) {
 
 test("Node consumes every normative schema and golden sequence", async () => {
   const schemaPaths = await files("schemas", ".json");
-  assert.equal(schemaPaths.length, 19);
+  assert.equal(schemaPaths.length, 20);
   for (const path of schemaPaths) {
     const schema = JSON.parse(await readFile(path, "utf8"));
     assert.equal(schema.$schema, "https://json-schema.org/draft/2020-12/schema");
@@ -136,7 +136,7 @@ test("Node consumes every normative schema and golden sequence", async () => {
   }
 
   const goldenPaths = await files("golden", ".jsonl");
-  assert.equal(goldenPaths.length, 10);
+  assert.equal(goldenPaths.length, 11);
   const kinds = new Set();
   let verdicts = 0;
   for (const path of goldenPaths) {
@@ -153,9 +153,9 @@ test("Node consumes every normative schema and golden sequence", async () => {
   }
   assert.deepEqual([...kinds].sort(), [
     "cancel", "credit", "error", "event", "initialize", "initialized", "ping", "pong",
-    "request", "response", "shutdown", "shutdown_ack", "stream_close", "stream_open",
+    "request", "response", "shutdown", "shutdown_ack", "stream_close", "stream_open", "stream_ready",
   ]);
-  assert.equal(verdicts, 44, "every frame in the golden corpus declares the verdict it receives");
+  assert.equal(verdicts, 61, "every frame in the golden corpus declares the verdict it receives");
 });
 
 test("the Node constants match the contract's own limits table", async () => {
@@ -175,7 +175,7 @@ test("the Node constants match the contract's own limits table", async () => {
 
 test("Node consumes every malformed fixture with its stable error", async () => {
   const paths = await files("invalid", ".json");
-  assert.equal(paths.length, 19);
+  assert.equal(paths.length, 28);
   for (const path of paths) {
     const fixture = JSON.parse(await readFile(path, "utf8"));
     const actual = errorCode(() => {

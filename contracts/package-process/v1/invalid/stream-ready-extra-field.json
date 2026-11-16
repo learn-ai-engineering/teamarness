@@ -1,0 +1,5 @@
+{
+  "mode": "payload",
+  "payload": "{\"kind\":\"stream_ready\",\"streamId\":\"p:bad\",\"payload\":{}}",
+  "expectedError": "malformed_frame"
+}

@@ -220,6 +220,19 @@ Its `message.post` command (Conversations 1.1) signs as the Host-derived actor: 
 
 Conversations 1.3 adds `runtime.guide`, an ordinary query with request `{}` and a bounded `{markdown}` response. Declare it to retrieve complete guide metadata and read the Provider's recovery instructions through the same generic client. Its five existing operation shapes stay unchanged. The [Conversations Package reference](../packages/conversations-package/README.md) lists limits and the distinction between the page schema's 64-item ceiling and the Backend's 32-row cap. Adding this guide makes Conversations agent-facing: bound-Agent access is now default-denied even through declared Ports. Use `agent_contracts()` and `describe(PortAccess::Agent, ...)` for complete metadata after binding. Person-authored declared consumption remains supported.
 
+When successful opening must mean listening, use process 1.1 and the explicit
+confirmed SDK methods: `CapabilityClient::subscribe_confirmed` or
+`PortClientV3::{live_query_confirmed,subscribe_event_confirmed}`. The Host confirms
+the Provider listener and its Consumer registration before returning success,
+without consuming a first value. Existing methods remain enqueue-only. A legacy
+1.0 Provider or an existing unconfirmed event upstream returns
+`capability_version_unsupported`; do not silently downgrade. Rebuild older
+Providers with the compatible SDK and declare 1.1 support. New generated manifests
+allow 1.0–1.1, and the Host selects the highest common minor at admission and launch.
+A Provider handler must register listeners and initialize change-filter baselines
+before returning its `EventSubscription`. Ready proves setup, not durable history
+or replay. See the [process reference](../contracts/package-process/v1/README.md#confirmed-stream-setup-11).
+
 For local diagnosis, `PackageHost::observe_ports()` and `Package::observe_ports()` provide bounded receivers. Acquire the Host receiver before making calls. Match a Consumer process scope and `p:` ID to the Host's assigned Provider `h:` ID; a shared event upstream has multiple Consumer scopes. A slow receiver reports `Lagged` and does not block routing. Neither receiver carries payloads or proves a write committed. To log the Conversations Provider's SDK observations during development, start its Backend with `TEAMARNESS_CONVERSATIONS_PORT_DIAGNOSTICS=1`. The resulting structured lines go to the Host's private rotated stderr files under `packages/logs/`; normal operation emits no Port observations. These files are not an in-app diagnostics API. Do not copy Message text, actor identity, grants, keys, or records into your own diagnostics.
 
 ## Discover Ports as the local Person
@@ -320,7 +333,7 @@ Three things cross the Package boundary, and each carries its own version.
 
 | Line | Version today | What it covers |
 |---|---|---|
-| Package Process Protocol | 1.0 | the frame set, the lifecycle operations, the `initialize` handshake |
+| Package Process Protocol | 1.0–1.1 | the frame set, the lifecycle operations, the `initialize` handshake |
 | Semantic Capability family | one per family, for example the record log's | that family's request and event shapes, bounds, vocabularies, and error codes |
 | Package UI bridge | `uiHostVersion` 2 | the mount contract your `mount(context)` is given. Version 2 added `context.view`; a UI written for version 1 keeps working |
 
