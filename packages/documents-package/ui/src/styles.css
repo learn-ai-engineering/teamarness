@@ -149,7 +149,7 @@ img.ProseMirror-separator { display: inline !important; border: none !important;
 @container (max-width: 52rem) { .settings-group { grid-template-columns: 1fr; gap: .75rem; } }
 .documents-settings .teamarness-control:disabled { opacity: .5; cursor: not-allowed; }
 .documents-settings button:focus-visible, .documents-settings input:focus-visible, .documents-settings select:focus-visible, .documents-settings summary:focus-visible { outline: 3px solid var(--teamarness-color-focus); outline-offset: 2px; }
-.mapping-refused-list, .mapping-files, .mapping-reformatted, .mapping-subfolders { margin: 0; padding-left: 1.2rem; }
+.mapping-refused-list, .mapping-files, .mapping-reformatted, .mapping-subfolders, .mapping-relocations { margin: 0; padding-left: 1.2rem; }
 .mapping-collections { list-style: none; margin: 0; padding: 0; display: grid; gap: 1.25rem; }
 .mapping-collection { display: grid; gap: .3rem; min-width: 0; }
 .mapping-collection-header { display: flex; align-items: center; gap: .6rem; min-width: 0; }
@@ -158,13 +158,16 @@ img.ProseMirror-separator { display: inline !important; border: none !important;
 .mapping-collection[data-state="unavailable"] .mapping-state { color: var(--teamarness-color-danger); }
 .mapping-unmap { margin-left: auto; }
 .mapping-unmap:disabled { opacity: .5; cursor: not-allowed; }
-.mapping-path, .mapping-report code, .mapping-refused code { font-family: var(--teamarness-font-mono); overflow-wrap: anywhere; }
+.mapping-path, .mapping-report code, .mapping-recursive-preview code, .mapping-refused code { font-family: var(--teamarness-font-mono); overflow-wrap: anywhere; }
 .mapping-path { color: var(--teamarness-color-text-muted); font-size: .85rem; }
-.mapping-counts, .mapping-git { margin: 0; font-size: .85rem; }
+.mapping-counts, .mapping-git, .mapping-mode { margin: 0; font-size: .85rem; }
 .mapping-refused summary { cursor: pointer; font-size: .85rem; }
 .mapping-detail { color: var(--teamarness-color-text-muted); }
 .mapping-hint { font-size: .85rem; }
-.mapping-report:empty, .documents-settings [hidden], .documents-settings .teamarness-notice:empty { display: none; }
-.mapping-report h3 { margin: 0 0 .4rem; font-size: .95rem; }
-.mapping-report h4 { margin: .6rem 0 .2rem; font-size: .9rem; }
+.mapping-recursive-preview:empty, .mapping-report:empty, .documents-settings [hidden], .documents-settings .teamarness-notice:empty { display: none; }
+.mapping-report h3, .mapping-recursive-preview h3 { margin: 0 0 .4rem; font-size: .95rem; }
+.mapping-report h4, .mapping-recursive-preview h4 { margin: .6rem 0 .2rem; font-size: .9rem; }
 .mapping-git-confirm { display: flex; gap: .5rem; align-items: flex-start; }
+
+.mapping-recursive-preview { margin-top: 1rem; }
+.mapping-collection > button { justify-self: start; }

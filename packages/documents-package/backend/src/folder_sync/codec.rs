@@ -278,15 +278,29 @@ pub(crate) fn representable_folder_segment(part: &str) -> bool {
 /// Creates missing parents one at a time, refusing hidden or unrepresentable segments and
 /// case aliases. Existing decomposed spelling is retained when it denotes the same NFC path.
 pub(crate) fn prepare_folder(root: &Path, logical: &str) -> Result<String, WriteRefused> {
+    folder_path(root, logical, true)
+}
+
+/// Resolves existing spelling and validates parents without creating a directory.
+pub(crate) fn preview_folder(root: &Path, logical: &str) -> Result<String, WriteRefused> {
+    folder_path(root, logical, false)
+}
+
+fn folder_path(root: &Path, logical: &str, create: bool) -> Result<String, WriteRefused> {
     crate::domain::normalize_folder(logical).map_err(|_| WriteRefused::OutsideRoot)?;
     let mut folder = root.to_path_buf();
     let mut actual = Vec::new();
     if !fs::metadata(root)?.is_dir() {
         return Err(WriteRefused::NotADirectory);
     }
+    let mut missing = false;
     for part in logical.split('/').filter(|part| !part.is_empty()) {
         if !representable_folder_segment(part) {
             return Err(WriteRefused::OutsideRoot);
+        }
+        if missing {
+            actual.push(part.to_owned());
+            continue;
         }
         let aliases = fs::read_dir(&folder)?
             .collect::<Result<Vec<_>, _>>()?
@@ -313,7 +327,13 @@ pub(crate) fn prepare_folder(root: &Path, logical: &str) -> Result<String, Write
             Ok(meta) if meta.file_type().is_symlink() => return Err(WriteRefused::Symlink),
             Ok(meta) if !meta.is_dir() => return Err(WriteRefused::NotADirectory),
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&folder)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if create {
+                    fs::create_dir(&folder)?;
+                } else {
+                    missing = true;
+                }
+            }
             Err(error) => return Err(error.into()),
         }
         actual.push(spelling);

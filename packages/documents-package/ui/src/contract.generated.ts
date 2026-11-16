@@ -71,6 +71,8 @@ export type FolderMapping = {
   };
   readonly "gitRoot": string | null;
   readonly "path": string;
+  readonly "pendingFolderChanges": number;
+  readonly "recursive": boolean;
   readonly "refused": readonly MappingRefusal[];
   readonly "state": "active" | "unavailable" | "paused";
   readonly "subfolders": readonly string[];
@@ -89,10 +91,12 @@ export type MappingRefusal = {
 };
 
 export type MappingReport = {
+  readonly "blocked": boolean;
   readonly "counts": {
     readonly "files": number;
     readonly "reformatted": number;
     readonly "refused": number;
+    readonly "relocations": number;
     readonly "subfolders": number;
   };
   readonly "files": readonly {
@@ -102,6 +106,11 @@ export type MappingReport = {
   readonly "gitRoot": string | null;
   readonly "reformatted": readonly string[];
   readonly "refused": readonly MappingRefusal[];
+  readonly "relocations": readonly ({
+    readonly "documentId": RecordId;
+    readonly "from": string | null;
+    readonly "to": string;
+  })[];
   readonly "subfolders": readonly string[];
 };
 
@@ -258,6 +267,17 @@ export type DocumentsContract = {
       } };
     readonly "documents.mapping.draft.get": { readonly request: Record<string, never>; readonly response: MappingDraft };
     readonly "documents.mapping.draft.set": { readonly request: MappingDraft; readonly response: Record<string, never> };
+    readonly "documents.mapping.enable-recursive": { readonly request: {
+        readonly "collectionId": RecordId;
+        readonly "confirmGit"?: boolean;
+        readonly "dryRun"?: boolean;
+      }; readonly response: {
+        readonly "changed": boolean;
+        readonly "collectionId": RecordId;
+        readonly "dryRun": boolean;
+        readonly "recursive": boolean;
+        readonly "report"?: MappingReport;
+      } };
     readonly "documents.mapping.list": { readonly request: Record<string, never>; readonly response: {
         readonly "collections": readonly ({
           readonly "archived": boolean;

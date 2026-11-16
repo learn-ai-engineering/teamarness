@@ -1405,6 +1405,66 @@ async fn flat_mapping_keeps_root_associations_and_ignores_remote_folders_after_r
     fixture.shutdown().await;
 }
 
+// Verifies: TEAM.SYS.DOCS-R14 — consent is local, survives a crash after mode commit,
+// and resumes through the ordinary reconciler without losing root identity or echoing imports.
+#[tokio::test]
+async fn enable_recursive_commit_restarts_without_enabling_another_installation() {
+    let mut alice = Fixture::new().await;
+    let mut bob = Fixture::new().await;
+    for fixture in [&mut alice, &mut bob] {
+        fixture.write("Note.md", "Root.\n");
+        fixture.folder().await;
+        let id = fixture.titled("Note").id;
+        fixture.place(&id, "Remote").await;
+        fixture.reconcile(&id).await;
+        fs::create_dir(fixture.root.join("Nested")).unwrap();
+        fixture.write("Nested/New.md", "New.\n");
+    }
+    assert_eq!(
+        alice.collection, bob.collection,
+        "same replicated Collection identity"
+    );
+    let id = alice.titled("Note").id;
+    let before = alice.state(&id).unwrap();
+    let collection = alice.collection.clone();
+    let preview = alice
+        .request(
+            "documents.mapping.enable-recursive",
+            json!({"collectionId":collection,"dryRun":true}),
+        )
+        .await;
+    assert_eq!(preview["report"]["counts"]["files"], 1);
+    alice
+        .request(
+            "documents.mapping.enable-recursive",
+            json!({"collectionId":collection}),
+        )
+        .await;
+    assert_eq!(alice.state(&id).unwrap(), before);
+    assert!(alice.root.join("Note.md").is_file());
+    // No reconcile ran between the mode commit and shutdown.
+    let alice = alice.restart().await;
+    assert!(alice.mapping().recursive);
+    alice.folder().await;
+    assert_eq!(alice.documents().len(), 2);
+    assert_eq!(alice.titled("Note").id, id);
+    assert_eq!(alice.read("Remote/Note.md"), "Root.\n");
+    assert_eq!(alice.read("Nested/New.md"), "New.\n");
+    assert_eq!(alice.state(&id).unwrap().base_version, before.base_version);
+    alice.settled().await;
+    let bob = bob.restart().await;
+    bob.write("Nested/New.md", "Still private.\n");
+    bob.write("Note.md", "Root edited.\n");
+    bob.folder().await;
+    assert!(!bob.mapping().recursive);
+    assert_eq!(bob.documents().len(), 1);
+    assert_eq!(bob.text(&id), "Root edited.\n");
+    assert_eq!(bob.state(&id).unwrap().rel_path, "Note.md");
+    assert!(!bob.root.join("Remote").exists());
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
 #[tokio::test]
 async fn recursive_unicode_case_moves_and_folder_scoped_suffixes() {
     let mut fixture = Fixture::new().await;

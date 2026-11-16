@@ -731,6 +731,7 @@ pub struct DocumentsActive {
     flusher: Mutex<Option<Session>>,
     /// The folder sync session, started and stopped beside the flusher.
     folder_sync: Mutex<Option<Session>>,
+    folder_reconciler: Mutex<folder_sync::FolderSync>,
     /// Whether this activation runs folder sync. Only reconciler tests, which drive it
     /// directly, turn it off.
     folder_sync_enabled: bool,
@@ -802,6 +803,16 @@ struct MappingSetRequest {
     #[serde(default)]
     new_collection_name: Option<String>,
     path: String,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    confirm_git: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MappingEnableRecursiveRequest {
+    collection_id: String,
     #[serde(default)]
     dry_run: bool,
     #[serde(default)]
@@ -1242,8 +1253,9 @@ pub(crate) fn router_configured(
             }
             let session = start_session(&store, &log, &sync, &changes, &hub);
             let flusher = start_flusher(&log, &hub, &changes, installation.clone());
+            let folder_reconciler = folder_sync::FolderSync::new(&log, &hub, &changes, installation.clone(), CancellationToken::new());
             let folder_sync = folder_sync_enabled
-                .then(|| start_folder_sync(&log, &hub, &changes, installation.clone()));
+                .then(|| start_folder_sync(folder_reconciler.clone(), &hub, &changes));
             Ok(DocumentsActive {
                 store,
                 log,
@@ -1255,6 +1267,7 @@ pub(crate) fn router_configured(
                 hub,
                 flusher: Mutex::new(Some(flusher)),
                 folder_sync: Mutex::new(folder_sync),
+                folder_reconciler: Mutex::new(folder_reconciler),
                 folder_sync_enabled,
                 data_directory,
                 place: Mutex::new(Place::default()),
@@ -1299,12 +1312,9 @@ pub(crate) fn router_configured(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(flusher);
         if state.folder_sync_enabled {
-            let folder_sync = start_folder_sync(
-                &state.log,
-                &state.hub,
-                &state.changes,
-                state.installation.clone(),
-            );
+            let reconciler = folder_sync::FolderSync::new(&state.log, &state.hub, &state.changes, state.installation.clone(), CancellationToken::new());
+            let folder_sync = start_folder_sync(reconciler.clone(), &state.hub, &state.changes);
+            *recover(&state.folder_reconciler) = reconciler;
             *recover(&state.folder_sync) = Some(folder_sync);
         }
         Ok(())
@@ -1389,6 +1399,16 @@ pub(crate) fn router_configured(
         "documents.mapping.set",
         |context: Context<DocumentsActive>, request: MappingSetRequest| async move {
             set_mapping(&context, request).await
+        },
+    )
+    .request(
+        "documents.mapping.enable-recursive",
+        |context: Context<DocumentsActive>, request: MappingEnableRecursiveRequest| async move {
+            require_collection(&context, &request.collection_id).await?;
+            let reconciler = recover(&context.state().folder_reconciler).clone();
+            reconciler.enable_recursive(request.collection_id, folder_sync::SetOptions {
+                dry_run: request.dry_run, confirm_git: request.confirm_git,
+            }).await
         },
     )
     .request(
@@ -3285,13 +3305,11 @@ async fn submit_update(
 /// Starts the folder sync session: it waits for the qualified replay, reconciles every mapping,
 /// then follows file, body and catalog changes ([`folder_sync::watch::run`]).
 fn start_folder_sync(
-    log: &RecordLog,
+    sync: folder_sync::FolderSync,
     hub: &BodyHub,
     changes: &watch::Sender<u64>,
-    author: String,
 ) -> Session {
-    let cancellation = CancellationToken::new();
-    let sync = folder_sync::FolderSync::new(log, hub, changes, author, cancellation.clone());
+    let cancellation = sync.cancellation();
     let task = tokio::spawn(folder_sync::watch::run(
         sync,
         hub.clone(),

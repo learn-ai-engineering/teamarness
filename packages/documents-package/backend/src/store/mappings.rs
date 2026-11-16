@@ -307,6 +307,23 @@ impl DocumentStore {
         transaction.commit().map_err(rerr)
     }
 
+    /// Enables recursive scanning in place; never replaces or clears file state.
+    pub(crate) fn enable_recursive_mapping(
+        &self,
+        collection: &str,
+        root: &str,
+    ) -> Result<bool, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .execute(
+                "UPDATE folder_mappings SET recursive=1 WHERE collection_id=?1 AND root_path=?2",
+                params![collection, root],
+            )
+            .map(|changed| changed == 1)
+            .map_err(rerr)
+    }
+
     /// Sets the state of the mapping of `collection_id`, only while its root is still
     /// `root_path`. Nothing else changes. Returns whether that mapping was found.
     ///

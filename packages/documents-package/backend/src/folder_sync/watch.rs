@@ -640,12 +640,21 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        request(
-            &mut session,
-            "documents.mapping.set",
-            json!({"collectionId":collection,"path":root.to_str().unwrap()}),
-        )
-        .await;
+        session
+            .handles
+            .store
+            .set_folder_mapping(&crate::store::mappings::FolderMapping {
+                collection_id: collection.clone(),
+                root_path: root.to_str().unwrap().to_owned(),
+                state: crate::store::mappings::MappingState::Active,
+                created_at: 1,
+                recursive: false,
+            })
+            .unwrap();
+        session
+            .handles
+            .changes
+            .send_modify(|revision| *revision += 1);
         let document = request(
             &mut session,
             "documents.document.create",
@@ -656,18 +665,18 @@ mod tests {
             .unwrap()
             .to_owned();
         eventually(|| root.join("Root.md").is_file(), "initial flat watch").await;
-        let mut mapping = session
-            .handles
-            .store
-            .folder_mapping(&collection)
-            .unwrap()
-            .unwrap();
-        mapping.recursive = true;
-        session.handles.store.set_folder_mapping(&mapping).unwrap();
-        session
-            .handles
-            .changes
-            .send_modify(|revision| *revision += 1);
+        request(
+            &mut session,
+            "documents.mapping.enable-recursive",
+            json!({"collectionId":collection,"dryRun":true}),
+        )
+        .await;
+        request(
+            &mut session,
+            "documents.mapping.enable-recursive",
+            json!({"collectionId":collection}),
+        )
+        .await;
         request(
             &mut session,
             "documents.document.place",

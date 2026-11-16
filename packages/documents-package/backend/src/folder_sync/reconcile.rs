@@ -205,6 +205,10 @@ impl FolderSync {
         }
     }
 
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
     /// Makes the next reconcile stop at `point`, as a crash would.
     #[cfg(test)]
     pub(crate) fn crash_at(&self, point: Crash) {
@@ -225,6 +229,24 @@ impl FolderSync {
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn crash_point(&self, _point: Crash) -> Result<(), BackendError> {
         Ok(())
+    }
+
+    /// Shares the worker's gate with consent validation and the mode commit.
+    pub(crate) async fn enable_recursive(
+        &self,
+        collection: String,
+        options: super::mapping::SetOptions,
+    ) -> Result<serde_json::Value, BackendError> {
+        let _gate = self.gate.lock().await;
+        let store = self.hub.store.clone();
+        let result = self
+            .blocking(move || super::mapping::enable_recursive(&store, &collection, options))
+            .await?;
+        if result["changed"] == true {
+            self.changes
+                .send_modify(|revision| *revision = revision.saturating_add(1));
+        }
+        Ok(result)
     }
 
     /// Reconciles the whole mapping of `collection`: every file of its folder, then every
@@ -1677,7 +1699,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn folder_of(rel: &str) -> &str {
+pub(super) fn folder_of(rel: &str) -> &str {
     rel.rsplit_once('/').map_or("", |(folder, _)| folder)
 }
 
