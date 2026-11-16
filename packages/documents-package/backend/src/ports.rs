@@ -105,7 +105,7 @@ pub(crate) fn decode_version(token: &str) -> Option<Frontiers> {
 
 /// What a Consumer can do with a Document's body.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BodyState {
+pub(super) enum BodyState {
     /// Every known record is imported: it can be read and revised.
     Available,
     /// Records this Installation holds cannot be opened yet.
@@ -125,6 +125,12 @@ impl BodyState {
 }
 
 fn body_state(hub: &BodyHub, document: &str) -> Result<BodyState, BackendError> {
+    body_availability(hub, document)
+}
+
+/// Whether `document`'s body can be read and revised now. It needs no request, so folder sync
+/// shares it with the Port.
+pub(super) fn body_availability(hub: &BodyHub, document: &str) -> Result<BodyState, BackendError> {
     if hub
         .store
         .identity_conflicted(document)

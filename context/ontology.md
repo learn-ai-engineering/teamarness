@@ -107,6 +107,7 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Canonical Markdown** | The Markdown export of a Document body as Markdown can carry it, with formatting Markdown cannot express dropped before writing, so exporting again gives the same bytes. The Documents Backend is its only producer (`markdown::export`); the normalisations are the Markdown contract |
 | **Version Token** | The canonical encoding of a Document body's Loro frontiers in the Documents Port Contract: the frontier IDs sorted by peer then counter, 12 bytes each, in base64url without padding, at most 64 IDs. `document.markdown` returns it and `document.revise` requires it as `baseVersion` |
 | **Comment** | An immutable Markdown remark anchored to one Document, optionally quoting an excerpt and optionally replying to a parent Comment on the same Document. Comments can be resolved and reopened and are never deleted |
+| **Folder Mapping** | A link, on one Installation, between a Collection and a folder of Markdown files, so that each `.md` file directly in the folder and its Document follow each other. It is never replicated. A file edit is imported as the local Person's revision; a Document change is written back to the file. A file whose import would lose text, or that is over the Documents bounds, is refused and left as it is (ADR 0041) |
 | **Archive** | Hiding a Collection or Document from the default listing by a record; archived entries remain openable and can be restored. Documents are never purged |
 
 ## Exhibits

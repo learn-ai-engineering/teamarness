@@ -37,6 +37,7 @@ const quote = (...content) => ({ type: "blockquote", content });
 const code = (params, value) => ({ type: "code_block", attrs: { params }, ...(value ? { content: [text(value)] } : {}) });
 const doc = (...content) => ({ type: "doc", content });
 const link = (href, title = null) => mark("link", { href, title });
+const preserved = (kind, value) => ({ type: "preserved_block", attrs: { kind }, ...(value ? { content: [text(value)] } : {}) });
 
 /** One body per fixture, written by the binding over the genesis. */
 const FIXTURES = {
@@ -122,4 +123,21 @@ bob.import(alice.export({ mode: "update", from: before }));
 if (JSON.stringify(alice.toJSON()) !== JSON.stringify(bob.toJSON())) throw new Error("the editors did not converge");
 write("concurrent-same-paragraph", alice);
 
-console.log(`Wrote ${Object.keys(FIXTURES).length + 1} binding fixtures to ${path.relative(process.cwd(), out)}`);
+// Written after the others, so that adding them left the earlier snapshots and their peers alone.
+const FRONT_MATTER = preserved("front_matter", '---\ntitle: "a | b"\n---');
+const TABLE = preserved("table", "| a | b |\n|---|---|\n| 1 | 2 |");
+const HTML = preserved("html", '<div class="x">\n</div>');
+const NESTED_TABLE = preserved("table", "| c |\n|---|");
+const NOTE = preserved("html", "<!-- note -->");
+
+const everyKind = session(++peer);
+edit(everyKind, doc(FRONT_MATTER, p(text("prose")), TABLE, HTML, quote(NESTED_TABLE), ul(li(p(text("item")), NOTE))));
+write("preserved-all-kinds", everyKind);
+
+// A block moved and another deleted whole, as a drop and a Delete write them.
+const rearranged = session(++peer);
+edit(rearranged, doc(FRONT_MATTER, p(text("first")), TABLE, p(text("second")), HTML));
+edit(rearranged, doc(FRONT_MATTER, TABLE, p(text("first")), p(text("second"))));
+write("preserved-moved-and-deleted", rearranged);
+
+console.log(`Wrote ${Object.keys(FIXTURES).length + 3} binding fixtures to ${path.relative(process.cwd(), out)}`);

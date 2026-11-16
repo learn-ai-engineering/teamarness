@@ -80,6 +80,10 @@ button, input, select, textarea { font: inherit; }
 .editor-surface .ProseMirror pre { margin: 0 0 .7em; padding: .6rem .8rem; border-radius: var(--teamarness-radius-control, 6px); background: var(--teamarness-color-panel); font-family: var(--teamarness-font-mono, ui-monospace, monospace); font-size: .88em; overflow-x: auto; }
 .editor-surface .ProseMirror code { font-family: var(--teamarness-font-mono, ui-monospace, monospace); font-size: .9em; padding: .05em .25em; border-radius: 4px; background: var(--teamarness-color-panel); }
 .editor-surface .ProseMirror pre code { padding: 0; background: none; }
+/* A Preserved Block's read-only frame. */
+.editor-surface .ProseMirror .preserved-block { margin: 0 0 .7em; border: 1px solid var(--teamarness-color-border); border-radius: var(--teamarness-radius-control, 6px); background: var(--teamarness-color-panel); color: var(--teamarness-color-text); cursor: default; }
+.editor-surface .ProseMirror .preserved-block figcaption { padding: .2rem .6rem; border-bottom: 1px solid var(--teamarness-color-border); color: var(--teamarness-color-text-muted); font-size: .75rem; user-select: none; }
+.editor-surface .ProseMirror .preserved-block pre { margin: 0; border-radius: 0; background: transparent; white-space: pre; }
 .editor-surface .ProseMirror ul, .editor-surface .ProseMirror ol { margin: 0 0 .7em; padding-left: 1.6rem; }
 .editor-surface .ProseMirror li > p { margin: 0 0 .2em; }
 .editor-surface .ProseMirror hr { border: 0; border-top: 1px solid var(--teamarness-color-border); margin: 1em 0; }
@@ -129,3 +133,38 @@ img.ProseMirror-separator { display: inline !important; border: none !important;
   .comments-panel { position: absolute; z-index: 4; top: 0; bottom: 0; right: 0; width: min(var(--right-width), 75%); box-shadow: -5px 0 15px #0004; }
   .right-resizer { position: absolute; z-index: 5; top: 0; bottom: 0; right: min(var(--right-width), 75%); }
 }
+
+/* The settings view (Configuration tab): folder mappings. It sits under the Shell's page header and
+   tabs, so it matches the About groups there: no panels, a title and intro beside each group's
+   content, and a rule between groups. */
+.documents-settings.teamarness-page { height: 100%; overflow: auto; max-width: none; padding: 1.25rem 0 2rem; container-type: inline-size; }
+.documents-settings.teamarness-page > * + * { margin-top: 0; }
+.settings-description { max-width: 40rem; margin: 0 0 1.5rem; color: var(--teamarness-color-text-muted); }
+.settings-group { display: grid; grid-template-columns: minmax(10rem, 1fr) minmax(0, 2.2fr); gap: 1rem 3rem; padding-block: 2rem; border-top: 1px solid var(--teamarness-color-border); }
+.settings-description + .settings-group { padding-top: .5rem; border-top: 0; }
+.settings-group h2 { margin: 0 0 .35rem; font-size: 1rem; font-weight: 600; }
+.settings-group-intro p { margin: 0; color: var(--teamarness-color-text-muted); }
+.settings-group-body { display: flex; flex-direction: column; gap: 1.1rem; min-width: 0; max-width: 40rem; }
+.settings-group-body > p { margin: 0; }
+@container (max-width: 52rem) { .settings-group { grid-template-columns: 1fr; gap: .75rem; } }
+.documents-settings .teamarness-control:disabled { opacity: .5; cursor: not-allowed; }
+.documents-settings button:focus-visible, .documents-settings input:focus-visible, .documents-settings select:focus-visible, .documents-settings summary:focus-visible { outline: 3px solid var(--teamarness-color-focus); outline-offset: 2px; }
+.mapping-refused-list, .mapping-files, .mapping-reformatted, .mapping-subfolders { margin: 0; padding-left: 1.2rem; }
+.mapping-collections { list-style: none; margin: 0; padding: 0; display: grid; gap: 1.25rem; }
+.mapping-collection { display: grid; gap: .3rem; min-width: 0; }
+.mapping-collection-header { display: flex; align-items: center; gap: .6rem; min-width: 0; }
+.mapping-collection-name { overflow-wrap: anywhere; }
+.mapping-state { color: var(--teamarness-color-text-muted); font-size: .85rem; }
+.mapping-collection[data-state="unavailable"] .mapping-state { color: var(--teamarness-color-danger); }
+.mapping-unmap { margin-left: auto; }
+.mapping-unmap:disabled { opacity: .5; cursor: not-allowed; }
+.mapping-path, .mapping-report code, .mapping-refused code { font-family: var(--teamarness-font-mono); overflow-wrap: anywhere; }
+.mapping-path { color: var(--teamarness-color-text-muted); font-size: .85rem; }
+.mapping-counts, .mapping-git { margin: 0; font-size: .85rem; }
+.mapping-refused summary { cursor: pointer; font-size: .85rem; }
+.mapping-detail { color: var(--teamarness-color-text-muted); }
+.mapping-hint { font-size: .85rem; }
+.mapping-report:empty, .documents-settings [hidden], .documents-settings .teamarness-notice:empty { display: none; }
+.mapping-report h3 { margin: 0 0 .4rem; font-size: .95rem; }
+.mapping-report h4 { margin: .6rem 0 .2rem; font-size: .9rem; }
+.mapping-git-confirm { display: flex; gap: .5rem; align-items: flex-start; }

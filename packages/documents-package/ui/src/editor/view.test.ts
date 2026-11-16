@@ -6,11 +6,11 @@ import { LoroDoc } from "loro-crdt";
 import { baseKeymap } from "prosemirror-commands";
 import { keymap } from "prosemirror-keymap";
 import type { Node } from "prosemirror-model";
-import { AllSelection, EditorState, TextSelection } from "prosemirror-state";
+import { AllSelection, EditorState, NodeSelection, TextSelection } from "prosemirror-state";
 import type { Command } from "prosemirror-state";
 import { EditorView } from "prosemirror-view";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { GuardHost } from "./guard";
+import type { GuardHost, GuardRefusal } from "./guard";
 import { MARK_EXPAND, schema } from "./schema";
 import {
   DocumentEditor, MAX_QUOTE, acceptableHref, boundedQuote, editorCommands, editorInputRules, editorKeymap,
@@ -420,5 +420,188 @@ describe("the rendered editor", () => {
     expect(form.hidden).toBe(true);
     expect(editor.element.querySelector(".ProseMirror a")?.getAttribute("href")).toBe("https://example.com/");
     editor.destroy();
+  });
+});
+
+describe("Preserved Blocks", () => {
+  const ALL_KINDS = join(import.meta.dirname, "../../../fixtures/body-trees/from-rust/24-preserved-all-kinds.loro");
+  const TOOLTIP = "Kept exactly as written. Edit it in a mapped file or ask an agent.";
+  const TABLE = "| a | b |\n|---|---|\n| 1 | 2 |";
+
+  function preserved(kind: string, source: string): Node {
+    return schema.node("preserved_block", { kind }, [schema.text(source)]);
+  }
+
+  function paragraph(text: string): Node {
+    return schema.node("paragraph", null, text ? [schema.text(text)] : []);
+  }
+
+  /** A Loro peer holding one body with every kind of Preserved Block, as the Rust core writes it. */
+  function allKinds(peer: bigint): LoroDoc {
+    const doc = new LoroDoc();
+    doc.import(new Uint8Array(readFileSync(ALL_KINDS)));
+    doc.setPeerId(peer);
+    doc.configTextStyle(MARK_EXPAND);
+    return doc;
+  }
+
+  /** An editor over `blocks`, bound to Loro with every editor plugin, recording refusals. */
+  async function editing(blocks: Node[]): Promise<{ view: EditorView; refusals: GuardRefusal[]; loro: LoroDoc }> {
+    const loro = genesisPeer(70n);
+    const refusals: GuardRefusal[] = [];
+    const guard: GuardHost = { unsentBytes: () => 0, flush: () => {}, refused: (reason) => { refusals.push(reason); } };
+    const view = new EditorView(document.createElement("div"), {
+      state: EditorState.create({ schema, doc: initialDocument(loro), plugins: editorPlugins(loro, guard, () => true) }),
+    });
+    views.push(view);
+    await nextTask();
+    view.dispatch(view.state.tr.replaceWith(0, view.state.doc.content.size, blocks));
+    refusals.length = 0;
+    await nextTask();
+    return { view, refusals, loro };
+  }
+
+  function selectNode(view: EditorView, position: number): void {
+    view.dispatch(view.state.tr.setSelection(NodeSelection.create(view.state.doc, position)));
+  }
+
+  it("preserved block renders read-only with its kind label", async () => {
+    const editor = new DocumentEditor({ guard: { unsentBytes: () => 0, flush: () => {} }, onCopyMarkdown: () => {}, onComment: () => {} });
+    document.body.append(editor.element);
+    editor.bind(allKinds(71n), true);
+    await nextTask();
+    const frames = [...editor.element.querySelectorAll<HTMLElement>(".ProseMirror .preserved-block")];
+    const label = (kind: string) => `${kind} · preserved Markdown`;
+    expect(frames.map((frame) => frame.querySelector("figcaption")?.textContent)).toEqual([
+      label("Front matter"), label("Table"), label("HTML"), label("Table"), label("HTML"),
+    ]);
+    expect(frames.map((frame) => frame.querySelector("pre")?.textContent)).toEqual([
+      '---\ntitle: "a | b"\n---', TABLE, '<div class="x">\n</div>', "| c |\n|---|", "<!-- note -->",
+    ]);
+    for (const frame of frames) {
+      expect(frame.getAttribute("role")).toBe("figure");
+      expect(frame.getAttribute("contenteditable")).toBe("false");
+      expect(frame.draggable).toBe(true);
+      expect(frame.getAttribute("title")).toBe(TOOLTIP);
+      expect(frame.getAttribute("aria-label")).toBe(`${frame.querySelector("figcaption")?.textContent}. ${TOOLTIP}`);
+      // ADR 0031: every style comes from the declared stylesheet.
+      expect(frame.outerHTML).not.toMatch(/\sstyle=/);
+    }
+    editor.destroy();
+  });
+
+  it("typing inside a preserved block is refused", async () => {
+    const blocks = [paragraph("before"), preserved("table", TABLE), paragraph("after")];
+    const { view, refusals } = await editing(blocks);
+    const position = view.state.doc.child(0).nodeSize;
+    const before = view.state.doc;
+
+    // The whole node selected: typing never replaces it.
+    selectNode(view, position);
+    type(view, "x");
+    expect(view.state.doc.eq(before)).toBe(true);
+    expect(refusals).toEqual(["preserved_read_only"]);
+
+    // A caret that somehow reached the source cannot edit it either.
+    refusals.length = 0;
+    select(view, position + 2);
+    type(view, "x");
+    expect(press(view, "Enter")).toBe(true);
+    expect(view.state.doc.child(1).textContent).toBe(TABLE);
+    expect(refusals.length).toBeGreaterThan(0);
+    expect(new Set(refusals)).toEqual(new Set(["preserved_read_only"]));
+
+    // The node view ignores every DOM mutation and stops input aimed at it.
+    const desc = view.nodeDOM(position) as HTMLElement & { pmViewDesc?: { ignoreMutation(record: unknown): boolean; stopEvent(event: Event): boolean } };
+    expect(desc.pmViewDesc?.ignoreMutation({ type: "characterData" })).toBe(true);
+    expect(desc.pmViewDesc?.stopEvent(new Event("beforeinput"))).toBe(true);
+    expect(desc.pmViewDesc?.stopEvent(new Event("mousedown"))).toBe(false);
+
+    // The rest of the Document stays editable.
+    refusals.length = 0;
+    select(view, 1);
+    type(view, "still ");
+    expect(view.state.doc.child(0).textContent).toBe("still before");
+    expect(refusals).toEqual([]);
+  });
+
+  it("a preserved block can be deleted and moved whole", async () => {
+    const blocks = [paragraph("before"), preserved("table", TABLE), paragraph("after")];
+    const { view, refusals } = await editing(blocks);
+    const position = view.state.doc.child(0).nodeSize;
+    const size = view.state.doc.child(1).nodeSize;
+
+    // Backspace beside the block selects it first; a second press removes it.
+    select(view, position + size + 1);
+    expect(press(view, "Backspace")).toBe(true);
+    expect(view.state.selection).toBeInstanceOf(NodeSelection);
+    expect(view.state.selection.from).toBe(position);
+    expect(view.state.doc.childCount).toBe(3);
+    // Delete beside the block does the same from the other side.
+    select(view, position - 1);
+    expect(press(view, "Delete")).toBe(true);
+    expect(view.state.selection.from).toBe(position);
+
+    expect(press(view, "Delete")).toBe(true);
+    expect(view.state.doc.childCount).toBe(2);
+    expect(view.state.doc.textContent).toBe("beforeafter");
+    expect(press(view, "Mod-z")).toBe(true);
+    await nextTask();
+    await nextTask();
+    expect(view.state.doc.child(1).attrs.kind).toBe("table");
+    expect(view.state.doc.child(1).textContent).toBe(TABLE);
+
+    selectNode(view, position);
+    expect(press(view, "Backspace")).toBe(true);
+    expect(view.state.doc.textContent).toBe("beforeafter");
+    await nextTask();
+
+    // A move, as a drop applies one: the block keeps its node, kind and source.
+    const { view: moving } = await editing(blocks);
+    const block = moving.state.doc.child(1);
+    moving.dispatch(moving.state.tr.delete(position, position + size).insert(0, block));
+    expect(moving.state.doc.child(0).eq(block)).toBe(true);
+    expect(moving.state.doc.childCount).toBe(3);
+    expect(refusals).toEqual([]);
+  });
+
+  it("Enter on a selected block starts a paragraph below it, even when it is front matter", async () => {
+    const { view, refusals } = await editing([preserved("front_matter", "---\na: 1\n---")]);
+    selectNode(view, 0);
+    expect(press(view, "Enter")).toBe(true);
+    type(view, "below");
+    expect(view.state.doc.child(0).type.name).toBe("preserved_block");
+    expect(view.state.doc.child(1).textContent).toBe("below");
+    expect(refusals).toEqual([]);
+  });
+
+  it("offers no block style for a selected block, and keeps every mark off it", async () => {
+    const { view } = await editing([paragraph("before"), preserved("table", TABLE)]);
+    selectNode(view, view.state.doc.child(0).nodeSize);
+    for (const command of [editorCommands.paragraph, editorCommands.heading(1), editorCommands.codeBlock, editorCommands.strong, editorCommands.hardBreak]) {
+      expect(command(view.state, undefined, view)).toBe(false);
+    }
+  });
+
+  it("keeps its node, kind and source when copied within the editor", async () => {
+    const { view, refusals } = await editing([paragraph("before"), preserved("table", TABLE), paragraph("after")]);
+    selectNode(view, view.state.doc.child(0).nodeSize);
+    const { dom, text } = view.serializeForClipboard(view.state.selection.content());
+    expect(text).toBe(TABLE);
+    select(view, view.state.doc.content.size - 1);
+    expect(view.pasteHTML(dom.innerHTML)).toBe(true);
+    const copies = view.state.doc.content.content.filter((node) => node.type.name === "preserved_block");
+    expect(copies.map((node) => [node.attrs.kind, node.textContent])).toEqual([["table", TABLE], ["table", TABLE]]);
+    expect(refusals).toEqual([]);
+  });
+
+  it("does not parse a forged frame of an unknown kind into a Preserved Block", async () => {
+    const { view } = await editing([paragraph("x")]);
+    select(view, 2);
+    view.pasteHTML('<figure class="preserved-block" data-kind="nonsense"><pre>source</pre></figure>');
+    let found = false;
+    view.state.doc.descendants((node) => { if (node.type.name === "preserved_block") found = true; });
+    expect(found).toBe(false);
+    expect(view.state.doc.textContent).toContain("source");
   });
 });

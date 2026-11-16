@@ -1,6 +1,6 @@
 import { Fragment, Slice } from "prosemirror-model";
 import type { Node } from "prosemirror-model";
-import { Plugin, PluginKey, TextSelection } from "prosemirror-state";
+import { NodeSelection, Plugin, PluginKey, TextSelection } from "prosemirror-state";
 import type { EditorState, Transaction } from "prosemirror-state";
 import { AddMarkStep, RemoveMarkStep, ReplaceAroundStep, ReplaceStep } from "prosemirror-transform";
 import type { Step } from "prosemirror-transform";
@@ -42,8 +42,13 @@ export const MEASURE_THRESHOLD_BYTES = EXPORT_BUDGET_BYTES / 2;
  * - `document_too_large`: the change would grow the body past its text budget.
  * - `step_too_large`: the change to undo or redo is too large to undo or redo as one record.
  * - `step_unknown`: the change to undo or redo could not be measured, so it is not undone or redone.
+ * - `preserved_read_only`: the change would edit the source of a Preserved Block.
+ * - `front_matter_first`: the change would leave front matter anywhere but first in the body, which
+ *   the Backend refuses as a schema violation, and which would lose the session's local state.
  */
-export type GuardRefusal = "block_too_large" | "document_too_large" | "step_too_large" | "step_unknown";
+export type GuardRefusal =
+  | "block_too_large" | "document_too_large" | "step_too_large" | "step_unknown"
+  | "preserved_read_only" | "front_matter_first";
 
 /** What the guard needs from the editor session. */
 export interface GuardHost {
@@ -216,6 +221,50 @@ export function measureTransaction(state: EditorState, tr: Transaction): Transac
   return cost;
 }
 
+const PRESERVED = "preserved_block";
+
+/** Whether the selection is a Preserved Block, or a caret or range inside the source of one. */
+export function selectionIsPreserved(state: EditorState): boolean {
+  const { selection } = state;
+  return selection.$from.parent.type.name === PRESERVED
+    || (selection instanceof NodeSelection && selection.node.type.name === PRESERVED);
+}
+
+/**
+ * Whether `step` reaches inside a Preserved Block. A step that takes a block whole has every
+ * position outside it, including the gap of a wrap or a lift around it. One that retypes a block
+ * has its gap inside.
+ */
+function stepEditsPreserved(step: Step, before: Node): boolean {
+  let positions: number[];
+  if (step instanceof ReplaceAroundStep) positions = [step.from, step.to, step.gapFrom, step.gapTo];
+  else if (step instanceof ReplaceStep) positions = [step.from, step.to];
+  else return false;
+  return positions.some((position) => before.resolve(position).parent.type.name === PRESERVED);
+}
+
+const frontMatterCache = new WeakMap<Node, number>();
+
+/** How many front matter blocks `node` holds. Persistent nodes are cached, as in {@link textBytes}. */
+function frontMatterBlocks(node: Node): number {
+  if (node.type.name === PRESERVED) return node.attrs.kind === "front_matter" ? 1 : 0;
+  if (node.isTextblock || node.isLeaf) return 0;
+  const cached = frontMatterCache.get(node);
+  if (cached !== undefined) return cached;
+  let total = 0;
+  node.forEach((child) => { total += frontMatterBlocks(child); });
+  frontMatterCache.set(node, total);
+  return total;
+}
+
+/** Whether `doc` holds front matter anywhere but as its first block (`read_tree` refuses that). */
+function frontMatterMisplaced(doc: Node): boolean {
+  const total = frontMatterBlocks(doc);
+  if (total === 0) return false;
+  const first = doc.child(0);
+  return total > 1 || first.type.name !== PRESERVED || first.attrs.kind !== "front_matter";
+}
+
 /** A paste too large for one export, cut at top-level block boundaries. */
 export type PastePlan =
   | Readonly<{ kind: "whole" }>
@@ -302,8 +351,11 @@ export function isBindingReplay(tr: Transaction): boolean {
 }
 
 /**
- * The pre-commit size guard.
+ * The pre-commit guard, of size and of Preserved Blocks.
  *
+ * - A transaction that edits the source of a Preserved Block is refused, and so is typing over a
+ *   selected one. Taking a block whole (delete, move, wrap, replace) applies. The one exception is
+ *   front matter, which a transaction may not leave anywhere but first in the body.
  * - Before a transaction applies, its growth is estimated ({@link estimateTransactionBytes}), and
  *   measured exactly on a fork when the estimate is above {@link MEASURE_THRESHOLD_BYTES}; when
  *   the pending export would then exceed {@link EXPORT_BUDGET_BYTES}, the session flushes first.
@@ -321,6 +373,14 @@ export function guardPlugin(host: GuardHost, options: GuardOptions = {}): Plugin
     state: { init: () => host, apply: (_tr, value) => value },
     filterTransaction(tr: Transaction, state: EditorState): boolean {
       if (!tr.docChanged || isBindingReplay(tr)) return true;
+      if (tr.steps.some((step, index) => stepEditsPreserved(step, tr.docs[index]!))) {
+        host.refused("preserved_read_only");
+        return false;
+      }
+      if (frontMatterMisplaced(tr.doc)) {
+        host.refused("front_matter_first");
+        return false;
+      }
       const before = textBytes(state.doc);
       const after = textBytes(tr.doc);
       if (after > TEXT_BUDGET_BYTES && after > before) {
@@ -337,6 +397,11 @@ export function guardPlugin(host: GuardHost, options: GuardOptions = {}): Plugin
       return true;
     },
     props: {
+      handleTextInput(view) {
+        if (!selectionIsPreserved(view.state)) return false;
+        host.refused("preserved_read_only");
+        return true;
+      },
       handlePaste(view, _event, slice) {
         const plan = planPaste(view.state.doc, slice, fragmentTextBytes(view.state.selection.content().content));
         if (plan.kind === "whole") return false;

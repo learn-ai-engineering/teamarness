@@ -6,7 +6,9 @@ use loro::{
     ValueOrContainer,
 };
 use proptest::prelude::*;
-use teamarness_documents_package::markdown::{Block, Inline, Link, Marks, write_tree};
+use teamarness_documents_package::markdown::{
+    Block, Inline, Link, Marks, PreservedKind, write_tree,
+};
 
 /// Cases per Markdown property; merge properties run a third of it.
 /// `CASES=60000 cargo test --release` runs the long search.
@@ -52,7 +54,7 @@ pub fn plain_text(blocks: &[Block]) -> String {
             }
             Block::Blockquote(children) => out.push_str(&plain_text(children)),
             Block::Rule => {}
-            Block::Code { text, .. } => out.push_str(text),
+            Block::Code { text, .. } | Block::Preserved { source: text, .. } => out.push_str(text),
             Block::Bullet { items, .. } | Block::Ordered { items, .. } => {
                 for item in items {
                     out.push_str(&plain_text(item));
@@ -126,6 +128,20 @@ pub fn human_types(doc: &LoroDoc, block: usize, at_end: bool, text: &str) {
             let pos = if at_end { run.len_unicode() } else { 0 };
             run.insert(pos, text).unwrap();
         }
+        _ => panic!("block {block} has no text"),
+    }
+    doc.commit();
+}
+
+/// A person's insert at a character offset in the block's first text run, as another Installation
+/// can make it.
+pub fn human_inserts(doc: &LoroDoc, block: usize, at: usize, text: &str) {
+    let children = match block_map(doc, block).get("children") {
+        Some(ValueOrContainer::Container(Container::List(list))) => list,
+        _ => panic!("block {block} has no children"),
+    };
+    match children.get(0) {
+        Some(ValueOrContainer::Container(Container::Text(run))) => run.insert(at, text).unwrap(),
         _ => panic!("block {block} has no text"),
     }
     doc.commit();
@@ -223,7 +239,102 @@ pub fn leaf(text: BoxedStrategy<String>, spaced: bool) -> impl Strategy<Value = 
         1 => Just(Block::Rule),
         1 => ("[a-z]{0,6}", "[a-z =(){};\n`~]{0,40}")
             .prop_map(|(params, text)| Block::Code { params, text }),
+        1 => preserved(),
     ]
+}
+
+/// A GFM table whose cells hold pipes (escaped), dashes, `<` and other Markdown punctuation.
+pub fn table_source() -> impl Strategy<Value = String> {
+    let cell = "[a-z0-9<>*_~-]{1,6}( \\\\\\|)?";
+    (1usize..4)
+        .prop_flat_map(move |columns| {
+            (
+                prop::collection::vec(cell, columns),
+                prop::sample::select(vec!["---", ":--", "--:", ":-:"]),
+                prop::collection::vec(prop::collection::vec(cell, columns), 0..3),
+                any::<bool>(),
+            )
+        })
+        .prop_map(|(header, delimiter, rows, piped)| {
+            let row = |cells: &[String]| {
+                if piped || cells.len() == 1 {
+                    format!("| {} |", cells.join(" | "))
+                } else {
+                    // Without an outer pipe, a line must not start as another block does.
+                    format!("c{}", cells.join(" | "))
+                }
+            };
+            let delimiters = vec![delimiter.to_owned(); header.len()];
+            let delimiter_row = if piped || header.len() == 1 {
+                row(&delimiters)
+            } else {
+                delimiters.join(" | ")
+            };
+            let mut lines = vec![row(&header), delimiter_row];
+            lines.extend(rows.iter().map(|cells| row(cells)));
+            lines.join("\n")
+        })
+}
+
+/// An HTML block with no blank line in it: a comment, or an element over several lines.
+pub fn html_source() -> impl Strategy<Value = String> {
+    prop_oneof![
+        "[a-z|<>= ]{0,12}".prop_map(|text| format!("<!-- {text} -->")),
+        (
+            prop::sample::select(vec!["div", "section", "details", "table", "center"]),
+            prop::collection::vec("[a-z0-9<][a-z0-9 |<>/=-]{0,12}[a-z0-9>]", 0..3),
+        )
+            .prop_map(|(tag, lines)| {
+                let mut out = vec![format!("<{tag} class=\"a|b\">")];
+                out.extend(lines);
+                out.push(format!("</{tag}>"));
+                out.join("\n")
+            }),
+    ]
+}
+
+/// YAML front matter whose values hold pipes, dashes, `<` and colons.
+pub fn front_matter_source() -> impl Strategy<Value = String> {
+    prop::collection::vec(("[a-z]{1,6}", "[a-z0-9|<: -]{0,10}"), 1..4).prop_map(|fields| {
+        let mut out = vec!["---".to_owned()];
+        out.extend(fields.iter().map(|(key, value)| format!("{key}: {value}")));
+        out.push("---".to_owned());
+        out.join("\n")
+    })
+}
+
+/// A Preserved Block that may sit anywhere a code block may.
+pub fn preserved() -> impl Strategy<Value = Block> {
+    // Whitespace after the final line is part of the source.
+    let trailing = || prop_oneof![4 => Just(""), 1 => Just(" "), 1 => Just("  "), 1 => Just("\t")];
+    prop_oneof![
+        (table_source(), trailing()).prop_map(|(source, trailing)| Block::Preserved {
+            kind: PreservedKind::Table,
+            source: source + trailing,
+        }),
+        (html_source(), trailing()).prop_map(|(source, trailing)| Block::Preserved {
+            kind: PreservedKind::Html,
+            source: source + trailing,
+        }),
+    ]
+}
+
+/// Blocks as [`blocks`] makes them, opening with front matter a quarter of the time.
+pub fn document(text: BoxedStrategy<String>, spaced: bool) -> impl Strategy<Value = Vec<Block>> {
+    (
+        prop::option::weighted(0.25, front_matter_source()),
+        blocks(text, spaced),
+    )
+        .prop_map(|(front, rest)| {
+            front
+                .map(|source| Block::Preserved {
+                    kind: PreservedKind::FrontMatter,
+                    source,
+                })
+                .into_iter()
+                .chain(rest)
+                .collect()
+        })
 }
 
 pub fn blocks(text: BoxedStrategy<String>, spaced: bool) -> impl Strategy<Value = Vec<Block>> {

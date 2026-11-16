@@ -14,11 +14,11 @@ use loro::{
     PeerID, UpdateOptions, ValueOrContainer,
 };
 
-use super::export::{parse, parse_revision, serialize};
+use super::export::{parse_revision, reimport, serialize};
 use super::schema::{
-    ATTRIBUTES, Block, CHILDREN, Inline, Marks, SchemaViolation, Segment, block_attributes,
-    body_list, child_list, configure, insert_block, insert_inlines, insert_item, list_entries,
-    mark_values, read_block, read_item, read_runs, read_tree, segments,
+    ATTRIBUTES, Block, CHILDREN, Inline, Marks, PreservedKind, SchemaViolation, Segment,
+    block_attributes, body_list, child_list, configure, insert_block, insert_inlines, insert_item,
+    list_entries, mark_values, read_block, read_item, read_runs, read_tree, segments,
 };
 
 /// The longest-common-subsequence table is bounded at this many cells (16 MiB of `u32`).
@@ -140,6 +140,8 @@ fn merge_once(
     read_tree(&work)?;
     let before = work.oplog_vv();
     reconcile_blocks(&body_list(&work)?, target, 1, diff)?;
+    // The update must leave a body that every reader accepts.
+    read_tree(&work)?;
     work.commit();
     let after = work.oplog_vv();
     let ops = after
@@ -242,7 +244,10 @@ fn replace_changed(run: &LoroText, target: &str) -> Result<(), MergeError> {
 
 /// What Markdown makes of a block on its own. `None` means it vanishes (an empty paragraph).
 fn normalize(block: &Block) -> Option<Block> {
-    let mut parsed = parse(&serialize(std::slice::from_ref(block)));
+    // Too deep to import: as with several blocks, Markdown does not give this block back.
+    let Ok(mut parsed) = reimport(&serialize(std::slice::from_ref(block))) else {
+        return Some(block.clone());
+    };
     match parsed.len() {
         0 => None,
         1 => parsed.pop(),
@@ -250,8 +255,13 @@ fn normalize(block: &Block) -> Option<Block> {
     }
 }
 
+/// Blocks that can be edited into each other in place. A Preserved Block of another kind is a
+/// different construct, so it is replaced.
 fn same_kind(a: &Block, b: &Block) -> bool {
-    a.node_name() == b.node_name()
+    match (a, b) {
+        (Block::Preserved { kind: a, .. }, Block::Preserved { kind: b, .. }) => a == b,
+        _ => a.node_name() == b.node_name(),
+    }
 }
 
 /// Matched index pairs in order: the unchanged prefix and suffix, and a longest common
@@ -381,7 +391,7 @@ fn reconcile_blocks(
         |c, t| same_kind(&current[c], &target[t]),
         |c| keep_blank && current_keys[c].is_none(),
     );
-    let steps: Vec<Step> = alignment
+    let mut steps: Vec<Step> = alignment
         .into_iter()
         .map(|pair| match pair {
             (Some(c), Some(t)) if current[c] == target[t] => Step::Keep,
@@ -393,6 +403,23 @@ fn reconcile_blocks(
             (None, None) => unreachable!("an alignment pair holds at least one side"),
         })
         .collect();
+    // New front matter goes before an empty paragraph the revision cannot mention, because
+    // front matter is only ever the first block.
+    if let Some(front) = target.first().filter(|block| {
+        matches!(
+            block,
+            Block::Preserved {
+                kind: PreservedKind::FrontMatter,
+                ..
+            }
+        )
+    }) && let Some(index) = steps
+        .iter()
+        .position(|step| matches!(step, Step::Insert(block) if std::ptr::eq(*block, front)))
+    {
+        let insert = steps.remove(index);
+        steps.insert(0, insert);
+    }
     apply_steps(list, &steps, depth, diff)
 }
 
@@ -516,7 +543,7 @@ fn update_block(
         Block::Paragraph(content) | Block::Heading { content, .. } => {
             reconcile_inlines(&list, content, diff)
         }
-        Block::Code { text, .. } => {
+        Block::Code { text, .. } | Block::Preserved { source: text, .. } => {
             match list_entries(&list).into_iter().next() {
                 Some(ValueOrContainer::Container(Container::Text(run))) => {
                     update_text(&run, &[(text.clone(), Marks::default())], diff)?

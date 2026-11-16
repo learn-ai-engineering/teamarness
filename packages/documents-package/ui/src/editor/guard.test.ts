@@ -3,11 +3,11 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { LoroDoc } from "loro-crdt";
-import { updateLoroToPmState } from "loro-prosemirror";
+import { createNodeFromLoroObj, updateLoroToPmState } from "loro-prosemirror";
 import type { LoroDocType } from "loro-prosemirror";
 import { Fragment, Slice } from "prosemirror-model";
 import type { Node } from "prosemirror-model";
-import { EditorState, TextSelection } from "prosemirror-state";
+import { EditorState, NodeSelection, TextSelection } from "prosemirror-state";
 import type { Transaction } from "prosemirror-state";
 import { EditorView } from "prosemirror-view";
 import { afterEach, describe, expect, it } from "vitest";
@@ -266,5 +266,136 @@ describe("structural edits", () => {
     expect(sizes.length).toBe(1);
     expect(sizes[0]!).toBeGreaterThan(60_000);
     expect(sizes[0]!).toBeLessThanOrEqual(RECORD_LIMIT_BYTES);
+  });
+});
+
+describe("Preserved Blocks", () => {
+  const TABLE = "| a |\n|---|\n| 1 |";
+  const FRONT_MATTER = "---\ntitle: x\n---";
+
+  function preserved(kind: string, source: string): Node {
+    return schema.node("preserved_block", { kind }, [schema.text(source)]);
+  }
+
+  /** Dispatches `change` and reports whether the guard let it through. */
+  function applies(view: EditorView, change: (tr: Transaction) => Transaction): boolean {
+    const before = view.state.doc;
+    view.dispatch(change(view.state.tr));
+    return !view.state.doc.eq(before);
+  }
+
+  it("text steps inside a preserved block are refused; remote updates apply", async () => {
+    const host = new Host();
+    // Positions: paragraph 0-3, table 3-(3 + size).
+    const content = doc(paragraph("a"), preserved("table", TABLE), paragraph("b"));
+    const view = guarded(host, content);
+    const start = 4;
+    const size = content.child(1).nodeSize;
+    const refused: Array<[string, (tr: Transaction) => Transaction]> = [
+      ["an insert", (tr) => tr.insertText("x", start + 1)],
+      ["a delete", (tr) => tr.delete(start, start + 2)],
+      ["clearing the source", (tr) => tr.delete(start, start + TABLE.length)],
+      ["a split", (tr) => tr.split(start + 2)],
+      ["joining the paragraph before", (tr) => tr.join(3)],
+      ["joining the paragraph after", (tr) => tr.join(3 + size)],
+      ["a block type change", (tr) => tr.setBlockType(3, 3 + size, schema.nodes.paragraph!)],
+      ["a kind change", (tr) => tr.setNodeMarkup(3, undefined, { kind: "html" })],
+      ["a replace from outside into it", (tr) => tr.delete(1, start + 2)],
+    ];
+    for (const [name, change] of refused) {
+      host.refusals.length = 0;
+      expect(applies(view, change), name).toBe(false);
+      expect(host.refusals, name).toEqual(["preserved_read_only"]);
+    }
+    expect(view.state.doc.eq(content)).toBe(true);
+
+    // A Loro update from another peer changes the source; the guard never filters the binding.
+    const genesis = () => {
+      const peer = new LoroDoc();
+      peer.import(new Uint8Array(readFileSync(GENESIS)));
+      peer.configTextStyle(MARK_EXPAND);
+      return peer;
+    };
+    const local = genesis();
+    local.setPeerId(5n);
+    updateLoroToPmState(local as unknown as LoroDocType, new Map(), EditorState.create({ schema, doc: content }));
+    const remote = genesis();
+    remote.import(local.export({ mode: "snapshot" }));
+    remote.setPeerId(6n);
+    local.setPeerId(7n);
+    const bound = new EditorView(document.createElement("div"), {
+      state: EditorState.create({ schema, doc: initialDocument(local), plugins: editorPlugins(local, host, () => true) }),
+    });
+    views.push(bound);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    host.refusals.length = 0;
+    const mapping = new Map();
+    createNodeFromLoroObj(schema, (remote as unknown as LoroDocType).getMap("doc"), mapping);
+    const edited = doc(paragraph("a"), preserved("table", TABLE.replace("1", "9")), paragraph("b"));
+    updateLoroToPmState(remote as unknown as LoroDocType, mapping, EditorState.create({ schema, doc: edited }));
+    local.import(remote.export({ mode: "update", from: local.oplogVersion() }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(bound.state.doc.child(1).textContent).toBe(TABLE.replace("1", "9"));
+    expect(bound.state.doc.childCount).toBe(3);
+    expect(host.refusals).toEqual([]);
+  });
+
+  it("a whole-node delete, move, wrap and replace are allowed", () => {
+    const host = new Host();
+    const content = doc(paragraph("a"), preserved("table", TABLE), paragraph("b"));
+    const size = content.child(1).nodeSize;
+    const view = guarded(host, content);
+    expect(applies(view, (tr) => tr.delete(3, 3 + size))).toBe(true);
+    expect(view.state.doc.childCount).toBe(2);
+
+    const moved = guarded(host, content);
+    expect(applies(moved, (tr) => tr.delete(3, 3 + size).insert(0, content.child(1)))).toBe(true);
+    expect(moved.state.doc.firstChild?.textContent).toBe(TABLE);
+
+    const wrapped = guarded(host, content);
+    expect(applies(wrapped, (tr) => tr.wrap(wrapped.state.doc.resolve(3).blockRange(wrapped.state.doc.resolve(3 + size))!, [{ type: schema.nodes.blockquote! }]))).toBe(true);
+    expect(wrapped.state.doc.child(1).type.name).toBe("blockquote");
+
+    const replaced = guarded(host, content);
+    replaced.dispatch(replaced.state.tr.setSelection(NodeSelection.create(replaced.state.doc, 3)));
+    expect(applies(replaced, (tr) => tr.replaceSelectionWith(paragraph("over")))).toBe(true);
+    expect(replaced.state.doc.child(1).textContent).toBe("over");
+    expect(host.refusals).toEqual([]);
+  });
+
+  it("a local step never leaves front matter anywhere but first, which the Backend refuses", () => {
+    const host = new Host();
+    const matter = preserved("front_matter", FRONT_MATTER);
+    const content = doc(matter, paragraph("a"));
+    const size = matter.nodeSize;
+    const view = guarded(host, content);
+    const refused: Array<[string, (tr: Transaction) => Transaction]> = [
+      ["a block above it", (tr) => tr.insert(0, paragraph("above"))],
+      ["moving it down", (tr) => tr.delete(0, size).insert(3, matter)],
+      ["nesting it", (tr) => tr.wrap(view.state.doc.resolve(0).blockRange(view.state.doc.resolve(size))!, [{ type: schema.nodes.blockquote! }])],
+      ["a second one", (tr) => tr.insert(view.state.doc.content.size, matter)],
+    ];
+    for (const [name, change] of refused) {
+      host.refusals.length = 0;
+      expect(applies(view, change), name).toBe(false);
+      expect(host.refusals, name).toEqual(["front_matter_first"]);
+    }
+    expect(view.state.doc.eq(content)).toBe(true);
+
+    // Front matter pasted anywhere else, on a body that has none.
+    const plain = guarded(host, doc(paragraph("a"), paragraph("b")));
+    expect(applies(plain, (tr) => tr.insert(3, matter))).toBe(false);
+    // First is the one allowed place, and it can always be removed or edited around.
+    expect(applies(plain, (tr) => tr.insert(0, matter))).toBe(true);
+    expect(applies(view, (tr) => tr.insertText("!", size + 1))).toBe(true);
+    expect(applies(view, (tr) => tr.insert(size, paragraph("below")))).toBe(true);
+    expect(applies(view, (tr) => tr.delete(0, size))).toBe(true);
+    expect(view.state.doc.firstChild?.type.name).toBe("paragraph");
+  });
+
+  it("counts a Preserved Block's source in the text and export estimates", () => {
+    const block = preserved("table", TABLE);
+    expect(textBytes(block)).toBe(TABLE.length);
+    expect(estimateNodeBytes(block)).toBeGreaterThan(TABLE.length);
   });
 });

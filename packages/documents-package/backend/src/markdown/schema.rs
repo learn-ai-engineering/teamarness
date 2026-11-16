@@ -50,6 +50,39 @@ pub enum Block {
         order: u32,
         items: Vec<Vec<Block>>,
     },
+    /// Markdown the editor cannot carry, kept as its exact source lines without any container
+    /// prefix. The text carries no marks. Front matter is only ever the first top-level block.
+    Preserved {
+        kind: PreservedKind,
+        source: String,
+    },
+}
+
+/// What a [`Block::Preserved`] holds. Its `kind` attribute is the tree's only record of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PreservedKind {
+    Table,
+    FrontMatter,
+    Html,
+}
+
+impl PreservedKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::FrontMatter => "front_matter",
+            Self::Html => "html",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "table" => Some(Self::Table),
+            "front_matter" => Some(Self::FrontMatter),
+            "html" => Some(Self::Html),
+            _ => None,
+        }
+    }
 }
 
 /// Inline content of a paragraph or heading.
@@ -85,6 +118,7 @@ impl Block {
             Block::Code { .. } => "code_block",
             Block::Bullet { .. } => "bullet_list",
             Block::Ordered { .. } => "ordered_list",
+            Block::Preserved { .. } => "preserved_block",
         }
     }
 }
@@ -187,7 +221,30 @@ pub(super) fn check_blocks(blocks: &[Block]) -> Result<(), SchemaViolation> {
     if blocks_depth(blocks) > MAX_NESTING {
         return Err(SchemaViolation::TooDeep);
     }
-    check_attributes(blocks)
+    check_attributes(blocks)?;
+    check_front_matter(blocks, "doc")
+}
+
+/// Front matter is only ever the first top-level block: anywhere else it has no Markdown form.
+fn check_front_matter(blocks: &[Block], parent: &'static str) -> Result<(), SchemaViolation> {
+    for (index, block) in blocks.iter().enumerate() {
+        match block {
+            Block::Preserved {
+                kind: PreservedKind::FrontMatter,
+                ..
+            } if parent != "doc" || index != 0 => {
+                return Err(SchemaViolation::MisplacedContent { parent });
+            }
+            Block::Blockquote(children) => check_front_matter(children, "blockquote")?,
+            Block::Bullet { items } | Block::Ordered { items, .. } => {
+                for item in items {
+                    check_front_matter(item, "list_item")?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn check_attributes(blocks: &[Block]) -> Result<(), SchemaViolation> {
@@ -221,7 +278,7 @@ fn check_attributes(blocks: &[Block]) -> Result<(), SchemaViolation> {
                 }
             }
             Block::Blockquote(children) => check_attributes(children)?,
-            Block::Paragraph(_) | Block::Rule | Block::Code { .. } => {}
+            Block::Paragraph(_) | Block::Rule | Block::Code { .. } | Block::Preserved { .. } => {}
         }
     }
     Ok(())
@@ -297,7 +354,7 @@ pub(super) fn insert_block(
             }
         }
         Block::Rule => {}
-        Block::Code { text, .. } => {
+        Block::Code { text, .. } | Block::Preserved { source: text, .. } => {
             if !text.is_empty() {
                 let run = children.insert_container(0, LoroText::new())?;
                 run.insert(0, text)?;
@@ -333,6 +390,7 @@ pub(super) fn block_attributes(block: &Block) -> Vec<(&'static str, LoroValue)> 
         Block::Heading { level, .. } => vec![("level", LoroValue::Double(f64::from(*level)))],
         Block::Code { params, .. } => vec![("params", LoroValue::from(params.as_str()))],
         Block::Ordered { order, .. } => vec![("order", LoroValue::Double(f64::from(*order)))],
+        Block::Preserved { kind, .. } => vec![("kind", LoroValue::from(kind.as_str()))],
         _ => Vec::new(),
     }
 }
@@ -465,7 +523,9 @@ pub fn read_tree(doc: &LoroDoc) -> Result<Vec<Block>, SchemaViolation> {
         Some(ValueOrContainer::Container(Container::List(list))) => list,
         _ => return Err(SchemaViolation::MissingBody),
     };
-    read_blocks(&children, "doc", 1)
+    let blocks = read_blocks(&children, "doc", 1)?;
+    check_front_matter(&blocks, "doc")?;
+    Ok(blocks)
 }
 
 /// The body's top-level `children` list.
@@ -608,7 +668,26 @@ pub(super) fn read_block(
                     });
                 }
             },
-            text: read_code(map)?,
+            text: read_plain_text(map, "code_block")?,
+        },
+        "preserved_block" => Block::Preserved {
+            kind: match attribute(map, "preserved_block", "kind")? {
+                // The editor schema's default, as for any attribute the tree does not hold.
+                None | Some(LoroValue::Null) => PreservedKind::Html,
+                Some(LoroValue::String(kind)) => {
+                    PreservedKind::parse(&kind).ok_or(SchemaViolation::InvalidAttribute {
+                        node: "preserved_block",
+                        attribute: "kind",
+                    })?
+                }
+                Some(_) => {
+                    return Err(SchemaViolation::InvalidAttribute {
+                        node: "preserved_block",
+                        attribute: "kind",
+                    });
+                }
+            },
+            source: read_plain_text(map, "preserved_block")?,
         },
         "bullet_list" => Block::Bullet {
             items: read_items(map, "bullet_list", depth)?,
@@ -651,7 +730,7 @@ pub(super) fn read_items(
             ValueOrContainer::Container(Container::Map(other)) => match node_name(&other)?.as_str()
             {
                 "paragraph" | "heading" | "blockquote" | "horizontal_rule" | "code_block"
-                | "bullet_list" | "ordered_list" | "hard_break" | "doc" => {
+                | "preserved_block" | "bullet_list" | "ordered_list" | "hard_break" | "doc" => {
                     Err(SchemaViolation::MisplacedContent { parent: node })
                 }
                 unknown => Err(SchemaViolation::UnknownNode(unknown.to_owned())),
@@ -669,21 +748,20 @@ pub(super) fn read_item(map: &LoroMap, depth: usize) -> Result<Vec<Block>, Schem
     }
 }
 
-fn read_code(map: &LoroMap) -> Result<String, SchemaViolation> {
+/// The text of a node that holds unmarked text only.
+fn read_plain_text(map: &LoroMap, node: &'static str) -> Result<String, SchemaViolation> {
     let mut text = String::new();
-    let Some(list) = child_list(map, "code_block")? else {
+    let Some(list) = child_list(map, node)? else {
         return Ok(text);
     };
     for entry in list_entries(&list) {
         let ValueOrContainer::Container(Container::Text(run)) = entry else {
-            return Err(SchemaViolation::MisplacedContent {
-                parent: "code_block",
-            });
+            return Err(SchemaViolation::MisplacedContent { parent: node });
         };
         for inline in read_runs(&run)? {
             match inline {
                 Inline::Text(chunk, marks) if marks == Marks::default() => text.push_str(&chunk),
-                _ => return Err(SchemaViolation::InvalidMark("code_block".to_owned())),
+                _ => return Err(SchemaViolation::InvalidMark(node.to_owned())),
             }
         }
     }
@@ -705,7 +783,8 @@ fn read_inlines(
             ValueOrContainer::Container(Container::Map(map)) => match node_name(&map)?.as_str() {
                 "hard_break" if breaks => out.push(Inline::Break),
                 "paragraph" | "heading" | "blockquote" | "horizontal_rule" | "code_block"
-                | "bullet_list" | "ordered_list" | "list_item" | "hard_break" | "doc" => {
+                | "preserved_block" | "bullet_list" | "ordered_list" | "list_item"
+                | "hard_break" | "doc" => {
                     return Err(SchemaViolation::MisplacedContent { parent: node });
                 }
                 unknown => return Err(SchemaViolation::UnknownNode(unknown.to_owned())),
@@ -722,7 +801,12 @@ pub(super) fn read_runs(text: &LoroText) -> Result<Vec<Inline>, SchemaViolation>
         .into_iter()
         .filter_map(|delta| match delta {
             TextDelta::Insert { insert, attributes } => {
-                Some(marks_of(attributes.as_ref()).map(|marks| Inline::Text(insert, marks)))
+                // The map type is pinned: with `notify` in a build, objc2's `IntoIterator` impls
+                // make inferring it overflow.
+                Some(
+                    marks_of::<HashMap<String, LoroValue, _>>(attributes.as_ref())
+                        .map(|marks| Inline::Text(insert, marks)),
+                )
             }
             _ => None,
         })
@@ -991,6 +1075,106 @@ mod tests {
         assert_eq!(
             read_tree(&doc),
             Err(SchemaViolation::InvalidMark("code_block".into()))
+        );
+    }
+
+    fn preserved(kind: PreservedKind, source: &str) -> Block {
+        Block::Preserved {
+            kind,
+            source: source.into(),
+        }
+    }
+
+    #[test]
+    fn preserved_block_round_trips_through_the_tree() {
+        let blocks = [
+            preserved(PreservedKind::FrontMatter, "---\ntitle: x\n---"),
+            preserved(PreservedKind::Table, "| a |\n|---|"),
+            Block::Blockquote(vec![preserved(PreservedKind::Html, "<div>\n</div>")]),
+            Block::Bullet {
+                items: vec![vec![
+                    Block::Paragraph(Vec::new()),
+                    preserved(PreservedKind::Table, "| b |\n|---|"),
+                ]],
+            },
+        ];
+        assert_eq!(read_tree(&body(&blocks)).unwrap(), blocks);
+    }
+
+    #[test]
+    fn preserved_block_rejects_unknown_kind() {
+        let doc = body(&[preserved(PreservedKind::Table, "| a |\n|---|")]);
+        attributes_of(&first_block(&doc))
+            .insert("kind", "spreadsheet")
+            .unwrap();
+        let invalid = SchemaViolation::InvalidAttribute {
+            node: "preserved_block",
+            attribute: "kind",
+        };
+        assert_eq!(read_tree(&doc), Err(invalid.clone()));
+
+        attributes_of(&first_block(&doc)).insert("kind", 3).unwrap();
+        assert_eq!(read_tree(&doc), Err(invalid));
+    }
+
+    #[test]
+    fn preserved_block_rejects_marks() {
+        let doc = body(&[preserved(PreservedKind::Html, "<div></div>")]);
+        let Some(ValueOrContainer::Container(Container::Text(run))) =
+            children_of(&first_block(&doc)).get(0)
+        else {
+            panic!("no text");
+        };
+        configure(&doc);
+        run.mark(0..2, "strong", LoroValue::Map(HashMap::new().into()))
+            .unwrap();
+        assert_eq!(
+            read_tree(&doc),
+            Err(SchemaViolation::InvalidMark("preserved_block".into()))
+        );
+    }
+
+    #[test]
+    fn preserved_block_holds_text_only() {
+        let doc = body(&[preserved(PreservedKind::Html, "<div></div>")]);
+        insert_block(&children_of(&first_block(&doc)), 0, &para("stray")).unwrap();
+        assert_eq!(
+            read_tree(&doc),
+            Err(SchemaViolation::MisplacedContent {
+                parent: "preserved_block"
+            })
+        );
+    }
+
+    #[test]
+    fn front_matter_only_first() {
+        let front = preserved(PreservedKind::FrontMatter, "---\nt: 1\n---");
+        assert!(read_tree(&body(std::slice::from_ref(&front))).is_ok());
+
+        // Second at the top level, in a blockquote, and in a list item.
+        for (blocks, parent) in [
+            (vec![para("x"), front.clone()], "doc"),
+            (vec![Block::Blockquote(vec![front.clone()])], "blockquote"),
+            (
+                vec![Block::Bullet {
+                    items: vec![vec![para("x"), front.clone()]],
+                }],
+                "list_item",
+            ),
+        ] {
+            let violation = SchemaViolation::MisplacedContent { parent };
+            assert!(matches!(
+                write_tree(&LoroDoc::new(), &blocks),
+                Err(WriteError::Schema(found)) if found == violation
+            ));
+        }
+
+        // A peer's tree is held to the same rule.
+        let doc = body(&[para("x")]);
+        insert_block(&body_list(&doc).unwrap(), 1, &front).unwrap();
+        assert_eq!(
+            read_tree(&doc),
+            Err(SchemaViolation::MisplacedContent { parent: "doc" })
         );
     }
 

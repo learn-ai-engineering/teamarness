@@ -114,8 +114,80 @@
       "initial": "x\n",
       "base": "initial",
       "concurrentHumanEdits": [],
-      "revision": "| a | b |\n|---|---|\n| 1 | 2 |\n",
-      "expectedMarkdown": "| a | b | |---|---| | 1 | 2 |\n"
+      "revision": "- [ ] task\n\n![alt](https://x.test/a.png)\n",
+      "expectedMarkdown": "- \\[ \\] task\n\n\\!\\[alt\\](https://x.test/a.png)\n"
+    },
+    {
+      "name": "a person adds a table row while an agent edits a cell; the table merges and is not duplicated",
+      "initial": "# Team\n\n| Name | Role |\n|---|---|\n| Ada | lead |\n| Lin | dev |\n",
+      "base": "initial",
+      "concurrentHumanEdits": [
+        {
+          "block": 1,
+          "at": "end",
+          "text": "\n| Mo | ops |"
+        }
+      ],
+      "revision": "# Team\n\n| Name | Role |\n|---|---|\n| Ada | owner |\n| Lin | dev |\n",
+      "expectedMarkdown": "# Team\n\n| Name | Role |\n|---|---|\n| Ada | owner |\n| Lin | dev |\n| Mo | ops |\n"
+    },
+    {
+      "name": "an agent replaces a table with prose",
+      "initial": "Intro.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nOutro.\n",
+      "base": "current",
+      "concurrentHumanEdits": [],
+      "revision": "Intro.\n\nThe table said one and two.\n\nOutro.\n",
+      "expectedMarkdown": "Intro.\n\nThe table said one and two.\n\nOutro.\n"
+    },
+    {
+      "name": "an unchanged table, front matter and HTML block merge to nothing",
+      "initial": "---\nt: 1\n---\n\n| a |\n|---|\n\n<div>\n</div>\n",
+      "base": "current",
+      "concurrentHumanEdits": [],
+      "revision": "---\nt: 1\n---\n\n| a |\n|---|\n\n<div>\n</div>\n",
+      "expectedMarkdown": "---\nt: 1\n---\n\n| a |\n|---|\n\n<div>\n</div>\n",
+      "expectedOps": 0
+    },
+    {
+      "name": "an agent's table that uses a reference definition keeps its lines and its target",
+      "initial": "Intro.\n",
+      "base": "current",
+      "concurrentHumanEdits": [],
+      "revision": "Intro.\n\n| a |\n|---|\n| [x][r] ![p][i] |\n\n[r]: https://x.test/page\n[i]: https://x.test/p.png\n",
+      "expectedMarkdown": "Intro.\n\n| a |\n|---|\n| [x][r] ![p][i] |\n\n[x](https://x.test/page) \\!\\[p\\](https://x.test/p.png)\n"
+    },
+    {
+      "name": "the same in a list item",
+      "initial": "Intro.\n",
+      "base": "current",
+      "concurrentHumanEdits": [],
+      "revision": "- Item\n\n  | a |\n  |---|\n  | [x][r] ![p][i] |\n\n[r]: https://x.test/page\n[i]: https://x.test/p.png\n",
+      "expectedMarkdown": "- Item\n  \n  | a |\n  |---|\n  | [x][r] ![p][i] |\n  \n  [x](https://x.test/page) \\!\\[p\\](https://x.test/p.png)\n"
+    },
+    {
+      "name": "the same in a blockquote",
+      "initial": "Intro.\n",
+      "base": "current",
+      "concurrentHumanEdits": [],
+      "revision": "> | a |\n> |---|\n> | [x][r] ![p][i] |\n\n[r]: https://x.test/page\n[i]: https://x.test/p.png\n",
+      "expectedMarkdown": "> | a |\n> |---|\n> | [x][r] ![p][i] |\n> \n> [x](https://x.test/page) \\!\\[p\\](https://x.test/p.png)\n"
+    },
+    {
+      "name": "the same for a table that falls back to literal text",
+      "initial": "Intro.\n",
+      "base": "current",
+      "concurrentHumanEdits": [],
+      "revision": "-\t| a |\n\t|---|\n\t| [x][r] ![p][i] |\n\n[r]: https://x.test/page\n[i]: https://x.test/p.png\n",
+      "expectedMarkdown": "- | a | |---| | \\[x\\]\\[r\\] \\!\\[p\\]\\[i\\] |\n  \n  [x](https://x.test/page) \\!\\[p\\](https://x.test/p.png)\n"
+    },
+    {
+      "name": "a table with its links paragraph merges to nothing, and so does the same text with the definition back",
+      "initial": "| a |\n|---|\n| [x][r] |\n\n[x](https://x.test/page)\n",
+      "base": "current",
+      "concurrentHumanEdits": [],
+      "revision": "| a |\n|---|\n| [x][r] |\n\n[x](https://x.test/page)\n\n[r]: https://x.test/page\n",
+      "expectedMarkdown": "| a |\n|---|\n| [x][r] |\n\n[x](https://x.test/page)\n",
+      "expectedOps": 0
     }
   ]
 }

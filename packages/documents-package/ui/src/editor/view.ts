@@ -6,14 +6,15 @@ import { keymap } from "prosemirror-keymap";
 import { Fragment } from "prosemirror-model";
 import type { MarkType, Node, NodeType } from "prosemirror-model";
 import { liftListItem, sinkListItem, splitListItem, wrapInList } from "prosemirror-schema-list";
-import { EditorState, Selection, TextSelection } from "prosemirror-state";
+import { EditorState, NodeSelection, Selection, TextSelection } from "prosemirror-state";
 import type { Command, Plugin, Transaction } from "prosemirror-state";
 import { EditorView } from "prosemirror-view";
 import { LoroSyncPlugin, LoroUndoPlugin, createNodeFromLoroObj } from "loro-prosemirror";
 import type { LoroDocType } from "loro-prosemirror";
 import type { LoroDoc } from "loro-crdt";
-import { guardPlugin } from "./guard";
+import { guardPlugin, selectionIsPreserved } from "./guard";
 import type { GuardHost, GuardRefusal } from "./guard";
+import { preservedPlugin } from "./preserved";
 import { schema } from "./schema";
 import { UndoHistory, guardedRedo, guardedUndo, historyPlugin } from "./undo";
 
@@ -124,6 +125,41 @@ const fenceOnEnter: Command = (state, dispatch) => {
   return true;
 };
 
+/** A block style never applies to a selected Preserved Block, whose source cannot become text. */
+function notOnPreserved(command: Command): Command {
+  return (state, dispatch, view) => !selectionIsPreserved(state) && command(state, dispatch, view);
+}
+
+/**
+ * Backspace at the start of a text block after a Preserved Block, or Delete at the end of one
+ * before it, selects the Preserved Block. Removing it takes one more press, so that a source never
+ * goes by accident. An empty text block is left to the default, which removes it.
+ */
+function selectPreservedBeside(direction: -1 | 1): Command {
+  return (state, dispatch) => {
+    const { $from, empty } = state.selection;
+    if (!empty || $from.depth === 0 || !$from.parent.isTextblock || $from.parent.content.size === 0) return false;
+    if ($from.parentOffset !== (direction < 0 ? 0 : $from.parent.content.size)) return false;
+    const container = $from.node($from.depth - 1);
+    const index = $from.index($from.depth - 1) + direction;
+    const beside = index >= 0 && index < container.childCount ? container.child(index) : null;
+    if (beside?.type !== nodes.preserved_block) return false;
+    dispatch?.(state.tr.setSelection(NodeSelection.create(state.doc, direction < 0 ? $from.before() - beside.nodeSize : $from.after())));
+    return true;
+  };
+}
+
+/** Enter on a selected Preserved Block starts a paragraph below it, never above front matter. */
+const paragraphBelowPreserved: Command = (state, dispatch) => {
+  const { selection } = state;
+  if (!(selection instanceof NodeSelection) || selection.node.type !== nodes.preserved_block) return false;
+  if (dispatch) {
+    const tr = state.tr.insert(selection.to, nodes.paragraph.create());
+    dispatch(tr.setSelection(TextSelection.create(tr.doc, selection.to + 1)).scrollIntoView());
+  }
+  return true;
+};
+
 /** The range of the link mark around an empty selection, or the selection itself. */
 function linkTarget(state: EditorState): { from: number; to: number } | null {
   const { from, to, empty, $from } = state.selection;
@@ -180,9 +216,9 @@ export function currentHref(state: EditorState): string | null {
 
 /** Every baseline block and mark, as the toolbar and the keymap invoke them. */
 export const editorCommands = {
-  paragraph: setBlockType(nodes.paragraph),
-  heading: (level: number): Command => setBlockType(nodes.heading, { level }),
-  codeBlock: setBlockType(nodes.code_block, { params: "" }),
+  paragraph: notOnPreserved(setBlockType(nodes.paragraph)),
+  heading: (level: number): Command => notOnPreserved(setBlockType(nodes.heading, { level })),
+  codeBlock: notOnPreserved(setBlockType(nodes.code_block, { params: "" })),
   bulletList: toggleList(nodes.bullet_list),
   orderedList: toggleList(nodes.ordered_list),
   blockquote: toggleBlockquote,
@@ -256,7 +292,8 @@ export function editorKeymap(openLink: () => boolean): Record<string, Command> {
     "Mod-z": guardedUndo,
     "Shift-Mod-z": guardedRedo,
     "Mod-y": guardedRedo,
-    Backspace: undoInputRule,
+    Backspace: chainCommands(undoInputRule, selectPreservedBeside(-1)),
+    Delete: selectPreservedBeside(1),
     "Mod-b": editorCommands.strong,
     "Mod-i": editorCommands.em,
     "Mod-`": editorCommands.code,
@@ -272,7 +309,7 @@ export function editorKeymap(openLink: () => boolean): Record<string, Command> {
     "Mod-_": editorCommands.horizontalRule,
     "Shift-Enter": chainCommands(exitCode, insertHardBreak),
     "Mod-Enter": chainCommands(exitCode, insertHardBreak),
-    Enter: chainCommands(fenceOnEnter, splitListItem(nodes.list_item)),
+    Enter: chainCommands(paragraphBelowPreserved, fenceOnEnter, splitListItem(nodes.list_item)),
     "Mod-[": liftListItem(nodes.list_item),
     "Mod-]": sinkListItem(nodes.list_item),
   };
@@ -290,6 +327,7 @@ export function editorPlugins(doc: LoroDoc, guard: GuardHost, openLink: () => bo
     LoroSyncPlugin({ doc: loro }),
     historyPlugin(history),
     LoroUndoPlugin({ doc, undoManager: history.manager }),
+    preservedPlugin(),
     editorInputRules(),
     keymap(editorKeymap(openLink)),
     keymap(baseKeymap),
@@ -328,6 +366,8 @@ const REFUSAL_TEXT: Readonly<Record<GuardRefusal, string>> = {
   document_too_large: "This Document has reached its size limit. Remove some content before adding more.",
   step_too_large: "That change is too large to undo or redo.",
   step_unknown: "That change could not be checked, so it cannot be undone or redone.",
+  preserved_read_only: "This block is kept exactly as written. Edit it in a mapped file or ask an agent.",
+  front_matter_first: "Front matter stays at the very top of the Document.",
 };
 
 export type DocumentEditorOptions = Readonly<{
@@ -338,7 +378,8 @@ export type DocumentEditorOptions = Readonly<{
 
 /**
  * The rendered editor of one open Document: a toolbar and a ProseMirror view bound to the
- * session's Loro document through `loro-prosemirror`. It never shows Markdown source.
+ * session's Loro document through `loro-prosemirror`. It never shows Markdown source, except a
+ * Preserved Block's, read-only in its frame.
  */
 export class DocumentEditor {
   readonly element: HTMLElement;

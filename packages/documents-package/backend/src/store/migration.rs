@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::store::StoreError;
 
-const LATEST_SCHEMA_VERSION: i64 = 8;
+const LATEST_SCHEMA_VERSION: i64 = 10;
 const MIGRATION_0001: &str = include_str!("../../migrations/0001_documents.sql");
 const MIGRATION_0002: &str = include_str!("../../migrations/0002_edit_targets.sql");
 const MIGRATION_0003: &str = include_str!("../../migrations/0003_comments.sql");
@@ -11,6 +11,8 @@ const MIGRATION_0005: &str = include_str!("../../migrations/0005_edit_identity_i
 const MIGRATION_0006: &str = include_str!("../../migrations/0006_import_failure.sql");
 const MIGRATION_0007: &str = include_str!("../../migrations/0007_schema_violation.sql");
 const MIGRATION_0008: &str = include_str!("../../migrations/0008_comment_history.sql");
+const MIGRATION_0009: &str = include_str!("../../migrations/0009_format_generation.sql");
+const MIGRATION_0010: &str = include_str!("../../migrations/0010_folder_mappings.sql");
 
 pub(super) fn apply(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection
@@ -72,6 +74,16 @@ pub(super) fn apply(connection: &mut Connection) -> Result<(), StoreError> {
                 "INSERT INTO comment_history_state(singleton,epoch,revision) VALUES(1,?1,0)",
                 [epoch],
             )
+            .map_err(|_| StoreError::Migration)?;
+    }
+    if current_version < 9 {
+        transaction
+            .execute_batch(MIGRATION_0009)
+            .map_err(|_| StoreError::Migration)?;
+    }
+    if current_version < 10 {
+        transaction
+            .execute_batch(MIGRATION_0010)
             .map_err(|_| StoreError::Migration)?;
     }
     transaction

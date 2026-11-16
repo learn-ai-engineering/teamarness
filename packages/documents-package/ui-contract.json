@@ -547,6 +547,228 @@
           "maximum": 1000000000
         }
       }
+    },
+    "mappingRefusal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "reason"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "reason": {
+          "enum": [
+            "lossy",
+            "too_large",
+            "not_utf8",
+            "schema_violation",
+            "merge_refused",
+            "symlink",
+            "title_too_long",
+            "name_collision_unresolved",
+            "unreadable"
+          ]
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 800
+        }
+      }
+    },
+    "mappingReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "counts",
+        "files",
+        "refused",
+        "reformatted",
+        "subfolders",
+        "gitRoot"
+      ],
+      "properties": {
+        "counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "files",
+            "refused",
+            "reformatted",
+            "subfolders"
+          ],
+          "properties": {
+            "files": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "refused": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "reformatted": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "subfolders": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "files": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "bytes"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              "bytes": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "refused": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "$ref": "#/$defs/mappingRefusal"
+          }
+        },
+        "reformatted": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "subfolders": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "gitRoot": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "folderMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "state",
+        "counts",
+        "refused",
+        "subfolders",
+        "gitRoot"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "active",
+            "unavailable",
+            "paused"
+          ]
+        },
+        "counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "files",
+            "refused",
+            "subfolders"
+          ],
+          "properties": {
+            "files": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "refused": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "subfolders": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "refused": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "$ref": "#/$defs/mappingRefusal"
+          }
+        },
+        "subfolders": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "gitRoot": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "mappingDraft": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "collectionId": {
+          "$ref": "#/$defs/recordId"
+        }
+      }
     }
   },
   "requests": {
@@ -917,6 +1139,162 @@
     "documents.place.set": {
       "request": {
         "$ref": "#/$defs/place"
+      },
+      "response": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    },
+    "documents.mapping.set": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "collectionId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "newCollectionName": {
+            "$ref": "#/$defs/name"
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "dryRun": {
+            "type": "boolean"
+          },
+          "confirmGit": {
+            "type": "boolean"
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "collectionId",
+          "path",
+          "direction",
+          "dryRun"
+        ],
+        "properties": {
+          "collectionId": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/recordId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "direction": {
+            "enum": [
+              "export",
+              "import",
+              "unchanged"
+            ]
+          },
+          "dryRun": {
+            "type": "boolean"
+          },
+          "report": {
+            "$ref": "#/$defs/mappingReport"
+          }
+        }
+      }
+    },
+    "documents.mapping.list": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "collections"
+        ],
+        "properties": {
+          "collections": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "collectionId",
+                "name",
+                "archived",
+                "mapping"
+              ],
+              "properties": {
+                "collectionId": {
+                  "$ref": "#/$defs/recordId"
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "archived": {
+                  "type": "boolean"
+                },
+                "mapping": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/folderMapping"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "documents.mapping.clear": {
+      "request": {
+        "$ref": "#/$defs/collectionRequest"
+      },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "collectionId",
+          "cleared"
+        ],
+        "properties": {
+          "collectionId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "cleared": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "documents.mapping.draft.get": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "response": {
+        "$ref": "#/$defs/mappingDraft"
+      }
+    },
+    "documents.mapping.draft.set": {
+      "request": {
+        "$ref": "#/$defs/mappingDraft"
       },
       "response": {
         "type": "object",
