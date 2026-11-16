@@ -110,6 +110,23 @@ function calls(fake: ReturnType<typeof createFakePackageClient>, operation: stri
 }
 
 describe("Documents settings view", () => {
+  it("shows a filesystem folder refusal without implying the logical folder was changed", async () => {
+    const original = listing().collections[0]!;
+    const current: Listing = { collections: [{
+      ...original,
+      mapping: {
+        ...original.mapping!,
+        refused: [{ name: ".hidden/Note.md", reason: "invalid_folder", detail: "Logical folder is valid; hidden disk paths are excluded" }],
+        counts: { ...original.mapping!.counts, refused: 1 },
+      },
+    }] };
+    const { fake } = backend({ list: () => current });
+    const { root, unmount } = await mounted(fake);
+    expect(root.textContent).toContain(".hidden/Note.md");
+    expect(root.textContent).toContain("This folder path cannot be synced to this filesystem");
+    expect(root.textContent).toContain("Logical folder is valid; hidden disk paths are excluded");
+    unmount();
+  });
   it("lists Collections with their mapping, counts and an expandable refusal list", async () => {
     const { fake } = backend();
     const { root, unmount } = await mounted(fake);

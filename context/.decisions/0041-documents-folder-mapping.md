@@ -35,7 +35,7 @@ Three facts shape the design:
 
 A dry run returns the pre-mapping report and changes nothing. The report lists the files that will be imported, the files that will be refused with their reasons, the files the first write-back will reformat, the subfolders that are not synced yet, and the git root. "Create Collection from folder" checks the folder as an empty Collection first, so a refused folder creates no Collection.
 
-**What is synced.** Regular files directly in the root whose name ends in lowercase `.md` and does not start with `.`. Folder sync never follows a symbolic link, never writes outside the root, and never overwrites a file whose bytes it has not read. Subfolders wait for slice C.
+**What is synced.** The stored mapping mode selects flat or recursive scanning. Flat mode includes only regular root files. Recursive mode includes eligible nested files and derives placement from their parent paths (ADR 0043). Both modes exclude hidden paths, temporary files, and extensions other than lowercase `.md`. Folder sync never deliberately follows a symbolic link, writes outside the root, or overwrites an unread source edit. An unavailable or refused subtree protects its tracked Documents from deletion. Existing mappings remain flat; preview-confirmed activation and mode controls remain Phase 3 work.
 
 **Lossy files are refused.** Before each import, `markdown::lost_tokens` imports and exports the file's text and compares its alphanumeric tokens. Reference labels and ordered-list item numbers are exempt, because a resolved reference and a renumbered list lose them legitimately. If any token is missing, the file is refused as `lossy`, with a sample of the lost tokens, and its bytes stay as they are. A file over the Documents bounds (R09), one that is not UTF-8, and one the schema cannot hold are refused the same way. A refusal records the file's hash, so the same bytes are not tried again until the file changes.
 
@@ -43,8 +43,10 @@ A dry run returns the pre-mapping report and changes nothing. The report lists t
 
 - An import's request ID is derived from the Document, the base version and the file's hash. Before it stages an import, the reconciler looks the ID up. An ID already in the record log advances the base instead of appending again.
 - A write-back records the hash and the version it is about to write before it renames the file into place. A file found with that hash adopts that version, and it is not imported.
-- A missing or unreadable root marks the mapping `unavailable` and archives nothing. So does a root that still exists but holds none of its synced files, such as an empty mount point, a folder deleted and made again, or files a file provider moved off the computer: archiving there would archive every Document for the team. An iCloud placeholder (`.Plan.md.icloud`) counts as its file, so an evicted file is not archived.
-- Write-back keeps the replaced file's permissions, and a case-only rename never replaces another file whose name differs only in case.
+- A missing or unreadable root marks the mapping `unavailable` and archives nothing. An established mapping with zero eligible readable Markdown files in its active scan scope does the same, including deletion of its only populated subtree. Any eligible readable file prevents this guard, even if not previously tracked. A deleted subtree archives its Documents only when absence is known and eligible files remain elsewhere. Unreadable, symlink-replaced, evicted, and refused prefixes do not mean deletion. An iCloud placeholder (`.Plan.md.icloud`) protects its file.
+- Write-back keeps the replaced file's permissions, and a case-only rename never replaces another file whose name differs only in case. Whole relative paths use case-folded NFC keys, so equal basenames in different folders are independent. Directory aliases are refused rather than silently merged.
+- Migration 0012 stores unfinished relocation intents with source, destination, expected hash, and placement operation identity. Recovery reserves both paths, preserves body bases and pending writes, and reuses the same placement identity. It adopts a completed move or refuses changed or unsafe bytes without creating another Document. Migration 0011 remains unchanged.
+- Remote placement imports source edits before movement, creates safe parents, and refuses an occupied destination. Hash-only local moves preserve identity only with an unambiguous unchanged-hash match. Cleanup removes only empty parents made empty by Teamarness's own successful move or removal, bottom-up, never recursively and never the root.
 - The first sync of a file never rewrites it. Write-back splices: unchanged top-level blocks keep their bytes. If the spliced text would not have the export's Canonical Markdown, the export is written instead.
 
 ## Rejected alternatives
@@ -59,7 +61,7 @@ A dry run returns the pre-mapping report and changes nothing. The report lists t
 ## Consequences
 
 - A bulk change, such as a git checkout of a mapped folder, becomes one edit per file for the whole team.
-- A Member on another build sees ordinary Person revisions. No new record kind or body node is added, so ADR 0042's format generation does not change.
+- Slice B body imports remain ordinary Person revisions. Slice C placement adds kind 12 and format generation 2 under ADR 0043; it changes no body node.
 - The loss check is conservative. An entity such as `&copy;`, which exports as `©`, loses the token `copy`, so its file is refused until it is rewritten.
 - An empty Document can be left by a crash between a new file's `document.create` and its first revision. The window is small, and no test injects it.
 - Migration 0010 makes a data directory unopenable by older builds, as every forward migration does.
@@ -67,7 +69,7 @@ A dry run returns the pre-mapping report and changes nothing. The report lists t
 ## Evidence
 
 - `packages/documents-package/backend/src/folder_sync/` (`mapping.rs`, `watch.rs`, `reconcile.rs`, `codec.rs`, `scan.rs`), `store/mappings.rs`, `migrations/0010_folder_mappings.sql`, `markdown/loss.rs`.
-- Tests: `folder_sync::reconcile::tests` (every reconcile branch, refuse then import, no echo, first sync, lossy and oversize files, missing root, the two crash points, an offline batch of 50 edits), `folder_sync::mapping::{tests, request_tests}` (each refusal reason, dry run, Create Collection from folder, listing, Unmap), `folder_sync::watch::tests`, and the two-Installation system test `tests/system/tests/documents_folder_sync.rs`. The settings view is tested in `packages/documents-package/ui/src/settings.test.ts`.
+- Tests: `folder_sync::reconcile::tests` (flat and recursive reconciliation, first-sync bytes, loss and bounds refusals, repeated moves, case and Unicode paths, subtree protection, the zero-files guard, archive/restore, cleanup, relocation and body-write crash recovery, no echo, and an offline batch of 50 edits), `folder_sync::mapping::{tests, request_tests}` (each refusal reason, dry run, Create Collection from folder, listing, Unmap), `folder_sync::watch::tests`, and the two-Installation system test `tests/system/tests/documents_folder_sync.rs`. The settings view is tested in `packages/documents-package/ui/src/settings.test.ts`.
 - **Weaknesses.** The watcher is qualified only locally on macOS (FSEvents), through `folder_sync::watch::tests` and the system test. CI runs no `cargo test`, so inotify (Linux) and Windows are not qualified. A save from a real editor is a manual check.
 
 ### Provenance (non-versioned)

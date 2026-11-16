@@ -575,6 +575,7 @@
             "symlink",
             "title_too_long",
             "name_collision_unresolved",
+            "invalid_folder",
             "unreadable"
           ]
         },

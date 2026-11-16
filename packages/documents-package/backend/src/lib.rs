@@ -199,6 +199,9 @@ mod store_tests {
         connection
             .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;")
             .unwrap();
+        connection
+            .execute_batch("DROP TABLE file_relocations;")
+            .unwrap();
         drop(connection);
         let store = DocumentStore::open(&path).unwrap();
         assert_eq!(
@@ -403,6 +406,9 @@ mod store_tests {
             }
             let connection = rusqlite::Connection::open(&path).unwrap();
             connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;").unwrap();
+            connection
+                .execute_batch("DROP TABLE file_relocations;")
+                .unwrap();
             drop(connection);
             let store = DocumentStore::open(&path).unwrap();
             let mut rows = store.identity_candidates().unwrap();
@@ -462,6 +468,9 @@ mod store_tests {
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
             .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;")
+            .unwrap();
+        connection
+            .execute_batch("DROP TABLE file_relocations;")
             .unwrap();
         drop(connection);
         let store = DocumentStore::open(&path).unwrap();
@@ -1519,7 +1528,7 @@ mod store_tests {
             let store = DocumentStore::open(&path).unwrap();
             assert_eq!(store.format_generation().unwrap(), 0);
             assert_eq!(store.cursor().unwrap().as_deref(), Some("kept"));
-            assert_eq!(version(), 11, "it migrates on to the latest schema");
+            assert_eq!(version(), 12, "it migrates on to the latest schema");
         }
     }
 
@@ -1560,7 +1569,7 @@ mod store_tests {
         };
         for round in 0..2 {
             let store = DocumentStore::open(&path).unwrap();
-            assert_eq!(version(), 11);
+            assert_eq!(version(), 12);
             assert_eq!(store.cursor().unwrap().as_deref(), Some("kept"));
             assert_eq!(store.format_generation().unwrap(), 3);
             assert_eq!(store.comment_head().unwrap().0, "old");
@@ -1621,7 +1630,7 @@ mod store_tests {
         drop(f.store);
         rusqlite::Connection::open(&path).unwrap().execute_batch(
             "ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order;
-             ALTER TABLE folder_mappings DROP COLUMN recursive; PRAGMA user_version=10;"
+             ALTER TABLE folder_mappings DROP COLUMN recursive; DROP TABLE file_relocations; PRAGMA user_version=10;"
         ).unwrap();
         for _ in 0..2 {
             let store = DocumentStore::open(&path).unwrap();
@@ -1652,7 +1661,7 @@ mod store_tests {
         DocumentStore::open(&path).unwrap();
         rusqlite::Connection::open(&path)
             .unwrap()
-            .pragma_update(None, "user_version", 12)
+            .pragma_update(None, "user_version", 13)
             .unwrap();
         assert!(matches!(
             DocumentStore::open(&path),
@@ -1662,7 +1671,7 @@ mod store_tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 
     // Verifies: TEAM.SYS.DOCS-R07 — a thread is its root and every nested reply in creation

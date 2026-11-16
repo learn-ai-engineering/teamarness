@@ -4845,6 +4845,9 @@ mod tests {
             }
             drop(store);
             let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch("DROP TABLE file_relocations;")
+                .unwrap();
             if old_version == 4 {
                 connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;").unwrap();
             } else {
@@ -4943,7 +4946,7 @@ mod tests {
         rusqlite::Connection::open(path)
             .unwrap()
             .execute_batch(
-                "ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=8;",
+                "DROP TABLE file_relocations; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=8;",
             )
             .unwrap();
     }
@@ -5520,6 +5523,9 @@ mod tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;").unwrap();
+        connection
+            .execute_batch("DROP TABLE file_relocations;")
+            .unwrap();
         drop(connection);
         let access = Arc::new(AtomicBool::new(false));
         let gained = access.clone();
@@ -5667,6 +5673,9 @@ mod tests {
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
             .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;")
+            .unwrap();
+        connection
+            .execute_batch("DROP TABLE file_relocations;")
             .unwrap();
         drop(connection);
         let scripted = ScriptedCapability::new().calls(move |method, payload| match method {

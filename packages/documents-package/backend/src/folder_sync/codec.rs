@@ -222,7 +222,7 @@ pub(crate) fn temp_name(name: &str) -> String {
 
 /// Checks that `rel` stays inside `root` with no symbolic link below `root`, and returns the
 /// folder that holds the file and the file's name.
-fn resolve(root: &Path, rel: &Path) -> Result<(PathBuf, String), WriteRefused> {
+pub(crate) fn resolve(root: &Path, rel: &Path) -> Result<(PathBuf, String), WriteRefused> {
     let mut parts = Vec::new();
     for component in rel.components() {
         match component {
@@ -244,6 +244,16 @@ fn resolve(root: &Path, rel: &Path) -> Result<(PathBuf, String), WriteRefused> {
     }
     let mut folder = root.to_path_buf();
     for part in folders {
+        let key = name_key(&part.to_string_lossy());
+        if fs::read_dir(&folder)?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .filter(|entry| name_key(&entry.file_name().to_string_lossy()) == key)
+            .count()
+            > 1
+        {
+            return Err(WriteRefused::OutsideRoot);
+        }
         folder.push(part);
         let metadata = fs::symlink_metadata(&folder)?;
         if metadata.file_type().is_symlink() {
@@ -254,6 +264,76 @@ fn resolve(root: &Path, rel: &Path) -> Result<(PathBuf, String), WriteRefused> {
         }
     }
     Ok((folder, name))
+}
+
+pub(crate) fn representable_folder_segment(part: &str) -> bool {
+    !part.starts_with('.')
+        && !part.ends_with(['.', ' '])
+        && part.len() <= 255
+        && !part
+            .chars()
+            .any(|c| RESERVED.contains(&c) || c.is_control())
+}
+
+/// Creates missing parents one at a time, refusing hidden or unrepresentable segments and
+/// case aliases. Existing decomposed spelling is retained when it denotes the same NFC path.
+pub(crate) fn prepare_folder(root: &Path, logical: &str) -> Result<String, WriteRefused> {
+    crate::domain::normalize_folder(logical).map_err(|_| WriteRefused::OutsideRoot)?;
+    let mut folder = root.to_path_buf();
+    let mut actual = Vec::new();
+    if !fs::metadata(root)?.is_dir() {
+        return Err(WriteRefused::NotADirectory);
+    }
+    for part in logical.split('/').filter(|part| !part.is_empty()) {
+        if !representable_folder_segment(part) {
+            return Err(WriteRefused::OutsideRoot);
+        }
+        let aliases = fs::read_dir(&folder)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|entry| name_key(&entry.file_name().to_string_lossy()) == name_key(part))
+            .collect::<Vec<_>>();
+        let spelling = if aliases.is_empty() {
+            part.to_owned()
+        } else {
+            if aliases.len() != 1 {
+                return Err(WriteRefused::OutsideRoot);
+            }
+            let name = aliases[0]
+                .file_name()
+                .into_string()
+                .map_err(|_| WriteRefused::OutsideRoot)?;
+            if name.nfc().collect::<String>() != part {
+                return Err(WriteRefused::OutsideRoot);
+            }
+            name
+        };
+        folder.push(&spelling);
+        match fs::symlink_metadata(&folder) {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(WriteRefused::Symlink),
+            Ok(meta) if !meta.is_dir() => return Err(WriteRefused::NotADirectory),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&folder)?,
+            Err(error) => return Err(error.into()),
+        }
+        actual.push(spelling);
+    }
+    Ok(actual.join("/"))
+}
+
+/// Removes only empty ancestors of a file Teamarness just moved or removed. No recursive
+/// removal, no symlinks, and no root removal, including when unmanaged hidden entries remain.
+pub(crate) fn remove_empty_parents(root: &Path, rel: &str) {
+    let mut parent = Path::new(rel).parent();
+    while let Some(path) = parent {
+        if path.as_os_str().is_empty() {
+            break;
+        }
+        if resolve(root, &path.join("entry")).is_err() || fs::remove_dir(root.join(path)).is_err() {
+            break;
+        }
+        parent = path.parent();
+    }
 }
 
 // ---------------------------------------------------------------- git

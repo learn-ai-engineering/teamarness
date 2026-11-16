@@ -46,6 +46,7 @@ export const FILE_REFUSAL_TEXT: Readonly<Record<MappingRefusal["reason"], string
   symlink: "A symbolic link, which is never followed",
   title_too_long: "Its name is too long for a Document title",
   name_collision_unresolved: "Another file has the same name, ignoring case",
+  invalid_folder: "This folder path cannot be synced to this filesystem",
   unreadable: "Cannot be read",
 };
 

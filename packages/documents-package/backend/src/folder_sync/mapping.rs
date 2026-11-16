@@ -178,7 +178,7 @@ pub(crate) fn set_mapping(
             return Err(refused("overlapping_mapping"));
         }
     }
-    let scanned = scan(&root).map_err(|_| refused("unreadable"))?;
+    let scanned = scan(&root, super::scan::ScanMode::Flat).map_err(|_| refused("unreadable"))?;
     let direction = if unchanged {
         Direction::Unchanged
     } else {

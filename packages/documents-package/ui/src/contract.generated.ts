@@ -85,7 +85,7 @@ export type MappingDraft = {
 export type MappingRefusal = {
   readonly "detail"?: string;
   readonly "name": string;
-  readonly "reason": "lossy" | "too_large" | "not_utf8" | "schema_violation" | "merge_refused" | "symlink" | "title_too_long" | "name_collision_unresolved" | "unreadable";
+  readonly "reason": "lossy" | "too_large" | "not_utf8" | "schema_violation" | "merge_refused" | "symlink" | "title_too_long" | "name_collision_unresolved" | "invalid_folder" | "unreadable";
 };
 
 export type MappingReport = {

@@ -3,7 +3,7 @@
 //! It waits until the record log replay is qualified (a new request ID is refused before then),
 //! reconciles every stored mapping in full, and then reacts to three sources:
 //!
-//! - **Files.** Each mapped root is watched non-recursively. An event is only a hint: it marks
+//! - **Files.** Each mapped root is watched in its stored flat or recursive mode. An event is only a hint: it marks
 //!   its mapping dirty, and the mapping is reconciled in full once a [`DEBOUNCE`] window has
 //!   passed. A rescan flag, a watcher error or a new watch also reconciles the mapping in full.
 //! - **Bodies.** A body update or status change writes that Document back; a lagged or resynced
@@ -77,13 +77,15 @@ fn relevant(kind: &EventKind) -> bool {
 /// One watched root.
 struct Watch {
     root: String,
+    recursive: bool,
     /// Dropping the watcher stops it.
     _watcher: RecommendedWatcher,
 }
 
-/// Watches `root` non-recursively; every relevant event marks `collection`.
+/// Watches `root` in its Installation-local mode; every relevant event marks `collection`.
 fn watch_root(
     root: &str,
+    recursive: bool,
     collection: &str,
     marks: &Arc<Mutex<Option<Arc<Marks>>>>,
 ) -> notify::Result<RecommendedWatcher> {
@@ -101,7 +103,14 @@ fn watch_root(
             Err(_) => marks.mark(&collection, true),
         }
     })?;
-    watcher.watch(&PathBuf::from(root), RecursiveMode::NonRecursive)?;
+    watcher.watch(
+        &PathBuf::from(root),
+        if recursive {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        },
+    )?;
     Ok(watcher)
 }
 
@@ -109,12 +118,12 @@ fn watch_root(
 /// changes to find what folder sync must act on.
 #[derive(Default)]
 struct Catalog {
-    /// Mapped Collection → root path.
-    mappings: HashMap<String, String>,
+    /// Mapped Collection → (root path, recursive).
+    mappings: HashMap<String, (String, bool)>,
     /// Collection → archived.
     collections: HashMap<String, bool>,
-    /// Document → (Collection, title, archived).
-    documents: HashMap<String, (String, Option<String>, bool)>,
+    /// Document → (Collection, title, archived, folder).
+    documents: HashMap<String, (String, Option<String>, bool, String)>,
 }
 
 impl Catalog {
@@ -123,7 +132,12 @@ impl Catalog {
             .folder_mappings()
             .map_err(|_| storage_failed())?
             .into_iter()
-            .map(|mapping| (mapping.collection_id, mapping.root_path))
+            .map(|mapping| {
+                (
+                    mapping.collection_id,
+                    (mapping.root_path, mapping.recursive),
+                )
+            })
             .collect();
         let collections = store
             .collections()
@@ -138,7 +152,12 @@ impl Catalog {
             .map(|document| {
                 (
                     document.id,
-                    (document.collection_id, document.title, document.archived),
+                    (
+                        document.collection_id,
+                        document.title,
+                        document.archived,
+                        document.folder,
+                    ),
                 )
             })
             .collect();
@@ -362,7 +381,9 @@ impl Loop {
         let stale: Vec<String> = self
             .watches
             .iter()
-            .filter(|(collection, watch)| mappings.get(*collection) != Some(&watch.root))
+            .filter(|(collection, watch)| {
+                mappings.get(*collection) != Some(&(watch.root.clone(), watch.recursive))
+            })
             .map(|(collection, _)| collection.clone())
             .collect();
         let dropped: Vec<Watch> = stale
@@ -393,7 +414,7 @@ impl Loop {
 
     /// Tries to watch every mapped root that has no watch. Returns the Collections now watched.
     async fn watch_missing(&mut self) -> Vec<String> {
-        let wanted: Vec<(String, String)> = self
+        let wanted: Vec<(String, (String, bool))> = self
             .catalog
             .mappings
             .iter()
@@ -407,15 +428,16 @@ impl Loop {
         let made = teamarness_package_sdk::blocking(&self.cancellation, move |_| {
             Ok(wanted
                 .into_iter()
-                .filter_map(|(collection, root)| {
+                .filter_map(|(collection, (root, recursive))| {
                     if !std::fs::metadata(&root).is_ok_and(|meta| meta.is_dir()) {
                         return None;
                     }
-                    let watcher = watch_root(&root, &collection, &slot).ok()?;
+                    let watcher = watch_root(&root, recursive, &collection, &slot).ok()?;
                     Some((
                         collection,
                         Watch {
                             root,
+                            recursive,
                             _watcher: watcher,
                         },
                     ))
@@ -600,6 +622,89 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
+    // Verifies: TEAM.SYS.DOCS-R14, TEAM.SYS.DOCS-R15; no UI subscription is mounted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recursive_watch_reconfigures_and_observes_nested_save_and_placement() {
+        let data = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        std::fs::create_dir_all(root.join("Nested/deep")).unwrap();
+        let mut session = start(data.path(), remembering_log()).await;
+        qualify_empty_history(&session).await;
+        let collection = request(
+            &mut session,
+            "documents.collection.create",
+            json!({"name":"Plans"}),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        request(
+            &mut session,
+            "documents.mapping.set",
+            json!({"collectionId":collection,"path":root.to_str().unwrap()}),
+        )
+        .await;
+        let document = request(
+            &mut session,
+            "documents.document.create",
+            json!({"collectionId":collection,"title":"Root"}),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        eventually(|| root.join("Root.md").is_file(), "initial flat watch").await;
+        let mut mapping = session
+            .handles
+            .store
+            .folder_mapping(&collection)
+            .unwrap()
+            .unwrap();
+        mapping.recursive = true;
+        session.handles.store.set_folder_mapping(&mapping).unwrap();
+        session
+            .handles
+            .changes
+            .send_modify(|revision| *revision += 1);
+        request(
+            &mut session,
+            "documents.document.place",
+            json!({"documentId":document,"folder":"Nested/deep"}),
+        )
+        .await;
+        eventually(
+            || root.join("Nested/deep/Root.md").is_file(),
+            "metadata-only placement",
+        )
+        .await;
+        std::fs::write(root.join("Nested/deep/Save.md"), "Nested save.\n").unwrap();
+        eventually(|| titled(&session, "Save"), "nested watcher save").await;
+        // Drain debounced self-write hints before a metadata-only operation; otherwise a
+        // startup or filesystem pass could accidentally cover missing catalog invalidation.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        request(
+            &mut session,
+            "documents.document.place",
+            json!({"documentId":document,"folder":"Other"}),
+        )
+        .await;
+        eventually(
+            || root.join("Other/Root.md").is_file(),
+            "settled metadata-only placement",
+        )
+        .await;
+        session.harness.suspend().await.unwrap();
+        std::fs::write(root.join("Nested/deep/Offline.md"), "Offline.\n").unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(!titled(&session, "Offline"));
+        session.harness.recover().await.unwrap();
+        session.handles.qualified.store(true, Ordering::Release);
+        eventually(|| titled(&session, "Offline"), "recursive resume").await;
+        session.harness.shutdown().await.unwrap();
+    }
+
     #[test]
     fn reads_and_opens_are_not_file_changes() {
         assert!(!relevant(&EventKind::Access(AccessKind::Open(
@@ -623,11 +728,17 @@ mod tests {
     #[test]
     fn catalog_changes_name_what_folder_sync_must_act_on() {
         let before = Catalog {
-            mappings: HashMap::from([("c".into(), "/a".into())]),
+            mappings: HashMap::from([("c".into(), ("/a".into(), false))]),
             collections: HashMap::from([("c".into(), false), ("d".into(), false)]),
             documents: HashMap::from([
-                ("1".into(), ("c".into(), Some("One".into()), false)),
-                ("2".into(), ("c".into(), Some("Two".into()), false)),
+                (
+                    "1".into(),
+                    ("c".into(), Some("One".into()), false, String::new()),
+                ),
+                (
+                    "2".into(),
+                    ("c".into(), Some("Two".into()), false, String::new()),
+                ),
             ]),
         };
         let same = Catalog {
@@ -639,12 +750,21 @@ mod tests {
         assert!(folders.is_empty() && documents.is_empty());
 
         let after = Catalog {
-            mappings: HashMap::from([("c".into(), "/a".into()), ("d".into(), "/b".into())]),
+            mappings: HashMap::from([
+                ("c".into(), ("/a".into(), true)),
+                ("d".into(), ("/b".into(), false)),
+            ]),
             collections: HashMap::from([("c".into(), true), ("d".into(), false)]),
             documents: HashMap::from([
-                ("1".into(), ("c".into(), Some("Renamed".into()), false)),
-                ("2".into(), ("c".into(), Some("Two".into()), false)),
-                ("3".into(), ("d".into(), None, false)),
+                (
+                    "1".into(),
+                    ("c".into(), Some("Renamed".into()), false, String::new()),
+                ),
+                (
+                    "2".into(),
+                    ("c".into(), Some("Two".into()), false, String::new()),
+                ),
+                ("3".into(), ("d".into(), None, false, String::new())),
             ]),
         };
         let (folders, documents) = before.changes(&after);

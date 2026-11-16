@@ -24,8 +24,28 @@ use crate::store::mappings::{FolderMapping, MappedFile, MappingState, RefusedFil
 /// A record log that signs every append as Alice, keeps it, and opens what it kept, so an
 /// inclusion check can read a request back.
 pub(in crate::backend::folder_sync) fn remembering_log() -> ScriptedCapability {
-    let records = Arc::new(Mutex::new(HashMap::<String, (u64, String, String)>::new()));
-    let next = Arc::new(AtomicU64::new(100));
+    remembering_history(Vec::new())
+}
+
+fn remembering_history(history: Vec<JsonValue>) -> ScriptedCapability {
+    let next = Arc::new(AtomicU64::new(100 + history.len() as u64));
+    let records = Arc::new(Mutex::new(
+        history
+            .into_iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                let seed = 100 + index as u64;
+                (
+                    URL_SAFE_NO_PAD.encode(seed.to_string()),
+                    (
+                        seed,
+                        payload["purpose"].as_str().unwrap().to_owned(),
+                        payload["canonical"].as_str().unwrap().to_owned(),
+                    ),
+                )
+            })
+            .collect::<HashMap<String, (u64, String, String)>>(),
+    ));
     ScriptedCapability::new().calls(move |method, payload| match method {
         "append" => {
             let seed = next.fetch_add(1, Ordering::SeqCst);
@@ -128,6 +148,73 @@ impl Fixture {
                 recursive: false,
             })
             .unwrap();
+    }
+
+    async fn restart(self) -> Self {
+        let Self {
+            session,
+            sync,
+            collection,
+            root,
+            _folder,
+            _data,
+        } = self;
+        let history: Vec<JsonValue> = session
+            .scripted
+            .recorded_calls()
+            .into_iter()
+            .filter(|call| call.method == "append")
+            .map(|call| call.payload)
+            .collect();
+        let scripted = remembering_history(history.clone());
+        session.harness.shutdown().await.unwrap();
+        drop(sync);
+        let session = start_without_folder_sync(_data.path(), scripted).await;
+        session.scripted.stream().opened().await;
+        for (index, payload) in history.iter().enumerate() {
+            let seed = 100 + index as u64;
+            deliver(&session, json!({"kind":"record", "cursor":hex(50, seed), "recordId":hex(64,seed), "orderKey":hex(82,seed), "author":ALICE, "signature":"c2ln", "purpose":payload["purpose"], "canonical":payload["canonical"], "sealedRecord":URL_SAFE_NO_PAD.encode(seed.to_string())})).await;
+        }
+        deliver(&session, json!({"kind":"replay_end", "cursor":hex(50, 99 + history.len() as u64), "gapFree":true})).await;
+        wait_until(
+            || session.handles.qualified.load(Ordering::Acquire),
+            "replayed persisted records",
+        )
+        .await;
+        let handles = &session.handles;
+        let sync = FolderSync::new(
+            &handles.log,
+            &handles.hub,
+            &handles.changes,
+            ALICE.to_owned(),
+            CancellationToken::new(),
+        );
+        Self {
+            session,
+            sync,
+            collection,
+            root,
+            _folder,
+            _data,
+        }
+    }
+
+    fn recursive(&self) {
+        let mut mapping = self.mapping();
+        mapping.recursive = true;
+        self.session
+            .handles
+            .store
+            .set_folder_mapping(&mapping)
+            .unwrap();
+    }
+
+    async fn place(&mut self, document: &str, folder: &str) {
+        self.request(
+            "documents.document.place",
+            json!({"documentId": document, "folder": folder}),
+        )
+        .await;
     }
 
     fn mapping(&self) -> FolderMapping {
@@ -751,7 +838,7 @@ async fn case_only_collisions_get_distinct_names_or_are_refused() {
     fixture.shutdown().await;
 }
 
-// Verifies: TEAM.SYS.DOCS-R14 (Write-back, No lost text) — a case-only file rename renames the
+// Verifies: TEAM.SYS.DOCS-R14 (Safety) — a case-only file rename renames the
 // file itself; it never replaces another file whose name differs only in case.
 #[test]
 fn a_case_only_rename_never_replaces_another_file() {
@@ -761,7 +848,7 @@ fn a_case_only_rename_never_replaces_another_file() {
     fs::write(root.join("Plan.md"), "refused\n").unwrap();
     let case_sensitive = fs::read_to_string(root.join("plan.md")).unwrap() == "mapped\n";
     if case_sensitive {
-        let refused = rename_file(root, "plan.md", "Plan.md").unwrap_err();
+        let refused = rename_file(root, "plan.md", "Plan.md", sha256(b"mapped\n")).unwrap_err();
         assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(
             fs::read_to_string(root.join("plan.md")).unwrap(),
@@ -775,7 +862,7 @@ fn a_case_only_rename_never_replaces_another_file() {
     }
     // The target is the file itself (a case-insensitive file system) or absent: it is renamed.
     fs::write(root.join("plan.md"), "mapped\n").unwrap();
-    rename_file(root, "plan.md", "Plan.md").unwrap();
+    rename_file(root, "plan.md", "Plan.md", sha256(b"mapped\n")).unwrap();
     let names: Vec<String> = fs::read_dir(root)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -798,7 +885,7 @@ async fn a_crash_after_the_append_never_duplicates_the_revision() {
     let stale = fixture.state(&document).unwrap();
 
     fixture.write("Doc.md", "First.\n\nSecond.\n");
-    fixture.sync.crash_at(Crash::AfterImportAppend);
+    fixture.sync.crash_at(Crash::ImportAppended);
     let before = fixture.appends();
     let crashed = fixture.sync.reconcile_folder(&fixture.collection).await;
     assert_eq!(crashed.unwrap_err().code(), "documents.test_crash");
@@ -836,7 +923,7 @@ async fn a_crash_after_the_rename_adopts_the_written_file() {
     let document = fixture.titled("Doc").id;
     fixture.edit(&document, "First.\n\nFrom the app.\n").await;
 
-    fixture.sync.crash_at(Crash::AfterWriteRename);
+    fixture.sync.crash_at(Crash::BodyWritten);
     let crashed = fixture.sync.reconcile_document(&document).await;
     assert_eq!(crashed.unwrap_err().code(), "documents.test_crash");
     assert_eq!(fixture.read("Doc.md"), "First.\n\nFrom the app.\n");
@@ -946,5 +1033,502 @@ async fn a_linked_file_is_refused_and_not_followed() {
     assert_eq!(refusals[0].rel_path, "Link.md");
     assert_eq!(refusals[0].reason, Refusal::Symlink.as_str());
     fixture.settled().await;
+    fixture.shutdown().await;
+}
+
+// Verifies: TEAM.SYS.DOCS-R14, TEAM.SYS.DOCS-R15.
+#[tokio::test]
+async fn recursive_import_export_preserves_folders_and_basename_identity() {
+    let mut fixture = Fixture::new().await;
+    fixture.recursive();
+    fs::create_dir_all(fixture.root.join("Plans/été")).unwrap();
+    fixture.write("Plans/été/Note.md", "Nested\nwrapped.\n");
+    fixture.write("Note.md", "Root.\n");
+    assert_eq!(fixture.folder().await.created, 2);
+    let nested = fixture
+        .documents()
+        .into_iter()
+        .find(|d| d.folder == "Plans/été")
+        .unwrap();
+    assert_eq!(nested.title.as_deref(), Some("Note"));
+    assert_eq!(fixture.text(&nested.id), "Nested wrapped.\n");
+    assert_eq!(fixture.read("Plans/été/Note.md"), "Nested\nwrapped.\n");
+    let exported = fixture.document("Note", "Exported.\n").await;
+    fixture
+        .request(
+            "documents.document.place",
+            json!({"documentId": exported, "folder": "New/deep"}),
+        )
+        .await;
+    fixture.reconcile(&exported).await;
+    assert_eq!(
+        fixture.state(&exported).unwrap().rel_path,
+        "New/deep/Note.md"
+    );
+    assert_eq!(fixture.read("New/deep/Note.md"), "Exported.\n");
+    fixture.settled().await;
+    fixture.shutdown().await;
+}
+
+// Verifies: TEAM.SYS.DOCS-R14, TEAM.SYS.DOCS-R15.
+#[tokio::test]
+async fn recursive_moves_repeat_and_directory_rename_keep_ids_and_bases() {
+    let mut fixture = Fixture::new().await;
+    fixture.recursive();
+    fixture.write("Note.md", "Original.\n");
+    fixture.folder().await;
+    let document = fixture.titled("Note").id;
+    let base = fixture.state(&document).unwrap();
+    for folder in ["A", "B", "A", "B", ""] {
+        let old = fixture.state(&document).unwrap().rel_path;
+        fs::create_dir_all(fixture.root.join(folder)).unwrap();
+        let new = if folder.is_empty() {
+            "Note.md".to_owned()
+        } else {
+            format!("{folder}/Note.md")
+        };
+        fs::rename(fixture.root.join(old), fixture.root.join(&new)).unwrap();
+        fixture.folder().await;
+        assert_eq!(fixture.titled("Note").folder, folder);
+        assert_eq!(fixture.titled("Note").id, document);
+        let state = fixture.state(&document).unwrap();
+        assert_eq!(state.base_version, base.base_version);
+        assert_eq!(state.written_hash, base.written_hash);
+        fixture.settled().await;
+    }
+    fixture.place(&document, "Old/deep").await;
+    fixture.reconcile(&document).await;
+    fs::write(fixture.root.join("Old/deep/Other.md"), "Other.\n").unwrap();
+    fixture.folder().await;
+    let other = fixture.titled("Other").id;
+    fs::rename(fixture.root.join("Old"), fixture.root.join("Renamed")).unwrap();
+    fixture.folder().await;
+    assert_eq!(fixture.titled("Note").folder, "Renamed/deep");
+    assert_eq!(fixture.titled("Other").folder, "Renamed/deep");
+    assert_eq!(fixture.titled("Other").id, other);
+    assert_eq!(fixture.documents().len(), 2);
+    fixture.settled().await;
+    fixture.shutdown().await;
+}
+
+// Verifies: TEAM.SYS.DOCS-R14, TEAM.SYS.DOCS-R15.
+#[tokio::test]
+async fn recursive_relocation_crash_refuses_changed_destination_without_duplicate_document() {
+    let mut fixture = Fixture::new().await;
+    fixture.recursive();
+    fixture.write("Note.md", "Original.\n");
+    fixture.folder().await;
+    let document = fixture.titled("Note").id;
+    fixture.place(&document, "New").await;
+    fixture.sync.crash_at(Crash::FileRelocated);
+    assert_eq!(
+        fixture
+            .sync
+            .reconcile_document(&document)
+            .await
+            .unwrap_err()
+            .code(),
+        "documents.test_crash"
+    );
+    fixture.write("New/Note.md", "Changed after move.\n");
+    let fixture = fixture.restart().await;
+    fixture.folder().await;
+    assert_eq!(
+        fixture.documents().len(),
+        1,
+        "an uncertain move must not create another Document"
+    );
+    assert_eq!(fixture.titled("Note").folder, "New");
+    assert!(!fixture.titled("Note").archived);
+    assert_eq!(fixture.read("New/Note.md"), "Changed after move.\n");
+    assert!(!fixture.refusals().is_empty());
+    fixture.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recursive_symlink_subtree_protects_documents_and_never_reads_outside() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new().await;
+    fixture.recursive();
+    fs::create_dir(fixture.root.join("Sub")).unwrap();
+    fixture.write("Sub/Note.md", "Inside.\n");
+    fixture.write("Sentinel.md", "Sentinel.\n");
+    fixture.folder().await;
+    let document = fixture.titled("Note").id;
+    let outside = fixture._folder.path().join("outside");
+    fs::rename(fixture.root.join("Sub"), &outside).unwrap();
+    fs::write(outside.join("Note.md"), "Never import.\n").unwrap();
+    symlink(&outside, fixture.root.join("Sub")).unwrap();
+    fixture.folder().await;
+    assert!(!fixture.titled("Note").archived);
+    fixture.reconcile(&document).await;
+    assert_eq!(fixture.text(&document), "Inside.\n");
+    assert_eq!(
+        fs::read_to_string(outside.join("Note.md")).unwrap(),
+        "Never import.\n"
+    );
+    assert!(
+        fixture
+            .refusals()
+            .iter()
+            .any(|r| r.rel_path == "Sub" && r.reason == "symlink")
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn recursive_ambiguous_hash_moves_refuse_without_archiving_or_pairing() {
+    let fixture = Fixture::new().await;
+    fixture.recursive();
+    fixture.write("One.md", "Same.\n");
+    fixture.write("Two.md", "Same.\n");
+    fixture.folder().await;
+    fs::create_dir(fixture.root.join("New")).unwrap();
+    fs::rename(fixture.root.join("One.md"), fixture.root.join("New/One.md")).unwrap();
+    fs::rename(fixture.root.join("Two.md"), fixture.root.join("New/Two.md")).unwrap();
+    fixture.folder().await;
+    assert_eq!(fixture.documents().len(), 2);
+    assert!(
+        fixture
+            .documents()
+            .iter()
+            .all(|d| !d.archived && d.folder.is_empty())
+    );
+    assert_eq!(
+        fixture.state(&fixture.titled("One").id).unwrap().rel_path,
+        "One.md"
+    );
+    assert!(!fixture.refusals().is_empty());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn recursive_cleanup_only_removes_parents_emptied_by_our_operation() {
+    let mut fixture = Fixture::new().await;
+    fixture.recursive();
+    let document = fixture.document("Note", "Text.\n").await;
+    fixture.place(&document, "Old/deep").await;
+    fixture.reconcile(&document).await;
+    fs::create_dir(fixture.root.join("UserEmpty")).unwrap();
+    fixture.place(&document, "New/deep").await;
+    fixture.reconcile(&document).await;
+    assert!(!fixture.root.join("Old").exists());
+    assert!(fixture.root.join("UserEmpty").is_dir());
+    fixture.write("New/.keep", "hidden");
+    fixture.place(&document, "").await;
+    fixture.reconcile(&document).await;
+    assert!(!fixture.root.join("New/deep").exists());
+    assert!(fixture.root.join("New/.keep").is_file());
+    assert!(fixture.root.is_dir());
+    fixture.shutdown().await;
+}
+
+// Verifies: TEAM.SYS.DOCS-R14, TEAM.SYS.DOCS-R15.
+#[tokio::test]
+async fn recursive_pending_body_move_and_placement_crash_recover_on_restart() {
+    for crash in [Crash::PlacementAppended, Crash::FileRelocated] {
+        let mut fixture = Fixture::new().await;
+        fixture.recursive();
+        fixture.write("Note.md", "First.\n");
+        fixture.folder().await;
+        let document = fixture.titled("Note").id;
+        fixture.edit(&document, "First.\n\nSecond.\n").await;
+        fixture.sync.crash_at(Crash::BodyWritten);
+        assert_eq!(
+            fixture
+                .sync
+                .reconcile_document(&document)
+                .await
+                .unwrap_err()
+                .code(),
+            "documents.test_crash"
+        );
+        assert!(
+            fixture
+                .state(&document)
+                .unwrap()
+                .pending_write_hash
+                .is_some()
+        );
+        if crash == Crash::PlacementAppended {
+            fs::create_dir(fixture.root.join("New")).unwrap();
+            fs::rename(
+                fixture.root.join("Note.md"),
+                fixture.root.join("New/Renamed.md"),
+            )
+            .unwrap();
+            fixture.sync.crash_at(crash);
+            assert_eq!(
+                fixture
+                    .sync
+                    .reconcile_folder(&fixture.collection)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                "documents.test_crash"
+            );
+        } else {
+            fixture.place(&document, "New").await;
+            fixture.sync.crash_at(crash);
+            assert_eq!(
+                fixture
+                    .sync
+                    .reconcile_document(&document)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                "documents.test_crash"
+            );
+        }
+        let persisted = fixture
+            .session
+            .handles
+            .store
+            .file_relocation(&document)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.source_path, "Note.md");
+        assert_eq!(persisted.expected_hash, sha256(b"First.\n\nSecond.\n"));
+        let fixture = fixture.restart().await;
+        fixture.folder().await;
+        assert_eq!(fixture.documents().len(), 1);
+        assert_eq!(fixture.documents()[0].id, document);
+        assert_eq!(fixture.documents()[0].folder, "New");
+        assert_eq!(fixture.text(&document), "First.\n\nSecond.\n");
+        let state = fixture.state(&document).unwrap();
+        assert_eq!(fixture.read(&state.rel_path), "First.\n\nSecond.\n");
+        assert!(state.pending_write_hash.is_none());
+        assert!(
+            fixture
+                .session
+                .handles
+                .store
+                .file_relocation(&document)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .session
+                .scripted
+                .recorded_calls()
+                .iter()
+                .filter(|call| call.method == "append")
+                .all(|call| call.payload["purpose"] == "document.rename"),
+            "only the interrupted basename rename may still need appending"
+        );
+        fixture.settled().await;
+        fixture.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn recursive_remote_move_imports_source_edit_and_refuses_occupied_target() {
+    let mut fixture = Fixture::new().await;
+    fixture.recursive();
+    fixture.write("Note.md", "First.\n");
+    fixture.folder().await;
+    let document = fixture.titled("Note").id;
+    fs::create_dir(fixture.root.join("New")).unwrap();
+    fixture.write("New/Note.md", "Unrelated.\n");
+    fixture.write("Note.md", "First.\n\nOutside.\n");
+    fixture.place(&document, "New").await;
+    fixture.reconcile(&document).await;
+    assert_eq!(fixture.text(&document), "First.\n\nOutside.\n");
+    assert_eq!(fixture.read("New/Note.md"), "Unrelated.\n");
+    assert_eq!(fixture.read("Note.md"), "First.\n\nOutside.\n");
+    assert!(!fixture.refusals().is_empty());
+    fs::remove_file(fixture.root.join("New/Note.md")).unwrap();
+    fixture.folder().await;
+    assert_eq!(fixture.state(&document).unwrap().rel_path, "New/Note.md");
+    assert_eq!(fixture.read("New/Note.md"), "First.\n\nOutside.\n");
+    fixture.settled().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn recursive_subtree_delete_restore_and_only_subtree_guard() {
+    let mut fixture = Fixture::new().await;
+    fixture.recursive();
+    fs::create_dir_all(fixture.root.join("Sub/deep")).unwrap();
+    fixture.write("Sub/deep/Note.md", "Nested.\n");
+    fixture.write("Sentinel.md", "Keep.\n");
+    fixture.folder().await;
+    let document = fixture.titled("Note").id;
+    fs::remove_dir_all(fixture.root.join("Sub")).unwrap();
+    assert_eq!(fixture.folder().await.archived, 1);
+    assert!(fixture.titled("Note").archived);
+    fixture
+        .request("documents.document.restore", json!({"documentId":document}))
+        .await;
+    fixture.reconcile(&document).await;
+    assert_eq!(fixture.read("Sub/deep/Note.md"), "Nested.\n");
+    fs::remove_file(fixture.root.join("Sentinel.md")).unwrap();
+    fixture.folder().await;
+    fs::remove_dir_all(fixture.root.join("Sub")).unwrap();
+    assert_eq!(fixture.folder().await.archived, 0);
+    assert_eq!(fixture.mapping().state, MappingState::Unavailable);
+    assert!(!fixture.titled("Note").archived);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn flat_mapping_keeps_root_associations_and_ignores_remote_folders_after_restart() {
+    let mut fixture = Fixture::new().await;
+    fixture.write("Note.md", "Root.\n");
+    fixture.folder().await;
+    let document = fixture.titled("Note").id;
+    fixture.place(&document, "Remote").await;
+    fixture.reconcile(&document).await;
+    fs::create_dir(fixture.root.join("Ignored")).unwrap();
+    fixture.write("Ignored/Private.md", "Private.\n");
+    let new = fixture.document("New", "Not flat.\n").await;
+    fixture.place(&new, "Remote").await;
+    fixture.reconcile(&new).await;
+    let fixture = fixture.restart().await;
+    fixture.write("Note.md", "Root edited.\n");
+    fs::rename(fixture.root.join("Note.md"), fixture.root.join("Local.md")).unwrap();
+    // Import the edit first at the last associated path; changed-content moves are not promised.
+    fs::rename(fixture.root.join("Local.md"), fixture.root.join("Note.md")).unwrap();
+    fixture.folder().await;
+    fs::rename(fixture.root.join("Note.md"), fixture.root.join("Local.md")).unwrap();
+    fixture.folder().await;
+    assert_eq!(fixture.documents().len(), 2);
+    assert_eq!(fixture.titled("Local").folder, "Remote");
+    assert_eq!(fixture.text(&document), "Root edited.\n");
+    assert_eq!(fixture.state(&document).unwrap().rel_path, "Local.md");
+    assert!(!fixture.mapping().recursive);
+    assert!(!fixture.root.join("Remote").exists());
+    assert!(!fixture.root.join("New.md").exists());
+    fixture.settled().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn recursive_unicode_case_moves_and_folder_scoped_suffixes() {
+    let mut fixture = Fixture::new().await;
+    fixture.recursive();
+    fs::create_dir(fixture.root.join("Cafe\u{301}")).unwrap();
+    fixture.write("Cafe\u{301}/Note.md", "Original.\n");
+    fixture.folder().await;
+    let document = fixture.titled("Note").id;
+    assert_eq!(fixture.titled("Note").folder, "Café");
+    fs::rename(
+        fixture.root.join("Cafe\u{301}/Note.md"),
+        fixture.root.join("Cafe\u{301}/note.md"),
+    )
+    .unwrap();
+    fixture.folder().await;
+    assert_eq!(fixture.titled("note").id, document);
+    let duplicate = fixture.document("note", "Second.\n").await;
+    fixture.place(&duplicate, "Café").await;
+    fixture.reconcile(&duplicate).await;
+    assert_eq!(fixture.read("Cafe\u{301}/note (2).md"), "Second.\n");
+    fixture.place(&document, "CAFÉ").await;
+    fixture.reconcile(&document).await;
+    assert_eq!(fixture.read("Cafe\u{301}/note.md"), "Original.\n");
+    assert!(
+        !fixture.refusals().is_empty(),
+        "a distinct logical case alias cannot silently merge"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn recursive_invalid_folder_refusal_is_visible_through_mapping_list_contract() {
+    let mut fixture = Fixture::new().await;
+    fixture.recursive();
+    let document = fixture.document("Note", "Safe.\n").await;
+    fixture.place(&document, ".hidden").await;
+    fixture.reconcile(&document).await;
+    let listed = fixture.request("documents.mapping.list", json!({})).await;
+    assert_eq!(
+        listed["collections"][0]["mapping"]["refused"][0]["reason"],
+        "invalid_folder"
+    );
+    let compiled = teamarness_package_contract::ui_contract::compile_ui_contract(include_bytes!(
+        "../../../ui-contract.json"
+    ))
+    .unwrap();
+    compiled
+        .validate_response("documents.mapping.list", &listed)
+        .unwrap();
+    assert_eq!(fixture.titled("Note").folder, ".hidden");
+    assert!(!fixture.root.join(".hidden").exists());
+    fixture.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recursive_unreadable_and_evicted_subtrees_preserve_associations() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new().await;
+    fixture.recursive();
+    fs::create_dir(fixture.root.join("Sub")).unwrap();
+    fixture.write("Sub/Note.md", "Private.\n");
+    fixture.write("Sentinel.md", "Keep.\n");
+    fixture.folder().await;
+    let document = fixture.titled("Note").id;
+    let before = fixture.state(&document).unwrap();
+    fs::set_permissions(fixture.root.join("Sub"), fs::Permissions::from_mode(0o000)).unwrap();
+    let outcome = fixture.folder().await;
+    fs::set_permissions(fixture.root.join("Sub"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(outcome.archived, 0);
+    assert_eq!(fixture.state(&document).unwrap(), before);
+    assert!(
+        fixture
+            .refusals()
+            .iter()
+            .any(|r| r.rel_path == "Sub" && r.reason == "unreadable")
+    );
+    fs::rename(
+        fixture.root.join("Sub/Note.md"),
+        fixture.root.join("Sub/.Note.md.icloud"),
+    )
+    .unwrap();
+    assert_eq!(fixture.folder().await.archived, 0);
+    assert_eq!(fixture.state(&document).unwrap(), before);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn recursive_collection_move_preserves_folder_and_imports_source_bytes() {
+    let mut fixture = Fixture::new().await;
+    fixture.recursive();
+    let document = fixture.document("Note", "First.\n").await;
+    fixture.place(&document, "Sub/deep").await;
+    fixture.reconcile(&document).await;
+    fixture.write("Sub/deep/Note.md", "First.\n\nOutside.\n");
+    let collection = fixture
+        .request("documents.collection.create", json!({"name":"Other"}))
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let destination = fixture._folder.path().join("other");
+    fs::create_dir(&destination).unwrap();
+    let mut mapping = fixture.mapping();
+    mapping.collection_id = collection.clone();
+    mapping.root_path = destination.to_str().unwrap().to_owned();
+    fixture
+        .session
+        .handles
+        .store
+        .set_folder_mapping(&mapping)
+        .unwrap();
+    fixture
+        .request(
+            "documents.document.move",
+            json!({"documentId":document,"collectionId":collection}),
+        )
+        .await;
+    fixture.reconcile(&document).await;
+    assert_eq!(fixture.text(&document), "First.\n\nOutside.\n");
+    assert_eq!(
+        fs::read_to_string(destination.join("Sub/deep/Note.md")).unwrap(),
+        "First.\n\nOutside.\n"
+    );
+    assert!(!fixture.root.join("Sub").exists());
     fixture.shutdown().await;
 }

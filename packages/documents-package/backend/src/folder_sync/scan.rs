@@ -1,16 +1,17 @@
-//! The flat folder scan: what a mapped root holds now, by hash, without following links.
+//! The mode-selected folder scan: what a mapped root holds now, by hash, without following links.
 
 use std::fs::{self, File};
 use std::io;
 use std::path::Path;
 
-use super::codec::{EXTENSION, TEMP_SUFFIX, sha256_reader};
+use super::codec::{EXTENSION, TEMP_SUFFIX, name_key, representable_folder_segment, sha256_reader};
+use crate::domain::normalize_folder;
 use crate::store::mappings::FileHash;
 
 /// One file a scan found to sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScannedFile {
-    /// The file's name, relative to the root.
+    /// The file's actual path spelling, relative to the root.
     pub rel: String,
     pub hash: FileHash,
     pub len: u64,
@@ -19,8 +20,7 @@ pub(crate) struct ScannedFile {
 /// What a mapped root holds. Every list is sorted by name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Scan {
-    /// Regular files directly in the root whose name ends in lowercase `.md` and does not start
-    /// with `.`.
+    /// Eligible regular files, with whole relative paths in recursive mode.
     pub files: Vec<ScannedFile>,
     /// Folders directly in the root whose name does not start with `.`. They are not synced
     /// yet.
@@ -35,6 +35,8 @@ pub(crate) struct Scan {
     /// "Optimize Storage" replaces `Plan.md` with the hidden `.Plan.md.icloud`. Each name is the
     /// evicted file's own name. Such a file still exists, so it is never archived.
     pub evicted: Vec<String>,
+    /// Unsafe or unavailable subtrees; absence below these paths never means deletion.
+    pub protected: Vec<(String, String)>,
 }
 
 /// The name of the file an iCloud placeholder `name` stands for: `.Plan.md.icloud` stands for
@@ -44,58 +46,146 @@ fn evicted_name(name: &str) -> Option<&str> {
     (original.ends_with(EXTENSION) && !original.starts_with('.')).then_some(original)
 }
 
-/// Scans the files directly in `root`. It does not descend into folders and does not follow
-/// symbolic links. Hidden entries, Teamarness's temporary files, other extensions and special
-/// files are skipped. An error means the root itself is missing or unreadable.
-pub(crate) fn scan(root: &Path) -> io::Result<Scan> {
+/// The Installation's selected scan scope; flat never opens a subfolder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanMode {
+    Flat,
+    Recursive,
+}
+
+impl From<bool> for ScanMode {
+    fn from(recursive: bool) -> Self {
+        if recursive {
+            Self::Recursive
+        } else {
+            Self::Flat
+        }
+    }
+}
+
+/// Scans without following links. Root failure is an error; subtree failures protect their
+/// prefixes. Hidden entries, temporary files, and extensions other than lowercase `.md` stay out.
+pub(crate) fn scan(root: &Path, mode: ScanMode) -> io::Result<Scan> {
     let mut scan = Scan::default();
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
+    scan_directory(root, "", mode, &mut scan)?;
+    scan.files.sort_by(|a, b| a.rel.cmp(&b.rel));
+    scan.subfolders.sort();
+    scan.symlinks.sort();
+    scan.unreadable.sort();
+    scan.evicted.sort();
+    scan.protected.sort();
+    Ok(scan)
+}
+
+impl Scan {
+    pub(crate) fn protects(&self, rel: &str) -> bool {
+        self.protected.iter().any(|(prefix, _)| {
+            rel == prefix
+                || rel
+                    .strip_prefix(prefix)
+                    .is_some_and(|tail| tail.starts_with('/'))
+        }) || self
+            .unreadable
+            .iter()
+            .chain(&self.evicted)
+            .any(|path| path == rel)
+    }
+}
+
+fn scan_directory(root: &Path, parent: &str, mode: ScanMode, scan: &mut Scan) -> io::Result<()> {
+    let entries = fs::read_dir(root.join(parent))?.collect::<Result<Vec<_>, _>>()?;
+    let mut directories = std::collections::HashMap::<String, Vec<String>>::new();
+    for entry in &entries {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            directories.entry(name_key(&name)).or_default().push(name);
+        }
+    }
+    for entry in entries {
         let raw = entry.file_name();
         let lossy = raw.to_string_lossy();
+        let relative = |name: &str| {
+            if parent.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{parent}/{name}")
+            }
+        };
+        let rel = relative(&lossy);
         if let Some(original) = evicted_name(&lossy) {
-            scan.evicted.push(original.to_owned());
+            scan.evicted.push(relative(original));
+            continue;
+        }
+        if mode == ScanMode::Recursive
+            && let Some(original) = lossy
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix(".icloud"))
+            && !original.is_empty()
+            && !original.starts_with('.')
+        {
+            scan.protected
+                .push((relative(original), "unreadable".to_owned()));
             continue;
         }
         if lossy.starts_with('.') || lossy.ends_with(TEMP_SUFFIX) {
             continue;
         }
         let Ok(file_type) = entry.file_type() else {
-            if lossy.ends_with(EXTENSION) {
-                scan.unreadable.push(lossy.into_owned());
-            }
+            scan.unreadable.push(rel.clone());
+            scan.protected.push((rel, "unreadable".to_owned()));
             continue;
         };
         if file_type.is_symlink() {
-            scan.symlinks.push(lossy.into_owned());
+            scan.symlinks.push(rel.clone());
+            if mode == ScanMode::Recursive {
+                scan.protected.push((rel, "symlink".to_owned()));
+            }
             continue;
         }
         if file_type.is_dir() {
-            scan.subfolders.push(lossy.into_owned());
+            if mode == ScanMode::Flat {
+                scan.subfolders.push(rel);
+                continue;
+            }
+            let reason = if raw.to_str().is_none()
+                || normalize_folder(&rel).is_err()
+                || !representable_folder_segment(&lossy)
+            {
+                Some("invalid_folder")
+            } else if directories
+                .get(&name_key(&lossy))
+                .is_some_and(|names| names.len() > 1)
+            {
+                Some("name_collision_unresolved")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                scan.protected.push((rel, reason.to_owned()));
+            } else if scan_directory(root, &rel, mode, scan).is_err() {
+                scan.protected.push((rel, "unreadable".to_owned()));
+            }
             continue;
         }
-        if !file_type.is_file() || !lossy.ends_with(EXTENSION) {
+        if !file_type.is_file() {
+            if mode == ScanMode::Recursive {
+                scan.protected.push((rel, "unreadable".to_owned()));
+            }
             continue;
         }
-        let Some(name) = raw.to_str() else {
-            scan.unreadable.push(lossy.into_owned());
+        if !lossy.ends_with(EXTENSION) {
             continue;
-        };
+        }
+        if raw.to_str().is_none() {
+            scan.unreadable.push(rel);
+            continue;
+        }
         match File::open(entry.path()).and_then(sha256_reader) {
-            Ok((hash, len)) => scan.files.push(ScannedFile {
-                rel: name.to_owned(),
-                hash,
-                len,
-            }),
-            Err(_) => scan.unreadable.push(name.to_owned()),
+            Ok((hash, len)) => scan.files.push(ScannedFile { rel, hash, len }),
+            Err(_) => scan.unreadable.push(rel),
         }
     }
-    scan.files.sort_by(|a, b| a.rel.cmp(&b.rel));
-    scan.subfolders.sort();
-    scan.symlinks.sort();
-    scan.unreadable.sort();
-    scan.evicted.sort();
-    Ok(scan)
+    Ok(())
 }
 
 /// The folders directly in `root` whose name does not start with `.`, sorted. Unlike [`scan`],
@@ -126,7 +216,7 @@ mod tests {
         fs::write(root.path().join("b.md"), "bee\n").unwrap();
         fs::write(root.path().join("a.md"), "").unwrap();
 
-        let scan = scan(root.path()).unwrap();
+        let scan = scan(root.path(), ScanMode::Flat).unwrap();
         assert_eq!(
             scan.files,
             vec![
@@ -162,7 +252,7 @@ mod tests {
         fs::create_dir(path.join("folder.md")).unwrap();
         fs::create_dir(path.join(".git")).unwrap();
 
-        let scan = scan(path).unwrap();
+        let scan = scan(path, ScanMode::Flat).unwrap();
         let names: Vec<&str> = scan.files.iter().map(|file| file.rel.as_str()).collect();
         assert_eq!(names, ["kept.md"]);
         assert_eq!(scan.subfolders, ["folder.md", "sub"]);
@@ -181,7 +271,7 @@ mod tests {
         fs::write(path.join("..hidden.md.icloud"), "placeholder").unwrap();
         fs::write(path.join("kept.md"), "x").unwrap();
 
-        let scan = scan(path).unwrap();
+        let scan = scan(path, ScanMode::Flat).unwrap();
         assert_eq!(scan.evicted, ["Plan.md"]);
         let names: Vec<&str> = scan.files.iter().map(|file| file.rel.as_str()).collect();
         assert_eq!(names, ["kept.md"]);
@@ -204,7 +294,7 @@ mod tests {
         symlink(root.join("missing.md"), root.join("dangling.md")).unwrap();
         symlink(outside.join("target.md"), root.join(".hidden-link.md")).unwrap();
 
-        let scan = scan(&root).unwrap();
+        let scan = scan(&root, ScanMode::Flat).unwrap();
         assert!(scan.files.is_empty());
         assert!(scan.subfolders.is_empty());
         assert_eq!(scan.symlinks, ["dangling.md", "linked-folder", "linked.md"]);
@@ -216,16 +306,88 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("socket.md");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let scan = scan(root.path()).unwrap();
+        let scan = scan(root.path(), ScanMode::Flat).unwrap();
         assert_eq!(scan, Scan::default());
+    }
+
+    #[test]
+    fn recursive_scan_bounds_paths_and_protects_folder_placeholders() {
+        let root = tempfile::tempdir().unwrap();
+        let deep = "a/b/c/d/e/f/g/h";
+        fs::create_dir_all(root.path().join(format!("{deep}/too-deep"))).unwrap();
+        fs::write(root.path().join(format!("{deep}/Yes.md")), "yes").unwrap();
+        fs::write(root.path().join(format!("{deep}/too-deep/No.md")), "no").unwrap();
+        fs::create_dir(root.path().join("bad:name")).unwrap();
+        fs::write(root.path().join("bad:name/No.md"), "no").unwrap();
+        fs::write(root.path().join(".Evicted.icloud"), "placeholder").unwrap();
+        let scanned = scan(root.path(), ScanMode::Recursive).unwrap();
+        assert_eq!(
+            scanned
+                .files
+                .iter()
+                .map(|f| f.rel.as_str())
+                .collect::<Vec<_>>(),
+            [format!("{deep}/Yes.md")]
+        );
+        assert!(scanned.protects("a/b/c/d/e/f/g/h/too-deep/No.md"));
+        assert!(scanned.protects("bad:name/No.md"));
+        assert!(scanned.protects("Evicted/Note.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_scan_permission_error_protects_only_the_unreadable_subtree() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("Blocked")).unwrap();
+        fs::write(root.path().join("Blocked/Note.md"), "private").unwrap();
+        fs::write(root.path().join("Sentinel.md"), "ok").unwrap();
+        fs::set_permissions(
+            root.path().join("Blocked"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let scanned = scan(root.path(), ScanMode::Recursive).unwrap();
+        fs::set_permissions(
+            root.path().join("Blocked"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(scanned.protects("Blocked/Note.md"));
+        assert!(!scanned.protects("Sentinel.md"));
+        assert_eq!(scanned.files.len(), 1);
+    }
+
+    #[test]
+    fn recursive_directory_casefold_aliases_are_refused_as_whole_subtrees() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("Straße")).unwrap();
+        // Some filesystems equate these spellings themselves; then two directory entries
+        // cannot exist. The codec's destination-alias refusal still covers that case.
+        if fs::create_dir(root.path().join("STRASSE")).is_err() {
+            return;
+        }
+        fs::write(root.path().join("Straße/One.md"), "one").unwrap();
+        fs::write(root.path().join("STRASSE/Two.md"), "two").unwrap();
+        let scanned = scan(root.path(), ScanMode::Recursive).unwrap();
+        assert!(scanned.files.is_empty());
+        assert!(scanned.protects("Straße/One.md"));
+        assert!(scanned.protects("STRASSE/Two.md"));
+        assert_eq!(scanned.protected.len(), 2);
+        assert!(
+            scanned
+                .protected
+                .iter()
+                .all(|(_, reason)| reason == "name_collision_unresolved")
+        );
     }
 
     #[test]
     fn scan_of_a_missing_root_is_an_error() {
         let parent = tempfile::tempdir().unwrap();
-        assert!(scan(&parent.path().join("missing")).is_err());
+        assert!(scan(&parent.path().join("missing"), ScanMode::Flat).is_err());
         let file = parent.path().join("file.md");
         fs::write(&file, "x").unwrap();
-        assert!(scan(&file).is_err());
+        assert!(scan(&file, ScanMode::Flat).is_err());
     }
 }

@@ -62,7 +62,7 @@ pub struct MappedFile {
     pub collection_id: String,
     /// The file's path relative to the mapping's root.
     pub rel_path: String,
-    /// The case-folded file name, unique within one mapping.
+    /// The case-folded NFC whole relative path, unique within one mapping.
     pub name_key: String,
     /// The version token the file was last synced at.
     pub base_version: Option<String>,
@@ -71,6 +71,17 @@ pub struct MappedFile {
     /// Set by [`DocumentStore::begin_write`] before a write-back renames the file.
     pub pending_write_hash: Option<FileHash>,
     pub pending_write_version: Option<String>,
+}
+
+/// A move whose metadata or file transition has not yet been adopted locally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileRelocation {
+    pub document_id: String,
+    pub source_path: String,
+    pub destination_path: String,
+    pub expected_hash: FileHash,
+    pub operation_id: [u8; 16],
+    pub local_move: bool,
 }
 
 /// A file folder sync did not import, with the reason the settings view shows.
@@ -175,6 +186,56 @@ fn write_error(error: rusqlite::Error) -> StoreError {
 }
 
 impl DocumentStore {
+    pub(crate) fn file_relocation(
+        &self,
+        document: &str,
+    ) -> Result<Option<FileRelocation>, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner.conn.query_row(
+            "SELECT source_path,destination_path,expected_hash,operation_id,local_move FROM file_relocations WHERE document_id=?1",
+            [document], |row| Ok(FileRelocation {
+                document_id: document.to_owned(), source_path: row.get(0)?, destination_path: row.get(1)?,
+                expected_hash: row.get(2)?, operation_id: row.get(3)?, local_move: row.get(4)?,
+            })
+        ).optional().map_err(rerr)
+    }
+
+    pub(crate) fn begin_relocation(&self, intent: &FileRelocation) -> Result<(), StoreError> {
+        let inner = lock(&self.inner)?;
+        inner.conn.execute(
+            "INSERT INTO file_relocations(document_id,source_path,destination_path,expected_hash,operation_id,local_move) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![intent.document_id,intent.source_path,intent.destination_path,intent.expected_hash.as_slice(),intent.operation_id.as_slice(),intent.local_move]
+        ).map_err(write_error)?;
+        Ok(())
+    }
+
+    /// Adopts the new path and clears the intent in one transaction, preserving body state.
+    pub(crate) fn finish_relocation(
+        &self,
+        document: &str,
+        destination: &str,
+        key: &str,
+    ) -> Result<(), StoreError> {
+        let mut inner = lock(&self.inner)?;
+        let transaction = inner
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(rerr)?;
+        transaction
+            .execute(
+                "UPDATE mapped_files SET rel_path=?2,name_key=?3 WHERE document_id=?1",
+                params![document, destination, key],
+            )
+            .map_err(write_error)?;
+        transaction
+            .execute(
+                "DELETE FROM file_relocations WHERE document_id=?1",
+                [document],
+            )
+            .map_err(rerr)?;
+        transaction.commit().map_err(rerr)
+    }
+
     /// The mapping of `collection_id`, if it has one.
     pub fn folder_mapping(&self, collection_id: &str) -> Result<Option<FolderMapping>, StoreError> {
         let inner = lock(&self.inner)?;
