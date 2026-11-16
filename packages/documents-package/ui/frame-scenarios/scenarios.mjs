@@ -196,6 +196,82 @@ async function copyMarkdown(h, view, engine, expected) {
 
 export const SCENARIOS = [
   {
+    name: "folder navigation and placement controls",
+    async run(h) {
+      const listing = h.workspace.listing;
+      const collectionId = listing.collections[0].id;
+      const research = "4".repeat(64);
+      listing.collections.push({ id: research, name: "Research", archived: false });
+      listing.documents.push({ id: "5".repeat(64), collectionId, folder: "Plans/Quarter", title: "Nested", archived: false });
+      await h.addView("alice", "alice");
+      const frame = h.frame("alice");
+      const folder = frame.getByRole("button", { name: "Folder Plans", exact: true });
+      await folder.focus();
+      await press(h, "Enter");
+      assert.equal(await folder.getAttribute("aria-expanded"), "false");
+      h.workspace.publishListing();
+      await h.delivery;
+      assert.equal(await folder.getAttribute("aria-expanded"), "false");
+      await press(h, "Space");
+      assert.equal(await folder.getAttribute("aria-expanded"), "true");
+      await frame.getByRole("button", { name: "Add Document to Frame scenarios", exact: true }).click();
+      const create = frame.locator(".document-create");
+      await create.getByRole("textbox", { name: "New Document title", exact: true }).fill("Created in folder");
+      await create.getByRole("button", { name: "Choose folder", exact: true }).click();
+      await create.getByRole("button", { name: "Plans/Quarter", exact: true }).click();
+      const draft = create.getByRole("textbox", { name: "New Document folder", exact: true });
+      await draft.fill("Typed/Deep");
+      h.workspace.publishListing();
+      await h.delivery;
+      assert.equal(await draft.inputValue(), "Typed/Deep");
+      await draft.press("Enter");
+      await h.waitFor(() => h.workspace.metadataRequests.length === 1, "foldered create");
+      assert.deepEqual(h.workspace.metadataRequests[0], { operation: "documents.document.create", payload: { collectionId, title: "Created in folder", folder: "Typed/Deep" } });
+      await create.waitFor({ state: "detached" });
+      await frame.getByRole("button", { name: "Actions for Scenario document", exact: true }).click();
+      await frame.getByRole("button", { name: "Move to folder", exact: true }).click();
+      const placement = frame.getByRole("form", { name: "Move Document to folder" });
+      const destination = placement.getByRole("textbox", { name: "Destination folder", exact: true });
+      await destination.fill("Plans/Quarter");
+      await placement.getByRole("button", { name: "Move", exact: true }).click();
+      await h.waitFor(() => listing.documents[0].folder === "Plans/Quarter", "placement");
+      await placement.waitFor({ state: "hidden" });
+      await folder.click();
+      // A teammate's placement reveals the selected Document without losing the editor or its text.
+      await h.editor("alice").click();
+      await type(h, "pending survives");
+      listing.documents[0].folder = "Remote/New";
+      h.workspace.publishListing();
+      await h.delivery;
+      await frame.getByRole("button", { name: "Folder Remote/New", exact: true }).waitFor();
+      assert.equal(await frame.locator('[aria-current="true"]').innerText(), "Scenario document");
+      assert.match(await h.editor("alice").innerText(), /pending survives/);
+      await frame.getByRole("button", { name: "Actions for Scenario document", exact: true }).click();
+      await frame.getByRole("button", { name: "Move to folder", exact: true }).click();
+      assert.equal(await destination.inputValue(), "Remote/New");
+      await placement.getByRole("button", { name: "Choose folder", exact: true }).click();
+      await placement.getByRole("button", { name: "Collection root", exact: true }).click();
+      await destination.press("Enter");
+      await h.waitFor(() => listing.documents[0].folder === "", "root reset");
+      await placement.waitFor({ state: "hidden" });
+      await frame.getByRole("button", { name: "Actions for Scenario document", exact: true }).click();
+      await frame.getByRole("group", { name: "Move to Collection", exact: true }).getByRole("button", { name: "Research", exact: true }).click();
+      await h.waitFor(() => listing.documents[0].collectionId === research, "Collection move");
+      assert.equal(listing.documents[0].folder, "");
+      assert.equal(await frame.locator("select").count(), 0);
+      assert.equal(await frame.locator(".folder-group[style], .folder-chooser[style], .document-placement[style], style").count(), 0);
+      // The Package, not the Shell, must fit ordinary controls into the existing narrow frame.
+      await h.page.locator('iframe[title="alice"]').evaluate((iframe) => { iframe.width = "540"; });
+      assert.equal(await h.rawFrame("alice").evaluate(() => innerWidth), 540);
+      await frame.getByRole("button", { name: "Actions for Scenario document", exact: true }).click();
+      await frame.getByRole("button", { name: "Move to folder", exact: true }).click();
+      await destination.fill("Narrow/Folder");
+      await placement.getByRole("button", { name: "Move", exact: true }).click();
+      await h.waitFor(() => listing.documents[0].folder === "Narrow/Folder", "narrow placement");
+      return "keyboard disclosures, typed/chosen create, draft retention, remote reveal, root reset and separate Collection move; no native selects or CSP residue";
+    },
+  },
+  {
     name: "every node and mark through real keyboard input",
     async run(h) {
       await h.addView("A1", "A");

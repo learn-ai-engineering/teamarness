@@ -101,6 +101,12 @@ export class Workspace {
     this.records = [];
     this.installations = new Map();
     this.comments = [];
+    this.listing = {
+      collections: [{ id: COLLECTION, name: "Frame scenarios", archived: false }],
+      documents: [{ id: DOCUMENT, collectionId: COLLECTION, folder: "", title: "Scenario document", archived: false }],
+    };
+    this.metadataRequests = [];
+    this.listingSubscriptions = new Map();
     this.allocated = new Set();
     /** Updates a Backend refused, by view; a scenario expects none unless it says so. */
     this.refusals = [];
@@ -109,6 +115,12 @@ export class Workspace {
     this.deliver = () => {};
     const genesis = authority.genesis(freshPeer(this.allocated));
     this.records.push({ author: null, bytes: genesis, requestId: null, published: true });
+  }
+
+  publishListing() {
+    for (const [id, view] of this.listingSubscriptions) {
+      this.send(view, { kind: "event", id, event: { availability: "current", warnings: [], ...this.listing } });
+    }
   }
 
   installation(id) {
@@ -221,11 +233,13 @@ class Installation {
         this.event(session, { event: "end", documentId: DOCUMENT });
       });
     }
-    // `documents.changes` and `documents.names` stay quiet: the listing never changes here.
+    if (operation === "documents.changes") this.workspace.listingSubscriptions.set(id, view);
+    // `documents.names` stays quiet.
     return null;
   }
 
   close(id) {
+    this.workspace.listingSubscriptions.delete(id);
     const peer = this.subscriptions.get(id);
     this.subscriptions.delete(id);
     if (peer !== undefined) this.sessions.delete(peer);
@@ -236,9 +250,25 @@ class Installation {
       case "documents.snapshot":
         return {
           availability: this.online ? "current" : "offline", warnings: [],
-          collections: [{ id: COLLECTION, name: "Frame scenarios", archived: false }],
-          documents: [{ id: DOCUMENT, collectionId: COLLECTION, folder: "", title: "Scenario document", archived: false }],
+          ...this.workspace.listing,
         };
+      case "documents.document.create": {
+        this.workspace.metadataRequests.push({ operation, payload });
+        const id = randomBytes(32).toString("hex");
+        this.workspace.listing.documents.push({ id, ...payload, folder: payload.folder ?? "", archived: false });
+        this.workspace.publishListing();
+        return { ok: true, id };
+      }
+      case "documents.document.place":
+      case "documents.document.move": {
+        this.workspace.metadataRequests.push({ operation, payload });
+        const document = this.workspace.listing.documents.find((d) => d.id === payload.documentId);
+        if (!document) throw packageError("documents.unknown_document");
+        if (operation === "documents.document.place") document.folder = payload.folder;
+        else document.collectionId = payload.collectionId;
+        this.workspace.publishListing();
+        return { ok: true, id: document.id };
+      }
       case "documents.document.open":
         return { documentId: DOCUMENT, editable: true };
       case "documents.place.get":

@@ -49,6 +49,7 @@ function backend(current: () => DocumentsSnapshot) {
       "documents.document.archive": record("documents.document.archive"),
       "documents.document.restore": record("documents.document.restore"),
       "documents.document.move": record("documents.document.move"),
+      "documents.document.place": record("documents.document.place"),
     },
     subscriptions: { "documents.changes": () => undefined },
   });
@@ -86,6 +87,229 @@ function texts(root: ParentNode, selector: string): string[] {
 }
 
 describe("Documents mount", () => {
+  // Verifies: TEAM.SYS.DOCS-R15, TEAM.SYS.DOCS-R04
+  it("groups visible Documents by folder with implicit parents, stable folder order and listing order inside each group", async () => {
+    const base = snapshot();
+    const current = { ...base, documents: [
+      { ...base.documents[0]!, folder: "Z/Deep", title: "Same" },
+      { ...base.documents[0]!, id: "4".repeat(64), folder: "A", title: "Same" },
+      { ...base.documents[0]!, id: "5".repeat(64), title: "Root" },
+      { ...base.documents[0]!, id: "6".repeat(64), folder: "A", title: "Later" },
+      { ...base.documents[0]!, id: "7".repeat(64), folder: "Past/Only", title: "Archived", archived: true },
+    ] };
+    const { fake } = backend(() => current);
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = host.attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    const disclosure = (path: string) => root.querySelector<HTMLButtonElement>(`[aria-label="Folder ${path}"]`)!;
+    expect(texts(root, ".folder-button")).toEqual(["A", "Z", "Deep"]);
+    expect(texts(root, '.document-list > .document-row > .document-title')).toEqual(["Root"]);
+    expect(texts(root, '[aria-label="Documents in folder A"] > .document-row > .document-title')).toEqual(["Same", "Later"]);
+    disclosure("Z").focus();
+    disclosure("Z").click();
+    expect(disclosure("Z").getAttribute("aria-expanded")).toBe("false");
+    expect(disclosure("Z/Deep")).toBeNull();
+    await fake.emit("documents.changes", current);
+    expect(disclosure("Z").getAttribute("aria-expanded")).toBe("false");
+    expect(root.activeElement).toBe(disclosure("Z"));
+    (root.querySelector('[aria-label="Show archived"]') as HTMLButtonElement).click();
+    expect(disclosure("Past/Only")).not.toBeNull();
+    expect(texts(root, ".document-title")).toContain("Archived (archived)");
+    await unmount();
+    host.remove();
+  });
+
+  it("reveals a selected Document after remote folder or Collection moves without replacing its editor", async () => {
+    const base = snapshot();
+    const other = "4".repeat(64);
+    let current = { ...base,
+      collections: [...base.collections, { id: other, name: "Research", archived: false }],
+      documents: [...base.documents, { ...base.documents[0]!, id: "5".repeat(64), folder: "Future/Nested", title: "Destination" }] };
+    const { fake } = backend(() => current);
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector('.document-title') as HTMLButtonElement).click();
+    await tick();
+    await opened(fake, { snapshot: ALL_NODES });
+    const editor = root.querySelector('.ProseMirror');
+    (root.querySelector('[aria-label="Folder Future"]') as HTMLButtonElement).click();
+    current = { ...current, documents: current.documents.map((d) => d.id === doc ? { ...d, folder: "Future/Nested" } : d) };
+    await fake.emit("documents.changes", current);
+    expect(root.querySelector('[aria-label="Folder Future"]')?.getAttribute('aria-expanded')).toBe('true');
+    expect(root.querySelector('[aria-current="true"]')?.textContent).toBe('Q4 plan');
+    expect(root.querySelector('.ProseMirror')).toBe(editor);
+    current = { ...current, documents: current.documents.map((d) => d.id === doc ? { ...d, collectionId: other } : d) };
+    await fake.emit("documents.changes", current);
+    expect(root.querySelector('[aria-current="true"]')?.closest('.collection-group')?.querySelector('.collection-button')?.textContent).toBe('Research');
+    expect(root.querySelector('.ProseMirror')).toBe(editor);
+    await unmount();
+  });
+
+  it("keeps folder actions open and keyboard focus usable during live invalidation", async () => {
+    const { fake } = backend(snapshot);
+    const host = document.createElement('div');
+    document.body.append(host);
+    const root = host.attachShadow({ mode: 'open' });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector('[aria-label="Actions for Q4 plan"]') as HTMLButtonElement).click();
+    const move = () => [...root.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent === 'Move to folder');
+    move()!.focus();
+    await fake.emit('documents.changes', snapshot());
+    expect(move()).toBeDefined();
+    expect(root.activeElement).toBe(move());
+    move()!.click();
+    expect((root.querySelector('[aria-label="Move Document to folder"]') as HTMLElement).hidden).toBe(false);
+    await unmount();
+    host.remove();
+  });
+
+  it("creates in chosen or typed folders and places in folders or root with ordinary controls", async () => {
+    const base = snapshot();
+    const current = { ...base, documents: [{ ...base.documents[0]!, folder: "Plans/Quarter" }],
+      collections: [...base.collections, { id: "4".repeat(64), name: "Research", archived: false }] };
+    const { fake, calls } = backend(() => current);
+    const root = document.createElement("div").attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    const click = (label: string, parent: ParentNode = root) => {
+      const control = [...parent.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.getAttribute('aria-label') === label || b.textContent === label);
+      expect(control, label).toBeDefined();
+      control!.click();
+    };
+    click('Add Document to Planning');
+    const form = root.querySelector('.document-create')!;
+    const title = form.querySelector<HTMLInputElement>('[aria-label="New Document title"]')!;
+    const folder = form.querySelector<HTMLInputElement>('[aria-label="New Document folder"]');
+    expect(folder).not.toBeNull();
+    click('Choose folder', form);
+    click('Plans', form);
+    expect(folder!.value).toBe('Plans');
+    title.value = 'Chosen';
+    click('Create', form);
+    await tick();
+    expect(calls.at(-1)).toEqual({ operation: 'documents.document.create', payload: { collectionId: planning, title: 'Chosen', folder: 'Plans' } });
+    click('Add Document to Planning');
+    folder!.value = 'Cafe\u0301/New';
+    folder!.dispatchEvent(new Event('input'));
+    title.value = 'Typed';
+    click('Create', form);
+    await tick();
+    expect(calls.at(-1)).toEqual({ operation: 'documents.document.create', payload: { collectionId: planning, title: 'Typed', folder: 'Café/New' } });
+    click('Actions for Q4 plan');
+    expect(root.querySelector('.document-actions')?.textContent).toContain('Current folder: Plans/Quarter');
+    click('Move to folder');
+    const placement = root.querySelector('[aria-label="Move Document to folder"]')!;
+    const destination = placement.querySelector<HTMLInputElement>('[aria-label="Destination folder"]')!;
+    expect(destination.value).toBe('Plans/Quarter');
+    destination.value = 'Other/Deep';
+    destination.dispatchEvent(new Event('input'));
+    await fake.emit('documents.changes', current);
+    expect(placement.querySelector('input')).toBe(destination);
+    expect(destination.value).toBe('Other/Deep');
+    click('Move', placement);
+    await tick();
+    expect(calls.at(-1)).toEqual({ operation: 'documents.document.place', payload: { documentId: doc, folder: 'Other/Deep' } });
+    click('Actions for Q4 plan');
+    click('Move to folder');
+    click('Choose folder', placement);
+    click('Collection root', placement);
+    click('Move', placement);
+    await tick();
+    expect(calls.at(-1)).toEqual({ operation: 'documents.document.place', payload: { documentId: doc, folder: '' } });
+    click('Actions for Q4 plan');
+    expect(root.querySelector('.document-move')?.textContent).toContain('Move to Collection');
+    click('Research', root.querySelector('.document-move')!);
+    await tick();
+    expect(calls.at(-1)).toEqual({ operation: 'documents.document.move', payload: { documentId: doc, collectionId: '4'.repeat(64) } });
+    expect(root.querySelector('select')).toBeNull();
+    await unmount();
+  });
+
+  it("keeps a refused foldered create draft and shows the invalid-folder error without retrying", async () => {
+    const calls: unknown[] = [];
+    const fake = createFakePackageClient({ requests: {
+      'documents.snapshot': snapshot,
+      'documents.document.create': (payload) => { calls.push(payload); throw { code: 'documents.invalid_folder' }; },
+    }, subscriptions: { 'documents.changes': () => undefined } });
+    const root = document.createElement('div').attachShadow({ mode: 'open' });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector('[aria-label="Add Document to Planning"]') as HTMLButtonElement).click();
+    const form = root.querySelector<HTMLFormElement>('.document-create')!;
+    const title = form.querySelector<HTMLInputElement>('[aria-label="New Document title"]')!;
+    const folder = form.querySelector<HTMLInputElement>('[aria-label="New Document folder"]')!;
+    title.value = 'Keep title';
+    folder.value = '../bad';
+    form.requestSubmit();
+    await tick();
+    expect(root.querySelector('[role="alert"]')?.textContent).toContain('relative folder path');
+    expect(title.value).toBe('Keep title');
+    expect(folder.value).toBe('../bad');
+    expect(calls).toEqual([{ collectionId: planning, title: 'Keep title', folder: '../bad' }]);
+    await unmount();
+  });
+
+  it("retains folder drafts through live updates, invalid-folder refusals, and older command completions", async () => {
+    let finish: ((value: { ok: true; id: string }) => void) | undefined;
+    let invalid = true;
+    const fake = createFakePackageClient({ requests: {
+      'documents.snapshot': snapshot,
+      'documents.document.create': () => new Promise<{ ok: true; id: string }>((resolve) => { finish = resolve; }),
+      'documents.document.place': () => {
+        if (invalid) throw { code: 'documents.invalid_folder' };
+        return new Promise<{ ok: true; id: string }>((resolve) => { finish = resolve; });
+      },
+    }, subscriptions: { 'documents.changes': () => undefined } });
+    const host = document.createElement('div');
+    document.body.append(host);
+    const root = host.attachShadow({ mode: 'open' });
+    const unmount = await mount(createTestMountContext({ client: fake.client, root }));
+    (root.querySelector('[aria-label="Add Document to Planning"]') as HTMLButtonElement).click();
+    const form = root.querySelector<HTMLFormElement>('.document-create')!;
+    const folder = form.querySelector<HTMLInputElement>('[aria-label="New Document folder"]');
+    expect(folder).not.toBeNull();
+    const title = form.querySelector<HTMLInputElement>('[aria-label="New Document title"]')!;
+    title.value = 'Draft';
+    folder!.value = 'First';
+    folder!.dispatchEvent(new Event('input'));
+    form.requestSubmit();
+    folder!.value = 'Newer/Folder';
+    folder!.dispatchEvent(new Event('input'));
+    folder!.focus();
+    folder!.setSelectionRange(2, 5);
+    await fake.emit('documents.changes', snapshot());
+    expect(root.activeElement).toBe(folder);
+    expect(folder!.selectionStart).toBe(2);
+    finish!({ ok: true, id: doc });
+    await tick();
+    expect(root.querySelector('.document-create')).toBe(form);
+    expect(title.value).toBe('Draft');
+    expect(folder!.value).toBe('Newer/Folder');
+    (form.querySelector('[aria-label="Cancel"]') as HTMLButtonElement).click();
+    (root.querySelector('[aria-label="Actions for Q4 plan"]') as HTMLButtonElement).click();
+    ([...root.querySelectorAll('button')].find((b) => b.textContent === 'Move to folder') as HTMLButtonElement).click();
+    const placement = root.querySelector<HTMLFormElement>('[aria-label="Move Document to folder"]')!;
+    const destination = placement.querySelector<HTMLInputElement>('input')!;
+    destination.value = '../bad';
+    destination.dispatchEvent(new Event('input'));
+    placement.requestSubmit();
+    await tick();
+    expect(root.querySelector('[role="alert"]')?.textContent).toContain('512');
+    expect(destination.value).toBe('../bad');
+    expect(placement.hidden).toBe(false);
+    invalid = false;
+    destination.value = 'First';
+    destination.dispatchEvent(new Event('input'));
+    placement.requestSubmit();
+    destination.value = 'Later';
+    destination.dispatchEvent(new Event('input'));
+    finish!({ ok: true, id: doc });
+    await tick();
+    expect(placement.hidden).toBe(false);
+    expect(destination.value).toBe('Later');
+    await unmount();
+    host.remove();
+  });
+
   it("lists Collections and Documents, hides archived until asked, and unmounts cleanly", async () => {
     const { fake } = backend(snapshot);
     const root = document.createElement("div").attachShadow({ mode: "open" });
@@ -717,7 +941,7 @@ describe("Documents mount", () => {
     document.body.click();
     expect(root.querySelector('.document-actions')).toBeNull();
     actions().click();
-    (root.querySelector('.document-actions button') as HTMLButtonElement).click();
+    ([...root.querySelectorAll('.document-actions button')].find((b) => b.textContent === 'Rename') as HTMLButtonElement).click();
     const input = root.querySelector('.document-rename input') as HTMLInputElement;
     expect(input.value).toBe('Q4 plan');
     input.value = 'Still typing';
@@ -727,9 +951,8 @@ describe("Documents mount", () => {
     (root.querySelector('.document-rename button[aria-label="Cancel"]') as HTMLButtonElement).click();
     expect(root.querySelector('.document-rename')).toBeNull();
     actions().click();
-    const move = root.querySelector('.document-move') as HTMLSelectElement;
-    move.value = research;
-    move.dispatchEvent(new Event('change'));
+    const move = root.querySelector('.document-move')!;
+    ([...move.querySelectorAll('button')].find((b) => b.textContent === 'Research') as HTMLButtonElement).click();
     await tick();
     expect(calls.at(-1)).toEqual({ operation: 'documents.document.move', payload: { documentId: doc, collectionId: research } });
     const toggle = root.querySelector('.archived-toggle') as HTMLButtonElement;
@@ -918,9 +1141,8 @@ describe("Documents mount", () => {
       const menuAction = root.querySelector('.collection-actions button') as HTMLButtonElement;
       menuAction.focus();
       await fake.emit('documents.changes', current);
-      expect(root.activeElement?.getAttribute('aria-label')).toBe('Actions for Planning');
+      expect(root.activeElement?.textContent).toBe('Rename');
       (root.activeElement as HTMLButtonElement).click();
-      (root.querySelector('.collection-actions button') as HTMLButtonElement).click();
       const rename = root.querySelector('.collection-rename input') as HTMLInputElement;
       rename.value = 'Renaming';
       rename.focus();
