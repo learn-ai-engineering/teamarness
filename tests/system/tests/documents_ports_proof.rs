@@ -1,7 +1,7 @@
 //! Documents Port Contract through the Host broker: a real SDK consumer Package lists, reads,
 //! revises and observes the real Documents Backend, and every row of the shared merge scenario
 //! table runs through `document.revise`. A 1.0 Consumer revises as the Installation Person; a
-//! 1.2 Consumer bound to a Workspace Agent enables Documents, reads its guide, and creates and
+//! 1.2 or 1.4 Consumer bound to a Workspace Agent enables Documents, reads its guide, and creates and
 //! revises as that Agent.
 #![cfg(unix)]
 #[allow(dead_code)] // Shared qualification helpers are used by different integration targets.
@@ -301,7 +301,7 @@ fn unique_text(bytes: usize) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
     let application = harness::StagedApplication::with(&PackageStage::documents());
-    // A 1.0 Consumer keeps working against the 1.3 Provider.
+    // A 1.0 Consumer keeps working against the 1.4 Provider.
     stage_consumer(&application.application_path, 0, 0);
     let root = application.root.path();
     let core = open_core(Addressing::Loopback, &root.join("alice-core")).await;
@@ -401,6 +401,7 @@ async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
     );
     assert_eq!(page["documents"][0]["id"], document);
     assert_eq!(page["documents"][0]["title"], "Q4");
+    assert_eq!(page["documents"][0]["folder"], "");
     assert_eq!(page["documents"][0]["body"], "available");
     let read = consumer.markdown(&document).await;
     assert_eq!(read["markdown"], "");
@@ -549,8 +550,19 @@ async fn real_sdk_consumer_lists_reads_revises_and_observes_documents() {
 /// key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn agent_bound_consumer_creates_and_revises_documents_as_the_agent() {
+    qualify_agent_create(2).await;
+}
+
+/// Verifies: TEAM.SYS.DOCS-R12, TEAM.SYS.DOCS-R15 — a 1.4 Agent creates at root or in
+/// a folder, lists placement, and revises from genesis through the real SDK/Host broker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn agent_bound_consumer_lists_folders_and_creates_then_revises_from_genesis() {
+    qualify_agent_create(4).await;
+}
+
+async fn qualify_agent_create(minor: u16) {
     let application = harness::StagedApplication::with(&PackageStage::documents());
-    stage_consumer(&application.application_path, 2, 2);
+    stage_consumer(&application.application_path, minor, minor);
     let root = application.root.path();
     let core = open_core(Addressing::Loopback, &root.join("alice-core")).await;
     let workspace = core.create_workspace("Documents agent proof").unwrap();
@@ -628,6 +640,9 @@ async fn agent_bound_consumer_creates_and_revises_documents_as_the_agent() {
     let guide = guide["markdown"].as_str().unwrap();
     assert!(guide.contains("## Create"), "{guide}");
     assert!(guide.contains("baseVersion set to the returned version"));
+    assert!(guide.contains("## Folders and mapped files"));
+    assert!(guide.contains("Existing mappings stay flat"));
+    assert!(guide.contains("Never retry the whole create automatically"));
     let revised = consumer
         .revise(&document, &read["version"], "Drafted by the Scribe\n")
         .await;
@@ -676,8 +691,69 @@ async fn agent_bound_consumer_creates_and_revises_documents_as_the_agent() {
     assert_eq!(provider_code(&unknown), "documents.unknown_collection");
     assert_eq!(unknown["uncertain"], false);
 
-    // Core holds the Person's create, the Agent's create, and two body edits, each Agent record
-    // signed with the Agent's key.
+    let root_listing = consumer
+        .value(
+            "query",
+            "document.list",
+            json!({"collectionId": collection}),
+        )
+        .await;
+    assert!(
+        root_listing["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == notes && row["folder"] == "")
+    );
+    if minor == 4 {
+        let foldered = consumer.value("command", "document.create", json!({
+            "collectionId": collection, "title": "Nested notes", "folder": "planning/Cafe\u{301}"
+        })).await;
+        let nested = foldered["documentId"].as_str().unwrap();
+        let genesis = consumer.markdown(nested).await;
+        assert_eq!(genesis["markdown"], "");
+        assert_eq!(
+            genesis["version"], foldered["version"],
+            "place does not change the body version"
+        );
+        let listing = consumer
+            .value(
+                "query",
+                "document.list",
+                json!({"collectionId": collection}),
+            )
+            .await;
+        let row = listing["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == nested)
+            .unwrap();
+        assert_eq!(row["folder"], "planning/Café");
+        assert_eq!(row["version"], foldered["version"]);
+        let revised = consumer
+            .revise(nested, &foldered["version"], "Nested notes by the Scribe\n")
+            .await;
+        assert_eq!(revised["ok"], true, "{revised}");
+        let read = consumer.markdown(nested).await;
+        assert_eq!(read["markdown"], "Nested notes by the Scribe\n");
+        assert_eq!(read["version"], revised["value"]["version"]);
+        let invalid = consumer
+            .call(
+                "command",
+                "document.create",
+                json!({
+                    "collectionId": collection, "title": "Invalid folder", "folder": "../outside"
+                }),
+            )
+            .await;
+        assert_eq!(provider_code(&invalid), "documents.invalid_folder");
+        assert_eq!(invalid["uncertain"], false);
+    }
+
+    // Core's authenticated records establish the signer, not a Consumer-supplied claim.
+    // Exact counts also prove root create and invalid-folder refusal append no placement.
+
     let mut records = core
         .subscribe_records(workspace_id, DOCUMENTS, None)
         .unwrap();
@@ -691,13 +767,26 @@ async fn agent_bound_consumer_creates_and_revises_documents_as_the_agent() {
     };
     assert_eq!(
         authors("document.create"),
-        vec![core.public_identity().to_string(), agent_key.clone()],
+        if minor == 4 {
+            vec![
+                core.public_identity().to_string(),
+                agent_key.clone(),
+                agent_key.clone(),
+            ]
+        } else {
+            vec![core.public_identity().to_string(), agent_key.clone()]
+        },
         "the Person created Q4 and the Agent created its notes"
     );
     assert_eq!(
         authors("document.edit"),
-        vec![agent_key.clone(), agent_key],
-        "both revises are the Agent's records"
+        vec![agent_key.clone(); if minor == 4 { 3 } else { 2 }],
+        "every revise is the Agent's record"
+    );
+
+    assert_eq!(
+        authors("document.place"),
+        if minor == 4 { vec![agent_key] } else { vec![] }
     );
 
     consumer

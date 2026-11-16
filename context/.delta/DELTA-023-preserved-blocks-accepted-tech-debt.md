@@ -144,15 +144,15 @@ Slice B (`TEAM.SYS.DOCS-R14`, ADR 0041) passed Verify round 1 on `dd73c5b` and r
 - **CR2-001. Deleting the last synced file stops sync.** When the last or only synced file of a mapped folder is deleted, the mapping becomes `unavailable` instead of archiving the Document. This is the emptied-root guard that protects against iCloud eviction and empty mount points. Write-back for that Collection then stops, and the settings view shows "Folder unavailable" with no reason. Adding any `.md` file resumes sync. Fix it if Members run into it: show a hint for the reason, or apply the guard only when two or more files were mapped.
 - **CR2-002. A recovered Linux folder may stay unavailable.** On Linux, an existing root that is `unavailable` may not recover until a restart: the reconcile is not retried, and the inotify watch can sit on an empty mount point or a dead inode. macOS is not affected, and Linux is not qualified.
 - **CR2-003. Write-back stops on mounts that refuse chmod.** If copying permissions fails, the write-back stops. On CIFS, SMB or FUSE mounts that refuse chmod, in-app edits then never reach the file. Make the permission copy best effort.
-- **SF2-001. R14 and ADR 0041 overstate the emptied-root rule.** They say the rule applies to a root that "holds none of its synced files". The code applies it only when no `.md` file is found at all. The R14 Import clause also lacks the exception from CR2-001.
+- **SF2-001. R14 and ADR 0041 overstated the emptied-root rule (documentation corrected in slice C).** They said the rule applies to a root that "holds none of its synced files". The code applies it only when no `.md` file is found at all. The R14 Import clause also lacked the exception from CR2-001. R14 and ADR 0041 now state the exact zero-eligible-readable-files guard and subtree exception. CR2-001 behavior is unchanged.
 - **CR-004. Reconciles cost too much.** A Document that stays pending, or an error that persists, rehashes the folder every second. Each of Teamarness's own writes triggers a full pass that reads the Document list once per Document (O(N²)).
 - **Maintainability.**
   - SM-003: pass-through wrapper layers (`append_record`, `reopen_unopened`, `body_state`).
   - SM-004: `mapped_file_by_name_key` is unused.
   - SM-005: the splice block splitter copies the Markdown import options instead of using `import_options`.
-  - SM2-001: the system test header still says "on Linux CI".
+  - SM2-001: the system test header said "on Linux CI". Slice C corrects it to local macOS qualification; CI still runs no Rust tests.
   - SM2-002: the case-only rename test cites R14 (Write-back, No lost text) instead of R14 (Safety).
-  - SM2-003: the reconciler's module doc and ADR 0041's test list leave out the emptied-root guard and the Phase 7 tests.
+  - SM2-003: the reconciler's module doc and ADR 0041's test list left out the emptied-root guard and the Phase 7 tests. Slice C's reconciler module doc now states the guard, and ADR 0041's evidence covers the zero-files and recursive tests. This documentation finding is corrected; unrelated maintainability debt remains deferred.
   - SM2-004: `DRAFT_SAVE_DELAY_MS` is exported but unused.
   - SM2-005: the settings page keeps `teamarness-page--readable` and then cancels its width in CSS.
 - **Accepted rare risks.** Recorded in the slice B plan checkpoint:

@@ -31,6 +31,16 @@ folder is a relative slash-separated path, normalized to NFC, at most {MAX_FOLDE
 
 To give the new Document content, call document.revise with that documentId, baseVersion set to the returned version, and the complete Markdown you want. Create then revise is two commands. If the revise is refused, the empty Document remains: revise it again, against a fresh read, rather than create another. A revise straight after a create can report documents.pending until the body is open; read it with document.markdown and revise again.
 
+## Folders and mapped files
+
+Folder paths are shared Document metadata; mapped disk roots and recursion consent belong to each Installation. New mappings include eligible nested lowercase .md files. Existing mappings stay flat until the local Member previews and confirms Enable subfolders. Before consent, existing root files keep their body association and new foldered Documents wait rather than flattening into root files. Ports do not configure mappings.
+
+Hidden paths are valid folder metadata but are not synced to disk. A mapping refuses hidden, unsafe or unrepresentable paths without changing the Document's folder. An unambiguous file move preserves identity only when its bytes are unchanged; an edit combined with a move, or an on-disk move across mappings, does not guarantee identity. Use the in-app Move to Collection control for an identity-preserving Collection move.
+
+Deleting a subtree archives its Documents only when the mapping can safely scan it and eligible readable files remain elsewhere. Deleting the only populated subtree instead marks the mapping unavailable and archives nothing. Restore recreates files and missing parents. Repeated archive after restore by the same author remains an accepted limitation; do not depend on it.
+
+Forward migrations preserve bodies and file associations but prevent older builds from opening the upgraded local database. Older peers on their own databases still exchange ordinary body edits; they ignore placement until upgrade re-evaluates their retained records. No redelivery is required.
+
 ## Revise against a version
 
 document.revise takes documentId, baseVersion and markdown. markdown is the whole Document as you want it, revised from the Markdown that document.markdown exported at baseVersion. Read first, change that text, and pass the version you read as baseVersion. Version tokens are opaque: never construct or change one.
@@ -63,7 +73,7 @@ The Host validates closed schemas and its own authority before dispatch. A Provi
 
 document.create refuses an unknown Collection with documents.unknown_collection, an archived Collection with documents.collection_archived, and an invalid title with documents.invalid_title. documents.invalid_folder refuses an invalid folder before append. documents.principal_not_bound on the first append means Core does not sign for this Agent now and nothing was written. These pre-create refusals are certain; any failure after create, including principal_not_bound on place, is uncertain. documents.capability_unavailable carries causeCode in Provider details. documents.storage_failed, documents.deferred and documents.rejected can follow a committed record, so treat them as uncertain when outcomeUncertain is set.
 
-runtime.guide, document.list, document.markdown, comment.changes and comment.thread are read-only and repeatable, but their results can change. Treat document.revise as not repeatable: after an uncertain revise, read the Document and decide from what it holds. document.create is not repeatable: every accepted create makes a new Document, so a retry duplicates it. Never automatically retry an uncertain command, including outcome_unknown after a timeout, Provider exit or an invalid response. List and reconcile first: look for the Document by Collection and title before you create it again, and read it before you revise it again.
+runtime.guide, document.list, document.markdown, comment.changes and comment.thread are read-only and repeatable, but their results can change. Treat document.revise as not repeatable: after an uncertain revise, read the Document and decide from what it holds. document.create is not repeatable: every accepted create makes a new Document, so a retry duplicates it. Never automatically retry an uncertain command, including outcome_unknown after a timeout, Provider exit or an invalid response. List and reconcile first: look for the Document by Collection, folder and title before you create it again, and read it before you revise it again.
 "#,
         payload_kib = PORT_PAYLOAD_BYTES / 1024,
         update_kib = MAX_UPDATE / 1024,

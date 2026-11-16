@@ -64,12 +64,12 @@ A dry run returns the pre-mapping report and changes nothing. The report lists t
 - Slice B body imports remain ordinary Person revisions. Slice C placement adds kind 12 and format generation 2 under ADR 0043; it changes no body node.
 - The loss check is conservative. An entity such as `&copy;`, which exports as `©`, loses the token `copy`, so its file is refused until it is rewritten.
 - An empty Document can be left by a crash between a new file's `document.create` and its first revision. The window is small, and no test injects it.
-- Migration 0010 makes a data directory unopenable by older builds, as every forward migration does.
+- Forward migrations 0010–0012 make an upgraded data directory unopenable by older builds. Migration 0011 preserves existing mappings as flat; 0012 adds durable relocation state. ADR 0043 describes mixed-version peer recovery.
 
 ## Evidence
 
 - `packages/documents-package/backend/src/folder_sync/` (`mapping.rs`, `watch.rs`, `reconcile.rs`, `codec.rs`, `scan.rs`), `store/mappings.rs`, `migrations/0010_folder_mappings.sql`, `markdown/loss.rs`.
-- Tests: `folder_sync::reconcile::tests` (flat and recursive reconciliation, first-sync bytes, loss and bounds refusals, repeated moves, case and Unicode paths, subtree protection, the zero-files guard, archive/restore, cleanup, relocation and body-write crash recovery, no echo, and an offline batch of 50 edits), `folder_sync::mapping::{tests, request_tests}` (each refusal reason, dry run, Create Collection from folder, listing, Unmap), `folder_sync::watch::tests`, and the two-Installation system test `tests/system/tests/documents_folder_sync.rs`. The settings view is tested in `packages/documents-package/ui/src/settings.test.ts`.
+- Tests: `folder_sync::reconcile::tests` (flat and recursive reconciliation, first-sync bytes, loss and bounds refusals, repeated moves, case and Unicode paths, subtree protection, the zero-files guard, archive/restore, cleanup, relocation and body-write crash recovery, no echo, and an offline batch of 50 edits), `folder_sync::mapping::{tests, request_tests}` (each refusal reason, dry run, Create Collection from folder, listing, Unmap), `folder_sync::watch::tests`, and the two-Installation system test `tests/system/tests/documents_folder_sync.rs` (nested concurrent saves, independent legacy consent, repeated moves, folder rename, cleanup, subtree archive/restore, the zero-files guard, and 50 nested offline edits without a UI mount). The settings view is tested in `packages/documents-package/ui/src/settings.test.ts`.
 - **Weaknesses.** The watcher is qualified only locally on macOS (FSEvents), through `folder_sync::watch::tests` and the system test. CI runs no `cargo test`, so inotify (Linux) and Windows are not qualified. A save from a real editor is a manual check.
 
 ### Provenance (non-versioned)
