@@ -223,6 +223,16 @@ pub(crate) fn temp_name(name: &str) -> String {
 /// Checks that `rel` stays inside `root` with no symbolic link below `root`, and returns the
 /// folder that holds the file and the file's name.
 pub(crate) fn resolve(root: &Path, rel: &Path) -> Result<(PathBuf, String), WriteRefused> {
+    resolve_existing_parent(root, rel)?
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound).into())
+}
+
+/// `None` proves a missing parent below a checked directory, not an inaccessible or unsafe
+/// parent. Recovery needs this distinction when a completed move's old parents are gone.
+pub(crate) fn resolve_existing_parent(
+    root: &Path,
+    rel: &Path,
+) -> Result<Option<(PathBuf, String)>, WriteRefused> {
     let mut parts = Vec::new();
     for component in rel.components() {
         match component {
@@ -242,23 +252,31 @@ pub(crate) fn resolve(root: &Path, rel: &Path) -> Result<(PathBuf, String), Writ
     if !fs::metadata(root)?.is_dir() {
         return Err(WriteRefused::NotADirectory);
     }
+    if folders
+        .iter()
+        .any(|part| part.to_string_lossy().ends_with(TEMP_SUFFIX))
+    {
+        return Err(WriteRefused::OutsideRoot);
+    }
     let mut folder = root.to_path_buf();
     for part in folders {
-        if part.to_string_lossy().ends_with(TEMP_SUFFIX) {
-            return Err(WriteRefused::OutsideRoot);
-        }
         let key = name_key(&part.to_string_lossy());
-        if fs::read_dir(&folder)?
+        let aliases = fs::read_dir(&folder)?
             .collect::<Result<Vec<_>, _>>()?
             .iter()
             .filter(|entry| name_key(&entry.file_name().to_string_lossy()) == key)
-            .count()
-            > 1
-        {
+            .count();
+        if aliases > 1 {
             return Err(WriteRefused::OutsideRoot);
         }
         folder.push(part);
-        let metadata = fs::symlink_metadata(&folder)?;
+        let metadata = match fs::symlink_metadata(&folder) {
+            Ok(metadata) => metadata,
+            Err(cause) if cause.kind() == io::ErrorKind::NotFound && aliases == 0 => {
+                return Ok(None);
+            }
+            Err(cause) => return Err(cause.into()),
+        };
         if metadata.file_type().is_symlink() {
             return Err(WriteRefused::Symlink);
         }
@@ -266,7 +284,7 @@ pub(crate) fn resolve(root: &Path, rel: &Path) -> Result<(PathBuf, String), Writ
             return Err(WriteRefused::NotADirectory);
         }
     }
-    Ok((folder, name))
+    Ok(Some((folder, name)))
 }
 
 pub(crate) fn representable_folder_segment(part: &str) -> bool {

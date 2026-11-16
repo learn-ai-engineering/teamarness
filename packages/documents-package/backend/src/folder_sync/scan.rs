@@ -79,16 +79,18 @@ pub(crate) fn scan(root: &Path, mode: ScanMode) -> io::Result<Scan> {
 
 impl Scan {
     pub(crate) fn protects(&self, rel: &str) -> bool {
+        let key = name_key(rel);
         self.protected.iter().any(|(prefix, _)| {
-            rel == prefix
-                || rel
-                    .strip_prefix(prefix)
+            let prefix = name_key(prefix);
+            key == prefix
+                || key
+                    .strip_prefix(&prefix)
                     .is_some_and(|tail| tail.starts_with('/'))
         }) || self
             .unreadable
             .iter()
             .chain(&self.evicted)
-            .any(|path| path == rel)
+            .any(|path| name_key(path) == key)
     }
 }
 
@@ -396,5 +398,44 @@ mod tests {
         let file = parent.path().join("file.md");
         fs::write(&file, "x").unwrap();
         assert!(scan(&file, ScanMode::Flat).is_err());
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R14.
+    #[test]
+    fn protected_paths_use_casefolded_nfc_identity_and_segment_boundaries() {
+        let scan = Scan {
+            protected: vec![("Plans/Cafe\u{301}".into(), "unreadable".into())],
+            ..Scan::default()
+        };
+        assert!(scan.protects("PLANS/CAFÉ"));
+        assert!(scan.protects("plans/Café/Note.md"));
+        assert!(!scan.protects("Plans/Caféteria/Note.md"));
+        assert!(!scan.protects("Plans/Café.md"));
+        assert!(!scan.protects("Other/Plans/Café/Note.md"));
+        assert!(!scan.protects("Plans"));
+        assert_eq!(scan.protected[0].0, "Plans/Cafe\u{301}");
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R14.
+    #[test]
+    fn exact_unavailable_paths_use_casefolded_nfc_identity_without_protecting_descendants() {
+        let scan = Scan {
+            unreadable: vec!["Plans/Cafe\u{301}.md".into()],
+            evicted: vec!["Straße/Note.md".into()],
+            ..Scan::default()
+        };
+        assert!(scan.protects("PLANS/CAFÉ.MD"));
+        assert!(scan.protects("STRASSE/note.md"));
+        for rel in [
+            "Plans/Café.md/child.md",
+            "Plans/Café.md2",
+            "Straße/Note.md/child.md",
+            "Straße/Note.md2",
+            "Other/STRASSE/Note.md",
+        ] {
+            assert!(!scan.protects(rel), "exact protection must not cover {rel}");
+        }
+        assert_eq!(scan.unreadable[0], "Plans/Cafe\u{301}.md");
+        assert_eq!(scan.evicted[0], "Straße/Note.md");
     }
 }

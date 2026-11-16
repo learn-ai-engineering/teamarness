@@ -164,6 +164,13 @@ pub(super) struct FileContent {
     pub(super) bytes: Option<Vec<u8>>,
 }
 
+/// Recovery must not use an unreadable or unsafe source as proof of completed movement.
+enum RelocationSource {
+    Absent,
+    Present(FileContent),
+    Unavailable,
+}
+
 /// The pieces folder sync needs from one activation. Cheap to clone; every clone shares one
 /// gate, so reconciles never interleave.
 #[derive(Clone)]
@@ -868,7 +875,7 @@ impl FolderSync {
     // ------------------------------------------------------------ Collection to folder
 
     async fn document(&self, document: &str, outcome: &mut Outcome) -> Result<(), BackendError> {
-        let Some(current) = self
+        let Some(mut current) = self
             .documents()
             .await?
             .into_iter()
@@ -911,6 +918,17 @@ impl FolderSync {
                 return Ok(());
             }
             state = Some(self.refetch(file).await?);
+            // Local recovery can append placement and rename records. Write-back must use
+            // that projection, not undo recovery with the metadata read before it.
+            let Some(recovered) = self
+                .documents()
+                .await?
+                .into_iter()
+                .find(|known| known.id == document)
+            else {
+                return Ok(());
+            };
+            current = recovered;
         }
         // A Document moved to another Collection leaves this folder.
         if let Some(file) = state.as_ref()
@@ -1394,7 +1412,25 @@ impl FolderSync {
         outcome: &mut Outcome,
     ) -> Result<bool, BackendError> {
         let target = self.read(root, &intent.destination_path).await?;
-        let source = self.read(root, &intent.source_path).await?;
+        let source = match self
+            .read_relocation_source(root, &intent.source_path)
+            .await?
+        {
+            RelocationSource::Absent => None,
+            RelocationSource::Present(content) => Some(content),
+            RelocationSource::Unavailable => {
+                self.refuse(
+                    &file.collection_id,
+                    &intent.source_path,
+                    None,
+                    Refusal::NameCollisionUnresolved,
+                    Some("relocation source unavailable".to_owned()),
+                    outcome,
+                )
+                .await?;
+                return Ok(false);
+            }
+        };
         let allow_destination = source.is_none()
             || self
                 .same_entry(root, &intent.source_path, &intent.destination_path)
@@ -1689,7 +1725,40 @@ impl FolderSync {
         Ok(taken)
     }
 
-    /// Reads `root/rel` without following a link. `None` when it is missing or not a file.
+    async fn read_relocation_source(
+        &self,
+        root: &Path,
+        rel: &str,
+    ) -> Result<RelocationSource, BackendError> {
+        let root = root.to_path_buf();
+        let rel = rel.to_owned();
+        self.blocking(move || {
+            // A missing root is unavailable. Only missing components below a safe root
+            // establish absence; never probe through a symlink or non-directory parent.
+            if !fs::symlink_metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
+                return Ok(RelocationSource::Unavailable);
+            }
+            let path = match super::codec::resolve_existing_parent(&root, Path::new(&rel)) {
+                Ok(Some((folder, name))) => folder.join(name),
+                Ok(None) => return Ok(RelocationSource::Absent),
+                Err(_) => return Ok(RelocationSource::Unavailable),
+            };
+            match fs::symlink_metadata(&path) {
+                Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
+                    Ok(RelocationSource::Absent)
+                }
+                Ok(metadata) if metadata.is_file() => Ok(match read_file(&path) {
+                    Ok(Some(content)) => RelocationSource::Present(content),
+                    // Disappearance between checks is not a completed-move proof.
+                    _ => RelocationSource::Unavailable,
+                }),
+                _ => Ok(RelocationSource::Unavailable),
+            }
+        })
+        .await
+    }
+
+    /// Reads `root/rel` without following a link. `None` when missing, unsafe or unreadable.
     async fn read(&self, root: &Path, rel: &str) -> Result<Option<FileContent>, BackendError> {
         let root = root.to_path_buf();
         let rel = rel.to_owned();
