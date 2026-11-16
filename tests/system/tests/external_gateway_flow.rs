@@ -19,7 +19,7 @@ use teamarness_package_host::{
     InstallPersonal, PackageHost, PackageHostCommand, PackageInstanceKey, UiMountId, WorkspaceId,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
 };
 
@@ -387,6 +387,9 @@ fn provider(root: &Path) {
     .unwrap();
     fs::write(root.join("backend/provider"), &binary).unwrap();
     let contract = serde_json::to_vec(&json!({"schemaVersion":1,"$defs":{},"requests":{
+        "proof.emit":{"request":{"type":"object","required":["value"],"properties":{"value":{}},"additionalProperties":false},"response":{"type":"object"}},
+        "proof.end":{"request":{"type":"object","required":["error"],"properties":{"error":{"type":"boolean"}},"additionalProperties":false},"response":{"type":"object"}},
+        "proof.command-release":{"request":{"type":"object","additionalProperties":false},"response":{"type":"object"}},
         "proof.guide":{"request":{"type":"object","properties":{"markdown":{"type":"string"}},"required":["markdown"],"additionalProperties":false},"response":{"type":"object"}},
         "proof.status":{"request":{"type":"object","additionalProperties":false},"response":{"type":"object"}},
         "proof.release":{"request":{"type":"object","additionalProperties":false},"response":{"type":"object"}}
@@ -397,9 +400,14 @@ fn provider(root: &Path) {
     manifest["backends"][0]["size"] = binary.len().into();
     manifest["backends"][0]["sha256"] = digest(&binary).into();
     manifest["ui"]["contract"]["sha256"] = digest(&contract).into();
+    manifest["protocol"] = json!({"major":1,"minMinor":1,"maxMinor":1});
     fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     update_ports(root, |ports| {
         ports["contracts"][0]["ports"].as_array_mut().unwrap().push(json!({"name":"sample.wait","kind":"query","description":"A controlled pending read.","request":{"type":"object","additionalProperties":false},"response":{"type":"object"}}));
+        ports["contracts"][0]["ports"].as_array_mut().unwrap().extend([
+            json!({"name":"sample.events","kind":"event","description":"Held listener setup and controlled values.","event":{}}),
+            json!({"name":"sample.stream","kind":"query","description":"Arbitrary streamed JSON with controlled terminal.","request":{"type":"object","additionalProperties":false},"event":{}}),
+        ]);
         for identity in [
             "dev.example.second",
             "dev.example.guide-less",
@@ -753,6 +761,30 @@ async fn live_discovery_freshness_and_legacy_controls_do_not_rebuild_gateway() {
             403
         );
     }
+    // Contract identity is selectable only after exact explicit opt-in.
+    select(
+        &host,
+        &gateway,
+        "dev.teamarness.conversations",
+        "sample.read",
+    )
+    .await;
+    assert_eq!(
+        http(
+            port,
+            &bearer,
+            "/v1/call",
+            Some(call(
+                "dev.teamarness.conversations",
+                3,
+                "sample.read",
+                json!({"offset":7})
+            ))
+        )
+        .await
+        .0,
+        200
+    );
     let query = call(UNKNOWN, 3, "sample.read", json!({"offset":7}));
     let expected = json!({"result":{"answer":42,"actor":{"kind":"person","identity":core.public_identity().to_string()}}});
     assert_eq!(
@@ -948,24 +980,24 @@ async fn live_discovery_freshness_and_legacy_controls_do_not_rebuild_gateway() {
     );
     remove(&host, "dev.example.replacement").await;
     provider(&path);
-    let mut excluded_provider: Value =
+    let mut conversations_provider: Value =
         serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    excluded_provider["identity"] = "dev.teamarness.conversations".into();
+    conversations_provider["identity"] = "dev.teamarness.conversations".into();
     fs::write(
         &manifest_path,
-        serde_json::to_vec(&excluded_provider).unwrap(),
+        serde_json::to_vec(&conversations_provider).unwrap(),
     )
     .unwrap();
     install(&host, path.clone(), "dev.teamarness.conversations").await;
-    let excluded = ui(&host, &gateway, "external-gateway.catalog.page", json!({})).await;
+    let conversations = ui(&host, &gateway, "external-gateway.catalog.page", json!({})).await;
     assert_eq!(
-        excluded["contracts"]
+        conversations["contracts"]
             .as_array()
             .unwrap()
             .iter()
             .find(|r| r["contract"] == UNKNOWN)
-            .unwrap()["excluded"],
-        true
+            .unwrap()["selected"],
+        false
     );
     assert_eq!(
         http(
@@ -977,6 +1009,19 @@ async fn live_discovery_freshness_and_legacy_controls_do_not_rebuild_gateway() {
         .await
         .0,
         403
+    );
+    // Provider identity is not a denylist either. Existing off state grants nothing.
+    select(&host, &gateway, UNKNOWN, "sample.read").await;
+    assert_eq!(
+        http(
+            port,
+            &bearer,
+            "/v1/call",
+            Some(call(UNKNOWN, 3, "sample.read", json!({"offset":7})))
+        )
+        .await
+        .0,
+        200
     );
     assert_eq!(
         ui(&host, &declared, "proof.execute", legacy_guide).await["ok"],
@@ -1339,6 +1384,9 @@ async fn bound_gateway_refuses_person_dispatch_without_actor_fallback() {
     let application = stage_backlog(&profile);
     let core = open_core(Addressing::Loopback, &profile.join("core")).await;
     let workspace = core.create_workspace("Bound caller").unwrap().id();
+    // Create the control before listener startup: Agent creation also changes canonical
+    // membership, which correctly pauses the listener while its watcher reconciles.
+    let agent = core.add_agent(workspace, "Caller-mode control").unwrap();
     let key = |identity: &str| {
         PackageInstanceKey::new(
             identity.parse().unwrap(),
@@ -1354,7 +1402,6 @@ async fn bound_gateway_refuses_person_dispatch_without_actor_fallback() {
     let provider_mount = open_mount(&host, &key(QUALIFICATION)).await;
     select(&host, &gateway, QUALIFICATION, "sample.read").await;
     let (port, bearer) = endpoint(&host, &gateway).await;
-    let agent = core.add_agent(workspace, "Caller-mode control").unwrap();
     core.bind_agent_package(workspace, agent, GATEWAY).unwrap();
     let refused = http(
         port,
@@ -1582,4 +1629,876 @@ fn assert_schema_references(document: &Value, node: &Value) {
         }
         _ => {}
     }
+}
+
+/// A disposable real Host, source Backlog and external gateway. No normal profile is touched.
+struct GatewayProof {
+    _root: tempfile::TempDir,
+    profile: PathBuf,
+    core: std::sync::Arc<teamarness_core::CoreRuntime>,
+    workspace: teamarness_core::WorkspaceId,
+    host: PackageHost,
+    gateway: UiMountId,
+    port: u16,
+    bearer: String,
+}
+impl GatewayProof {
+    async fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().canonicalize().unwrap();
+        let application = stage_backlog(&profile);
+        let core = open_core(Addressing::Loopback, &profile.join("core")).await;
+        let workspace = core
+            .create_workspace("Confirmed gateway proof")
+            .unwrap()
+            .id();
+        let host = open_host(&application, profile.join("host"), core.clone()).await;
+        install(&host, gateway_directory(), GATEWAY).await;
+        let key = PackageInstanceKey::new(
+            GATEWAY.parse().unwrap(),
+            WorkspaceId::new(workspace.to_string()).unwrap(),
+        );
+        let gateway = open_mount(&host, &key).await;
+        let (port, bearer) = endpoint(&host, &gateway).await;
+        Self {
+            _root: root,
+            profile,
+            core,
+            workspace,
+            host,
+            gateway,
+            port,
+            bearer,
+        }
+    }
+    fn key(&self, identity: &str) -> PackageInstanceKey {
+        PackageInstanceKey::new(
+            identity.parse().unwrap(),
+            WorkspaceId::new(self.workspace.to_string()).unwrap(),
+        )
+    }
+    async fn select(&self, contract: &str, ports: &[&str]) {
+        for port in ports {
+            select(&self.host, &self.gateway, contract, port).await;
+        }
+    }
+    async fn call(&self, contract: &str, major: u16, port: &str, request: Value) -> (u16, Value) {
+        http(
+            self.port,
+            &self.bearer,
+            "/v1/call",
+            Some(call(contract, major, port, request)),
+        )
+        .await
+    }
+    async fn result(&self, contract: &str, major: u16, port: &str, request: Value) -> Value {
+        let (status, body) = self.call(contract, major, port, request).await;
+        assert_eq!(status, 200, "{port}: {body}");
+        body["result"].clone()
+    }
+    async fn finish(self) {
+        shutdown(self.host).await;
+        self.core.shutdown().await.unwrap();
+    }
+}
+
+async fn post_socket(port: u16, bearer: &str, route: &str, body: Value) -> TcpStream {
+    let body = serde_json::to_string(&body).unwrap();
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    socket.write_all(format!("POST {route} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {bearer}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    socket
+}
+struct Ndjson {
+    socket: BufReader<TcpStream>,
+    pending: Vec<u8>,
+}
+impl Ndjson {
+    async fn established(socket: TcpStream) -> Self {
+        tokio::time::timeout(Duration::from_secs(25), async {
+            let mut socket = BufReader::new(socket);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                head.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            assert!(head.starts_with("HTTP/1.1 200"), "opening refusal: {head}");
+            for header in [
+                "content-type: application/x-ndjson",
+                "cache-control: no-store",
+                "x-content-type-options: nosniff",
+                "transfer-encoding: chunked",
+            ] {
+                assert!(head.to_lowercase().contains(header), "missing {header}");
+            }
+            Self {
+                socket,
+                pending: Vec::new(),
+            }
+        })
+        .await
+        .expect("bounded confirmed HTTP opening")
+    }
+    async fn next(&mut self) -> Option<Value> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+                    let line: Vec<_> = self.pending.drain(..=end).collect();
+                    return Some(serde_json::from_slice(&line).unwrap());
+                }
+                let mut line = String::new();
+                match self.socket.read_line(&mut line).await {
+                    Ok(0) => return None,
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return None,
+                    result => {
+                        result.unwrap();
+                    }
+                }
+                let size = usize::from_str_radix(line.trim(), 16).unwrap();
+                if size == 0 {
+                    return None;
+                }
+                assert!(size <= 256 * 1024 + 4096);
+                let mut bytes = vec![0; size + 2];
+                self.socket.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes[size..], b"\r\n");
+                self.pending.extend_from_slice(&bytes[..size]);
+            }
+        })
+        .await
+        .expect("bounded stream progress")
+    }
+    async fn ready(&mut self, contract: &str, port: &str, kind: &str) {
+        assert_eq!(
+            self.next().await,
+            Some(
+                json!({"type":"ready","contract":contract,"major":if contract == BACKLOG {1} else {3},"port":port,"kind":kind,"delivery":"stream"})
+            )
+        );
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires freshly built TEAMARNESS_EXTERNAL_GATEWAY_PACKAGE_DIR; run scripts/verify-external-gateway.mjs"]
+async fn unknown_provider_confirmed_setup_is_held_until_listener_registration() {
+    use support::harness::{QUALIFICATION, poll_short};
+    let proof = GatewayProof::new().await;
+    let path = proof.profile.join("unknown");
+    provider(&path);
+    install(&proof.host, path, QUALIFICATION).await;
+    let control = open_mount(&proof.host, &proof.key(QUALIFICATION)).await;
+    proof.select(QUALIFICATION, &["sample.events"]).await;
+    let mut opening = post_socket(
+        proof.port,
+        &proof.bearer,
+        "/v1/subscribe",
+        call(QUALIFICATION, 3, "sample.events", Value::Null),
+    )
+    .await;
+    assert!(
+        poll_short(|| async {
+            ui(&proof.host, &control, "proof.status", json!({})).await["setupWaiting"] == 1
+        })
+        .await,
+        "Provider handler must enter held setup"
+    );
+    let mut byte = [0];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), opening.read(&mut byte))
+            .await
+            .is_err(),
+        "no HTTP 200 or ready before real setup returns"
+    );
+    ui(&proof.host, &control, "proof.release", json!({})).await;
+    let mut stream = Ndjson::established(opening).await;
+    stream.ready(QUALIFICATION, "sample.events", "event").await;
+    ui(
+        &proof.host,
+        &control,
+        "proof.emit",
+        json!({"value":{"first":"post-ready change"}}),
+    )
+    .await;
+    assert_eq!(
+        stream.next().await,
+        Some(json!({"type":"value","value":{"first":"post-ready change"}}))
+    );
+    drop(stream);
+    proof.finish().await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14, TEAM.SYS.BACKLOG-R09
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires freshly built TEAMARNESS_EXTERNAL_GATEWAY_PACKAGE_DIR; run scripts/verify-external-gateway.mjs"]
+async fn real_ticket_writes_conflicts_and_backlog_event_follow_confirmed_ready() {
+    let proof = GatewayProof::new().await;
+    let native = open_mount(&proof.host, &proof.key(BACKLOG)).await;
+    // Epic creation remains native, not a gateway business operation.
+    let epic = ui(
+        &proof.host,
+        &native,
+        "backlog.epic.create",
+        json!({"title":"Gateway Epic"}),
+    )
+    .await;
+    proof
+        .select(
+            BACKLOG,
+            &[
+                "ticket.create",
+                "ticket.get",
+                "ticket.update",
+                "backlog.changed",
+            ],
+        )
+        .await;
+    let created = proof
+        .result(
+            BACKLOG,
+            1,
+            "ticket.create",
+            json!({"epicId":epic["epicId"],"title":"Outside Ticket","body":"Initial text"}),
+        )
+        .await;
+    let socket = post_socket(
+        proof.port,
+        &proof.bearer,
+        "/v1/subscribe",
+        call(BACKLOG, 1, "backlog.changed", Value::Null),
+    )
+    .await;
+    let mut stream = Ndjson::established(socket).await;
+    stream.ready(BACKLOG, "backlog.changed", "event").await;
+    // Initial read follows confirmed ready. The next change needs no prior event.
+    let current = proof
+        .result(
+            BACKLOG,
+            1,
+            "ticket.get",
+            json!({"ticketId":created["ticketId"]}),
+        )
+        .await;
+    assert_eq!(current["version"], created["version"]);
+    assert_eq!(current["creator"], proof.core.public_identity().to_string());
+    assert_eq!(current["body"], "Initial text");
+    let updated = proof.result(BACKLOG, 1, "ticket.update", json!({"ticketId":created["ticketId"],"baseVersion":current["version"],"body":"Maintained text","status":"in_progress"})).await;
+    assert_ne!(updated["version"], current["version"]);
+    assert_eq!(
+        stream.next().await,
+        Some(json!({"type":"value","value":{}}))
+    );
+    let maintained = proof
+        .result(
+            BACKLOG,
+            1,
+            "ticket.get",
+            json!({"ticketId":created["ticketId"]}),
+        )
+        .await;
+    assert_eq!(maintained["version"], updated["version"]);
+    assert_eq!(maintained["body"], "Maintained text");
+    assert_eq!(
+        maintained["lastEditor"],
+        proof.core.public_identity().to_string()
+    );
+    let stale = proof.call(BACKLOG, 1, "ticket.update", json!({"ticketId":created["ticketId"],"baseVersion":current["version"],"body":"Must not replace"})).await;
+    assert_eq!(
+        stale.1["error"],
+        json!({"source":"provider","code":"backlog.stale_version","retryable":false,"outcomeUncertain":false,"details":{"ticket":maintained}})
+    );
+    assert_ne!(stale.0, 200);
+    assert_eq!(
+        proof
+            .result(
+                BACKLOG,
+                1,
+                "ticket.get",
+                json!({"ticketId":created["ticketId"]})
+            )
+            .await,
+        maintained
+    );
+    // Exact event disable closes the idle stream while the read stays selected.
+    let page = ui(
+        &proof.host,
+        &proof.gateway,
+        "external-gateway.catalog.page",
+        json!({"contract":BACKLOG}),
+    )
+    .await;
+    let event = page["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["port"] == "backlog.changed")
+        .unwrap();
+    ui(&proof.host, &proof.gateway, "external-gateway.tool.set", json!({"contract":BACKLOG,"major":1,"provider":BACKLOG,"port":"backlog.changed","fingerprint":event["fingerprint"],"enabled":false})).await;
+    assert_stream_closed(&mut stream).await;
+    assert_eq!(
+        proof
+            .result(
+                BACKLOG,
+                1,
+                "ticket.get",
+                json!({"ticketId":created["ticketId"]})
+            )
+            .await,
+        maintained
+    );
+    let denied = http(
+        proof.port,
+        &proof.bearer,
+        "/v1/subscribe",
+        Some(call(BACKLOG, 1, "backlog.changed", Value::Null)),
+    )
+    .await;
+    assert_eq!(denied.0, 403);
+    proof.select(BACKLOG, &["backlog.changed"]).await;
+    let socket = post_socket(
+        proof.port,
+        &proof.bearer,
+        "/v1/subscribe",
+        call(BACKLOG, 1, "backlog.changed", Value::Null),
+    )
+    .await;
+    let mut reconnected = Ndjson::established(socket).await;
+    reconnected.ready(BACKLOG, "backlog.changed", "event").await;
+    assert_eq!(
+        proof
+            .result(
+                BACKLOG,
+                1,
+                "ticket.get",
+                json!({"ticketId":created["ticketId"]})
+            )
+            .await,
+        maintained,
+        "explicit reconnect reconciles rather than replaying"
+    );
+    drop(reconnected);
+    proof.finish().await;
+}
+
+async fn assert_stream_closed(stream: &mut Ndjson) {
+    tokio::time::timeout(Duration::from_secs(6), async {
+        // Already-admitted bounded frames/socket bytes may drain after denial.
+        while let Some(frame) = stream.next().await {
+            assert!(matches!(frame["type"].as_str(), Some("value" | "end")));
+            if frame["type"] == "end" {
+                assert_eq!(frame["reason"], "error");
+                assert!(stream.next().await.is_none());
+                return;
+            }
+        }
+    })
+    .await
+    .expect("idle denial closes within bounded listener drain");
+}
+
+// Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires freshly built TEAMARNESS_EXTERNAL_GATEWAY_PACKAGE_DIR; run scripts/verify-external-gateway.mjs"]
+async fn real_document_create_then_revise_preserves_opaque_versions_and_person_records() {
+    use support::harness::{PackageStage, stage_package_with};
+    const DOCUMENTS: &str = "dev.teamarness.documents";
+    let proof = GatewayProof::new().await;
+    let app = stage_package_with(&proof.profile.join("documents"), &PackageStage::documents());
+    install(&proof.host, app.join(DOCUMENTS), DOCUMENTS).await;
+    let native = open_mount(&proof.host, &proof.key(DOCUMENTS)).await;
+    let collection = ui(
+        &proof.host,
+        &native,
+        "documents.collection.create",
+        json!({"name":"Gateway Collection"}),
+    )
+    .await;
+    proof
+        .select(
+            DOCUMENTS,
+            &["document.create", "document.revise", "document.markdown"],
+        )
+        .await;
+    let created = proof
+        .result(
+            DOCUMENTS,
+            1,
+            "document.create",
+            json!({"collectionId":collection["id"],"title":"Outside Document"}),
+        )
+        .await;
+    let empty = proof
+        .result(
+            DOCUMENTS,
+            1,
+            "document.markdown",
+            json!({"documentId":created["documentId"]}),
+        )
+        .await;
+    assert_eq!(empty["markdown"], "");
+    assert_eq!(empty["version"], created["version"]);
+    assert!(empty["version"].is_string());
+    let first = proof.result(DOCUMENTS, 1, "document.revise", json!({"documentId":created["documentId"],"baseVersion":empty["version"],"markdown":"First body\n"})).await;
+    assert_eq!(first["changed"], true);
+    let read = proof
+        .result(
+            DOCUMENTS,
+            1,
+            "document.markdown",
+            json!({"documentId":created["documentId"]}),
+        )
+        .await;
+    assert_eq!(read["markdown"], "First body\n");
+    assert_eq!(read["version"], first["version"]);
+    assert_ne!(read["version"], empty["version"]);
+    let second = proof.result(DOCUMENTS, 1, "document.revise", json!({"documentId":created["documentId"],"baseVersion":read["version"],"markdown":"Maintained body\n"})).await;
+    assert_eq!(second["changed"], true);
+    let final_read = proof
+        .result(
+            DOCUMENTS,
+            1,
+            "document.markdown",
+            json!({"documentId":created["documentId"]}),
+        )
+        .await;
+    assert_eq!(
+        final_read,
+        json!({"markdown":"Maintained body\n","version":second["version"]})
+    );
+    let mut records = proof
+        .core
+        .subscribe_records(proof.workspace, DOCUMENTS, None)
+        .unwrap();
+    let page = records.next_page(256).unwrap();
+    for (purpose, count) in [("document.create", 1), ("document.edit", 2)] {
+        let records: Vec<_> = page
+            .events
+            .iter()
+            .filter(|e| e.purpose() == purpose)
+            .collect();
+        assert_eq!(records.len(), count);
+        assert!(
+            records
+                .iter()
+                .all(|r| r.author().to_string() == proof.core.public_identity().to_string()),
+            "Host-derived Person signs every Document write"
+        );
+    }
+    proof.finish().await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14, TEAM.SYS.PKG-R18
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires freshly built TEAMARNESS_EXTERNAL_GATEWAY_PACKAGE_DIR; run scripts/verify-external-gateway.mjs"]
+async fn real_draft_text_and_128kib_binary_updates_preserve_revision_conflict_details() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    const EXHIBITS: &str = "dev.teamarness.exhibits";
+    let proof = GatewayProof::new().await;
+    support::harness::stage_exhibits(&proof.profile.join("application"));
+    install(
+        &proof.host,
+        proof.profile.join("application").join(EXHIBITS),
+        EXHIBITS,
+    )
+    .await;
+    proof
+        .select(
+            EXHIBITS,
+            &[
+                "file.write",
+                "file.put",
+                "files.missing",
+                "draft.update",
+                "exhibit.read",
+                "file.text",
+                "file.read",
+            ],
+        )
+        .await;
+    let text = proof
+        .result(
+            EXHIBITS,
+            1,
+            "file.write",
+            json!({"text":"<h1>First Draft</h1>\n"}),
+        )
+        .await;
+    let bytes: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+    let sha = digest(&bytes);
+    let missing = proof
+        .result(EXHIBITS, 1, "files.missing", json!({"sha256s":[sha]}))
+        .await;
+    assert_eq!(missing["missing"][0]["sha256"], sha);
+    let upload = json!({"sha256":sha,"size":bytes.len(),"chunkIndex":0,"chunkCount":1,"data":STANDARD.encode(&bytes)});
+    assert!(
+        serde_json::to_vec(&call(EXHIBITS, 1, "file.put", upload.clone()))
+            .unwrap()
+            .len()
+            < 256 * 1024
+    );
+    assert_eq!(
+        proof.result(EXHIBITS, 1, "file.put", upload).await,
+        json!({"complete":true})
+    );
+    assert_eq!(
+        proof
+            .result(
+                EXHIBITS,
+                1,
+                "files.missing",
+                json!({"sha256s":[sha,text["sha256"]]})
+            )
+            .await,
+        json!({"missing":[]})
+    );
+    let files =
+        json!([{"path":"index.html","sha256":text["sha256"]},{"path":"data.wasm","sha256":sha}]);
+    let first = proof.result(EXHIBITS, 1, "draft.update", json!({"exhibitId":"gateway-proof","title":"Outside Draft","entry":"index.html","files":files,"expectedRevision":0})).await;
+    assert_eq!(first["revision"], 1);
+    let new_text = proof
+        .result(
+            EXHIBITS,
+            1,
+            "file.write",
+            json!({"text":"<h1>Maintained Draft</h1>\n"}),
+        )
+        .await;
+    let files = json!([{"path":"index.html","sha256":new_text["sha256"]},{"path":"data.wasm","sha256":sha}]);
+    let second = proof.result(EXHIBITS, 1, "draft.update", json!({"exhibitId":"gateway-proof","title":"Maintained Draft","entry":"index.html","files":files,"expectedRevision":first["revision"]})).await;
+    assert_eq!(second["revision"], 2);
+    let read = proof
+        .result(
+            EXHIBITS,
+            1,
+            "exhibit.read",
+            json!({"exhibitId":"gateway-proof"}),
+        )
+        .await;
+    assert_eq!(read["revision"], second["revision"]);
+    assert_eq!(read["title"], "Maintained Draft");
+    assert_eq!(read["fileCount"], 2);
+    assert_eq!(
+        read["updatedBy"],
+        json!({"kind":"person","identity":proof.core.public_identity().to_string()})
+    );
+    assert_eq!(
+        proof
+            .result(
+                EXHIBITS,
+                1,
+                "file.text",
+                json!({"sha256":new_text["sha256"]})
+            )
+            .await["text"],
+        "<h1>Maintained Draft</h1>\n"
+    );
+    let binary = proof
+        .result(
+            EXHIBITS,
+            1,
+            "file.read",
+            json!({"sha256":sha,"chunkIndex":0}),
+        )
+        .await;
+    assert_eq!(
+        STANDARD.decode(binary["data"].as_str().unwrap()).unwrap(),
+        bytes
+    );
+    let stale = proof.call(EXHIBITS, 1, "draft.update", json!({"exhibitId":"gateway-proof","title":"Stale Draft","entry":"index.html","files":[{"path":"index.html","sha256":text["sha256"]}],"expectedRevision":first["revision"]})).await;
+    assert_ne!(stale.0, 200);
+    assert_eq!(
+        stale.1["error"],
+        json!({"source":"provider","code":"exhibits.revision_conflict","retryable":false,"outcomeUncertain":false,"details":{"revision":2}})
+    );
+    assert_eq!(
+        proof
+            .result(
+                EXHIBITS,
+                1,
+                "exhibit.read",
+                json!({"exhibitId":"gateway-proof"})
+            )
+            .await,
+        read
+    );
+    proof.finish().await;
+}
+
+fn gateway_artifacts() -> Vec<(String, String)> {
+    let directory = gateway_directory();
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(directory.join("teamarness.package.json")).unwrap())
+            .unwrap();
+    [
+        "teamarness.package.json",
+        manifest["backends"][0]["path"].as_str().unwrap(),
+        manifest["ui"]["entrypoint"]["path"].as_str().unwrap(),
+        manifest["ui"]["contract"]["path"].as_str().unwrap(),
+    ]
+    .into_iter()
+    .map(|p| (p.to_owned(), digest(&fs::read(directory.join(p)).unwrap())))
+    .collect()
+}
+
+// Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires freshly built TEAMARNESS_EXTERNAL_GATEWAY_PACKAGE_DIR; run scripts/verify-external-gateway.mjs"]
+async fn unknown_live_provider_four_shapes_values_terminals_generation_and_legacy_refusal() {
+    use support::harness::QUALIFICATION;
+    let before = gateway_artifacts();
+    let proof = GatewayProof::new().await;
+    assert!(
+        !catalog(&proof.host, &proof.gateway)
+            .await
+            .iter()
+            .any(|r| r["contract"] == QUALIFICATION)
+    );
+    let path = proof.profile.join("unknown");
+    provider(&path);
+    install(&proof.host, path.clone(), QUALIFICATION).await;
+    let control = open_mount(&proof.host, &proof.key(QUALIFICATION)).await;
+    assert_eq!(
+        proof
+            .call(QUALIFICATION, 3, "sample.write", json!({"value":"off"}))
+            .await
+            .0,
+        403
+    );
+    proof
+        .select(
+            QUALIFICATION,
+            &[
+                "sample.read",
+                "sample.write",
+                "sample.stream",
+                "sample.events",
+            ],
+        )
+        .await;
+    assert_eq!(
+        proof
+            .result(QUALIFICATION, 3, "sample.read", json!({"offset":7}))
+            .await,
+        json!({"answer":42,"actor":{"kind":"person","identity":proof.core.public_identity().to_string()}})
+    );
+    assert_eq!(
+        proof
+            .result(QUALIFICATION, 3, "sample.write", json!({"value":"once"}))
+            .await,
+        json!({"written":true})
+    );
+    assert_eq!(
+        proof
+            .call(QUALIFICATION, 3, "sample.stream", json!({}))
+            .await
+            .0,
+        400
+    );
+    let schema = http(
+        proof.port,
+        &proof.bearer,
+        &format!("/v1/contracts/{QUALIFICATION}/3"),
+        None,
+    )
+    .await;
+    assert_eq!(schema.0, 200);
+    let ports = schema.1["schema"]["contracts"][0]["ports"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        ports
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "runtime.guide",
+            "sample.events",
+            "sample.read",
+            "sample.stream",
+            "sample.write"
+        ]
+    );
+    assert_schema_references(&schema.1["schema"], &schema.1["schema"]);
+    let socket = post_socket(
+        proof.port,
+        &proof.bearer,
+        "/v1/subscribe",
+        call(QUALIFICATION, 3, "sample.stream", json!({})),
+    )
+    .await;
+    let mut stream = Ndjson::established(socket).await;
+    stream.ready(QUALIFICATION, "sample.stream", "query").await;
+    for value in [
+        Value::Null,
+        json!(false),
+        json!(42),
+        json!("scalar"),
+        json!([1,null,{"nested":true}]),
+        json!({"type":"ready","value":{"result":7}}),
+    ] {
+        ui(&proof.host, &control, "proof.emit", json!({"value":value})).await;
+        assert_eq!(
+            stream.next().await,
+            Some(json!({"type":"value","value":value}))
+        );
+    }
+    ui(&proof.host, &control, "proof.end", json!({"error":false})).await;
+    assert_eq!(
+        stream.next().await,
+        Some(json!({"type":"end","reason":"completed"}))
+    );
+    assert!(stream.next().await.is_none());
+    let socket = post_socket(
+        proof.port,
+        &proof.bearer,
+        "/v1/subscribe",
+        call(QUALIFICATION, 3, "sample.stream", json!({})),
+    )
+    .await;
+    let mut stream = Ndjson::established(socket).await;
+    stream.ready(QUALIFICATION, "sample.stream", "query").await;
+    reload(&proof.host, QUALIFICATION).await;
+    assert_stream_closed(&mut stream).await;
+    // An actual selected 1.0 Provider still serves reads, but cannot confirm a stream.
+    let manifest_path = path.join("teamarness.package.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["protocol"] = json!({"major":1,"minMinor":0,"maxMinor":0});
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    reload(&proof.host, QUALIFICATION).await;
+    assert_eq!(
+        proof
+            .result(QUALIFICATION, 3, "sample.read", json!({"offset":7}))
+            .await["answer"],
+        42
+    );
+    let refused = http(
+        proof.port,
+        &proof.bearer,
+        "/v1/subscribe",
+        Some(call(QUALIFICATION, 3, "sample.stream", json!({}))),
+    )
+    .await;
+    assert_ne!(refused.0, 200);
+    assert_eq!(refused.1["error"]["code"], "capability_version_unsupported");
+    manifest["protocol"] = json!({"major":1,"minMinor":1,"maxMinor":1});
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    reload(&proof.host, QUALIFICATION).await;
+    let socket = post_socket(
+        proof.port,
+        &proof.bearer,
+        "/v1/subscribe",
+        call(QUALIFICATION, 3, "sample.stream", json!({})),
+    )
+    .await;
+    let mut fresh = Ndjson::established(socket).await;
+    fresh.ready(QUALIFICATION, "sample.stream", "query").await;
+    let control = open_mount(&proof.host, &proof.key(QUALIFICATION)).await;
+    ui(
+        &proof.host,
+        &control,
+        "proof.emit",
+        json!({"value":"explicit reconnect"}),
+    )
+    .await;
+    assert_eq!(
+        fresh.next().await,
+        Some(json!({"type":"value","value":"explicit reconnect"}))
+    );
+    drop(fresh);
+    assert_eq!(
+        gateway_artifacts(),
+        before,
+        "live install and every shape leave gateway artifact bytes unchanged"
+    );
+    let socket = post_socket(
+        proof.port,
+        &proof.bearer,
+        "/v1/subscribe",
+        call(QUALIFICATION, 3, "sample.stream", json!({})),
+    )
+    .await;
+    let mut stream = Ndjson::established(socket).await;
+    stream.ready(QUALIFICATION, "sample.stream", "query").await;
+    ui(&proof.host, &control, "proof.end", json!({"error":true})).await;
+    let end = stream.next().await.unwrap();
+    assert_eq!(end["type"], "end");
+    assert_eq!(end["reason"], "error");
+    assert_eq!(end["error"]["code"], "proof.stream_failed");
+    assert!(stream.next().await.is_none());
+    proof.finish().await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires freshly built TEAMARNESS_EXTERNAL_GATEWAY_PACKAGE_DIR; run scripts/verify-external-gateway.mjs"]
+async fn held_command_observer_loss_and_policy_change_execute_once_with_host_person() {
+    use support::harness::{QUALIFICATION, poll_short};
+    let proof = GatewayProof::new().await;
+    let path = proof.profile.join("unknown");
+    provider(&path);
+    install(&proof.host, path, QUALIFICATION).await;
+    let control = open_mount(&proof.host, &proof.key(QUALIFICATION)).await;
+    proof
+        .select(QUALIFICATION, &["sample.write", "sample.read"])
+        .await;
+    let observer = post_socket(
+        proof.port,
+        &proof.bearer,
+        "/v1/call",
+        call(QUALIFICATION, 3, "sample.write", json!({"value":"held"})),
+    )
+    .await;
+    assert!(
+        poll_short(|| async {
+            ui(&proof.host, &control, "proof.status", json!({})).await["commandWaiting"] == 1
+        })
+        .await
+    );
+    drop(observer);
+    ui(&proof.host, &proof.gateway, "external-gateway.package.set", json!({"provider":QUALIFICATION,"enabled":false,"contracts":[{"contract":QUALIFICATION,"major":3}]})).await;
+    assert_eq!(
+        proof
+            .call(
+                QUALIFICATION,
+                3,
+                "sample.write",
+                json!({"value":"later denied"})
+            )
+            .await
+            .0,
+        403
+    );
+    ui(&proof.host, &control, "proof.command-release", json!({})).await;
+    assert!(
+        poll_short(|| async {
+            ui(&proof.host, &control, "proof.status", json!({})).await["rows"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await
+    );
+    let status = ui(&proof.host, &control, "proof.status", json!({})).await;
+    assert_eq!(status["writes"], 1);
+    assert_eq!(
+        status["rows"],
+        json!([{"value":"held","actor":{"kind":"person","identity":proof.core.public_identity().to_string()}}])
+    );
+    proof.select(QUALIFICATION, &["sample.read"]).await;
+    assert_eq!(
+        proof
+            .result(QUALIFICATION, 3, "sample.read", json!({"offset":7}))
+            .await["answer"],
+        42
+    );
+    assert_eq!(
+        ui(&proof.host, &control, "proof.status", json!({})).await["writes"],
+        1,
+        "reconciliation never replays the command"
+    );
+    proof.finish().await;
 }
