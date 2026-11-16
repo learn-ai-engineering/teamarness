@@ -1,6 +1,6 @@
 # DELTA-023 — Preserved Blocks findings accepted as tech debt
 
-**Status:** open (2026-11-03; updated at slice A Close and in slice B Phase 1, 2026-11-15, and in slice B Phase 6, 2026-11-16). These findings from Verify of Filesystem Docs slice A are deferred, not fixed. The owner of each group is the follow-up named in it.
+**Status:** open (2026-11-03; updated at slice A Close and in slice B Phase 1, 2026-11-15, and in slice B Phase 6 and at slice B Close, 2026-11-16). Groups 1–10 hold findings from Verify of Filesystem Docs slice A, and group 11 holds findings from slice B. They are deferred, not fixed. The owner of each group is the follow-up named in it.
 
 Don ruled on these:
 
@@ -136,3 +136,32 @@ Round 4 (`verify/20261103T010000Z_slice-a-review-4.md`) retained eight P2 findin
 - **CR4-001, behaviour.** The contract now states it: one destination with a space or a tab removes every other link target and the inline code in its paragraph. The behaviour itself is part of the dropped text in group 4.
 
 Follow-up: CR4-001's behaviour stays with group 4: the loss check refuses a mapped file that hits it.
+
+### 11. Slice B folder sync findings (Verify rounds 1 and 2)
+
+Slice B (`TEAM.SYS.DOCS-R14`, ADR 0041) passed Verify round 1 on `dd73c5b` and round 2 on `78e76f0`. Neither round found a P0 or P1 finding. The reviews are `verify/20261116T031118Z_slice-b-review-1.md` and `verify/20261116T050000Z_slice-b-review-2.md`. Corrective Phase 7 fixed CR-001, CR-002 and CR-003, together with SM-001, SM-002, SM-006, SM-007, SM-008 and SF-001. Don ruled the following tech debt on 2026-11-16:
+
+- **CR2-001. Deleting the last synced file stops sync.** When the last or only synced file of a mapped folder is deleted, the mapping becomes `unavailable` instead of archiving the Document. This is the emptied-root guard that protects against iCloud eviction and empty mount points. Write-back for that Collection then stops, and the settings view shows "Folder unavailable" with no reason. Adding any `.md` file resumes sync. Fix it if Members run into it: show a hint for the reason, or apply the guard only when two or more files were mapped.
+- **CR2-002. A recovered Linux folder may stay unavailable.** On Linux, an existing root that is `unavailable` may not recover until a restart: the reconcile is not retried, and the inotify watch can sit on an empty mount point or a dead inode. macOS is not affected, and Linux is not qualified.
+- **CR2-003. Write-back stops on mounts that refuse chmod.** If copying permissions fails, the write-back stops. On CIFS, SMB or FUSE mounts that refuse chmod, in-app edits then never reach the file. Make the permission copy best effort.
+- **SF2-001. R14 and ADR 0041 overstate the emptied-root rule.** They say the rule applies to a root that "holds none of its synced files". The code applies it only when no `.md` file is found at all. The R14 Import clause also lacks the exception from CR2-001.
+- **CR-004. Reconciles cost too much.** A Document that stays pending, or an error that persists, rehashes the folder every second. Each of Teamarness's own writes triggers a full pass that reads the Document list once per Document (O(N²)).
+- **Maintainability.**
+  - SM-003: pass-through wrapper layers (`append_record`, `reopen_unopened`, `body_state`).
+  - SM-004: `mapped_file_by_name_key` is unused.
+  - SM-005: the splice block splitter copies the Markdown import options instead of using `import_options`.
+  - SM2-001: the system test header still says "on Linux CI".
+  - SM2-002: the case-only rename test cites R14 (Write-back, No lost text) instead of R14 (Safety).
+  - SM2-003: the reconciler's module doc and ADR 0041's test list leave out the emptied-root guard and the Phase 7 tests.
+  - SM2-004: `DRAFT_SAVE_DELAY_MS` is exported but unused.
+  - SM2-005: the settings page keeps `teamarness-page--readable` and then cancels its width in CSS.
+- **Accepted rare risks.** Recorded in the slice B plan checkpoint:
+  - A file edited at the moment it is removed loses the edit.
+  - A crash after an import, followed by an offline edit, can drop a teammate's concurrent edit.
+  - A link swapped in between the scan and the open is followed.
+  - A remap or clear during a reconcile can write to the old folder.
+  - A failed Create Collection from folder leaves an empty Collection.
+  - A crash between `document.create` and the first revision leaves an empty Document.
+- **Repeat archive by the same author.** This is a Documents limitation that slice B exposed; it is not caused by slice B. After an archive and a restore, the same author cannot archive the Document again, and deleting its mapped file does not archive it either. Another author can. The likely cause: `document.archive` and `document.restore` records carry only `(author, document)`, so a repeat record is identical to the first and is probably deduplicated by the record log. This is not confirmed. Don judged it a tolerable edge case.
+
+Follow-up: the next Documents workstream, or a bug report if Members run into CR2-001 or the repeat archive in use.
