@@ -231,6 +231,7 @@ pub(crate) fn set_mapping(
             root_path: root_path.clone(),
             state: MappingState::Active,
             created_at,
+            recursive: false,
         })
         .map_err(|cause| match cause {
             StoreError::Conflict => refused("overlapping_mapping"),

@@ -237,7 +237,7 @@ class Installation {
         return {
           availability: this.online ? "current" : "offline", warnings: [],
           collections: [{ id: COLLECTION, name: "Frame scenarios", archived: false }],
-          documents: [{ id: DOCUMENT, collectionId: COLLECTION, title: "Scenario document", archived: false }],
+          documents: [{ id: DOCUMENT, collectionId: COLLECTION, folder: "", title: "Scenario document", archived: false }],
         };
       case "documents.document.open":
         return { documentId: DOCUMENT, editable: true };

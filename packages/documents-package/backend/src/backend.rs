@@ -65,6 +65,7 @@ fn capability_error(operation: &str, cause: BackendError) -> BackendError {
 fn domain_error(cause: DomainError) -> BackendError {
     match cause {
         DomainError::InvalidName => error("documents.invalid_name", false),
+        DomainError::InvalidFolder => error("documents.invalid_folder", false),
         DomainError::InvalidTitle => error("documents.invalid_title", false),
         DomainError::InvalidUpdate | DomainError::InvalidGenesis => {
             error("documents.invalid_update", false)
@@ -824,6 +825,8 @@ struct MappingDraft {
 struct DocumentCreateRequest {
     collection_id: String,
     title: String,
+    #[serde(default)]
+    folder: String,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -836,6 +839,12 @@ struct DocumentRenameRequest {
 struct DocumentMoveRequest {
     document_id: String,
     collection_id: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DocumentPlaceRequest {
+    document_id: String,
+    folder: String,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1416,6 +1425,8 @@ pub(crate) fn router_configured(
     .request(
         "documents.document.create",
         |context: Context<DocumentsActive>, request: DocumentCreateRequest| async move {
+            let folder = crate::domain::normalize_folder(&request.folder).map_err(domain_error)?;
+            let operation_id = placement_id()?;
             require_collection(&context, &request.collection_id).await?;
             let author = context.state().installation.clone();
             let record = DomainRecord::document_create(
@@ -1425,6 +1436,16 @@ pub(crate) fn router_configured(
                 crate::body::genesis(),
             )
             .map_err(domain_error)?;
+            let created = append(&context, record).await?;
+            place_created_document(&context, &author, None, &created, &folder, operation_id).await?;
+            Ok(created)
+        },
+    )
+    .request(
+        "documents.document.place",
+        |context: Context<DocumentsActive>, request: DocumentPlaceRequest| async move {
+            let record = DomainRecord::document_place(&context.state().installation, &request.document_id, &request.folder, placement_id()?).map_err(domain_error)?;
+            require_document(&context, &request.document_id).await?;
             append(&context, record).await
         },
     )
@@ -2253,6 +2274,7 @@ impl DocumentsActive {
                 json!({
                     "id": document.id,
                     "collectionId": document.collection_id,
+                    "folder": document.folder,
                     "title": document.title.unwrap_or_else(|| "Untitled".into()),
                     "archived": document.archived,
                 })
@@ -2273,6 +2295,35 @@ impl DocumentsActive {
             "warnings": warnings,
         }))
     }
+}
+
+fn placement_id() -> Result<[u8; 16], BackendError> {
+    let mut id = [0; 16];
+    getrandom::fill(&mut id).map_err(|_| error("documents.edit_failed", true))?;
+    Ok(id)
+}
+
+/// Creation has already committed: every subsequent failure is an uncertain whole command.
+async fn place_created_document(
+    context: &Context<DocumentsActive>,
+    author: &str,
+    principal: Option<&str>,
+    created: &JsonValue,
+    folder: &str,
+    operation_id: [u8; 16],
+) -> Result<(), BackendError> {
+    if folder.is_empty() {
+        return Ok(());
+    }
+    let document = created["id"]
+        .as_str()
+        .ok_or_else(|| storage_failed().with_outcome_uncertain(true))?;
+    let record = DomainRecord::document_place(author, document, folder, operation_id)
+        .map_err(|cause| domain_error(cause).with_outcome_uncertain(true))?;
+    append_as(context, record, principal)
+        .await
+        .map_err(|cause| cause.with_outcome_uncertain(true))?;
+    Ok(())
 }
 
 /// Appends one domain record and projects it locally, answering with the record identity,
@@ -4795,10 +4846,10 @@ mod tests {
             drop(store);
             let connection = rusqlite::Connection::open(&path).unwrap();
             if old_version == 4 {
-                connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; PRAGMA user_version=4;").unwrap();
+                connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;").unwrap();
             } else {
                 connection
-                    .execute_batch("DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; PRAGMA user_version=5;")
+                    .execute_batch("DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=5;")
                     .unwrap();
             }
             drop(connection);
@@ -4837,6 +4888,52 @@ mod tests {
         }
     }
 
+    // Verifies: TEAM.SYS.DOCS-R05, TEAM.SYS.DOCS-R15 — genuine kind 12 recovers without redelivery.
+    #[tokio::test]
+    async fn upgrade_recovers_retained_placement_and_retries_unopenable_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let records = [
+            DomainRecord::collection_create("bob", "Plans").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap(),
+            DomainRecord::document_place("bob", &hex(64, 2), "Plans/été", [3; 16]).unwrap(),
+        ];
+        let store = DocumentStore::open(&path).unwrap();
+        for (i, record) in records.iter().enumerate() {
+            ingest_as_seen(&store, i as u64 + 1, record);
+        }
+        drop(store);
+        // The sealed row holds real kind-12 bytes. Simulate the older decoder's disposition,
+        // not an undecodable surrogate delivered to the upgraded decoder.
+        rusqlite::Connection::open(&path).unwrap().execute_batch(
+            "UPDATE records SET quarantine_code='malformed_record' WHERE purpose='document.place';
+             UPDATE documents SET folder='',place_order='';
+             UPDATE metadata SET format_generation=1;"
+        ).unwrap();
+        let waiting = Arc::new(Mutex::new(HashSet::from([3])));
+        let log = log_opening(encoded(&records), waiting.clone());
+        let session = start(directory.path(), log.clone()).await;
+        assert_eq!(session.handles.store.format_generation().unwrap(), 1);
+        assert_eq!(session.handles.store.documents().unwrap()[0].folder, "");
+        session.harness.shutdown().await.unwrap();
+        waiting.lock().unwrap().clear();
+        let session = start(directory.path(), log.clone()).await;
+        assert_eq!(
+            session.handles.store.documents().unwrap()[0].folder,
+            "Plans/été"
+        );
+        assert_eq!(session.handles.store.format_generation().unwrap(), 2);
+        assert_eq!(quarantine_code(&path, 3), None);
+        assert_eq!(session.handles.store.record_count().unwrap(), 3);
+        session.harness.shutdown().await.unwrap();
+        let session = start(directory.path(), log).await;
+        assert_eq!(
+            session.handles.store.documents().unwrap()[0].folder,
+            "Plans/été"
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
     /// Bytes no build decodes: the canonical form an older build could not read, or a record
     /// no build ever will.
     const UNDECODABLE: &[u8] = b"not a domain record";
@@ -4846,7 +4943,7 @@ mod tests {
         rusqlite::Connection::open(path)
             .unwrap()
             .execute_batch(
-                "ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; PRAGMA user_version=8;",
+                "ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=8;",
             )
             .unwrap();
     }
@@ -5422,7 +5519,7 @@ mod tests {
             ).unwrap();
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; PRAGMA user_version=4;").unwrap();
+        connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;").unwrap();
         drop(connection);
         let access = Arc::new(AtomicBool::new(false));
         let gained = access.clone();
@@ -5569,7 +5666,7 @@ mod tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;")
             .unwrap();
         drop(connection);
         let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
@@ -8169,7 +8266,7 @@ mod tests {
         assert_eq!(contract.contracts.len(), 1);
         let provided = &contract.contracts[0];
         assert_eq!(provided.identity, ports::CONTRACT);
-        assert_eq!((provided.major, provided.minor), (1, 3));
+        assert_eq!((provided.major, provided.minor), (1, 4));
         let names: Vec<_> = provided
             .ports
             .iter()
@@ -8206,6 +8303,7 @@ mod tests {
             "documents.unknown_collection",
             "documents.collection_archived",
             "documents.invalid_title",
+            "documents.invalid_folder",
             "documents.actor_unauthorized",
             "documents.principal_not_bound",
         ] {
@@ -8773,6 +8871,24 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), relisted)
             .await
             .expect("a rename invalidates the listing");
+        session
+            .harness
+            .request(
+                "documents.document.place",
+                json!({"documentId":document,"folder":"Plans"}),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.next_event().await.unwrap().unwrap();
+                if event["$teamarnessPortValue"] == json!({}) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("placement invalidates the listing independently of body changes");
         events.close().await;
         session.harness.shutdown().await.unwrap();
     }
@@ -8818,7 +8934,7 @@ mod tests {
     fn port_contract_minors_are_additive() {
         assert_additive(
             include_bytes!("../tests/fixtures/ports-1.2.json"),
-            include_bytes!("../../ports.json"),
+            include_bytes!("../tests/fixtures/ports-1.3.json"),
             (2, 3),
             4,
         );
@@ -8834,6 +8950,69 @@ mod tests {
             (0, 1),
             0,
         );
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12 — only listing folder and optional create folder change in 1.4.
+    #[test]
+    fn port_contract_14_only_adds_declared_folder_fields() {
+        use teamarness_package_contract::port_contract::{
+            check_additive_minor_documents, compile_port_contracts,
+        };
+        let old =
+            compile_port_contracts(include_bytes!("../tests/fixtures/ports-1.3.json")).unwrap();
+        let current = include_bytes!("../../ports.json");
+        let new = compile_port_contracts(current).unwrap();
+        assert_eq!(new.contracts[0].minor, 4);
+        assert_eq!(old.contracts[0].ports.len(), new.contracts[0].ports.len());
+        // The generic checker requires exact schemas. Remove exactly the declared 1.4
+        // additions, then prove every other shape and referenced definition stayed.
+        let mut normalized: JsonValue = serde_json::from_slice(current).unwrap();
+        assert_eq!(
+            normalized["$defs"]["folder"],
+            json!({"type":"string", "maxLength":512})
+        );
+        normalized["$defs"]
+            .as_object_mut()
+            .unwrap()
+            .remove("folder");
+        let doc = &mut normalized["$defs"]["document"];
+        assert_eq!(
+            doc["properties"]["folder"],
+            json!({"$ref":"#/$defs/folder"})
+        );
+        assert!(
+            doc["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("folder"))
+        );
+        doc["properties"].as_object_mut().unwrap().remove("folder");
+        doc["required"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|v| v != "folder");
+        let create = normalized["contracts"][0]["ports"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|p| p["name"] == "document.create")
+            .unwrap();
+        assert_eq!(
+            create["request"]["properties"]["folder"],
+            json!({"$ref":"#/$defs/folder"})
+        );
+        assert!(
+            !create["request"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("folder"))
+        );
+        create["request"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("folder");
+        let normalized = compile_port_contracts(&serde_json::to_vec(&normalized).unwrap()).unwrap();
+        check_additive_minor_documents(&old, &normalized, ports::CONTRACT).unwrap();
     }
 
     fn agent() -> JsonValue {
@@ -9113,6 +9292,198 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
+    // Verifies: TEAM.SYS.DOCS-R09, TEAM.SYS.DOCS-R12 — maximum folder paths fit bounded pages.
+    #[tokio::test]
+    async fn document_listing_with_maximum_folders_stays_within_payload_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (collection, _) = ported_document(&mut session).await;
+        let folder = "é".repeat(crate::domain::MAX_FOLDER_BYTES / 2);
+        for _ in 0..ports::MAX_PAGE {
+            port_as(&mut session.harness, "command", "document.create", agent(),
+                json!({"collectionId":collection,"title":"界".repeat(crate::domain::MAX_TITLE),"folder":folder})).await.unwrap();
+        }
+        let page = query(
+            &mut session.harness,
+            "document.list",
+            json!({"collectionId":collection,"limit":64}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page["documents"].as_array().unwrap().len(), ports::MAX_PAGE);
+        assert!(serde_json::to_vec(&page).unwrap().len() <= ports::PORT_PAYLOAD_BYTES);
+        let contract = teamarness_package_contract::port_contract::compile_port_contracts(
+            include_bytes!("../../ports.json"),
+        )
+        .unwrap();
+        contract
+            .validate(ports::CONTRACT, "document.list", "response", &page)
+            .unwrap();
+        let last = query(
+            &mut session.harness,
+            "document.list",
+            json!({"collectionId":collection,"after":page["next"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(last["documents"][0]["folder"], folder);
+        assert_eq!(last["documents"].as_array().unwrap().len(), 1);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12, TEAM.SYS.DOCS-R15 — caller paths share canonical placement.
+    #[tokio::test]
+    async fn foldered_create_and_placement_preserve_authorship_and_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (collection, original) = ported_document(&mut session).await;
+        let before = appends(&session);
+        for actor in [alice(), agent()] {
+            let created = port_as(
+                &mut session.harness,
+                "command",
+                "document.create",
+                actor.clone(),
+                json!({"collectionId":collection,"title":"Foldered","folder":"Plans/e\u{301}"}),
+            )
+            .await
+            .unwrap();
+            let calls = append_calls(&session);
+            let create = &calls[calls.len() - 2];
+            let place = &calls[calls.len() - 1];
+            assert_eq!(appended_record(create).kind(), "document.create");
+            assert_eq!(appended_record(place).kind(), "document.place");
+            assert_eq!(
+                appended_record(create).author(),
+                appended_record(place).author()
+            );
+            assert_eq!(
+                create.payload.get("principal"),
+                place.payload.get("principal")
+            );
+            assert_eq!(
+                appended_record(create).author(),
+                if actor["kind"] == "agent" {
+                    AGENT_KEY
+                } else {
+                    ALICE
+                }
+            );
+            let page = query(
+                &mut session.harness,
+                "document.list",
+                json!({"collectionId":collection}),
+            )
+            .await
+            .unwrap();
+            let doc = page["documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["id"] == created["documentId"])
+                .unwrap();
+            assert_eq!(doc["folder"], "Plans/é");
+            assert_eq!(doc["version"], created["version"]);
+            port_as(&mut session.harness, "command", "document.revise", actor,
+                json!({"documentId":created["documentId"],"baseVersion":created["version"],"markdown":"Body intact\n"})).await.unwrap();
+        }
+        assert_eq!(appends(&session), before + 6);
+        let created = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({"collectionId":collection,"title":"UI","folder":"A"}),
+            )
+            .await
+            .unwrap();
+        let id = created["id"].as_str().unwrap();
+        let mut identities = HashSet::new();
+        for folder in ["B", "A", "B", ""] {
+            session
+                .harness
+                .request(
+                    "documents.document.place",
+                    json!({"documentId":id,"folder":folder}),
+                )
+                .await
+                .unwrap();
+            let calls = append_calls(&session);
+            identities.insert(appended_record(calls.last().unwrap()).encode());
+            let snapshot = session
+                .harness
+                .request("documents.snapshot", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot["documents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|d| d["id"] == id)
+                    .unwrap()["folder"],
+                folder
+            );
+        }
+        assert_eq!(identities.len(), 4);
+        let before = appends(&session);
+        for folder in ["../bad", "a//b", "a\\b", "/root"] {
+            let request = json!({"collectionId":collection,"title":"Bad","folder":folder});
+            let refused = session
+                .harness
+                .request("documents.document.create", request.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code(), "documents.invalid_folder");
+            let refused = port_as(
+                &mut session.harness,
+                "command",
+                "document.create",
+                agent(),
+                request,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refused.code(), "documents.invalid_folder");
+            assert!(!refused.outcome_uncertain());
+            let refused = session
+                .harness
+                .request(
+                    "documents.document.place",
+                    json!({"documentId":original,"folder":folder}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code(), "documents.invalid_folder");
+        }
+        assert_eq!(appends(&session), before);
+        for ui in [false, true] {
+            let request = json!({"collectionId":collection,"title":"Root","folder":""});
+            if ui {
+                session
+                    .harness
+                    .request("documents.document.create", request)
+                    .await
+                    .unwrap();
+            } else {
+                port_as(
+                    &mut session.harness,
+                    "command",
+                    "document.create",
+                    alice(),
+                    request,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            appends(&session),
+            before + 2,
+            "empty folder appends only create"
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
     async fn create_as(
         harness: &mut Harness,
         actor: JsonValue,
@@ -9377,6 +9748,75 @@ mod tests {
             .unwrap();
         assert_eq!(page["documents"].as_array().unwrap().len(), 1);
         session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12, TEAM.SYS.DOCS-R15 — even a certain second-append refusal
+    // leaves a created Document, so neither caller can safely retry the whole command.
+    #[tokio::test]
+    async fn foldered_create_second_append_failure_is_uncertain_and_never_retried() {
+        for ui in [false, true] {
+            let next = Arc::new(std::sync::atomic::AtomicU64::new(100));
+            let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+                "open" => Ok(
+                    json!({"results":payload["sealedRecords"].as_array().unwrap().iter()
+                    .map(|_| json!({"status":"waiting_for_history_access"})).collect::<Vec<_>>()}),
+                ),
+                "append" if payload["purpose"] == "document.place" => {
+                    Err(error("principal_not_bound", false))
+                }
+                "append" => {
+                    let seed = next.fetch_add(1, Ordering::SeqCst);
+                    let author = if payload.get("principal").is_some() {
+                        AGENT_KEY
+                    } else {
+                        ALICE
+                    };
+                    Ok(
+                        json!({"recordId":hex(64,seed),"orderKey":hex(82,seed),"author":author,
+                        "signature":"c2ln","sealedRecord":"c2VhbGVk","durability":"committed"}),
+                    )
+                }
+                _ => Err(error("unavailable", false)),
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let mut session = start(directory.path(), scripted).await;
+            let (collection, _) = ported_document(&mut session).await;
+            let before = appends(&session);
+            let request = json!({"collectionId":collection,"title":"Partial","folder":"A"});
+            let cause = if ui {
+                session
+                    .harness
+                    .request("documents.document.create", request)
+                    .await
+                    .unwrap_err()
+            } else {
+                port_as(
+                    &mut session.harness,
+                    "command",
+                    "document.create",
+                    agent(),
+                    request,
+                )
+                .await
+                .unwrap_err()
+            };
+            assert!(cause.outcome_uncertain());
+            assert_eq!(appends(&session), before + 2);
+            let documents = session.handles.store.documents().unwrap();
+            let partial = documents
+                .iter()
+                .find(|d| d.title.as_deref() == Some("Partial"))
+                .unwrap();
+            assert_eq!(partial.folder, "");
+            assert_eq!(
+                session.handles.bodies.lock().unwrap()[&partial.id].text(),
+                ""
+            );
+            // Observe beyond the flusher retry interval: creates and placements are not staged.
+            tokio::time::sleep(FLUSH_RETRY * 2).await;
+            assert_eq!(appends(&session), before + 2);
+            session.harness.shutdown().await.unwrap();
+        }
     }
 
     // Verifies: TEAM.SYS.DOCS-R12 — a create whose append may have committed is uncertain, so a

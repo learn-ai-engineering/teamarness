@@ -67,6 +67,7 @@ pub struct DocumentView {
     /// The Order Key of the create record, which orders the listing.
     pub order_key: String,
     pub collection_id: String,
+    pub folder: String,
     pub archived: bool,
     pub title: Option<String>,
 }
@@ -1365,7 +1366,7 @@ impl DocumentStore {
         let inner = lock(&self.inner)?;
         let mut statement = inner
             .conn
-            .prepare("SELECT document_id,creator,collection_id,archived,create_order FROM documents ORDER BY create_order,document_id")
+            .prepare("SELECT document_id,creator,collection_id,archived,create_order,folder FROM documents ORDER BY create_order,document_id")
             .map_err(rerr)?;
         let rows = statement
             .query_map([], |row| {
@@ -1375,17 +1376,19 @@ impl DocumentStore {
                     row.get::<_, String>(2)?,
                     row.get::<_, bool>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })
             .map_err(rerr)?;
         rows.map(|row| {
             row.map(
-                |(id, creator, collection_id, archived, order_key)| DocumentView {
+                |(id, creator, collection_id, archived, order_key, folder)| DocumentView {
                     title: inner.texts.get(&id).map(|(_, text)| text.clone()),
                     id,
                     creator,
                     order_key,
                     collection_id,
+                    folder,
                     archived,
                 },
             )

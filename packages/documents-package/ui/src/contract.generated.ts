@@ -52,6 +52,7 @@ export type Comments = {
 export type Document = {
   readonly "archived": boolean;
   readonly "collectionId": RecordId;
+  readonly "folder": Folder;
   readonly "id": RecordId;
   readonly "title": string;
 };
@@ -59,6 +60,8 @@ export type Document = {
 export type DocumentRequest = {
   readonly "documentId": RecordId;
 };
+
+export type Folder = string;
 
 export type FolderMapping = {
   readonly "counts": {
@@ -207,6 +210,7 @@ export type DocumentsContract = {
     readonly "documents.document.archive": { readonly request: DocumentRequest; readonly response: Appended };
     readonly "documents.document.create": { readonly request: {
         readonly "collectionId": RecordId;
+        readonly "folder"?: Folder;
         readonly "title": Title;
       }; readonly response: Appended };
     readonly "documents.document.markdown": { readonly request: {
@@ -224,6 +228,10 @@ export type DocumentsContract = {
         readonly "documentId": RecordId;
       }; readonly response: Appended };
     readonly "documents.document.open": { readonly request: DocumentRequest; readonly response: BodyState };
+    readonly "documents.document.place": { readonly request: {
+        readonly "documentId": RecordId;
+        readonly "folder": Folder;
+      }; readonly response: Appended };
     readonly "documents.document.recover": { readonly request: {
         readonly "documentId": RecordId;
         readonly "requestIds": readonly RequestId[];

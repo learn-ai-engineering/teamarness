@@ -23,7 +23,7 @@ function snapshot(): DocumentsSnapshot {
       { id: planning, name: "Planning", archived: false },
       { id: archive, name: "Old", archived: true },
     ],
-    documents: [{ id: doc, collectionId: planning, title: "Q4 plan", archived: false }],
+    documents: [{ id: doc, collectionId: planning, folder: "", title: "Q4 plan", archived: false }],
   };
 }
 
@@ -169,7 +169,7 @@ describe("Documents mount", () => {
     current = {
       ...current,
       collections: [...current.collections, { id: "4".repeat(64), name: "Research", archived: false }],
-      documents: [...current.documents, { id: "5".repeat(64), collectionId: planning, title: "OKRs", archived: false }],
+      documents: [...current.documents, { id: "5".repeat(64), collectionId: planning, folder: "", title: "OKRs", archived: false }],
     };
     await fake.emit("documents.changes", current);
     expect(texts(root, ".collection-button")).toEqual(["Planning", "Research"]);
@@ -196,7 +196,7 @@ describe("Documents mount", () => {
     const research = "4".repeat(64);
     let current = { ...snapshot(),
       collections: [...snapshot().collections, { id: research, name: "Research", archived: false }],
-      documents: [...snapshot().documents, { id: "5".repeat(64), collectionId: research, title: "New plan", archived: false }],
+      documents: [...snapshot().documents, { id: "5".repeat(64), collectionId: research, folder: "", title: "New plan", archived: false }],
     };
     const { fake } = backend(() => current);
     const root = document.createElement("div").attachShadow({ mode: "open" });
@@ -526,7 +526,7 @@ describe("Documents mount", () => {
     const other = '4'.repeat(64);
     const parent = '5'.repeat(64);
     const current = { ...snapshot(), documents: [...snapshot().documents,
-      { id: other, collectionId: planning, title: 'Other', archived: false }] };
+      { id: other, collectionId: planning, folder: "", title: 'Other', archived: false }] };
     const added: unknown[] = [];
     let fail = true;
     const fake = createFakePackageClient({ requests: {
@@ -677,7 +677,7 @@ describe("Documents mount", () => {
     const research = "4".repeat(64);
     const other = "5".repeat(64);
     const current = { ...snapshot(), collections: [...snapshot().collections, { id: research, name: "Research", archived: false }],
-      documents: [...snapshot().documents, { id: other, collectionId: research, title: "Notes", archived: false }] };
+      documents: [...snapshot().documents, { id: other, collectionId: research, folder: "", title: "Notes", archived: false }] };
     const { fake } = backend(() => current);
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
@@ -700,7 +700,7 @@ describe("Documents mount", () => {
   it("dismisses menus, preserves rename input on snapshot, and routes restore and move", async () => {
     const research = "4".repeat(64);
     const current = { ...snapshot(), collections: [...snapshot().collections, { id: research, name: "Research", archived: false }],
-      documents: [...snapshot().documents, { id: "5".repeat(64), collectionId: planning, title: "Past", archived: true }] };
+      documents: [...snapshot().documents, { id: "5".repeat(64), collectionId: planning, folder: "", title: "Past", archived: true }] };
     const { fake, calls } = backend(() => current);
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
@@ -1009,7 +1009,7 @@ describe("Documents selection and remembered place", () => {
   function listing(): DocumentsSnapshot {
     const base = snapshot();
     return { ...base, collections: [{ id: research, name: "Research", archived: false }, ...base.collections],
-      documents: [...base.documents, { id: notes, collectionId: research, title: "Notes", archived: false }] };
+      documents: [...base.documents, { id: notes, collectionId: research, folder: "", title: "Notes", archived: false }] };
   }
 
   function placeBackend(place: PackageValue | (() => PackageValue)) {

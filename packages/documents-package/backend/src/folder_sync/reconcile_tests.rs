@@ -125,6 +125,7 @@ impl Fixture {
                 root_path: self.root.to_str().unwrap().to_owned(),
                 state: MappingState::Active,
                 created_at: 1,
+                recursive: false,
             })
             .unwrap();
     }

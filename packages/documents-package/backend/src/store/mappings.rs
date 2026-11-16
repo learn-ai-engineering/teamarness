@@ -52,6 +52,7 @@ pub struct FolderMapping {
     pub state: MappingState,
     /// When the mapping was made, in Unix milliseconds.
     pub created_at: i64,
+    pub recursive: bool,
 }
 
 /// The file of one mapped Document.
@@ -85,7 +86,7 @@ pub struct RefusedFile {
     pub detail: Option<String>,
 }
 
-const MAPPING_COLUMNS: &str = "collection_id,root_path,state,created_at";
+const MAPPING_COLUMNS: &str = "collection_id,root_path,state,created_at,recursive";
 const FILE_COLUMNS: &str = "document_id,collection_id,rel_path,name_key,base_version,written_hash,pending_write_hash,pending_write_version";
 
 fn hash(value: Option<Vec<u8>>) -> Result<Option<FileHash>, StoreError> {
@@ -94,18 +95,25 @@ fn hash(value: Option<Vec<u8>>) -> Result<Option<FileHash>, StoreError> {
         .transpose()
 }
 
-fn mapping_row(row: &Row<'_>) -> rusqlite::Result<(String, String, String, i64)> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+fn mapping_row(row: &Row<'_>) -> rusqlite::Result<(String, String, String, i64, bool)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
 }
 
 fn mapping(
-    (collection_id, root_path, state, created_at): (String, String, String, i64),
+    (collection_id, root_path, state, created_at, recursive): (String, String, String, i64, bool),
 ) -> Result<FolderMapping, StoreError> {
     Ok(FolderMapping {
         collection_id,
         root_path,
         state: MappingState::parse(&state)?,
         created_at,
+        recursive,
     })
 }
 
@@ -224,13 +232,14 @@ impl DocumentStore {
         }
         transaction
             .execute(
-                "INSERT INTO folder_mappings(collection_id,root_path,state,created_at) VALUES(?1,?2,?3,?4)
-                 ON CONFLICT(collection_id) DO UPDATE SET root_path=excluded.root_path,state=excluded.state,created_at=excluded.created_at",
+                "INSERT INTO folder_mappings(collection_id,root_path,state,created_at,recursive) VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(collection_id) DO UPDATE SET root_path=excluded.root_path,state=excluded.state,created_at=excluded.created_at,recursive=excluded.recursive",
                 params![
                     mapping.collection_id,
                     mapping.root_path,
                     mapping.state.as_str(),
-                    mapping.created_at
+                    mapping.created_at,
+                    mapping.recursive
                 ],
             )
             .map_err(write_error)?;
@@ -581,6 +590,7 @@ mod tests {
             root_path: root.to_owned(),
             state: MappingState::Active,
             created_at,
+            recursive: false,
         }
     }
 
@@ -623,6 +633,32 @@ mod tests {
         paused.state = MappingState::Paused;
         f.store.set_folder_mapping(&paused).unwrap();
         assert_eq!(f.store.folder_mapping("c1").unwrap(), Some(paused));
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R15 — updating state never resets local recursion consent.
+    #[test]
+    fn recursive_mode_survives_updates_and_restart() {
+        let f = fixture();
+        let mut saved = mapping("c1", "/a", 1);
+        saved.recursive = true;
+        f.store.set_folder_mapping(&saved).unwrap();
+        f.store
+            .upsert_mapped_file(&file("d1", "c1", "Plan"))
+            .unwrap();
+        f.store
+            .set_folder_mapping_state("c1", "/a", MappingState::Unavailable)
+            .unwrap();
+        let mut saved = f.store.folder_mapping("c1").unwrap().unwrap();
+        assert!(saved.recursive);
+        saved.state = MappingState::Active;
+        f.store.set_folder_mapping(&saved).unwrap();
+        drop(f.store);
+        let store = DocumentStore::open(&f.path).unwrap();
+        assert_eq!(store.folder_mapping("c1").unwrap(), Some(saved));
+        assert_eq!(
+            store.mapped_files("c1").unwrap(),
+            vec![file("d1", "c1", "Plan")]
+        );
     }
 
     #[test]
