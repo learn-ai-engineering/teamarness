@@ -418,7 +418,7 @@ const KNOWN_LOSSES: [(&str, &[&str]); 2] = [
     ("40-table-inline-link", &["https", "x", "test", "unused"]),
 ];
 
-/// B-10. The loss check passes every corpus file that keeps its text.
+/// Verifies: TEAM.SYS.DOCS-R14 (No lost text). The loss check passes every corpus file that keeps its text.
 #[test]
 fn the_loss_check_passes_the_corpus() {
     let mut failures = Vec::new();
@@ -440,7 +440,7 @@ fn the_loss_check_passes_the_corpus() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// B-10. Each drop the contract names is reported, including a reference past the budget.
+/// Verifies: TEAM.SYS.DOCS-R14 (No lost text). Each drop the contract names is reported, including a reference past the budget.
 #[test]
 fn the_loss_check_reports_each_known_drop() {
     let url = url_100();
@@ -462,7 +462,7 @@ fn the_loss_check_reports_each_known_drop() {
     }
 }
 
-/// B-10. Normalisation that only escapes or rewrites syntax keeps every token.
+/// Verifies: TEAM.SYS.DOCS-R14 (No lost text). Normalisation that only escapes or rewrites syntax keeps every token.
 #[test]
 fn the_loss_check_passes_escaping_and_resolved_references() {
     for case in [

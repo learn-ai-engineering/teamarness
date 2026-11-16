@@ -629,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn the_listing_shows_every_collection_and_its_mapping() {
+    fn a_mapping_without_a_collection_is_not_listed_and_clears_once() {
         let data = tempfile::tempdir().unwrap();
         let folder = tempfile::tempdir().unwrap();
         std::fs::create_dir(folder.path().join("sub")).unwrap();
@@ -705,7 +705,7 @@ mod request_tests {
         session
     }
 
-    // Verifies: slice B B-1, B-3 — every refusal reason of `documents.mapping.set`.
+    // Verifies: TEAM.SYS.DOCS-R14 (Configuration, Mapping rules) — every refusal reason of `documents.mapping.set`.
     #[tokio::test]
     async fn set_refuses_each_unsafe_or_conflicting_folder() {
         let data = tempfile::tempdir().unwrap();
@@ -798,7 +798,7 @@ mod request_tests {
         session.harness.shutdown().await.unwrap();
     }
 
-    // Verifies: slice B B-2 — a dry run reports and changes nothing; B-1 — "Create Collection
+    // Verifies: TEAM.SYS.DOCS-R14 (Pre-mapping report) — a dry run reports and changes nothing; (Configuration) — "Create Collection
     // from folder"; the listing and Unmap.
     #[tokio::test]
     async fn preview_create_list_and_clear() {
@@ -921,7 +921,7 @@ mod request_tests {
         session.harness.shutdown().await.unwrap();
     }
 
-    // Verifies: slice B B-1 — the settings form's draft survives a Package switch.
+    // Verifies: TEAM.SYS.DOCS-R14 (Configuration) — the settings form's draft survives a Package switch.
     #[tokio::test]
     async fn the_mapping_draft_is_remembered_in_memory() {
         let data = tempfile::tempdir().unwrap();

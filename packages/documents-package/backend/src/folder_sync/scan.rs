@@ -31,6 +31,17 @@ pub(crate) struct Scan {
     /// Entries that would be synced but cannot be: the name is not UTF-8, or the file cannot be
     /// read. A name that is not UTF-8 is shown lossily.
     pub unreadable: Vec<String>,
+    /// Files the file provider moved off this computer and left a placeholder for: iCloud
+    /// "Optimize Storage" replaces `Plan.md` with the hidden `.Plan.md.icloud`. Each name is the
+    /// evicted file's own name. Such a file still exists, so it is never archived.
+    pub evicted: Vec<String>,
+}
+
+/// The name of the file an iCloud placeholder `name` stands for: `.Plan.md.icloud` stands for
+/// `Plan.md`.
+fn evicted_name(name: &str) -> Option<&str> {
+    let original = name.strip_prefix('.')?.strip_suffix(".icloud")?;
+    (original.ends_with(EXTENSION) && !original.starts_with('.')).then_some(original)
 }
 
 /// Scans the files directly in `root`. It does not descend into folders and does not follow
@@ -42,6 +53,10 @@ pub(crate) fn scan(root: &Path) -> io::Result<Scan> {
         let entry = entry?;
         let raw = entry.file_name();
         let lossy = raw.to_string_lossy();
+        if let Some(original) = evicted_name(&lossy) {
+            scan.evicted.push(original.to_owned());
+            continue;
+        }
         if lossy.starts_with('.') || lossy.ends_with(TEMP_SUFFIX) {
             continue;
         }
@@ -79,6 +94,7 @@ pub(crate) fn scan(root: &Path) -> io::Result<Scan> {
     scan.subfolders.sort();
     scan.symlinks.sort();
     scan.unreadable.sort();
+    scan.evicted.sort();
     Ok(scan)
 }
 
@@ -154,6 +170,21 @@ mod tests {
         assert!(scan.unreadable.is_empty());
         assert_eq!(subfolders(path), scan.subfolders);
         assert!(subfolders(&path.join("missing")).is_empty());
+    }
+
+    #[test]
+    fn scan_lists_icloud_placeholders_as_evicted_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path();
+        fs::write(path.join(".Plan.md.icloud"), "placeholder").unwrap();
+        fs::write(path.join(".notes.txt.icloud"), "placeholder").unwrap();
+        fs::write(path.join("..hidden.md.icloud"), "placeholder").unwrap();
+        fs::write(path.join("kept.md"), "x").unwrap();
+
+        let scan = scan(path).unwrap();
+        assert_eq!(scan.evicted, ["Plan.md"]);
+        let names: Vec<&str> = scan.files.iter().map(|file| file.rel.as_str()).collect();
+        assert_eq!(names, ["kept.md"]);
     }
 
     #[cfg(unix)]

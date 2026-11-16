@@ -37,9 +37,11 @@ const ICON_PATHS = {
   reply: "M9 17 4 12l5-5 M4 12h10a6 6 0 0 1 6 6v1",
   resolve: "M4 12l5 5L20 6", reopen: "M4 11a8 8 0 1 1 2 6 M4 5v6h6",
   clock: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M12 7v5l3 2",
+  unlink: "M15 7h2a5 5 0 0 1 0 10h-2 M9 17H7A5 5 0 0 1 7 7h2 M12 3v2 M12 19v2",
 } as const;
 
-function icon(name: keyof typeof ICON_PATHS, label: string, onClick: () => void, tooltip = false): HTMLButtonElement {
+/** An icon button: `label` is its accessible name and native title; `tooltip` adds the styled hint. */
+export function icon(name: keyof typeof ICON_PATHS, label: string, onClick: () => void, tooltip = false): HTMLButtonElement {
   const control = button("", "documents-icon", onClick);
   control.setAttribute("aria-label", label);
   control.title = label;

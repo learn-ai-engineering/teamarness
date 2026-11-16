@@ -29,7 +29,7 @@ Three facts shape the design:
 **Mapping rules.** `documents.mapping.set` checks the folder before it stores anything:
 
 - The path is absolute, exists and is a folder.
-- It is not inside the Package Data Directory, and it does not equal, contain or sit inside another mapping's root.
+- It is not inside the Package Data Directory, and it does not equal, contain or sit inside another mapping's root. The Package SDK exposes only the Package Data Directory, so the check guards that folder, not the whole Installation data directory: a Member can still map the Installation's profile folder or another Package's folder. Guarding those needs a Host capability, which this ADR does not add.
 - If the folder has no `.md` file to sync, the Collection is exported to it. If the Collection has no Document, the folder is imported into it. If both have content, the mapping is refused (`not_empty`). Merging two non-empty sides is not offered.
 - If the folder is inside a git working tree, the mapping is refused (`git_working_tree`) until the Member confirms it. Git changes files in bulk, and each change becomes an edit for the whole team. Teamarness does not detect or deduplicate edits that git delivers.
 
@@ -43,7 +43,8 @@ A dry run returns the pre-mapping report and changes nothing. The report lists t
 
 - An import's request ID is derived from the Document, the base version and the file's hash. Before it stages an import, the reconciler looks the ID up. An ID already in the record log advances the base instead of appending again.
 - A write-back records the hash and the version it is about to write before it renames the file into place. A file found with that hash adopts that version, and it is not imported.
-- A missing or unreadable root marks the mapping `unavailable` and archives nothing.
+- A missing or unreadable root marks the mapping `unavailable` and archives nothing. So does a root that still exists but holds none of its synced files, such as an empty mount point, a folder deleted and made again, or files a file provider moved off the computer: archiving there would archive every Document for the team. An iCloud placeholder (`.Plan.md.icloud`) counts as its file, so an evicted file is not archived.
+- Write-back keeps the replaced file's permissions, and a case-only rename never replaces another file whose name differs only in case.
 - The first sync of a file never rewrites it. Write-back splices: unchanged top-level blocks keep their bytes. If the spliced text would not have the export's Canonical Markdown, the export is written instead.
 
 ## Rejected alternatives
@@ -67,7 +68,7 @@ A dry run returns the pre-mapping report and changes nothing. The report lists t
 
 - `packages/documents-package/backend/src/folder_sync/` (`mapping.rs`, `watch.rs`, `reconcile.rs`, `codec.rs`, `scan.rs`), `store/mappings.rs`, `migrations/0010_folder_mappings.sql`, `markdown/loss.rs`.
 - Tests: `folder_sync::reconcile::tests` (every reconcile branch, refuse then import, no echo, first sync, lossy and oversize files, missing root, the two crash points, an offline batch of 50 edits), `folder_sync::mapping::{tests, request_tests}` (each refusal reason, dry run, Create Collection from folder, listing, Unmap), `folder_sync::watch::tests`, and the two-Installation system test `tests/system/tests/documents_folder_sync.rs`. The settings view is tested in `packages/documents-package/ui/src/settings.test.ts`.
-- **Weaknesses.** The watcher is exercised on macOS (FSEvents) and in CI on Linux (inotify) through the system test only. Windows is not qualified. A save from a real editor is a manual check.
+- **Weaknesses.** The watcher is qualified only locally on macOS (FSEvents), through `folder_sync::watch::tests` and the system test. CI runs no `cargo test`, so inotify (Linux) and Windows are not qualified. A save from a real editor is a manual check.
 
 ### Provenance (non-versioned)
 

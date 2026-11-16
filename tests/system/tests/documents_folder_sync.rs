@@ -296,7 +296,7 @@ fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
-/// Verifies: slice B B-4, B-5, B-6, B-7, B-8, B-9, B-10 and B-11 end to end.
+/// Verifies: TEAM.SYS.DOCS-R14 (Export, Import, Write-back, No lost text, Safety) end to end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_mapped_folder_and_its_collection_follow_each_other() {
     let application = harness::StagedApplication::with(&PackageStage::documents());

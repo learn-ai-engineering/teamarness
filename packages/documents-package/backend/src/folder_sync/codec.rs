@@ -166,10 +166,15 @@ pub(crate) fn write_atomic(
 ) -> Result<FileHash, WriteRefused> {
     let (folder, name) = resolve(root, rel)?;
     let path = folder.join(&name);
+    // The replaced file's permissions, so a private note stays private after a write-back.
+    let mut permissions = None;
     let found = match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => return Err(WriteRefused::Symlink),
         Ok(metadata) if !metadata.is_file() => return Err(WriteRefused::NotAFile),
-        Ok(_) => Some(sha256_reader(File::open(&path)?)?.0),
+        Ok(metadata) => {
+            permissions = Some(metadata.permissions());
+            Some(sha256_reader(File::open(&path)?)?.0)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
@@ -190,6 +195,9 @@ pub(crate) fn write_atomic(
             .write(true)
             .create_new(true)
             .open(&temp)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         drop(file);
@@ -458,6 +466,30 @@ mod tests {
             "two\n"
         );
         assert!(temp_files(root.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_keeps_the_replaced_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private.md");
+        fs::write(&path, "secret\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(
+            root.path(),
+            Path::new("private.md"),
+            "still secret\n",
+            Some(sha256(b"secret\n")),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "still secret\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

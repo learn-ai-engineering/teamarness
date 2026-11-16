@@ -468,8 +468,8 @@ mod tests {
     use super::super::reconcile::tests::remembering_log;
     use crate::backend::tests::{Session, qualify_empty_history, start};
 
-    /// Waits up to ten seconds, polling: file watchers report within a second on every
-    /// platform CI runs, but not within the shorter waits of the Backend tests.
+    /// Waits up to ten seconds, polling: file watchers report within a second, but not within
+    /// the shorter waits of the Backend tests.
     async fn eventually(mut ready: impl FnMut() -> bool, what: &str) {
         for _ in 0..500 {
             if ready() {
@@ -498,7 +498,7 @@ mod tests {
             .unwrap_or_else(|cause| panic!("{operation}: {}", cause.code()))
     }
 
-    // Verifies: slice B B-4, B-5 (watcher) and the lifecycle — a mapping set by request
+    // Verifies: TEAM.SYS.DOCS-R14 (Export, Import, Safety) — a mapping set by request
     // exports, the running session imports a new file, a suspended session does nothing, and a
     // resumed one reconciles what changed while it was stopped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -543,6 +543,8 @@ mod tests {
             "# Later\n\nWritten while suspended.\n",
         )
         .unwrap();
+        // negative-wait: longer than the debounce and a watcher's report, so a suspended
+        // session that still reconciled would have made the Document by now.
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(
             !titled(&session, "Later"),
@@ -561,7 +563,7 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
-    // Verifies: slice B B-3 — a non-empty folder and a non-empty Collection are not mapped.
+    // Verifies: TEAM.SYS.DOCS-R14 (Mapping rules) — a non-empty folder and a non-empty Collection are not mapped.
     #[tokio::test]
     async fn a_full_folder_and_a_full_collection_are_not_mapped() {
         let data = tempfile::tempdir().unwrap();

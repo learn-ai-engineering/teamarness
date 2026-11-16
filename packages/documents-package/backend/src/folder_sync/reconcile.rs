@@ -248,6 +248,14 @@ impl FolderSync {
             self.set_state(&mapping, MappingState::Unavailable).await?;
             return Ok(());
         };
+        let files = self.mapped_files(collection).await?;
+        if scanned.files.is_empty() && files.iter().any(|file| file.written_hash.is_some()) {
+            // A root that holds none of its synced files is treated as missing, not emptied: an
+            // empty mount point, a folder deleted and made again, or files a file provider moved
+            // off this computer. Archiving here would archive every Document for the team.
+            self.set_state(&mapping, MappingState::Unavailable).await?;
+            return Ok(());
+        }
         self.set_state(&mapping, MappingState::Active).await?;
 
         let on_disk: HashMap<&str, &ScannedFile> = scanned
@@ -255,8 +263,13 @@ impl FolderSync {
             .iter()
             .map(|file| (file.rel.as_str(), file))
             .collect();
-        let unreadable: HashSet<&str> = scanned.unreadable.iter().map(String::as_str).collect();
-        let files = self.mapped_files(collection).await?;
+        // A file that cannot be read now, or that a file provider evicted, still exists.
+        let present_unsynced: HashSet<&str> = scanned
+            .unreadable
+            .iter()
+            .chain(&scanned.evicted)
+            .map(String::as_str)
+            .collect();
         let mapped: HashSet<&str> = files.iter().map(|file| file.rel_path.as_str()).collect();
         let mut new_files: Vec<&ScannedFile> = scanned
             .files
@@ -283,7 +296,7 @@ impl FolderSync {
                 self.import(&root, file, outcome).await?;
                 continue;
             }
-            if unreadable.contains(file.rel_path.as_str()) {
+            if present_unsynced.contains(file.rel_path.as_str()) {
                 continue;
             }
             if file.written_hash.is_none() {
@@ -1420,13 +1433,33 @@ pub(super) fn read_file(path: &Path) -> io::Result<Option<FileContent>> {
 fn rename_file(root: &Path, from: &str, to: &str) -> io::Result<()> {
     let source = root.join(from);
     let target = root.join(to);
-    if !fs::symlink_metadata(&source)?.is_file() {
+    let own = fs::symlink_metadata(&source)?;
+    if !own.is_file() {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
-    if name_key(from) != name_key(to) && fs::symlink_metadata(&target).is_ok() {
+    // A case-only rename finds its own file on a case-insensitive file system. Any other file
+    // there, such as a refused `Plan.md` beside `plan.md` on a case-sensitive one, is never
+    // replaced.
+    if let Ok(found) = fs::symlink_metadata(&target)
+        && (name_key(from) != name_key(to) || !same_file(&own, &found))
+    {
         return Err(io::Error::from(io::ErrorKind::AlreadyExists));
     }
     fs::rename(source, target)
+}
+
+/// Whether two entries are the same file on disk.
+#[cfg(unix)]
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Whether two entries are the same file on disk. Without inode numbers, a target that differs
+/// only in case is taken to be the source, as on the case-insensitive file systems there.
+#[cfg(not(unix))]
+fn same_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
+    true
 }
 
 fn log_refused_write(document: &str, refused: &WriteRefused) {

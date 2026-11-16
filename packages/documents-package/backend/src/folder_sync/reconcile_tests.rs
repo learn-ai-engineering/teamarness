@@ -13,7 +13,7 @@ use teamarness_package_sdk::testing::ScriptedCapability;
 use teamarness_package_sdk::{BackendError, CancellationToken};
 
 use super::super::codec::sha256;
-use super::{Crash, FolderSync, Outcome, Refusal, request_id, title_of};
+use super::{Crash, FolderSync, Outcome, Refusal, rename_file, request_id, title_of};
 use crate::backend::tests::{
     ALICE, Session, Writer, deliver, hex, qualify_empty_history, remote_edit, session_update,
     start_without_folder_sync, submit, wait_until,
@@ -299,7 +299,7 @@ fn titles_come_from_file_stems() {
     assert_eq!(title_of("   .md"), "Untitled");
 }
 
-// Verifies: B-4, B-8 — an export mapping writes every non-archived Document as its Canonical
+// Verifies: TEAM.SYS.DOCS-R14 (Export, Write-back) — an export mapping writes every non-archived Document as its Canonical
 // Markdown; a second reconcile writes and appends nothing.
 #[tokio::test]
 async fn export_writes_every_document_as_canonical_markdown_once() {
@@ -340,7 +340,7 @@ async fn export_writes_every_document_as_canonical_markdown_once() {
     fixture.shutdown().await;
 }
 
-// Verifies: B-3, B-7, B-9 — an import mapping creates one Document per file, titled by its
+// Verifies: TEAM.SYS.DOCS-R14 (Mapping rules, Import, Write-back) — an import mapping creates one Document per file, titled by its
 // stem; the first sync never rewrites a file, even a hard-wrapped one.
 #[tokio::test]
 async fn import_creates_documents_and_the_first_sync_never_rewrites() {
@@ -379,7 +379,7 @@ async fn import_creates_documents_and_the_first_sync_never_rewrites() {
     fixture.shutdown().await;
 }
 
-// Verifies: B-6, B-7, B-8 — a changed file is imported as one revision; an unchanged one is
+// Verifies: TEAM.SYS.DOCS-R14 (Import, Write-back) — a changed file is imported as one revision; an unchanged one is
 // left; an in-app edit is spliced back, keeping unchanged blocks byte for byte, and the
 // write-back is never imported.
 #[tokio::test]
@@ -422,7 +422,7 @@ async fn changed_files_import_and_edits_splice_back_without_echo() {
     fixture.shutdown().await;
 }
 
-// Verifies: B-5, B-7 — a file edit that is not yet imported is never overwritten: when a
+// Verifies: TEAM.SYS.DOCS-R14 (Import, Write-back) — a file edit that is not yet imported is never overwritten: when a
 // teammate's edit needs writing back, the file is imported first, and both edits survive in
 // the Document and the file.
 #[tokio::test]
@@ -448,7 +448,7 @@ async fn an_unimported_file_edit_is_imported_before_the_write_back() {
     fixture.shutdown().await;
 }
 
-// Verifies: B-10 — a file whose import would lose text stays byte for byte and is refused as
+// Verifies: TEAM.SYS.DOCS-R14 (No lost text) — a file whose import would lose text stays byte for byte and is refused as
 // `lossy` with its lost tokens, once; a mapped file edited into a lossy shape keeps both its
 // bytes and its Document's text, and is not overwritten by a write-back. A fixed file imports.
 #[tokio::test]
@@ -501,7 +501,7 @@ async fn lossy_files_are_refused_and_left_byte_for_byte() {
     fixture.shutdown().await;
 }
 
-// Verifies: B-11 — an oversize file is refused before any record: no Document, empty or not.
+// Verifies: TEAM.SYS.DOCS-R14 (No lost text) — an oversize file is refused before any record: no Document, empty or not.
 #[tokio::test]
 async fn an_oversize_file_leaves_no_document() {
     let fixture = Fixture::new().await;
@@ -527,7 +527,7 @@ async fn an_oversize_file_leaves_no_document() {
     fixture.shutdown().await;
 }
 
-// Verifies: B-9 — a missing root sets the mapping `unavailable` and archives nothing; when it
+// Verifies: TEAM.SYS.DOCS-R14 (Safety) — a missing root sets the mapping `unavailable` and archives nothing; when it
 // returns, the mapping is active again and nothing changed.
 #[tokio::test]
 async fn a_missing_root_archives_nothing() {
@@ -558,7 +558,65 @@ async fn a_missing_root_archives_nothing() {
     fixture.shutdown().await;
 }
 
-// Verifies: B-9 — a deleted file archives its Document; a file renamed outside renames its
+// Verifies: TEAM.SYS.DOCS-R14 (Safety) — a root that still exists but holds none of its synced
+// files (an empty mount point, a folder made again, evicted files) is unavailable and archives
+// nothing; an iCloud placeholder keeps its file's Document unarchived.
+#[tokio::test]
+async fn an_emptied_root_or_an_evicted_file_archives_nothing() {
+    let fixture = Fixture::new().await;
+    fixture.write("A.md", "a\n");
+    fixture.write("B.md", "b\n");
+    fixture.folder().await;
+    fixture.settled().await;
+    let before = fixture.appends();
+
+    // Every synced file is gone, but the folder is still there.
+    fs::rename(
+        path(&fixture.root, "A.md"),
+        fixture.root.with_file_name("A.md"),
+    )
+    .unwrap();
+    fs::rename(
+        path(&fixture.root, "B.md"),
+        fixture.root.with_file_name("B.md"),
+    )
+    .unwrap();
+    assert_eq!(fixture.folder().await, Outcome::default());
+    assert_eq!(fixture.mapping().state, MappingState::Unavailable);
+    assert_eq!(fixture.appends(), before);
+    assert!(
+        fixture
+            .documents()
+            .iter()
+            .all(|document| !document.archived)
+    );
+
+    // The files come back: the mapping is active again and nothing changed.
+    fs::rename(
+        fixture.root.with_file_name("A.md"),
+        path(&fixture.root, "A.md"),
+    )
+    .unwrap();
+    fs::rename(
+        fixture.root.with_file_name("B.md"),
+        path(&fixture.root, "B.md"),
+    )
+    .unwrap();
+    fixture.settled().await;
+    assert_eq!(fixture.mapping().state, MappingState::Active);
+    assert_eq!(fixture.appends(), before);
+
+    // iCloud "Optimize Storage" evicts A.md and leaves `.A.md.icloud`: A is not archived.
+    fs::remove_file(path(&fixture.root, "A.md")).unwrap();
+    fixture.write(".A.md.icloud", "placeholder");
+    assert_eq!(fixture.folder().await, Outcome::default());
+    assert_eq!(fixture.mapping().state, MappingState::Active);
+    assert_eq!(fixture.appends(), before);
+    assert!(!fixture.titled("A").archived);
+    fixture.shutdown().await;
+}
+
+// Verifies: TEAM.SYS.DOCS-R14 (Import, Write-back) — a deleted file archives its Document; a file renamed outside renames its
 // Document; a Document rename renames its file; a remote archive removes the file and a restore
 // writes it again; a new Document gets a new file.
 #[tokio::test]
@@ -635,7 +693,7 @@ async fn files_and_documents_follow_each_other_through_their_lifecycle() {
     fixture.shutdown().await;
 }
 
-// Verifies: B-9 — an archive while the file holds an unimported edit imports the edit first,
+// Verifies: TEAM.SYS.DOCS-R14 (Write-back) — an archive while the file holds an unimported edit imports the edit first,
 // then removes the file.
 #[tokio::test]
 async fn an_archive_imports_an_unimported_edit_before_removing_the_file() {
@@ -660,7 +718,7 @@ async fn an_archive_imports_an_unimported_edit_before_removing_the_file() {
     fixture.shutdown().await;
 }
 
-// Verifies: B-9 — names that differ only in case never share a file: Documents get distinct
+// Verifies: TEAM.SYS.DOCS-R14 (No lost text) — names that differ only in case never share a file: Documents get distinct
 // files, and a new file whose name collides with a mapped one is refused.
 #[tokio::test]
 async fn case_only_collisions_get_distinct_names_or_are_refused() {
@@ -692,7 +750,43 @@ async fn case_only_collisions_get_distinct_names_or_are_refused() {
     fixture.shutdown().await;
 }
 
-// Verifies: B-12 — a crash after an import's append and before its file state is saved is
+// Verifies: TEAM.SYS.DOCS-R14 (Write-back, No lost text) — a case-only file rename renames the
+// file itself; it never replaces another file whose name differs only in case.
+#[test]
+fn a_case_only_rename_never_replaces_another_file() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    fs::write(root.join("plan.md"), "mapped\n").unwrap();
+    fs::write(root.join("Plan.md"), "refused\n").unwrap();
+    let case_sensitive = fs::read_to_string(root.join("plan.md")).unwrap() == "mapped\n";
+    if case_sensitive {
+        let refused = rename_file(root, "plan.md", "Plan.md").unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(root.join("plan.md")).unwrap(),
+            "mapped\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("Plan.md")).unwrap(),
+            "refused\n"
+        );
+        fs::remove_file(root.join("Plan.md")).unwrap();
+    }
+    // The target is the file itself (a case-insensitive file system) or absent: it is renamed.
+    fs::write(root.join("plan.md"), "mapped\n").unwrap();
+    rename_file(root, "plan.md", "Plan.md").unwrap();
+    let names: Vec<String> = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["Plan.md"]);
+    assert_eq!(
+        fs::read_to_string(root.join("Plan.md")).unwrap(),
+        "mapped\n"
+    );
+}
+
+// Verifies: TEAM.SYS.DOCS-R14 (Safety) — a crash after an import's append and before its file state is saved is
 // retried as the same request: one revision, and no text twice.
 #[tokio::test]
 async fn a_crash_after_the_append_never_duplicates_the_revision() {
@@ -731,7 +825,7 @@ async fn a_crash_after_the_append_never_duplicates_the_revision() {
     fixture.shutdown().await;
 }
 
-// Verifies: B-12 — a crash after a write-back renamed its file into place and before
+// Verifies: TEAM.SYS.DOCS-R14 (Safety) — a crash after a write-back renamed its file into place and before
 // `finish_write` adopts the file on the next reconcile instead of importing it.
 #[tokio::test]
 async fn a_crash_after_the_rename_adopts_the_written_file() {
@@ -764,7 +858,7 @@ async fn a_crash_after_the_rename_adopts_the_written_file() {
     fixture.shutdown().await;
 }
 
-// Verifies: B-6 — an offline batch of 50 edits, 3 new files and 2 deletions imports as exactly
+// Verifies: TEAM.SYS.DOCS-R14 (Import) — an offline batch of 50 edits, 3 new files and 2 deletions imports as exactly
 // 50 revisions, 3 creates with 3 first revisions, and 2 archives, with no duplication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_offline_batch_imports_with_the_expected_record_count() {
@@ -803,7 +897,7 @@ async fn an_offline_batch_imports_with_the_expected_record_count() {
     fixture.shutdown().await;
 }
 
-// Verifies: an archived Collection pauses its mapping and leaves its files; a restore resumes it.
+// Verifies: TEAM.SYS.DOCS-R14 (Safety) — an archived Collection pauses its mapping and leaves its files; a restore resumes it.
 #[tokio::test]
 async fn an_archived_collection_pauses_its_mapping() {
     let mut fixture = Fixture::new().await;
@@ -836,7 +930,7 @@ async fn an_archived_collection_pauses_its_mapping() {
     fixture.shutdown().await;
 }
 
-// Verifies: symbolic links are never followed: a linked `.md` file is refused as `symlink`.
+// Verifies: TEAM.SYS.DOCS-R14 (What is synced, No lost text) — symbolic links are never followed: a linked `.md` file is refused as `symlink`.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_linked_file_is_refused_and_not_followed() {

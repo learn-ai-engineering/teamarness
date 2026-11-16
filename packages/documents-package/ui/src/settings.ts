@@ -7,6 +7,7 @@ import {
   type TypedPackageClient,
 } from "@teamarness/package-ui-sdk";
 import type { DocumentsContract, FolderMapping, MappingDraft, MappingRefusal, MappingReport } from "./contract.generated";
+import { icon } from "./view";
 
 type Listed = DocumentsContract["requests"]["documents.mapping.list"]["response"]["collections"][number];
 type SetRequest = DocumentsContract["requests"]["documents.mapping.set"]["request"];
@@ -108,6 +109,23 @@ function nameList(className: string, names: readonly string[], total: number): H
 }
 
 /**
+ * One settings group, laid out like the Shell's About groups: its title and intro on the left,
+ * its content on the right, and a rule above every group but the first.
+ */
+function group(id: string, title: string, intro: string, ...body: Node[]): HTMLElement {
+  const section = element("section", "settings-group");
+  section.setAttribute("aria-labelledby", `settings-${id}-heading`);
+  const lead = element("div", "settings-group-intro");
+  const heading = element("h2", undefined, title);
+  heading.id = `settings-${id}-heading`;
+  lead.append(heading, element("p", undefined, intro));
+  const content = element("div", "settings-group-body");
+  content.append(...body);
+  section.append(lead, content);
+  return section;
+}
+
+/**
  * The Documents settings view (the Shell's **Configuration** tab): every Collection with its
  * folder mapping, and a form that previews a folder, then maps it or creates a Collection from
  * it. The form's unsent path and name survive a Package switch in the Backend's memory.
@@ -121,8 +139,10 @@ class MappingSettings {
   private readonly target = element("select", KIT.input);
   private readonly nameField = element("label", KIT.field);
   private readonly name = element("input", KIT.input);
-  private readonly preview = button("Preview", KIT.secondary, () => void this.runPreview());
-  private readonly map = button("Map folder", KIT.primary, () => void this.runMap());
+  private readonly preview = button("Preview", KIT.primary, () => void this.runPreview());
+  private readonly map = button("Map folder", KIT.secondary, () => void this.runMap());
+  /** Why Map or Create is not available yet, next to the buttons. */
+  private readonly hint = element("p", "teamarness-help mapping-hint");
   private readonly report = element("section", "mapping-report");
   private readonly gitField = element("label", "mapping-git-confirm");
   private readonly gitConfirm = element("input");
@@ -141,18 +161,14 @@ class MappingSettings {
   /** The remembered target, applied once the Collections it may name are listed. */
   private pendingTarget: string | null = null;
 
-  constructor(client: TypedPackageClient<DocumentsContract>, displayName: string) {
+  constructor(client: TypedPackageClient<DocumentsContract>) {
     this.client = client;
-    const header = element("header", "teamarness-page-header");
-    header.append(
-      element("h1", "teamarness-page-title", `${displayName} settings`),
-      element("p", "teamarness-page-subtitle", "Map a Collection to a folder of Markdown files on this computer. Teamarness keeps the files and the Documents in step. Mappings are not shared with the Workspace."),
-    );
+    // The Shell's page header and Configuration tab already name the Package and the view.
+    const description = element("p", "settings-description",
+      "Map a Collection to a folder of Markdown files on this computer. Teamarness keeps the files and the Documents in sync. Mappings are not shared with the Workspace.");
 
-    const collections = element("section", "teamarness-section teamarness-stack");
-    collections.append(element("h2", "teamarness-section-title", "Collections"), this.listStatus, this.list);
+    const collections = group("collections", "Collections", "Each Collection and the folder it is mapped to.", this.listStatus, this.list);
 
-    const form = element("section", "teamarness-section teamarness-stack mapping-form");
     const pathField = element("label", KIT.field, "Folder path");
     this.path.type = "text";
     this.path.placeholder = "/absolute/path/to/folder";
@@ -169,17 +185,18 @@ class MappingSettings {
     this.nameField.append(this.name);
     this.gitConfirm.type = "checkbox";
     this.gitField.append(this.gitConfirm, this.gitText);
-    const actions = element("div", "teamarness-inline");
+    const actions = element("div", "teamarness-inline mapping-actions");
     actions.append(this.preview, this.map);
+    this.hint.id = "mapping-hint";
+    this.map.setAttribute("aria-describedby", this.hint.id);
     this.error.setAttribute("role", "alert");
     this.status.setAttribute("role", "status");
-    form.append(
-      element("h2", "teamarness-section-title", "Map a folder"),
-      element("p", "teamarness-help", "Preview the folder first. Teamarness lists the files it will import, the files it will refuse and why, and the files it will reformat when it first writes them back. Subfolders are not synced yet."),
-      pathField, targetField, this.nameField, actions, this.error, this.status, this.report, this.gitField,
-    );
+    const form = group("map", "Map a folder",
+      "Preview the folder first. Teamarness lists the files it will import, the files it will refuse and why, and the files it will reformat when it first writes them back. Subfolders are not synced yet.",
+      pathField, targetField, this.nameField, actions, this.hint, this.error, this.status, this.report, this.gitField);
+    form.classList.add("mapping-form");
 
-    this.article.append(header, collections, form);
+    this.article.append(description, collections, form);
     this.path.addEventListener("input", () => this.edited());
     this.name.addEventListener("input", () => this.edited());
     this.target.addEventListener("change", () => this.edited());
@@ -257,8 +274,12 @@ class MappingSettings {
     heading.append(element("span", "mapping-state", mapping === null ? "Not mapped" : STATE_TEXT[mapping.state]));
     item.append(heading);
     if (mapping === null) return item;
-    if (mapping.state === "active") item.dataset.state = "active";
-    else item.dataset.state = mapping.state;
+    item.dataset.state = mapping.state;
+    const unmap = icon("unlink", "Unmap", () => void this.unmap(collection), true);
+    unmap.classList.add("mapping-unmap");
+    unmap.setAttribute("aria-label", `Unmap ${collection.name}`);
+    unmap.disabled = this.busy;
+    heading.append(unmap);
     item.append(element("code", "mapping-path", mapping.path));
     const counts = [
       plural(mapping.counts.files, "file"),
@@ -279,10 +300,6 @@ class MappingSettings {
       details.append(element("summary", undefined, `${plural(mapping.counts.refused, "refused file")}`), refusalList(mapping.refused, mapping.counts.refused));
       item.append(details);
     }
-    const unmap = button("Unmap", KIT.secondary, () => void this.unmap(collection));
-    unmap.setAttribute("aria-label", `Unmap ${collection.name}`);
-    unmap.disabled = this.busy;
-    item.append(unmap);
     return item;
   }
 
@@ -335,9 +352,19 @@ class MappingSettings {
     this.gitText.textContent = git === null ? ""
       : ` This folder is inside the git working tree ${git}. Git pulls, checkouts and merges change these files, and every change becomes an edit for the whole team. Map it anyway.`;
     this.gitConfirm.setAttribute("aria-label", "Map a folder inside a git working tree");
-    this.map.disabled = this.busy || this.previewed === null
-      || (creating && this.name.value.trim() === "")
-      || (git !== null && !this.gitConfirm.checked);
+    // Preview is the next step until a preview exists; then Map or Create is.
+    const previewed = this.previewed !== null;
+    this.preview.className = previewed ? KIT.secondary : KIT.primary;
+    this.map.className = previewed ? KIT.primary : KIT.secondary;
+    const action = creating ? "Create Collection from folder" : "Map folder";
+    const waiting = !previewed
+      ? this.path.value.trim() === "" ? `Enter a folder path and Preview it to enable ${action}.` : `Preview the folder to enable ${action}.`
+      : creating && this.name.value.trim() === "" ? `Name the new Collection to enable ${action}.`
+        : git !== null && !this.gitConfirm.checked ? `Confirm the git warning below to enable ${action}.`
+          : "";
+    this.hint.textContent = waiting;
+    this.hint.hidden = waiting === "";
+    this.map.disabled = this.busy || waiting !== "";
     this.renderReport();
   }
 
@@ -469,7 +496,7 @@ export async function mountSettings(
   client: TypedPackageClient<DocumentsContract>,
   cleanupStyles: () => void,
 ): Promise<PackageUnmount> {
-  const settings = new MappingSettings(client, context.package.displayName);
+  const settings = new MappingSettings(client);
   context.root.append(settings.article);
   let subscription: PackageSubscription | null = null;
   try {

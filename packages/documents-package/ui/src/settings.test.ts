@@ -4,7 +4,6 @@ import type { PackageValue } from "@teamarness/package-ui-sdk";
 import { describe, expect, it } from "vitest";
 import type { DocumentsContract } from "./contract.generated";
 import { mount } from "./index";
-import { DRAFT_SAVE_DELAY_MS } from "./settings";
 
 type Listing = DocumentsContract["requests"]["documents.mapping.list"]["response"];
 type Report = NonNullable<DocumentsContract["requests"]["documents.mapping.set"]["response"]["report"]>;
@@ -49,8 +48,10 @@ function tick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/** Polls until `done` holds, for at most two seconds. */
 async function settle(done: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 200 && !done(); attempt += 1) await tick();
+  const deadline = Date.now() + 2_000;
+  while (!done() && Date.now() < deadline) await tick();
   expect(done()).toBe(true);
 }
 
@@ -112,12 +113,23 @@ describe("Documents settings view", () => {
   it("lists Collections with their mapping, counts and an expandable refusal list", async () => {
     const { fake } = backend();
     const { root, unmount } = await mounted(fake);
-    expect(root.querySelector("h1")?.textContent).toBe("Documents settings");
+    // The Shell's page header and Configuration tab name the view: no heading of its own.
+    expect(root.querySelector("h1")).toBeNull();
+    expect(root.querySelector(".settings-description")?.textContent).toContain("keeps the files and the Documents in sync.");
+    expect(texts(root, ".settings-group h2")).toEqual(["Collections", "Map a folder"]);
+    // No panels: the groups are not kit sections.
+    expect(root.querySelector(".teamarness-section")).toBeNull();
     expect(root.querySelector(".collection-rail")).toBeNull();
     expect(texts(root, ".mapping-collection-name")).toEqual(["Planning", "Empty"]);
     expect(texts(root, ".mapping-state")).toEqual(["Synced", "Not mapped"]);
     expect(root.querySelector(".mapping-path")?.textContent).toBe("/Users/me/plans");
     expect(root.querySelector(".mapping-counts")?.textContent).toBe("3 files · 2 refused · 1 subfolder not synced yet");
+    // Unmap is an icon button in the Collection's header row, named for the Collection.
+    const unmap = root.querySelector('.mapping-collection-header [aria-label="Unmap Planning"]') as HTMLButtonElement;
+    expect(unmap.title).toBe("Unmap");
+    expect(unmap.querySelector("svg")).not.toBeNull();
+    expect(unmap.querySelector("[role=tooltip]")?.textContent).toBe("Unmap");
+    expect(root.querySelectorAll(".mapping-unmap")).toHaveLength(1);
     const details = root.querySelector(".mapping-refused") as HTMLDetailsElement;
     expect(details.open).toBe(false);
     expect(details.querySelector("summary")?.textContent).toBe("2 refused files");
@@ -160,12 +172,22 @@ describe("Documents settings view", () => {
     const { root, unmount } = await mounted(fake);
     const preview = buttonNamed(root, "Preview");
     const map = buttonNamed(root, "Create Collection from folder");
+    const hint = root.querySelector(".mapping-hint") as HTMLElement;
     expect(preview.disabled).toBe(true);
     expect(map.disabled).toBe(true);
+    expect(hint.textContent).toBe("Enter a folder path and Preview it to enable Create Collection from folder.");
     type(input(root, "Folder path"), " /Users/me/notes ");
     expect(preview.disabled).toBe(false);
+    // Until a preview exists, Preview is the primary action and Create waits, saying why.
+    expect(preview.classList.contains("teamarness-control--primary")).toBe(true);
+    expect(map.classList.contains("teamarness-control--secondary")).toBe(true);
+    expect(map.disabled).toBe(true);
+    expect(map.getAttribute("aria-describedby")).toBe(hint.id);
+    expect(hint.textContent).toBe("Preview the folder to enable Create Collection from folder.");
     preview.click();
     await settle(() => root.querySelector(".mapping-summary") !== null);
+    expect(preview.classList.contains("teamarness-control--secondary")).toBe(true);
+    expect(map.classList.contains("teamarness-control--primary")).toBe(true);
     expect(calls(fake, "documents.mapping.set")).toEqual([{ newCollectionName: "Untitled", path: "/Users/me/notes", dryRun: true }]);
     expect(root.querySelector(".mapping-summary")?.textContent).toBe("2 files will be imported.");
     expect(texts(root, ".mapping-files li")).toEqual(["Plan.md", "Wrapped.md"]);
@@ -175,8 +197,10 @@ describe("Documents settings view", () => {
     expect((root.querySelector(".mapping-git-confirm") as HTMLElement).hidden).toBe(true);
     // A name is needed to create the Collection.
     expect(map.disabled).toBe(true);
+    expect(hint.textContent).toBe("Name the new Collection to enable Create Collection from folder.");
     type(input(root, "New Collection name"), "Notes");
     expect(map.disabled).toBe(false);
+    expect(hint.hidden).toBe(true);
     map.click();
     await settle(() => calls(fake, "documents.mapping.set").length === 2 && root.querySelector("[role=status]")?.textContent !== "");
     expect(calls(fake, "documents.mapping.set")[1]).toEqual({ newCollectionName: "Notes", path: "/Users/me/notes", dryRun: false, confirmGit: false });
@@ -231,6 +255,7 @@ describe("Documents settings view", () => {
     expect(warning.textContent).toContain("inside the git working tree /Users/me/repo");
     const map = buttonNamed(root, "Map folder");
     expect(map.disabled).toBe(true);
+    expect(root.querySelector(".mapping-hint")?.textContent).toBe("Confirm the git warning below to enable Map folder.");
     const confirm = input(root, "Map a folder inside a git working tree");
     confirm.checked = true;
     confirm.dispatchEvent(new Event("change"));
@@ -258,7 +283,7 @@ describe("Documents settings view", () => {
     const { root, unmount } = await mounted(first.fake);
     type(input(root, "Folder path"), "/Users/me/notes");
     type(input(root, "New Collection name"), "Notes");
-    await new Promise((resolve) => setTimeout(resolve, DRAFT_SAVE_DELAY_MS + 20));
+    await settle(() => first.drafts.length > 0);
     expect(first.drafts.at(-1)).toEqual({ path: "/Users/me/notes", name: "Notes" });
     type(input(root, "Collection") as unknown as HTMLSelectElement, empty);
     // Unmounting saves a draft that is still waiting.
