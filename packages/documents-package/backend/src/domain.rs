@@ -5,6 +5,10 @@
 //! created it, so a record that targets one carries that 64-character identity.
 
 use std::fmt;
+use unicode_normalization::UnicodeNormalization;
+
+pub(crate) const MAX_FOLDER_BYTES: usize = 512;
+pub(crate) const MAX_FOLDER_SEGMENTS: usize = 8;
 
 const MAGIC: &[u8] = b"TDOCS\x01";
 pub(crate) const MAX_NAME: usize = 128;
@@ -59,6 +63,12 @@ pub enum DomainRecord {
         document: String,
         collection: String,
     },
+    DocumentPlace {
+        author: String,
+        document: String,
+        folder: String,
+        operation_id: [u8; 16],
+    },
     DocumentArchive {
         author: String,
         document: String,
@@ -104,6 +114,7 @@ pub enum DomainError {
     InvalidTarget,
     InvalidName,
     InvalidTitle,
+    InvalidFolder,
     InvalidUpdate,
     /// A `document.create` without a body genesis, or with one that is not exactly the genesis.
     InvalidGenesis,
@@ -204,6 +215,23 @@ impl DomainRecord {
             collection: collection.into(),
         })
     }
+    pub fn document_place(
+        author: &str,
+        document: &str,
+        folder: &str,
+        operation_id: [u8; 16],
+    ) -> Result<Self, DomainError> {
+        validate_identity(author)?;
+        validate_target(document)?;
+        let folder = normalize_folder(folder)?;
+        Ok(Self::DocumentPlace {
+            author: author.into(),
+            document: document.into(),
+            folder,
+            operation_id,
+        })
+    }
+
     pub fn document_archive(author: &str, document: &str) -> Result<Self, DomainError> {
         validate_identity(author)?;
         validate_target(document)?;
@@ -322,6 +350,7 @@ impl DomainRecord {
             | Self::DocumentCreate { author, .. }
             | Self::DocumentRename { author, .. }
             | Self::DocumentMove { author, .. }
+            | Self::DocumentPlace { author, .. }
             | Self::DocumentArchive { author, .. }
             | Self::DocumentRestore { author, .. }
             | Self::IdentifiedDocumentEdit { author, .. }
@@ -344,6 +373,7 @@ impl DomainRecord {
             | Self::DocumentCreate { collection, .. } => Some(collection),
             Self::DocumentRename { document, .. }
             | Self::DocumentMove { document, .. }
+            | Self::DocumentPlace { document, .. }
             | Self::DocumentArchive { document, .. }
             | Self::DocumentRestore { document, .. }
             | Self::IdentifiedDocumentEdit { document, .. }
@@ -363,6 +393,7 @@ impl DomainRecord {
             Self::DocumentCreate { .. } => "document.create",
             Self::DocumentRename { .. } => "document.rename",
             Self::DocumentMove { .. } => "document.move",
+            Self::DocumentPlace { .. } => "document.place",
             Self::DocumentArchive { .. } => "document.archive",
             Self::DocumentRestore { .. } => "document.restore",
             Self::IdentifiedDocumentEdit { .. } => "document.edit",
@@ -378,7 +409,7 @@ impl DomainRecord {
     pub const CREATE_KIND: &'static str = "document.create";
 
     /// Every purpose the listing and comments need opened after restart.
-    pub const METADATA_KINDS: [&'static str; 12] = [
+    pub const METADATA_KINDS: [&'static str; 13] = [
         "collection.create",
         "collection.rename",
         "collection.archive",
@@ -386,6 +417,7 @@ impl DomainRecord {
         "document.create",
         "document.rename",
         "document.move",
+        "document.place",
         "document.archive",
         "document.restore",
         "comment.add",
@@ -452,6 +484,18 @@ impl DomainRecord {
                 put_text(&mut out, author);
                 put_text(&mut out, document);
                 put_text(&mut out, collection);
+            }
+            Self::DocumentPlace {
+                author,
+                document,
+                folder,
+                operation_id,
+            } => {
+                out.push(12);
+                put_text(&mut out, author);
+                put_text(&mut out, document);
+                put_text(&mut out, folder);
+                out.extend_from_slice(operation_id);
             }
             Self::DocumentArchive { author, document } => {
                 out.push(8);
@@ -568,6 +612,20 @@ impl DomainRecord {
                 let update = take_bytes(bytes, &mut p)?;
                 Self::identified_document_edit(&author, &document, &request_id, digest, update)?
             }
+            12 => {
+                let document = take_text(bytes, &mut p)?;
+                let folder = take_text(bytes, &mut p)?;
+                if normalize_folder(&folder)? != folder {
+                    return Err(DomainError::InvalidFolder);
+                }
+                let operation_id = bytes
+                    .get(p..p + 16)
+                    .ok_or(DomainError::InvalidLength)?
+                    .try_into()
+                    .unwrap();
+                p += 16;
+                Self::document_place(&author, &document, &folder, operation_id)?
+            }
             20 => {
                 let document = take_text(bytes, &mut p)?;
                 let parent = take_text(bytes, &mut p)?;
@@ -602,6 +660,28 @@ impl DomainRecord {
         }
         Ok(record)
     }
+}
+
+/// Local ingress normalizes Unicode; canonical decoding additionally requires equality.
+pub(crate) fn normalize_folder(value: &str) -> Result<String, DomainError> {
+    let folder: String = value.nfc().collect();
+    if folder.is_empty() {
+        return Ok(folder);
+    }
+    let segments: Vec<_> = folder.split('/').collect();
+    if folder.len() > MAX_FOLDER_BYTES
+        || segments.len() > MAX_FOLDER_SEGMENTS
+        || folder.contains('\\')
+        || folder.chars().any(char::is_control)
+        || (folder.as_bytes().get(1..3) == Some(b":/")
+            && folder.as_bytes()[0].is_ascii_alphabetic())
+        || segments
+            .iter()
+            .any(|s| s.is_empty() || *s == "." || *s == "..")
+    {
+        return Err(DomainError::InvalidFolder);
+    }
+    Ok(folder)
 }
 
 pub(crate) fn validate_identity(v: &str) -> Result<(), DomainError> {
@@ -699,6 +779,69 @@ mod tests {
     use super::*;
 
     const TARGET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    // Verifies: TEAM.SYS.DOCS-R15 — canonical placement carries a distinct operation identity.
+    #[test]
+    fn placement_canonical_record_and_folder_bounds() {
+        let mut bytes = b"TDOCS\x01\x0c".to_vec();
+        for field in ["alice", TARGET, "Plans/été"] {
+            put_text(&mut bytes, field);
+        }
+        bytes.extend_from_slice(&[7; 16]);
+        let record = DomainRecord::decode(&bytes).expect("kind 12 placement");
+        assert_eq!(record.kind(), "document.place");
+        assert_eq!(record.target(), Some(TARGET));
+        assert_eq!(record.encode(), bytes);
+        let normalized =
+            DomainRecord::document_place("alice", TARGET, "Plans/e\u{301}té", [7; 16]).unwrap();
+        assert_eq!(normalized, record);
+        assert_ne!(
+            DomainRecord::document_place("alice", TARGET, "Plans/été", [8; 16])
+                .unwrap()
+                .encode(),
+            bytes
+        );
+        assert!(DomainRecord::decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(DomainRecord::decode(&trailing).is_err());
+        for folder in [
+            "",
+            ".hidden",
+            "C:notes",
+            "a/b/c/d/e/f/g/h",
+            &"é".repeat(256),
+        ] {
+            let mut bytes = b"TDOCS\x01\x0c".to_vec();
+            for field in ["alice", TARGET, folder] {
+                put_text(&mut bytes, field);
+            }
+            bytes.extend_from_slice(&[8; 16]);
+            assert!(DomainRecord::decode(&bytes).is_ok(), "{folder:?}");
+        }
+        for folder in [
+            "e\u{301}",
+            "a/b/c/d/e/f/g/h/i",
+            &format!("{}a", "é".repeat(256)),
+            "/a",
+            "a/",
+            "a//b",
+            ".",
+            "..",
+            "a/../b",
+            "a\\b",
+            "a\0b",
+            "a\nb",
+            "C:/a",
+        ] {
+            let mut bytes = b"TDOCS\x01\x0c".to_vec();
+            for field in ["alice", TARGET, folder] {
+                put_text(&mut bytes, field);
+            }
+            bytes.extend_from_slice(&[8; 16]);
+            assert!(DomainRecord::decode(&bytes).is_err(), "{folder:?}");
+        }
+    }
 
     #[test]
     fn old_comment_fixture_and_new_author_clock_round_trip() {

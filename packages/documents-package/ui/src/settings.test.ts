@@ -18,7 +18,7 @@ function listing(): Listing {
       {
         collectionId: planning, name: "Planning", archived: false,
         mapping: {
-          path: "/Users/me/plans", state: "active",
+          path: "/Users/me/plans", state: "active", recursive: false, pendingFolderChanges: 1,
           counts: { files: 3, refused: 2, subfolders: 1 },
           refused: [
             { name: "Links.md", reason: "lossy", detail: "example com" },
@@ -35,11 +35,13 @@ function listing(): Listing {
 
 function report(gitRoot: string | null = null): Report {
   return {
-    counts: { files: 2, refused: 1, reformatted: 1, subfolders: 1 },
+    counts: { files: 2, refused: 1, reformatted: 1, subfolders: 0, relocations: 1 },
+    blocked: false,
+    relocations: [{ documentId: created, from: "Root.md", to: "Moved/Root.md" }],
     files: [{ name: "Plan.md", bytes: 14 }, { name: "Wrapped.md", bytes: 12 }],
     refused: [{ name: "Lossy.md", reason: "lossy", detail: "https example com" }],
     reformatted: ["Wrapped.md"],
-    subfolders: ["drafts"],
+    subfolders: [],
     gitRoot,
   };
 }
@@ -62,6 +64,7 @@ function texts(root: ParentNode, selector: string): string[] {
 type Handlers = {
   list?: () => Listing;
   set?: (payload: PackageValue) => unknown;
+  enable?: (payload: PackageValue) => unknown;
   draft?: PackageValue;
 };
 
@@ -71,6 +74,7 @@ function backend(handlers: Handlers = {}) {
   const fake = createFakePackageClient({
     requests: {
       "documents.mapping.list": () => current(),
+      "documents.mapping.enable-recursive": (payload) => (handlers.enable?.(payload) ?? {}) as PackageValue,
       "documents.mapping.set": (payload) => (handlers.set?.(payload) ?? {}) as PackageValue,
       "documents.mapping.clear": (payload) => ({ collectionId: (payload as { collectionId: string }).collectionId, cleared: true }),
       "documents.mapping.draft.get": () => handlers.draft ?? {},
@@ -110,6 +114,82 @@ function calls(fake: ReturnType<typeof createFakePackageClient>, operation: stri
 }
 
 describe("Documents settings view", () => {
+  it("previews subfolders, cancels without enabling, then confirms sharing without losing drafts", async () => {
+    let recursive = false;
+    const { fake } = backend({
+      list: () => ({ collections: listing().collections.map((c) => c.mapping ? { ...c, mapping: { ...c.mapping, recursive, pendingFolderChanges: recursive ? 0 : 1 } } : c) }),
+      enable: (payload) => {
+        if ((payload as { dryRun?: boolean }).dryRun) return { collectionId: planning, dryRun: true, recursive: false, changed: false, report: report() };
+        recursive = true;
+        return { collectionId: planning, dryRun: false, recursive: true, changed: true };
+      },
+    });
+    const { root, unmount } = await mounted(fake);
+    type(input(root, "Folder path"), "/draft/path");
+    type(input(root, "New Collection name"), "Draft");
+    expect(root.textContent).toContain("Subfolders not synced");
+    expect(root.textContent).toContain("1 folder change waiting for confirmation");
+    buttonNamed(root, "Enable subfolders").click();
+    await settle(() => root.querySelector(".mapping-recursive-preview h3") !== null);
+    expect(calls(fake, "documents.mapping.enable-recursive")).toEqual([{ collectionId: planning, dryRun: true }]);
+    expect(root.querySelector(".mapping-recursive-preview")?.textContent).toContain("shared with the Workspace");
+    expect(root.querySelector(".mapping-recursive-preview")?.textContent).toContain("Root.md → Moved/Root.md");
+    buttonNamed(root, "Cancel").click();
+    expect(calls(fake, "documents.mapping.enable-recursive")).toHaveLength(1);
+    expect(root.querySelector(".mapping-recursive-preview h3")).toBeNull();
+    buttonNamed(root, "Enable subfolders").click();
+    await settle(() => root.querySelector(".mapping-recursive-preview h3") !== null);
+    buttonNamed(root, "Confirm enable subfolders").click();
+    await settle(() => root.textContent?.includes("Subfolders synced") === true);
+    expect(calls(fake, "documents.mapping.enable-recursive").at(-1)).toEqual({ collectionId: planning, dryRun: false, confirmGit: false });
+    expect(root.querySelector(".mapping-collection")?.textContent).not.toContain("not synced");
+    expect(input(root, "Folder path").value).toBe("/draft/path");
+    expect(input(root, "New Collection name").value).toBe("Draft");
+    await unmount();
+  });
+
+  it("blocks unsafe relocation confirmation and requires the git warning for safe activation", async () => {
+    let blocked = true;
+    const { fake } = backend({ enable: (payload) => {
+      if ((payload as { dryRun?: boolean }).dryRun) return { collectionId: planning, dryRun: true, recursive: false, changed: false, report: { ...report("/repo"), blocked } };
+      throw createPackageRequestError({ packageError: { code: "documents.mapping_refused", details: { reason: "relocation_blocked" } } });
+    } });
+    const { root, unmount } = await mounted(fake);
+    buttonNamed(root, "Enable subfolders").click();
+    await settle(() => root.querySelector(".mapping-recursive-preview h3") !== null);
+    expect(buttonNamed(root, "Confirm enable subfolders").disabled).toBe(true);
+    buttonNamed(root, "Cancel").click();
+    blocked = false;
+    buttonNamed(root, "Enable subfolders").click();
+    await settle(() => root.querySelector(".mapping-recursive-preview h3") !== null);
+    expect(buttonNamed(root, "Confirm enable subfolders").disabled).toBe(true);
+    const git = input(root, "Enable subfolders inside a git working tree");
+    git.checked = true;
+    git.dispatchEvent(new Event("change"));
+    expect(buttonNamed(root, "Confirm enable subfolders").disabled).toBe(false);
+    buttonNamed(root, "Confirm enable subfolders").click();
+    await settle(() => root.textContent?.includes("A required file relocation is blocked") === true);
+    expect(calls(fake, "documents.mapping.enable-recursive").at(-1)).toEqual({ collectionId: planning, dryRun: false, confirmGit: true });
+    await unmount();
+  });
+
+  it("shows a filesystem folder refusal without implying the logical folder was changed", async () => {
+    const original = listing().collections[0]!;
+    const current: Listing = { collections: [{
+      ...original,
+      mapping: {
+        ...original.mapping!,
+        refused: [{ name: ".hidden/Note.md", reason: "invalid_folder", detail: "Logical folder is valid; hidden disk paths are excluded" }],
+        counts: { ...original.mapping!.counts, refused: 1 },
+      },
+    }] };
+    const { fake } = backend({ list: () => current });
+    const { root, unmount } = await mounted(fake);
+    expect(root.textContent).toContain(".hidden/Note.md");
+    expect(root.textContent).toContain("This folder path cannot be synced to this filesystem");
+    expect(root.textContent).toContain("Logical folder is valid; hidden disk paths are excluded");
+    unmount();
+  });
   it("lists Collections with their mapping, counts and an expandable refusal list", async () => {
     const { fake } = backend();
     const { root, unmount } = await mounted(fake);
@@ -193,7 +273,7 @@ describe("Documents settings view", () => {
     expect(texts(root, ".mapping-files li")).toEqual(["Plan.md", "Wrapped.md"]);
     expect(texts(root, ".mapping-report .mapping-refused-list li")).toEqual(["Lossy.md: Importing it would lose text (https example com)"]);
     expect(texts(root, ".mapping-reformatted li")).toEqual(["Wrapped.md"]);
-    expect(texts(root, ".mapping-subfolders li")).toEqual(["drafts"]);
+    expect(texts(root, ".mapping-subfolders li")).toEqual([]);
     expect((root.querySelector(".mapping-git-confirm") as HTMLElement).hidden).toBe(true);
     // A name is needed to create the Collection.
     expect(map.disabled).toBe(true);

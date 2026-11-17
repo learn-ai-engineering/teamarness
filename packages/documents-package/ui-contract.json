@@ -55,7 +55,8 @@
         "id",
         "collectionId",
         "title",
-        "archived"
+        "archived",
+        "folder"
       ],
       "properties": {
         "id": {
@@ -71,6 +72,9 @@
         },
         "archived": {
           "type": "boolean"
+        },
+        "folder": {
+          "$ref": "#/$defs/folder"
         }
       }
     },
@@ -571,6 +575,7 @@
             "symlink",
             "title_too_long",
             "name_collision_unresolved",
+            "invalid_folder",
             "unreadable"
           ]
         },
@@ -589,7 +594,9 @@
         "refused",
         "reformatted",
         "subfolders",
-        "gitRoot"
+        "gitRoot",
+        "relocations",
+        "blocked"
       ],
       "properties": {
         "counts": {
@@ -599,7 +606,8 @@
             "files",
             "refused",
             "reformatted",
-            "subfolders"
+            "subfolders",
+            "relocations"
           ],
           "properties": {
             "files": {
@@ -615,6 +623,10 @@
               "minimum": 0
             },
             "subfolders": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "relocations": {
               "type": "integer",
               "minimum": 0
             }
@@ -677,6 +689,43 @@
               "type": "null"
             }
           ]
+        },
+        "blocked": {
+          "type": "boolean"
+        },
+        "relocations": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "documentId",
+              "from",
+              "to"
+            ],
+            "properties": {
+              "documentId": {
+                "$ref": "#/$defs/recordId"
+              },
+              "from": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "maxLength": 1024
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "to": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              }
+            }
+          }
         }
       }
     },
@@ -689,7 +738,9 @@
         "counts",
         "refused",
         "subfolders",
-        "gitRoot"
+        "gitRoot",
+        "recursive",
+        "pendingFolderChanges"
       ],
       "properties": {
         "path": {
@@ -750,6 +801,13 @@
               "type": "null"
             }
           ]
+        },
+        "recursive": {
+          "type": "boolean"
+        },
+        "pendingFolderChanges": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     },
@@ -769,6 +827,10 @@
           "$ref": "#/$defs/recordId"
         }
       }
+    },
+    "folder": {
+      "type": "string",
+      "maxLength": 512
     }
   },
   "requests": {
@@ -849,6 +911,9 @@
           },
           "title": {
             "$ref": "#/$defs/title"
+          },
+          "folder": {
+            "$ref": "#/$defs/folder"
           }
         }
       },
@@ -1299,6 +1364,74 @@
       "response": {
         "type": "object",
         "additionalProperties": false
+      }
+    },
+    "documents.document.place": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "documentId",
+          "folder"
+        ],
+        "properties": {
+          "documentId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "folder": {
+            "$ref": "#/$defs/folder"
+          }
+        }
+      },
+      "response": {
+        "$ref": "#/$defs/appended"
+      }
+    },
+    "documents.mapping.enable-recursive": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "collectionId"
+        ],
+        "properties": {
+          "collectionId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "dryRun": {
+            "type": "boolean"
+          },
+          "confirmGit": {
+            "type": "boolean"
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "collectionId",
+          "dryRun",
+          "recursive",
+          "changed"
+        ],
+        "properties": {
+          "collectionId": {
+            "$ref": "#/$defs/recordId"
+          },
+          "dryRun": {
+            "type": "boolean"
+          },
+          "recursive": {
+            "type": "boolean"
+          },
+          "changed": {
+            "type": "boolean"
+          },
+          "report": {
+            "$ref": "#/$defs/mappingReport"
+          }
+        }
       }
     }
   },

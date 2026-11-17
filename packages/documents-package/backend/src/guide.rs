@@ -1,4 +1,4 @@
-//! Runtime advice for the public Documents Ports (1.3). Numeric limits come from their
+//! Runtime advice for the public Documents Ports (1.4). Numeric limits come from their
 //! enforcement.
 
 use serde_json::{Value as JsonValue, json};
@@ -7,7 +7,9 @@ use super::ports::{
     MAX_COMMENT_CHANGES, MAX_PAGE, MAX_THREAD_COMMENTS, MAX_VERSION_IDS, PORT_PAYLOAD_BYTES,
 };
 use crate::body::MAX_TEXT_BYTES;
-use crate::domain::{MAX_MARKDOWN, MAX_QUOTE, MAX_TITLE, MAX_UPDATE};
+use crate::domain::{
+    MAX_FOLDER_BYTES, MAX_FOLDER_SEGMENTS, MAX_MARKDOWN, MAX_QUOTE, MAX_TITLE, MAX_UPDATE,
+};
 
 pub(super) fn response() -> JsonValue {
     let markdown = format!(
@@ -15,7 +17,7 @@ pub(super) fn response() -> JsonValue {
 
 ## Discover and read
 
-document.list with {{}} returns Collections and Documents in Order Key order, at most {MAX_PAGE} entries per page. A page can be shorter to fit the {payload_kib} KiB Port value bound. While next is present, pass it as after to read the following page; a missing next means the listing is complete. With collectionId, the page holds only that Collection's Documents. Each Collection has id, name and archived. Each Document has id, collectionId, title, archived and body: available, pending or unavailable. Only an available body has a version. IDs are 64 lowercase hexadecimal characters. Titles need not be unique, so use an ID returned by document.list, not a guessed title.
+document.list with {{}} returns Collections and Documents in Order Key order, at most {MAX_PAGE} entries per page. A page can be shorter to fit the {payload_kib} KiB Port value bound. While next is present, pass it as after to read the following page; a missing next means the listing is complete. With collectionId, the page holds only that Collection's Documents. Each Collection has id, name and archived. Each Document has id, collectionId, title, folder (empty at Collection root), archived and body: available, pending or unavailable. Only an available body has a version. IDs are 64 lowercase hexadecimal characters. Titles need not be unique, so use an ID returned by document.list, not a guessed title.
 
 document.markdown takes documentId and returns the body as Canonical Markdown with the version it was exported at. documents.pending means this Installation holds records for the Document that it cannot open yet; read again later. documents.unavailable means a conflict or a failed import stopped the body, or its version needs more than {MAX_VERSION_IDS} IDs to carry; it does not mean the Document is empty. documents.too_large means the response would exceed the {payload_kib} KiB Port value bound.
 
@@ -23,9 +25,21 @@ documents.changed is a live-only invalidation that may coalesce, with no initial
 
 ## Create
 
-document.create takes only collectionId and title, and creates an empty Document. The title is 1 to {MAX_TITLE} characters, with no control characters and no leading or trailing whitespace. The Collection must exist and must not be archived. The response is documentId and version.
+document.create takes collectionId, title and optionally folder, and creates an empty Document. The title is 1 to {MAX_TITLE} characters, with no control characters and no leading or trailing whitespace. The Collection must exist and must not be archived. The response is documentId and version, always the genesis version.
+
+folder is a relative slash-separated path, normalized to NFC, at most {MAX_FOLDER_SEGMENTS} segments and {MAX_FOLDER_BYTES} UTF-8 bytes. Empty means Collection root. Empty internal segments, dot or dot-dot segments, absolute paths, backslashes and control characters are refused with documents.invalid_folder before creating anything. Omitted or empty folder appends only create; a non-root folder appends create then place as the same authorized Person or Agent. A failed second append can leave an empty root Document and is outcome-uncertain, even if Core refuses that append with documents.principal_not_bound. Never retry the whole create automatically: list and reconcile first. There is no Agent move Port. Folders are metadata, not independent entities; moving between Collections preserves the folder.
 
 To give the new Document content, call document.revise with that documentId, baseVersion set to the returned version, and the complete Markdown you want. Create then revise is two commands. If the revise is refused, the empty Document remains: revise it again, against a fresh read, rather than create another. A revise straight after a create can report documents.pending until the body is open; read it with document.markdown and revise again.
+
+## Folders and mapped files
+
+Folder paths are shared Document metadata; mapped disk roots and recursion consent belong to each Installation. New mappings include eligible nested lowercase .md files. Existing mappings stay flat until the local Member previews and confirms Enable subfolders. Before consent, existing root files keep their body association and new foldered Documents wait rather than flattening into root files. Ports do not configure mappings.
+
+Hidden paths are valid folder metadata but are not synced to disk. A mapping refuses hidden, unsafe or unrepresentable paths without changing the Document's folder. An unambiguous file move preserves identity only when its bytes are unchanged; an edit combined with a move, or an on-disk move across mappings, does not guarantee identity. Use the in-app Move to Collection control for an identity-preserving Collection move.
+
+Deleting a subtree archives its Documents only when the mapping can safely scan it and eligible readable files remain elsewhere. Deleting the only populated subtree instead marks the mapping unavailable and archives nothing. Restore recreates files and missing parents. Repeated archive after restore by the same author remains an accepted limitation; do not depend on it.
+
+Forward migrations preserve bodies and file associations but prevent older builds from opening the upgraded local database. Older peers on their own databases still exchange ordinary body edits; they ignore placement until upgrade re-evaluates their retained records. No redelivery is required.
 
 ## Revise against a version
 
@@ -57,9 +71,9 @@ comment.add takes documentId, markdown (1 byte to {markdown_kib} KiB), and optio
 
 The Host validates closed schemas and its own authority before dispatch. A Provider refusal arrives as provider_error with details.provider.code, details.provider.retryable and bounded details.provider.details. Inspect outcomeUncertain as well as the code.
 
-document.create refuses an unknown Collection with documents.unknown_collection, an archived Collection with documents.collection_archived, and an invalid title with documents.invalid_title. documents.principal_not_bound means Core does not sign for this Agent now; nothing was written. These refusals are certain. documents.capability_unavailable carries causeCode in Provider details. documents.storage_failed, documents.deferred and documents.rejected can follow a committed record, so treat them as uncertain when outcomeUncertain is set.
+document.create refuses an unknown Collection with documents.unknown_collection, an archived Collection with documents.collection_archived, and an invalid title with documents.invalid_title. documents.invalid_folder refuses an invalid folder before append. documents.principal_not_bound on the first append means Core does not sign for this Agent now and nothing was written. These pre-create refusals are certain; any failure after create, including principal_not_bound on place, is uncertain. documents.capability_unavailable carries causeCode in Provider details. documents.storage_failed, documents.deferred and documents.rejected can follow a committed record, so treat them as uncertain when outcomeUncertain is set.
 
-runtime.guide, document.list, document.markdown, comment.changes and comment.thread are read-only and repeatable, but their results can change. Treat document.revise as not repeatable: after an uncertain revise, read the Document and decide from what it holds. document.create is not repeatable: every accepted create makes a new Document, so a retry duplicates it. Never automatically retry an uncertain command, including outcome_unknown after a timeout, Provider exit or an invalid response. List and reconcile first: look for the Document by Collection and title before you create it again, and read it before you revise it again.
+runtime.guide, document.list, document.markdown, comment.changes and comment.thread are read-only and repeatable, but their results can change. Treat document.revise as not repeatable: after an uncertain revise, read the Document and decide from what it holds. document.create is not repeatable: every accepted create makes a new Document, so a retry duplicates it. Never automatically retry an uncertain command, including outcome_unknown after a timeout, Provider exit or an invalid response. List and reconcile first: look for the Document by Collection, folder and title before you create it again, and read it before you revise it again.
 "#,
         payload_kib = PORT_PAYLOAD_BYTES / 1024,
         update_kib = MAX_UPDATE / 1024,

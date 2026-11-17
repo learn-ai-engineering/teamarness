@@ -7,8 +7,11 @@
 //! - its hash is `pending_write_hash`: the write-back that made it is adopted, not imported;
 //! - it changed: loss check, then import as the local Person's revision of `base_version`;
 //! - it is new: pre-check, then a Document is created and given the file's text;
-//! - it is missing, and its hash is on a new path: the Document is renamed;
-//! - it is missing otherwise: the Document is archived.
+//! - it is missing, and its hash uniquely matches a new path: rename/place its Document;
+//! - it is known missing otherwise: archive, except under the zero-eligible-files guard.
+//!
+//! Recursive scans protect unreadable and unsafe prefixes from deletion. Flat mappings never
+//! enroll subfolders; remote placement waits locally while tracked root bodies keep syncing.
 //!
 //! Collection to folder ([`FolderSync::reconcile_document`]): a Document that moved past its
 //! file's `base_version` is written back with the splice writer, after any unimported edit of
@@ -21,9 +24,13 @@
 //!   An ID already in the record log advances the base instead of appending again.
 //! - A write-back records the hash and version it is about to write before it renames the file
 //!   ([`DocumentStore::begin_write`]). A file found with that hash adopts that version.
+//! - A relocation retains both paths, its expected hash, and a stable placement identity until
+//!   the new path is adopted. Recovery completes it or visibly refuses changed/unsafe bytes.
 //!
 //! A missing or unreadable root archives nothing: the mapping is `unavailable` until it
-//! returns. The first sync of a file never rewrites it. A refused file is never touched, and the
+//! returns. An established mapping with zero eligible readable files in its selected scan scope
+//! also becomes unavailable, including deletion of its only populated subtree. The first sync
+//! of a file never rewrites it. A refused file is never touched, and the
 //! same bytes are not retried until they change.
 
 use std::collections::{HashMap, HashSet};
@@ -48,9 +55,11 @@ use super::codec::{
 };
 use super::scan::{ScannedFile, scan};
 use crate::body::{BodyError, DocumentBody, MAX_TEXT_BYTES};
-use crate::domain::{DomainRecord, MAX_TITLE, MAX_UPDATE};
+use crate::domain::{DomainRecord, MAX_TITLE, MAX_UPDATE, normalize_folder};
 use crate::markdown;
-use crate::store::mappings::{FileHash, FolderMapping, MappedFile, MappingState, RefusedFile};
+use crate::store::mappings::{
+    FileHash, FileRelocation, FolderMapping, MappedFile, MappingState, RefusedFile,
+};
 use crate::store::{DocumentStore, DocumentView, StoreError};
 
 /// The most bytes folder sync reads from one file. Canonical text is bounded by
@@ -79,6 +88,7 @@ pub(crate) enum Refusal {
     TitleTooLong,
     /// Another file of the mapping already has this name on a case-insensitive file system.
     NameCollisionUnresolved,
+    InvalidFolder,
 }
 
 impl Refusal {
@@ -92,6 +102,7 @@ impl Refusal {
             Self::Symlink => "symlink",
             Self::TitleTooLong => "title_too_long",
             Self::NameCollisionUnresolved => "name_collision_unresolved",
+            Self::InvalidFolder => "invalid_folder",
         }
     }
 }
@@ -125,9 +136,13 @@ pub(crate) struct Outcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Crash {
     /// After an import's record reached the record log, before its file state is saved.
-    AfterImportAppend,
+    ImportAppended,
     /// After a write-back renamed its file into place, before `finish_write`.
-    AfterWriteRename,
+    BodyWritten,
+    /// Placement reached the log but the new path is not adopted yet.
+    PlacementAppended,
+    /// The file moved but the new path is not adopted yet.
+    FileRelocated,
 }
 
 /// What an import did.
@@ -147,6 +162,13 @@ enum Imported {
 pub(super) struct FileContent {
     pub(super) hash: FileHash,
     pub(super) bytes: Option<Vec<u8>>,
+}
+
+/// Recovery must not use an unreadable or unsafe source as proof of completed movement.
+enum RelocationSource {
+    Absent,
+    Present(FileContent),
+    Unavailable,
 }
 
 /// The pieces folder sync needs from one activation. Cheap to clone; every clone shares one
@@ -190,6 +212,10 @@ impl FolderSync {
         }
     }
 
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
     /// Makes the next reconcile stop at `point`, as a crash would.
     #[cfg(test)]
     pub(crate) fn crash_at(&self, point: Crash) {
@@ -210,6 +236,24 @@ impl FolderSync {
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn crash_point(&self, _point: Crash) -> Result<(), BackendError> {
         Ok(())
+    }
+
+    /// Shares the worker's gate with consent validation and the mode commit.
+    pub(crate) async fn enable_recursive(
+        &self,
+        collection: String,
+        options: super::mapping::SetOptions,
+    ) -> Result<serde_json::Value, BackendError> {
+        let _gate = self.gate.lock().await;
+        let store = self.hub.store.clone();
+        let result = self
+            .blocking(move || super::mapping::enable_recursive(&store, &collection, options))
+            .await?;
+        if result["changed"] == true {
+            self.changes
+                .send_modify(|revision| *revision = revision.saturating_add(1));
+        }
+        Ok(result)
     }
 
     /// Reconciles the whole mapping of `collection`: every file of its folder, then every
@@ -239,20 +283,59 @@ impl FolderSync {
             return Ok(());
         };
         let root = PathBuf::from(&mapping.root_path);
+        let mut blocked_paths = HashSet::new();
+        let mut blocked_documents = HashSet::new();
+        for file in self.mapped_files(collection).await? {
+            if let Some(intent) = self.relocation(&file.document_id).await?
+                && !self
+                    .resume_relocation(&root, &file, &intent, false, outcome)
+                    .await?
+            {
+                blocked_paths.insert(name_key(&intent.source_path));
+                blocked_paths.insert(name_key(&intent.destination_path));
+                blocked_documents.insert(file.document_id);
+            }
+        }
         let scanned = {
             let root = root.clone();
-            self.blocking(move || Ok(scan(&root))).await?
+            self.blocking(move || Ok(scan(&root, mapping.recursive.into())))
+                .await?
         };
         let Ok(scanned) = scanned else {
             // An unmounted drive or a removed folder archives nothing.
             self.set_state(&mapping, MappingState::Unavailable).await?;
             return Ok(());
         };
+        let known_refusals = self.refusals(collection).await?;
+        for (rel, reason) in scanned
+            .protected
+            .iter()
+            .map(|(rel, reason)| (rel.as_str(), reason.as_str()))
+            .chain(
+                scanned
+                    .unreadable
+                    .iter()
+                    .map(|rel| (rel.as_str(), "unreadable")),
+            )
+        {
+            let refusal = RefusedFile {
+                collection_id: collection.to_owned(),
+                rel_path: rel.to_owned(),
+                refused_hash: None,
+                reason: reason.to_owned(),
+                detail: None,
+            };
+            if !known_refusals.contains(&refusal) {
+                self.store(move |store| store.set_refused_file(&refusal))
+                    .await?;
+                outcome.refused += 1;
+                self.announce();
+            }
+        }
         let files = self.mapped_files(collection).await?;
         if scanned.files.is_empty() && files.iter().any(|file| file.written_hash.is_some()) {
-            // A root that holds none of its synced files is treated as missing, not emptied: an
-            // empty mount point, a folder deleted and made again, or files a file provider moved
-            // off this computer. Archiving here would archive every Document for the team.
+            // An established mapping with zero eligible readable files in its active scope
+            // is unavailable, including deletion of its only populated subtree.
             self.set_state(&mapping, MappingState::Unavailable).await?;
             return Ok(());
         }
@@ -263,19 +346,62 @@ impl FolderSync {
             .iter()
             .map(|file| (file.rel.as_str(), file))
             .collect();
-        // A file that cannot be read now, or that a file provider evicted, still exists.
-        let present_unsynced: HashSet<&str> = scanned
-            .unreadable
-            .iter()
-            .chain(&scanned.evicted)
-            .map(String::as_str)
-            .collect();
+        // Protected prefixes are not absence, including symlink-replaced directories.
+        for file in &files {
+            if scanned.protects(&file.rel_path) || blocked_paths.contains(&file.name_key) {
+                blocked_documents.insert(file.document_id.clone());
+            }
+        }
         let mapped: HashSet<&str> = files.iter().map(|file| file.rel_path.as_str()).collect();
         let mut new_files: Vec<&ScannedFile> = scanned
             .files
             .iter()
-            .filter(|file| !mapped.contains(file.rel.as_str()))
+            .filter(|file| {
+                !mapped.contains(file.rel.as_str()) && !blocked_paths.contains(&name_key(&file.rel))
+            })
             .collect();
+
+        // A hash match is identity evidence only when there is exactly one source and target.
+        let missing: Vec<&MappedFile> = files
+            .iter()
+            .filter(|file| {
+                !on_disk.contains_key(file.rel_path.as_str())
+                    && !blocked_documents.contains(&file.document_id)
+            })
+            .collect();
+        let matches = |file: &MappedFile, target: &ScannedFile| {
+            Some(target.hash) == file.written_hash || Some(target.hash) == file.pending_write_hash
+        };
+        for file in &missing {
+            let candidates: Vec<_> = new_files
+                .iter()
+                .filter(|target| matches(file, target))
+                .collect();
+            if candidates.len() > 1
+                || candidates.iter().any(|target| {
+                    missing
+                        .iter()
+                        .filter(|source| matches(source, target))
+                        .count()
+                        > 1
+                })
+            {
+                blocked_documents.insert(file.document_id.clone());
+                for target in candidates {
+                    blocked_paths.insert(name_key(&target.rel));
+                    self.refuse(
+                        collection,
+                        &target.rel,
+                        Some(target.hash),
+                        Refusal::NameCollisionUnresolved,
+                        Some("ambiguous hash move".to_owned()),
+                        outcome,
+                    )
+                    .await?;
+                }
+            }
+        }
+        new_files.retain(|file| !blocked_paths.contains(&name_key(&file.rel)));
 
         for link in &scanned.symlinks {
             if link.ends_with(EXTENSION) {
@@ -285,6 +411,9 @@ impl FolderSync {
         }
 
         for file in &files {
+            if blocked_documents.contains(&file.document_id) {
+                continue;
+            }
             if let Some(found) = on_disk.get(file.rel_path.as_str()) {
                 if Some(found.hash) == file.written_hash {
                     continue;
@@ -294,9 +423,6 @@ impl FolderSync {
                     continue;
                 }
                 self.import(&root, file, outcome).await?;
-                continue;
-            }
-            if present_unsynced.contains(file.rel_path.as_str()) {
                 continue;
             }
             if file.written_hash.is_none() {
@@ -341,7 +467,10 @@ impl FolderSync {
             .collect();
         let refused = self.refusals(collection).await?;
         for refusal in refused {
-            if !present.contains(refusal.rel_path.as_str()) {
+            if !present.contains(refusal.rel_path.as_str())
+                && !scanned.protects(&refusal.rel_path)
+                && !blocked_paths.contains(&name_key(&refusal.rel_path))
+            {
                 let collection = collection.to_owned();
                 self.store(move |store| store.clear_refused_file(&collection, &refusal.rel_path))
                     .await?;
@@ -364,6 +493,9 @@ impl FolderSync {
             }
         }
         for document in documents {
+            if blocked_documents.contains(&document) {
+                continue;
+            }
             self.document(&document, outcome).await?;
         }
         Ok(())
@@ -502,7 +634,7 @@ impl FolderSync {
                 // then finds its ID included.
                 drain_local_writes(&self.log, &self.hub, &self.changes, &self.author, document)
                     .await?;
-                self.crash_point(Crash::AfterImportAppend)?;
+                self.crash_point(Crash::ImportAppended)?;
                 // The merge's own version: it holds no edit adopted after the merge forked the
                 // body, so a concurrent edit is still written back.
                 encode_version(&staged.version)
@@ -612,6 +744,14 @@ impl FolderSync {
             .as_str()
             .ok_or_else(storage_failed)?
             .to_owned();
+        let folder = normalize_folder(folder_of(&file.rel)).map_err(|_| storage_failed())?;
+        if !folder.is_empty() {
+            self.append(
+                DomainRecord::document_place(&self.author, &document, &folder, operation_id()?)
+                    .map_err(|_| storage_failed())?,
+            )
+            .await?;
+        }
         // The file state names the genesis as its base and no written hash, so a crash before
         // the first revision imports the file into this Document on the next reconcile.
         let state = MappedFile {
@@ -657,32 +797,59 @@ impl FolderSync {
         target: &ScannedFile,
         outcome: &mut Outcome,
     ) -> Result<(), BackendError> {
-        let title = title_of(&target.rel);
-        let current = self
-            .documents()
-            .await?
-            .into_iter()
-            .find(|document| document.id == file.document_id);
-        if let Some(current) = current
-            && current.title.as_deref() != Some(title.as_str())
-            && let Ok(record) =
-                DomainRecord::document_rename(&self.author, &file.document_id, &title)
+        if title_of(&target.rel).chars().count() > MAX_TITLE
+            || normalize_folder(folder_of(&target.rel)).is_err()
         {
-            self.append(record).await?;
+            self.refuse(
+                &file.collection_id,
+                &target.rel,
+                Some(target.hash),
+                Refusal::InvalidFolder,
+                None,
+                outcome,
+            )
+            .await?;
+            return Ok(());
         }
-        let state = MappedFile {
-            rel_path: target.rel.clone(),
-            name_key: name_key(&target.rel),
-            ..file.clone()
+        let key = name_key(&target.rel);
+        if self
+            .mapped_files(&file.collection_id)
+            .await?
+            .iter()
+            .any(|other| other.document_id != file.document_id && other.name_key == key)
+        {
+            self.refuse(
+                &file.collection_id,
+                &target.rel,
+                Some(target.hash),
+                Refusal::NameCollisionUnresolved,
+                None,
+                outcome,
+            )
+            .await?;
+            return Ok(());
+        }
+        let intent = FileRelocation {
+            document_id: file.document_id.clone(),
+            source_path: file.rel_path.clone(),
+            destination_path: target.rel.clone(),
+            expected_hash: target.hash,
+            operation_id: operation_id()?,
+            local_move: true,
         };
-        self.store(move |store| {
-            store.upsert_mapped_file(&state)?;
-            store.clear_refused_file(&state.collection_id, &state.rel_path)?;
-            Ok(())
-        })
-        .await?;
-        outcome.renamed += 1;
-        // The renamed file may also have been edited since; the write-back below imports it.
+        let saved = intent.clone();
+        self.store(move |store| store.begin_relocation(&saved))
+            .await?;
+        let mapping = self
+            .mapping(&file.collection_id)
+            .await?
+            .ok_or_else(storage_failed)?;
+        if self
+            .resume_relocation(Path::new(&mapping.root_path), file, &intent, false, outcome)
+            .await?
+        {
+            outcome.renamed += 1;
+        }
         Ok(())
     }
 
@@ -708,7 +875,7 @@ impl FolderSync {
     // ------------------------------------------------------------ Collection to folder
 
     async fn document(&self, document: &str, outcome: &mut Outcome) -> Result<(), BackendError> {
-        let Some(current) = self
+        let Some(mut current) = self
             .documents()
             .await?
             .into_iter()
@@ -721,6 +888,48 @@ impl FolderSync {
             self.store(move |store| store.mapped_file(&document))
                 .await?
         };
+        if let Some(file) = &state
+            && folder_of(&file.rel_path)
+                .split('/')
+                .any(|part| part.ends_with(super::codec::TEMP_SUFFIX))
+        {
+            self.refuse(
+                &file.collection_id,
+                &file.rel_path,
+                None,
+                Refusal::InvalidFolder,
+                Some("Tracked path is excluded by the reserved temporary suffix".to_owned()),
+                outcome,
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(file) = &state
+            && let Some(intent) = self.relocation(document).await?
+        {
+            let Some(mapping) = self.mapping(&file.collection_id).await? else {
+                return Ok(());
+            };
+            if mapping.state != MappingState::Active
+                || !self
+                    .resume_relocation(Path::new(&mapping.root_path), file, &intent, false, outcome)
+                    .await?
+            {
+                return Ok(());
+            }
+            state = Some(self.refetch(file).await?);
+            // Local recovery can append placement and rename records. Write-back must use
+            // that projection, not undo recovery with the metadata read before it.
+            let Some(recovered) = self
+                .documents()
+                .await?
+                .into_iter()
+                .find(|known| known.id == document)
+            else {
+                return Ok(());
+            };
+            current = recovered;
+        }
         // A Document moved to another Collection leaves this folder.
         if let Some(file) = state.as_ref()
             && file.collection_id != current.collection_id
@@ -763,6 +972,9 @@ impl FolderSync {
             outcome.pending += 1;
             return Ok(());
         };
+        if !mapping.recursive && state.is_none() && !current.folder.is_empty() {
+            return Ok(());
+        }
         match state {
             None => self.write_new(&root, &current, &title, outcome).await,
             Some(file) => self.write_back(&root, file, &title, outcome).await,
@@ -785,8 +997,23 @@ impl FolderSync {
             outcome.pending += 1;
             return Ok(());
         };
-        let taken = self.taken(root, &document.collection_id, None).await?;
-        let name = unique_name(title, &taken);
+        let prepared = {
+            let root = root.to_path_buf();
+            let folder = document.folder.clone();
+            self.blocking(move || Ok(super::codec::prepare_folder(&root, &folder)))
+                .await?
+        };
+        let folder = match prepared {
+            Ok(folder) => folder,
+            Err(_) => {
+                self.refuse(&document.collection_id, &document.folder, None, Refusal::InvalidFolder, Some("Logical folder retained; disk path is hidden, unsafe, aliased, or unrepresentable".to_owned()), outcome).await?;
+                return Ok(());
+            }
+        };
+        let taken = self
+            .taken(root, &document.collection_id, &folder, None)
+            .await?;
+        let name = relative_name(&folder, &unique_name(title, &taken));
         let hash = sha256(text.as_bytes());
         // Phase one: the file state names what is about to be written, so a crash after the
         // write adopts it.
@@ -810,7 +1037,7 @@ impl FolderSync {
         };
         match written {
             Ok(_) => {
-                self.crash_point(Crash::AfterWriteRename)?;
+                self.crash_point(Crash::BodyWritten)?;
                 let id = document.id.clone();
                 self.store(move |store| store.finish_write(&id)).await?;
                 self.verify(&document.id);
@@ -859,6 +1086,9 @@ impl FolderSync {
                 return Ok(());
             }
             file = self.rename_after_title(root, file, title, outcome).await?;
+            if self.relocation(&file.document_id).await?.is_some() {
+                return Ok(());
+            }
             let Some((text, version)) = self.body(&file.document_id) else {
                 outcome.pending += 1;
                 return Ok(());
@@ -920,7 +1150,7 @@ impl FolderSync {
             };
             match written {
                 Ok(_) => {
-                    self.crash_point(Crash::AfterWriteRename)?;
+                    self.crash_point(Crash::BodyWritten)?;
                     let id = file.document_id.clone();
                     self.store(move |store| store.finish_write(&id)).await?;
                     self.verify(&file.document_id);
@@ -949,47 +1179,86 @@ impl FolderSync {
         title: &str,
         outcome: &mut Outcome,
     ) -> Result<MappedFile, BackendError> {
-        let stem = file
-            .rel_path
-            .strip_suffix(EXTENSION)
-            .unwrap_or(&file.rel_path);
-        if file_name(stem) == file_name(title) {
+        let current = self
+            .documents()
+            .await?
+            .into_iter()
+            .find(|document| document.id == file.document_id)
+            .ok_or_else(storage_failed)?;
+        let recursive = self
+            .mapping(&file.collection_id)
+            .await?
+            .is_some_and(|mapping| mapping.recursive);
+        let placement_changed = recursive
+            && normalize_folder(folder_of(&file.rel_path)).ok().as_deref()
+                != Some(current.folder.as_str());
+        let stem = title_of(&file.rel_path);
+        if !placement_changed && file_name(&stem) == file_name(title) {
             return Ok(file);
         }
+        let folder = if placement_changed {
+            let root = root.to_path_buf();
+            let logical = current.folder.clone();
+            match self
+                .blocking(move || Ok(super::codec::prepare_folder(&root, &logical)))
+                .await?
+            {
+                Ok(folder) => folder,
+                Err(_) => {
+                    self.refuse(&file.collection_id, &current.folder, None, Refusal::InvalidFolder, Some("Logical folder retained; disk path is hidden, unsafe, aliased, or unrepresentable".to_owned()), outcome).await?;
+                    return Ok(file);
+                }
+            }
+        } else {
+            folder_of(&file.rel_path).to_owned()
+        };
         let taken = self
-            .taken(root, &file.collection_id, Some(&file.name_key))
+            .taken(root, &file.collection_id, &folder, Some(&file.rel_path))
             .await?;
-        let name = unique_name(title, &taken);
+        let name = relative_name(
+            &folder,
+            &if placement_changed {
+                file_name(title)
+            } else {
+                unique_name(title, &taken)
+            },
+        );
         if name == file.rel_path {
             return Ok(file);
         }
-        let moved = {
-            let root = root.to_path_buf();
-            let from = file.rel_path.clone();
-            let to = name.clone();
-            self.blocking(move || Ok(rename_file(&root, &from, &to)))
-                .await?
+        let intent = FileRelocation {
+            document_id: file.document_id.clone(),
+            source_path: file.rel_path.clone(),
+            destination_path: name,
+            expected_hash: file.written_hash.ok_or_else(storage_failed)?,
+            operation_id: operation_id()?,
+            local_move: false,
         };
-        if let Err(cause) = moved {
-            eprintln!(
-                "documents folder sync rename failure: document={} kind={:?}",
-                file.document_id,
-                cause.kind()
-            );
+        if self
+            .relocation_conflicts(root, &file, &intent, false)
+            .await?
+        {
+            self.refuse(
+                &file.collection_id,
+                &intent.destination_path,
+                None,
+                Refusal::NameCollisionUnresolved,
+                Some("relocation blocked".to_owned()),
+                outcome,
+            )
+            .await?;
             return Ok(file);
         }
-        let state = MappedFile {
-            rel_path: name.clone(),
-            name_key: name_key(&name),
-            ..file
-        };
+        let saved = intent.clone();
+        self.store(move |store| store.begin_relocation(&saved))
+            .await?;
+        if self
+            .resume_relocation(root, &file, &intent, true, outcome)
+            .await?
         {
-            let state = state.clone();
-            self.store(move |store| store.upsert_mapped_file(&state))
-                .await?;
+            outcome.moved += 1;
         }
-        outcome.moved += 1;
-        Ok(state)
+        self.refetch(&file).await
     }
 
     /// Removes the file of an archived or moved Document, importing any unimported edit first.
@@ -1002,6 +1271,15 @@ impl FolderSync {
     ) -> Result<bool, BackendError> {
         let mut file = file.clone();
         for _ in 0..WRITE_ATTEMPTS {
+            let safe = {
+                let root = root.to_path_buf();
+                let rel = file.rel_path.clone();
+                self.blocking(move || Ok(super::codec::resolve(&root, Path::new(&rel)).is_ok()))
+                    .await?
+            };
+            if !safe {
+                return Ok(false);
+            }
             let Some(content) = self.read(root, &file.rel_path).await? else {
                 let id = file.document_id.clone();
                 self.store(move |store| store.delete_mapped_file(&id))
@@ -1018,14 +1296,23 @@ impl FolderSync {
                 continue;
             }
             let removed = {
-                let path = root.join(&file.rel_path);
+                let root = root.to_path_buf();
+                let rel = file.rel_path.clone();
                 self.blocking(move || {
-                    Ok(match fs::symlink_metadata(&path) {
+                    if super::codec::resolve(&root, Path::new(&rel)).is_err() {
+                        return Ok(Err(io::Error::from(io::ErrorKind::InvalidInput)));
+                    }
+                    let path = root.join(&rel);
+                    let result = match fs::symlink_metadata(&path) {
                         Ok(meta) if meta.is_file() => fs::remove_file(&path),
                         Ok(_) => Err(io::Error::from(io::ErrorKind::InvalidInput)),
                         Err(cause) if cause.kind() == io::ErrorKind::NotFound => Ok(()),
                         Err(cause) => Err(cause),
-                    })
+                    };
+                    if result.is_ok() {
+                        super::codec::remove_empty_parents(&root, &rel);
+                    }
+                    Ok(result)
                 })
                 .await?
             };
@@ -1044,6 +1331,237 @@ impl FolderSync {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    async fn relocation(&self, document: &str) -> Result<Option<FileRelocation>, BackendError> {
+        let document = document.to_owned();
+        self.store(move |store| store.file_relocation(&document))
+            .await
+    }
+
+    async fn same_entry(&self, root: &Path, from: &str, to: &str) -> Result<bool, BackendError> {
+        let root = root.to_path_buf();
+        let from = from.to_owned();
+        let to = to.to_owned();
+        self.blocking(move || {
+            Ok(name_key(&from) == name_key(&to)
+                && fs::symlink_metadata(root.join(from))
+                    .ok()
+                    .zip(fs::symlink_metadata(root.join(to)).ok())
+                    .is_some_and(|(a, b)| a.is_file() && b.is_file() && same_file(&a, &b)))
+        })
+        .await
+    }
+
+    /// Check both durable ownership and actual basename entries before movement or adoption.
+    /// Only recovery may count the destination itself as the moved file.
+    async fn relocation_conflicts(
+        &self,
+        root: &Path,
+        file: &MappedFile,
+        intent: &FileRelocation,
+        allow_destination: bool,
+    ) -> Result<bool, BackendError> {
+        let key = name_key(&intent.destination_path);
+        if self
+            .mapped_files(&file.collection_id)
+            .await?
+            .iter()
+            .any(|other| other.document_id != file.document_id && other.name_key == key)
+        {
+            return Ok(true);
+        }
+        let root = root.to_path_buf();
+        let source = intent.source_path.clone();
+        let destination = intent.destination_path.clone();
+        self.blocking(move || {
+            if super::codec::resolve(&root, Path::new(&destination)).is_err() {
+                return Ok(true);
+            }
+            let folder = folder_of(&destination);
+            let Ok(entries) = fs::read_dir(root.join(folder)) else {
+                return Ok(true);
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return Ok(true);
+                };
+                let rel = relative_name(folder, &entry.file_name().to_string_lossy());
+                if name_key(&rel) == key
+                    && rel != source
+                    && !(allow_destination && rel == destination)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
+    }
+
+    /// A retained intent reserves both paths. Changed or unsafe bytes are refused, never
+    /// interpreted as a new file or a deletion while completion remains uncertain.
+    /// Only the invocation that saved a remote intent may move its source: after restart,
+    /// matching source bytes could be a recreation of a file already moved before a crash.
+    async fn resume_relocation(
+        &self,
+        root: &Path,
+        file: &MappedFile,
+        intent: &FileRelocation,
+        newly_planned: bool,
+        outcome: &mut Outcome,
+    ) -> Result<bool, BackendError> {
+        let target = self.read(root, &intent.destination_path).await?;
+        let source = match self
+            .read_relocation_source(root, &intent.source_path)
+            .await?
+        {
+            RelocationSource::Absent => None,
+            RelocationSource::Present(content) => Some(content),
+            RelocationSource::Unavailable => {
+                self.refuse(
+                    &file.collection_id,
+                    &intent.source_path,
+                    None,
+                    Refusal::NameCollisionUnresolved,
+                    Some("relocation source unavailable".to_owned()),
+                    outcome,
+                )
+                .await?;
+                return Ok(false);
+            }
+        };
+        let allow_destination = source.is_none()
+            || self
+                .same_entry(root, &intent.source_path, &intent.destination_path)
+                .await?;
+        if self
+            .relocation_conflicts(root, file, intent, allow_destination)
+            .await?
+        {
+            if newly_planned {
+                // This invocation has not attempted movement. Persisted intents never use
+                // this evidence: an old source could have been recreated after a crash.
+                let id = file.document_id.clone();
+                self.store(move |store| store.cancel_relocation(&id))
+                    .await?;
+            }
+            self.refuse(
+                &file.collection_id,
+                &intent.destination_path,
+                None,
+                Refusal::NameCollisionUnresolved,
+                Some("relocation blocked".to_owned()),
+                outcome,
+            )
+            .await?;
+            return Ok(false);
+        }
+        if !intent.local_move
+            && newly_planned
+            && source
+                .as_ref()
+                .is_some_and(|content| content.hash == intent.expected_hash)
+        {
+            let root = root.to_path_buf();
+            let from = intent.source_path.clone();
+            let to = intent.destination_path.clone();
+            let expected = intent.expected_hash;
+            if self
+                .blocking(move || Ok(rename_file(&root, &from, &to, expected)))
+                .await?
+                .is_err()
+            {
+                self.refuse(
+                    &file.collection_id,
+                    &intent.destination_path,
+                    None,
+                    Refusal::NameCollisionUnresolved,
+                    Some("relocation blocked".to_owned()),
+                    outcome,
+                )
+                .await?;
+                return Ok(false);
+            }
+            self.crash_point(Crash::FileRelocated)?;
+        } else if (source.is_some()
+            && !self
+                .same_entry(root, &intent.source_path, &intent.destination_path)
+                .await?)
+            || !target.is_some_and(|content| content.hash == intent.expected_hash)
+        {
+            self.refuse(
+                &file.collection_id,
+                &intent.destination_path,
+                None,
+                Refusal::NameCollisionUnresolved,
+                Some("relocation bytes changed or unavailable".to_owned()),
+                outcome,
+            )
+            .await?;
+            return Ok(false);
+        }
+        if intent.local_move {
+            let current = self
+                .documents()
+                .await?
+                .into_iter()
+                .find(|document| document.id == file.document_id)
+                .ok_or_else(storage_failed)?;
+            if self
+                .mapping(&file.collection_id)
+                .await?
+                .is_some_and(|mapping| mapping.recursive)
+                && current.folder
+                    != normalize_folder(folder_of(&intent.destination_path))
+                        .map_err(|_| storage_failed())?
+            {
+                self.append(
+                    DomainRecord::document_place(
+                        &self.author,
+                        &file.document_id,
+                        folder_of(&intent.destination_path),
+                        intent.operation_id,
+                    )
+                    .map_err(|_| storage_failed())?,
+                )
+                .await?;
+                self.crash_point(Crash::PlacementAppended)?;
+            }
+            let title = title_of(&intent.destination_path);
+            if title_of(&intent.source_path) != title
+                && current.title.as_deref() != Some(title.as_str())
+            {
+                self.append(
+                    DomainRecord::document_rename(&self.author, &file.document_id, &title)
+                        .map_err(|_| storage_failed())?,
+                )
+                .await?;
+            }
+        }
+        if !intent.local_move {
+            let root = root.to_path_buf();
+            let source = intent.source_path.clone();
+            self.blocking(move || {
+                super::codec::remove_empty_parents(&root, &source);
+                Ok(())
+            })
+            .await?;
+        }
+        let saved = intent.clone();
+        self.store(move |store| {
+            store.finish_relocation(
+                &saved.document_id,
+                &saved.destination_path,
+                &name_key(&saved.destination_path),
+            )
+        })
+        .await?;
+        let collection = file.collection_id.clone();
+        let destination = intent.destination_path.clone();
+        self.store(move |store| store.clear_refused_file(&collection, &destination))
+            .await?;
+        Ok(true)
     }
 
     // ------------------------------------------------------------ helpers
@@ -1175,21 +1693,28 @@ impl FolderSync {
         &self,
         root: &Path,
         collection: &str,
+        folder: &str,
         own: Option<&str>,
     ) -> Result<HashSet<String>, BackendError> {
         let mut taken: HashSet<String> = self
             .mapped_files(collection)
             .await?
             .into_iter()
-            .map(|file| file.name_key)
+            .filter(|file| name_key(folder_of(&file.rel_path)) == name_key(folder))
+            .filter(|file| own != Some(file.rel_path.as_str()))
+            .map(|file| name_key(file.rel_path.rsplit('/').next().unwrap_or(&file.rel_path)))
             .collect();
-        let root = root.to_path_buf();
+        let own = own
+            .filter(|own| folder_of(own) == folder)
+            .map(|own| own.rsplit('/').next().unwrap_or(own).to_owned());
+        let root = root.join(folder);
         let entries = self
             .blocking(move || {
                 Ok(fs::read_dir(&root)
                     .map(|entries| {
                         entries
                             .filter_map(Result::ok)
+                            .filter(|entry| own.as_deref() != entry.file_name().to_str())
                             .map(|entry| name_key(&entry.file_name().to_string_lossy()))
                             .collect::<Vec<_>>()
                     })
@@ -1197,16 +1722,54 @@ impl FolderSync {
             })
             .await?;
         taken.extend(entries);
-        if let Some(own) = own {
-            taken.remove(own);
-        }
         Ok(taken)
     }
 
-    /// Reads `root/rel` without following a link. `None` when it is missing or not a file.
+    async fn read_relocation_source(
+        &self,
+        root: &Path,
+        rel: &str,
+    ) -> Result<RelocationSource, BackendError> {
+        let root = root.to_path_buf();
+        let rel = rel.to_owned();
+        self.blocking(move || {
+            // A missing root is unavailable. Only missing components below a safe root
+            // establish absence; never probe through a symlink or non-directory parent.
+            if !fs::symlink_metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
+                return Ok(RelocationSource::Unavailable);
+            }
+            let path = match super::codec::resolve_existing_parent(&root, Path::new(&rel)) {
+                Ok(Some((folder, name))) => folder.join(name),
+                Ok(None) => return Ok(RelocationSource::Absent),
+                Err(_) => return Ok(RelocationSource::Unavailable),
+            };
+            match fs::symlink_metadata(&path) {
+                Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
+                    Ok(RelocationSource::Absent)
+                }
+                Ok(metadata) if metadata.is_file() => Ok(match read_file(&path) {
+                    Ok(Some(content)) => RelocationSource::Present(content),
+                    // Disappearance between checks is not a completed-move proof.
+                    _ => RelocationSource::Unavailable,
+                }),
+                _ => Ok(RelocationSource::Unavailable),
+            }
+        })
+        .await
+    }
+
+    /// Reads `root/rel` without following a link. `None` when missing, unsafe or unreadable.
     async fn read(&self, root: &Path, rel: &str) -> Result<Option<FileContent>, BackendError> {
-        let path = root.join(rel);
-        let read = self.blocking(move || Ok(read_file(&path))).await?;
+        let root = root.to_path_buf();
+        let rel = rel.to_owned();
+        let read = self
+            .blocking(move || {
+                if super::codec::resolve(&root, Path::new(&rel)).is_err() {
+                    return Ok(Ok(None));
+                }
+                Ok(read_file(&root.join(rel)))
+            })
+            .await?;
         match read {
             Ok(content) => Ok(content),
             Err(cause) => {
@@ -1316,10 +1879,29 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+pub(super) fn folder_of(rel: &str) -> &str {
+    rel.rsplit_once('/').map_or("", |(folder, _)| folder)
+}
+
+fn relative_name(folder: &str, name: &str) -> String {
+    if folder.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{folder}/{name}")
+    }
+}
+
+fn operation_id() -> Result<[u8; 16], BackendError> {
+    let mut id = [0; 16];
+    getrandom::fill(&mut id).map_err(|_| storage_failed())?;
+    Ok(id)
+}
+
 /// The Document title a file name gives: its stem, with control characters replaced by `-`
 /// and the ends trimmed, or `Untitled`.
 pub(crate) fn title_of(rel: &str) -> String {
-    let stem = rel.strip_suffix(EXTENSION).unwrap_or(rel);
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let stem = name.strip_suffix(EXTENSION).unwrap_or(name);
     let title: String = stem
         .chars()
         .map(|c| if c.is_control() { '-' } else { c })
@@ -1354,6 +1936,7 @@ pub(super) fn precheck(
     bytes: Option<Vec<u8>>,
     genesis: &[u8],
 ) -> Result<(String, String), (Refusal, Option<String>)> {
+    normalize_folder(folder_of(rel)).map_err(|_| (Refusal::InvalidFolder, None))?;
     let text = checked_text(bytes)?;
     let canonical = markdown::canonical(&text).map_err(|_| (Refusal::SchemaViolation, None))?;
     if canonical.len() > MAX_TEXT_BYTES {
@@ -1430,12 +2013,19 @@ pub(super) fn read_file(path: &Path) -> io::Result<Option<FileContent>> {
 
 /// Renames `root/from` to `root/to`, never over another file. A rename that changes only case
 /// is the same file on a case-insensitive file system, so it is allowed.
-fn rename_file(root: &Path, from: &str, to: &str) -> io::Result<()> {
+fn rename_file(root: &Path, from: &str, to: &str, expected: FileHash) -> io::Result<()> {
+    super::codec::resolve(root, Path::new(from))
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    super::codec::resolve(root, Path::new(to))
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     let source = root.join(from);
     let target = root.join(to);
     let own = fs::symlink_metadata(&source)?;
     if !own.is_file() {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    if sha256_reader(File::open(&source)?)?.0 != expected {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
     // A case-only rename finds its own file on a case-insensitive file system. Any other file
     // there, such as a refused `Plan.md` beside `plan.md` on a case-sensitive one, is never
@@ -1445,7 +2035,13 @@ fn rename_file(root: &Path, from: &str, to: &str) -> io::Result<()> {
     {
         return Err(io::Error::from(io::ErrorKind::AlreadyExists));
     }
-    fs::rename(source, target)
+    fs::rename(&source, &target)?;
+    for parent in [source.parent(), target.parent()].into_iter().flatten() {
+        if let Ok(directory) = File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// Whether two entries are the same file on disk.

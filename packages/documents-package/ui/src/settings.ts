@@ -26,6 +26,8 @@ const KIT = {
 
 /** Why `documents.mapping.set` refused a folder, as the Member reads it. */
 export const MAPPING_REFUSAL_TEXT: Readonly<Record<string, string>> = {
+  not_mapped: "This Collection is no longer mapped.",
+  relocation_blocked: "A required file relocation is blocked. Nothing was enabled. Preview again after resolving the refused paths.",
   not_absolute: "Enter an absolute path that starts with /.",
   not_found: "No folder exists at this path.",
   not_a_directory: "This path is a file, not a folder.",
@@ -46,6 +48,7 @@ export const FILE_REFUSAL_TEXT: Readonly<Record<MappingRefusal["reason"], string
   symlink: "A symbolic link, which is never followed",
   title_too_long: "Its name is too long for a Document title",
   name_collision_unresolved: "Another file has the same name, ignoring case",
+  invalid_folder: "This folder path cannot be synced to this filesystem",
   unreadable: "Cannot be read",
 };
 
@@ -108,6 +111,31 @@ function nameList(className: string, names: readonly string[], total: number): H
   return list;
 }
 
+function appendReport(container: HTMLElement, report: MappingReport, summary: string): void {
+  container.append(element("h3", "teamarness-section-title", "Preview"), element("p", "mapping-summary", summary));
+  if (report.files.length > 0) container.append(nameList("mapping-files", report.files.map((file) => file.name), report.counts.files));
+  if (report.counts.refused > 0) {
+    container.append(element("h4", undefined, `${plural(report.counts.refused, "file")} will not be imported`), refusalList(report.refused, report.counts.refused));
+  }
+  if (report.counts.reformatted > 0) {
+    container.append(
+      element("h4", undefined, `${plural(report.counts.reformatted, "file")} will be reformatted`),
+      element("p", "teamarness-help", "Teamarness writes these files in its canonical Markdown the first time it writes back an edit. Their text does not change."),
+      nameList("mapping-reformatted", report.reformatted, report.counts.reformatted),
+    );
+  }
+  if (report.counts.subfolders > 0) {
+    container.append(
+      element("h4", undefined, `${plural(report.counts.subfolders, "subfolder")} not synced`),
+      nameList("mapping-subfolders", report.subfolders, report.counts.subfolders),
+    );
+  }
+  if (report.counts.relocations > 0) container.append(
+    element("h4", undefined, `${plural(report.counts.relocations, "planned relocation")}`),
+    nameList("mapping-relocations", report.relocations.map((move) => `${move.from ?? "Export"} → ${move.to}`), report.counts.relocations),
+  );
+}
+
 /**
  * One settings group, laid out like the Shell's About groups: its title and intro on the left,
  * its content on the right, and a rule above every group but the first.
@@ -151,6 +179,9 @@ class MappingSettings {
   private readonly status = element("p", KIT.notice);
   private collections: readonly Listed[] = [];
   private previewed: { key: string; report: MappingReport; direction: string } | null = null;
+  private readonly recursivePanel = element("section", "mapping-recursive-preview");
+  private recursivePreview: { collection: Listed; report: MappingReport } | null = null;
+  private recursiveGitConfirmed = false;
   private busy = false;
   private disposed = false;
   private readonly openRefusals = new Set<string>();
@@ -167,7 +198,7 @@ class MappingSettings {
     const description = element("p", "settings-description",
       "Map a Collection to a folder of Markdown files on this computer. Teamarness keeps the files and the Documents in sync. Mappings are not shared with the Workspace.");
 
-    const collections = group("collections", "Collections", "Each Collection and the folder it is mapped to.", this.listStatus, this.list);
+    const collections = group("collections", "Collections", "Each Collection and the folder it is mapped to.", this.listStatus, this.list, this.recursivePanel);
 
     const pathField = element("label", KIT.field, "Folder path");
     this.path.type = "text";
@@ -192,7 +223,7 @@ class MappingSettings {
     this.error.setAttribute("role", "alert");
     this.status.setAttribute("role", "status");
     const form = group("map", "Map a folder",
-      "Preview the folder first. Teamarness lists the files it will import, the files it will refuse and why, and the files it will reformat when it first writes them back. Subfolders are not synced yet.",
+      "Preview the folder first. Teamarness lists the files it will import, the files it will refuse and why, and the files it will reformat when it first writes them back. New mappings include subfolders. Imported files are shared with the Workspace.",
       pathField, targetField, this.nameField, actions, this.hint, this.error, this.status, this.report, this.gitField);
     form.classList.add("mapping-form");
 
@@ -284,9 +315,16 @@ class MappingSettings {
     const counts = [
       plural(mapping.counts.files, "file"),
       `${mapping.counts.refused} refused`,
-      ...(mapping.counts.subfolders > 0 ? [`${plural(mapping.counts.subfolders, "subfolder")} not synced yet`] : []),
+      ...(!mapping.recursive && mapping.counts.subfolders > 0 ? [`${plural(mapping.counts.subfolders, "subfolder")} not synced yet`] : []),
     ];
     item.append(element("p", "mapping-counts teamarness-help", counts.join(" · ")));
+    item.append(element("p", "mapping-mode", mapping.recursive ? "Subfolders synced" : "Subfolders not synced"));
+    if (!mapping.recursive) {
+      if (mapping.pendingFolderChanges > 0) item.append(element("p", "teamarness-help", `${plural(mapping.pendingFolderChanges, "folder change")} waiting for confirmation.`));
+      const enable = button("Enable subfolders", KIT.secondary, () => void this.previewRecursive(collection));
+      enable.disabled = this.busy;
+      item.append(enable);
+    }
     if (mapping.gitRoot !== null) {
       item.append(element("p", "mapping-git teamarness-help", `Inside the git working tree ${mapping.gitRoot}.`));
     }
@@ -301,6 +339,70 @@ class MappingSettings {
       item.append(details);
     }
     return item;
+  }
+
+  private renderRecursivePreview(): void {
+    this.recursivePanel.replaceChildren();
+    const preview = this.recursivePreview;
+    if (!preview) return;
+    const { collection, report } = preview;
+    this.recursivePanel.append(element("h3", undefined, `Enable subfolders for ${collection.name}`),
+      element("p", undefined, "Files imported from subfolders are shared with the Workspace. This enables subfolders only on this Installation. Existing file associations are kept."));
+    appendReport(this.recursivePanel, report, `${plural(report.counts.files, "new file")} will be imported.`);
+    if (report.blocked) this.recursivePanel.append(element("p", KIT.noticeDanger, "Required relocations are blocked. Resolve the refused paths, then preview again. Subfolders remain disabled."));
+    if (report.gitRoot !== null) {
+      const label = element("label", "mapping-git-confirm");
+      const check = element("input");
+      check.type = "checkbox";
+      check.checked = this.recursiveGitConfirmed;
+      check.setAttribute("aria-label", "Enable subfolders inside a git working tree");
+      check.addEventListener("change", () => { this.recursiveGitConfirmed = check.checked; this.renderRecursivePreview(); });
+      label.append(check, document.createTextNode(` Inside the git working tree ${report.gitRoot}. Git pulls, checkouts and merges become edits shared with the Workspace. Enable subfolders anyway.`));
+      this.recursivePanel.append(label);
+    }
+    const confirm = button("Confirm enable subfolders", KIT.primary, () => void this.confirmRecursive());
+    confirm.disabled = this.busy || report.blocked || (report.gitRoot !== null && !this.recursiveGitConfirmed);
+    const cancel = button("Cancel", KIT.secondary, () => { this.recursivePreview = null; this.renderRecursivePreview(); });
+    cancel.disabled = this.busy;
+    const actions = element("div", "teamarness-inline mapping-actions");
+    actions.append(confirm, cancel);
+    this.recursivePanel.append(actions);
+  }
+
+  private async previewRecursive(collection: Listed): Promise<void> {
+    this.recursivePreview = null;
+    this.recursiveGitConfirmed = false;
+    this.error.textContent = "";
+    this.setBusy(true);
+    try {
+      const answer = await this.client.request("documents.mapping.enable-recursive", { collectionId: collection.collectionId, dryRun: true });
+      if (this.disposed) return;
+      if (answer.report) this.recursivePreview = { collection, report: answer.report };
+      else await this.refresh();
+    } catch (error) {
+      this.error.textContent = mappingErrorText(error);
+    } finally {
+      this.setBusy(false);
+    }
+  }
+
+  private async confirmRecursive(): Promise<void> {
+    const preview = this.recursivePreview;
+    if (!preview || preview.report.blocked) return;
+    this.error.textContent = "";
+    this.setBusy(true);
+    try {
+      await this.client.request("documents.mapping.enable-recursive", { collectionId: preview.collection.collectionId, dryRun: false, confirmGit: this.recursiveGitConfirmed });
+      if (this.disposed) return;
+      this.status.textContent = `Subfolders enabled for ${preview.collection.name}. Imported files are shared with the Workspace.`;
+      this.recursivePreview = null;
+    } catch (error) {
+      this.error.textContent = mappingErrorText(error);
+      this.recursivePreview = null;
+    } finally {
+      this.setBusy(false);
+    }
+    await this.refresh();
   }
 
   private async unmap(collection: Listed): Promise<void> {
@@ -383,24 +485,7 @@ class MappingSettings {
       : previewed.direction === "unchanged"
         ? "This Collection is mapped to this folder already."
         : `${plural(report.counts.files, "file")} will be imported.`;
-    this.report.append(element("h3", "teamarness-section-title", "Preview"), element("p", "mapping-summary", summary));
-    if (report.files.length > 0) this.report.append(nameList("mapping-files", report.files.map((file) => file.name), report.counts.files));
-    if (report.counts.refused > 0) {
-      this.report.append(element("h4", undefined, `${plural(report.counts.refused, "file")} will not be imported`), refusalList(report.refused, report.counts.refused));
-    }
-    if (report.counts.reformatted > 0) {
-      this.report.append(
-        element("h4", undefined, `${plural(report.counts.reformatted, "file")} will be reformatted`),
-        element("p", "teamarness-help", "Teamarness writes these files in its canonical Markdown the first time it writes back an edit. Their text does not change."),
-        nameList("mapping-reformatted", report.reformatted, report.counts.reformatted),
-      );
-    }
-    if (report.counts.subfolders > 0) {
-      this.report.append(
-        element("h4", undefined, `${plural(report.counts.subfolders, "subfolder")} not synced yet`),
-        nameList("mapping-subfolders", report.subfolders, report.counts.subfolders),
-      );
-    }
+    appendReport(this.report, report, summary);
   }
 
   private request(dryRun: boolean): SetRequest {
@@ -452,6 +537,7 @@ class MappingSettings {
 
   private setBusy(busy: boolean): void {
     this.busy = busy;
+    this.renderRecursivePreview();
     this.renderList();
     this.renderForm();
   }

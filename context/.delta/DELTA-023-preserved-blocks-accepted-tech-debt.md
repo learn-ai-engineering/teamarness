@@ -144,15 +144,15 @@ Slice B (`TEAM.SYS.DOCS-R14`, ADR 0041) passed Verify round 1 on `dd73c5b` and r
 - **CR2-001. Deleting the last synced file stops sync.** When the last or only synced file of a mapped folder is deleted, the mapping becomes `unavailable` instead of archiving the Document. This is the emptied-root guard that protects against iCloud eviction and empty mount points. Write-back for that Collection then stops, and the settings view shows "Folder unavailable" with no reason. Adding any `.md` file resumes sync. Fix it if Members run into it: show a hint for the reason, or apply the guard only when two or more files were mapped.
 - **CR2-002. A recovered Linux folder may stay unavailable.** On Linux, an existing root that is `unavailable` may not recover until a restart: the reconcile is not retried, and the inotify watch can sit on an empty mount point or a dead inode. macOS is not affected, and Linux is not qualified.
 - **CR2-003. Write-back stops on mounts that refuse chmod.** If copying permissions fails, the write-back stops. On CIFS, SMB or FUSE mounts that refuse chmod, in-app edits then never reach the file. Make the permission copy best effort.
-- **SF2-001. R14 and ADR 0041 overstate the emptied-root rule.** They say the rule applies to a root that "holds none of its synced files". The code applies it only when no `.md` file is found at all. The R14 Import clause also lacks the exception from CR2-001.
+- **SF2-001. R14 and ADR 0041 overstated the emptied-root rule (documentation corrected in slice C).** They said the rule applies to a root that "holds none of its synced files". The code applies it only when no `.md` file is found at all. The R14 Import clause also lacked the exception from CR2-001. R14 and ADR 0041 now state the exact zero-eligible-readable-files guard and subtree exception. CR2-001 behavior is unchanged.
 - **CR-004. Reconciles cost too much.** A Document that stays pending, or an error that persists, rehashes the folder every second. Each of Teamarness's own writes triggers a full pass that reads the Document list once per Document (O(N²)).
 - **Maintainability.**
   - SM-003: pass-through wrapper layers (`append_record`, `reopen_unopened`, `body_state`).
   - SM-004: `mapped_file_by_name_key` is unused.
   - SM-005: the splice block splitter copies the Markdown import options instead of using `import_options`.
-  - SM2-001: the system test header still says "on Linux CI".
+  - SM2-001: the system test header said "on Linux CI". Slice C corrects it to local macOS qualification; CI still runs no Rust tests.
   - SM2-002: the case-only rename test cites R14 (Write-back, No lost text) instead of R14 (Safety).
-  - SM2-003: the reconciler's module doc and ADR 0041's test list leave out the emptied-root guard and the Phase 7 tests.
+  - SM2-003: the reconciler's module doc and ADR 0041's test list left out the emptied-root guard and the Phase 7 tests. Slice C's reconciler module doc now states the guard, and ADR 0041's evidence covers the zero-files and recursive tests. This documentation finding is corrected; unrelated maintainability debt remains deferred.
   - SM2-004: `DRAFT_SAVE_DELAY_MS` is exported but unused.
   - SM2-005: the settings page keeps `teamarness-page--readable` and then cancels its width in CSS.
 - **Accepted rare risks.** Recorded in the slice B plan checkpoint:
@@ -165,3 +165,21 @@ Slice B (`TEAM.SYS.DOCS-R14`, ADR 0041) passed Verify round 1 on `dd73c5b` and r
 - **Repeat archive by the same author.** This is a Documents limitation that slice B exposed; it is not caused by slice B. After an archive and a restore, the same author cannot archive the Document again, and deleting its mapped file does not archive it either. Another author can. The likely cause: `document.archive` and `document.restore` records carry only `(author, document)`, so a repeat record is identical to the first and is probably deduplicated by the record log. This is not confirmed. Don judged it a tolerable edge case.
 
 Follow-up: the next Documents workstream, or a bug report if Members run into CR2-001 or the repeat archive in use.
+
+### 12. Slice C accepted limitations and follow-up checks
+
+Don accepted the Filesystem Docs outcome on 2026-11-17 after hands-on subfolder creation, filesystem edits appearing across app instances, renames and archives. He requested folders-first alphabetical display, then confirmed it after creating new Documents and folders. That UI-only follow-up passed all 162 Documents UI tests. Don explicitly chose focused tests and manual acceptance instead of another full validation or review round, approved local integration, and deferred the items below.
+
+The cumulative technical review `verify/20261117T000228Z_slice-c-review-3.md` remains failed. All 15 automated commands passed at `1988351`, but independent verification confirmed CR-301 and CR-302. Acceptance does not mean those findings were fixed or falsified. The later UI ordering commit does not alter either mechanism.
+
+- **CR-301 — A file replaces a tracked directory.** If a regular file occupies a previously tracked directory path, reconciliation can archive the former descendants. Restoring the directory can create new Documents instead of recovering the original mapping identities. The archived body history remains. Two real-caller tests reproduced this. Don accepts the unusual directory/file replacement scenario as a current limitation rather than requesting more recovery machinery.
+- **CR-302 — Case-only directory move on case-sensitive storage.** Renaming a single directory from `Plans` to `plans` can leave its local move refused and subsequent target edits unsynchronized on case-sensitive lookup. This is independently confirmed by code tracing, not runtime reproduction on case-sensitive storage. The available test location equated case spellings; that case passed. Don accepts deferral and did not approve creating a disk image. Renaming through an intermediate name is not a verified repair for an already retained intent.
+- **SM-201 — Uncertain-create instructions.** The Agent guide should explicitly search the whole Collection, including root and the requested folder, and inspect candidate identities before a deliberate new create. Creation may survive while placement fails. Automatic retry remains prohibited.
+- **SM-202 — Conditional alias test.** The physical dual-directory test returns on any second-directory creation error. Distinguish an established unsupported-storage condition from unrelated setup failures and report physical noncoverage explicitly. Real-store ownership tests do not qualify simultaneous physical aliases.
+- **SF-201 — Create comment certainty.** Scope the `principal_not_bound` certainty exception in `ports.rs` to the first/create append. The implementation correctly reports every post-create placement failure as uncertain; the broad comment needs correction.
+
+**Manual details not separately established:** legacy preview/cancel/enable state preservation; a real-editor round trip preserving untouched blocks; populated-directory rename IDs and missing-parent creation; sentinel versus only-subtree deletion, restore and unmap; and named refusal/occupied-target byte preservation. Don's successful everyday use is not represented as execution of each original manual procedure. These are follow-up checks, not outstanding work in the closed workstream.
+
+**Broader qualification remains open:** real provider eviction, physical dual-alias storage, case-sensitive recovery execution, Linux and Windows watchers, separate-network latency, historical executables and distribution signing. App/DMG build success was ad-hoc linker signing, not Developer ID or notarization. Existing zero-files, hash-only move, uncertain-create, ambiguous-intent, race and repeat-archive limits remain.
+
+**Owner and destination:** Don or the next Documents maintainer, in a separately prioritized Documents maintenance/qualification scope. Revisit when actual use or a wider release justifies it; do not automatically restart the closed corrective loop. No further implementation is implied by recording these items.

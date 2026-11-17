@@ -52,6 +52,7 @@ pub struct FolderMapping {
     pub state: MappingState,
     /// When the mapping was made, in Unix milliseconds.
     pub created_at: i64,
+    pub recursive: bool,
 }
 
 /// The file of one mapped Document.
@@ -61,7 +62,7 @@ pub struct MappedFile {
     pub collection_id: String,
     /// The file's path relative to the mapping's root.
     pub rel_path: String,
-    /// The case-folded file name, unique within one mapping.
+    /// The case-folded NFC whole relative path, unique within one mapping.
     pub name_key: String,
     /// The version token the file was last synced at.
     pub base_version: Option<String>,
@@ -70,6 +71,17 @@ pub struct MappedFile {
     /// Set by [`DocumentStore::begin_write`] before a write-back renames the file.
     pub pending_write_hash: Option<FileHash>,
     pub pending_write_version: Option<String>,
+}
+
+/// A move whose metadata or file transition has not yet been adopted locally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileRelocation {
+    pub document_id: String,
+    pub source_path: String,
+    pub destination_path: String,
+    pub expected_hash: FileHash,
+    pub operation_id: [u8; 16],
+    pub local_move: bool,
 }
 
 /// A file folder sync did not import, with the reason the settings view shows.
@@ -85,7 +97,7 @@ pub struct RefusedFile {
     pub detail: Option<String>,
 }
 
-const MAPPING_COLUMNS: &str = "collection_id,root_path,state,created_at";
+const MAPPING_COLUMNS: &str = "collection_id,root_path,state,created_at,recursive";
 const FILE_COLUMNS: &str = "document_id,collection_id,rel_path,name_key,base_version,written_hash,pending_write_hash,pending_write_version";
 
 fn hash(value: Option<Vec<u8>>) -> Result<Option<FileHash>, StoreError> {
@@ -94,18 +106,25 @@ fn hash(value: Option<Vec<u8>>) -> Result<Option<FileHash>, StoreError> {
         .transpose()
 }
 
-fn mapping_row(row: &Row<'_>) -> rusqlite::Result<(String, String, String, i64)> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+fn mapping_row(row: &Row<'_>) -> rusqlite::Result<(String, String, String, i64, bool)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
 }
 
 fn mapping(
-    (collection_id, root_path, state, created_at): (String, String, String, i64),
+    (collection_id, root_path, state, created_at, recursive): (String, String, String, i64, bool),
 ) -> Result<FolderMapping, StoreError> {
     Ok(FolderMapping {
         collection_id,
         root_path,
         state: MappingState::parse(&state)?,
         created_at,
+        recursive,
     })
 }
 
@@ -167,6 +186,69 @@ fn write_error(error: rusqlite::Error) -> StoreError {
 }
 
 impl DocumentStore {
+    pub(crate) fn file_relocation(
+        &self,
+        document: &str,
+    ) -> Result<Option<FileRelocation>, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner.conn.query_row(
+            "SELECT source_path,destination_path,expected_hash,operation_id,local_move FROM file_relocations WHERE document_id=?1",
+            [document], |row| Ok(FileRelocation {
+                document_id: document.to_owned(), source_path: row.get(0)?, destination_path: row.get(1)?,
+                expected_hash: row.get(2)?, operation_id: row.get(3)?, local_move: row.get(4)?,
+            })
+        ).optional().map_err(rerr)
+    }
+
+    pub(crate) fn begin_relocation(&self, intent: &FileRelocation) -> Result<(), StoreError> {
+        let inner = lock(&self.inner)?;
+        inner.conn.execute(
+            "INSERT INTO file_relocations(document_id,source_path,destination_path,expected_hash,operation_id,local_move) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![intent.document_id,intent.source_path,intent.destination_path,intent.expected_hash.as_slice(),intent.operation_id.as_slice(),intent.local_move]
+        ).map_err(write_error)?;
+        Ok(())
+    }
+
+    /// Cancels only an attempt the caller knows has not reached filesystem movement.
+    pub(crate) fn cancel_relocation(&self, document: &str) -> Result<(), StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .execute(
+                "DELETE FROM file_relocations WHERE document_id=?1",
+                [document],
+            )
+            .map_err(rerr)?;
+        Ok(())
+    }
+
+    /// Adopts the new path and clears the intent in one transaction, preserving body state.
+    pub(crate) fn finish_relocation(
+        &self,
+        document: &str,
+        destination: &str,
+        key: &str,
+    ) -> Result<(), StoreError> {
+        let mut inner = lock(&self.inner)?;
+        let transaction = inner
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(rerr)?;
+        transaction
+            .execute(
+                "UPDATE mapped_files SET rel_path=?2,name_key=?3 WHERE document_id=?1",
+                params![document, destination, key],
+            )
+            .map_err(write_error)?;
+        transaction
+            .execute(
+                "DELETE FROM file_relocations WHERE document_id=?1",
+                [document],
+            )
+            .map_err(rerr)?;
+        transaction.commit().map_err(rerr)
+    }
+
     /// The mapping of `collection_id`, if it has one.
     pub fn folder_mapping(&self, collection_id: &str) -> Result<Option<FolderMapping>, StoreError> {
         let inner = lock(&self.inner)?;
@@ -224,17 +306,35 @@ impl DocumentStore {
         }
         transaction
             .execute(
-                "INSERT INTO folder_mappings(collection_id,root_path,state,created_at) VALUES(?1,?2,?3,?4)
-                 ON CONFLICT(collection_id) DO UPDATE SET root_path=excluded.root_path,state=excluded.state,created_at=excluded.created_at",
+                "INSERT INTO folder_mappings(collection_id,root_path,state,created_at,recursive) VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(collection_id) DO UPDATE SET root_path=excluded.root_path,state=excluded.state,created_at=excluded.created_at,recursive=excluded.recursive",
                 params![
                     mapping.collection_id,
                     mapping.root_path,
                     mapping.state.as_str(),
-                    mapping.created_at
+                    mapping.created_at,
+                    mapping.recursive
                 ],
             )
             .map_err(write_error)?;
         transaction.commit().map_err(rerr)
+    }
+
+    /// Enables recursive scanning in place; never replaces or clears file state.
+    pub(crate) fn enable_recursive_mapping(
+        &self,
+        collection: &str,
+        root: &str,
+    ) -> Result<bool, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .execute(
+                "UPDATE folder_mappings SET recursive=1 WHERE collection_id=?1 AND root_path=?2",
+                params![collection, root],
+            )
+            .map(|changed| changed == 1)
+            .map_err(rerr)
     }
 
     /// Sets the state of the mapping of `collection_id`, only while its root is still
@@ -581,6 +681,7 @@ mod tests {
             root_path: root.to_owned(),
             state: MappingState::Active,
             created_at,
+            recursive: false,
         }
     }
 
@@ -623,6 +724,32 @@ mod tests {
         paused.state = MappingState::Paused;
         f.store.set_folder_mapping(&paused).unwrap();
         assert_eq!(f.store.folder_mapping("c1").unwrap(), Some(paused));
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R15 — updating state never resets local recursion consent.
+    #[test]
+    fn recursive_mode_survives_updates_and_restart() {
+        let f = fixture();
+        let mut saved = mapping("c1", "/a", 1);
+        saved.recursive = true;
+        f.store.set_folder_mapping(&saved).unwrap();
+        f.store
+            .upsert_mapped_file(&file("d1", "c1", "Plan"))
+            .unwrap();
+        f.store
+            .set_folder_mapping_state("c1", "/a", MappingState::Unavailable)
+            .unwrap();
+        let mut saved = f.store.folder_mapping("c1").unwrap().unwrap();
+        assert!(saved.recursive);
+        saved.state = MappingState::Active;
+        f.store.set_folder_mapping(&saved).unwrap();
+        drop(f.store);
+        let store = DocumentStore::open(&f.path).unwrap();
+        assert_eq!(store.folder_mapping("c1").unwrap(), Some(saved));
+        assert_eq!(
+            store.mapped_files("c1").unwrap(),
+            vec![file("d1", "c1", "Plan")]
+        );
     }
 
     #[test]

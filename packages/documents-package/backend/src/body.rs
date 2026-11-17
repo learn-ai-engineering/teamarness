@@ -30,7 +30,7 @@ pub(crate) const MAX_TEXT_BYTES: usize = 192 * 1024;
 pub(crate) const MAX_RECENT_IDENTITIES: usize = 256;
 /// The format this build reads. Bump it in any change that adds a body node or a record kind, so
 /// that an Installation re-evaluates once what an older build paused or quarantined (ADR 0042).
-pub(crate) const FORMAT_GENERATION: u32 = 1;
+pub(crate) const FORMAT_GENERATION: u32 = 2;
 
 /// Every peer this process has handed out, so a peer is never reused even across Documents.
 static ALLOCATED_PEERS: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(Mutex::default);
