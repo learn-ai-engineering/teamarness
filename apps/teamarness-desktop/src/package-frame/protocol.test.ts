@@ -81,6 +81,7 @@ describe("Package UI bridge protocol", () => {
     const accepted: unknown[] = [
       { kind: "hello", protocol: FRAME_BRIDGE_PROTOCOL },
       { kind: "mounted" },
+      { kind: "open_settings" },
       { kind: "request", id: 1, operation: "reference.read", payload: {} },
       { kind: "cancel", id: 2 },
       { kind: "subscribe", id: 3, operation: "reference.changes", payload: null },
@@ -89,9 +90,7 @@ describe("Package UI bridge protocol", () => {
       { kind: "fault", source: "listener" },
       { kind: "unmounted", ok: true },
     ];
-    expect(accepted.map((message) => parseFrameMessage(message)?.kind)).toEqual([
-      "hello", "mounted", "request", "cancel", "subscribe", "ack", "unsubscribe", "fault", "unmounted",
-    ]);
+    expect(accepted.map((message) => parseFrameMessage(message))).toEqual(accepted);
 
     for (const message of [
       { kind: CONNECT_KIND, protocol: FRAME_BRIDGE_PROTOCOL },
@@ -136,7 +135,8 @@ describe("Package UI bridge protocol", () => {
         package: presentation,
         workspace: { id: "ff".repeat(16), name: "Workspace" },
         view: "main",
-        uiHostVersion: 2,
+        uiHostVersion: 3,
+        openSettings: false,
         theme: themeSnapshot(),
       },
       { kind: "theme", theme: themeSnapshot() },
@@ -150,10 +150,7 @@ describe("Package UI bridge protocol", () => {
       { kind: "stream_terminated", id: 2, error: { ...envelope, packageError: { code: "fixture.rejected", retryable: false, details: { field: "value" } } } },
       { kind: "unmount" },
     ];
-    expect(accepted.map((message) => parseShellMessage(message)?.kind)).toEqual([
-      "mount", "theme", "response", "response", "subscribed", "subscribe_failed",
-      "unsubscribed", "event", "stream_terminated", "stream_terminated", "unmount",
-    ]);
+    expect(accepted.map((message) => parseShellMessage(message))).toEqual(accepted);
 
     const extraToken = { ...themeSnapshot(), values: { ...themeSnapshot().values, "--rogue": "red" } };
     const missingToken = { ...themeSnapshot(), values: { "--teamarness-color-text": "#fff" } };
@@ -193,11 +190,16 @@ describe("Package UI bridge protocol", () => {
       },
       workspace: { id: "ff".repeat(16), name: "Workspace" },
       view: "settings",
-      uiHostVersion: 2,
+      uiHostVersion: 3,
+      openSettings: false,
       theme: themeSnapshot(),
     };
     const parsed = parseShellMessage(mount);
-    expect(parsed?.kind === "mount" ? parsed.view : null).toBe("settings");
+    expect(parsed).toEqual(mount);
+    expect(parseShellMessage({ ...mount, openSettings: "true" })).toBeNull();
+    const withoutAvailability: Record<string, unknown> = { ...mount };
+    delete withoutAvailability.openSettings;
+    expect(parseShellMessage(withoutAvailability)).toBeNull();
     const withoutView: Record<string, unknown> = { ...mount };
     delete withoutView.view;
     expect(parseShellMessage(withoutView)).toBeNull();
@@ -233,4 +235,13 @@ describe("Package UI bridge protocol", () => {
       expect(parseBridgeErrorEnvelope(partial)).toBeNull();
     }
   });
+});
+
+// Verifies: TEAM.SYS.SHELL-R05, TEAM.SYS.PKG-R19.
+it("accepts only the exact target-free settings intent on private bridge 4", () => {
+  expect(FRAME_BRIDGE_PROTOCOL).toBe(4);
+  expect(parseFrameMessage({ kind: "open_settings" })).toEqual({ kind: "open_settings" });
+  for (const key of ["url", "route", "target", "workspaceId", "packageIdentity", "mount", "id"]) {
+    expect(parseFrameMessage({ kind: "open_settings", [key]: "foreign" })).toBeNull();
+  }
 });

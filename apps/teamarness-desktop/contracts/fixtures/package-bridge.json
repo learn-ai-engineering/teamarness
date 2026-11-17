@@ -110,7 +110,7 @@
     "loader": {
       "token": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
       "entrypoint": "ui/index.js",
-      "uiHostVersion": 2,
+      "uiHostVersion": 3,
       "contractDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "package": {
         "identity": "com.example.fixture",
@@ -132,7 +132,7 @@
   "loader": {
     "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "entrypoint": "ui/index.js",
-    "uiHostVersion": 2,
+    "uiHostVersion": 3,
     "contractDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "package": {
       "identity": "com.example.fixture",

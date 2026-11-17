@@ -39,6 +39,18 @@ export type PackageMountTimers = Readonly<{
   clearTimeout(handle: unknown): void;
 }>;
 
+/** Shell-only authority captured from an opened mount, never from a frame message. */
+export type PackageSettingsOrigin = Readonly<{
+  instance: PackageInstanceKey;
+  processGeneration: number;
+  isCurrent(): boolean;
+}>;
+
+export type PackageSettingsNavigation = Readonly<{
+  available(origin: PackageSettingsOrigin): boolean;
+  open(origin: PackageSettingsOrigin): Promise<void>;
+}>;
+
 export interface MountedPackageUi {
   unmount(): Promise<void>;
 }
@@ -99,6 +111,7 @@ export class PackageMountController {
     private readonly theme: PackageThemeSource = staticThemeSource,
     private readonly timers: PackageMountTimers = globalTimers,
     private readonly createChannel: () => MessageChannel = () => new MessageChannel(),
+    private readonly settingsNavigation?: PackageSettingsNavigation,
   ) {}
 
   public mount(
@@ -177,6 +190,11 @@ export class PackageMountController {
       src: `teamarness-package://localhost/${loader.token}/__teamarness/frame.html`,
       title: loader.view === "settings" ? `${loader.package.displayName} settings` : `${loader.package.displayName} interface`,
     });
+    const origin: PackageSettingsOrigin = Object.freeze({
+      instance: Object.freeze({ packageIdentity: loader.package.identity, workspaceId: loader.workspace.id }),
+      processGeneration: loader.package.processGeneration,
+      isCurrent: () => this.current === mounted && !unmountRequested && !hostDisposed && !hostClosed && !denied(),
+    });
     const stopWatchingLoad = frame.onLoad(() => {
       if (frameLoaded) {
         reportFault("navigation");
@@ -197,6 +215,9 @@ export class PackageMountController {
         port: channel.port1,
         transport: this.bridge.transport,
         onFault: reportFault,
+        onOpenSettings: async () => {
+          if (origin.isCurrent()) await this.settingsNavigation?.open(origin);
+        },
       });
       host = started;
       started.start();
@@ -216,6 +237,7 @@ export class PackageMountController {
           workspace: loader.workspace,
           view: loader.view,
           uiHostVersion: loader.uiHostVersion,
+          openSettings: loader.view === "main" && (this.settingsNavigation?.available(origin) ?? false),
           theme: this.theme.current(),
         });
         stopTheme = this.theme.subscribe((theme) => { started.sendTheme(theme); });

@@ -278,9 +278,9 @@ describe("author surface", () => {
 });
 
 describe("mount contract version and views", () => {
-  it("is mount contract version 2 with a main and a settings view", async () => {
+  it("is mount contract version 3 with a main and a settings view", async () => {
     const surface = await import("./index");
-    expect(surface.PACKAGE_UI_HOST_VERSION).toBe(2);
+    expect(surface.PACKAGE_UI_HOST_VERSION).toBe(3);
     expect(surface.PACKAGE_UI_VIEWS).toEqual(["main", "settings"]);
     expect(Object.isFrozen(surface.PACKAGE_UI_VIEWS)).toBe(true);
   });

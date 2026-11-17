@@ -242,7 +242,7 @@ export class PackagePageController {
     const presentation = buildPackagePagePresentation(snapshot, target);
     if (!presentation) return renderMissing(snapshot === null);
     return renderPackagePage(presentation, {
-      tab: tab === "configuration" && presentation.settings ? "configuration" : "about",
+      tab,
       catalog: this.catalog,
       working: this.working,
       feedback: this.feedback.current(),

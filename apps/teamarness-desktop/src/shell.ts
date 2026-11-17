@@ -1,6 +1,7 @@
 import type { PackageHostSnapshot, PackageInstanceKey, PackageManagementBridge, PackageUiView } from "./package-contracts";
 import { PackageManagementController, type RegistrationFeedback } from "./package-install";
 import { buildPackagePagePresentation, PackagePageController, type PackagePageTab } from "./package-page";
+import type { PackageSettingsOrigin } from "./package-mount";
 import type { PackageLifecycleFailure, PackageLifecycleResult } from "./package-shell";
 import type { InstallationPackageVisibility } from "./package-visibility";
 import {
@@ -97,6 +98,7 @@ export class Shell {
   private presentationRevision = 0;
   private applicationUpdating = false;
   private packagePageTabFocus = false;
+  private configurationUnavailable = false;
   /** Counts navigations, so one that finishes unmounting after a newer one started leaves the newer one's mount alone. */
   private navigation = 0;
   /** A newer presentation may finish recovery, but a newer navigation or block revokes it. */
@@ -200,12 +202,58 @@ export class Shell {
     this.renderPackageConsumers();
   }
 
-  public async navigate(requested: ShellRoute): Promise<void> {
+  private currentSettingsOrigin(origin: PackageSettingsOrigin): boolean {
+    const route = this.selectedRoute;
+    return !this.applicationUpdating && origin.isCurrent()
+      && this.workspaceModel?.activeWorkspaceId === origin.instance.workspaceId
+      && route.kind === "package-instance"
+      && route.instance.workspaceId === origin.instance.workspaceId
+      && route.instance.packageIdentity === origin.instance.packageIdentity;
+  }
+
+  public canOpenPackageSettings(origin: PackageSettingsOrigin): boolean {
+    if (!this.currentSettingsOrigin(origin) || this.packageSnapshotFailed) return false;
+    const instance = this.packageSnapshot?.instances.find(({ key }) => sameInstance(key, origin.instance));
+    return this.packageSnapshot?.state === "running" && instance?.lifecycle === "active"
+      && instance.processGeneration === origin.processGeneration
+      && this.packageSnapshot.packages.some((entry) => entry.identity === origin.instance.packageIdentity && entry.views?.includes("settings"));
+  }
+
+  public async openPackageSettings(origin: PackageSettingsOrigin): Promise<void> {
+    if (!this.currentSettingsOrigin(origin)) return;
+    const callingInstance = this.packageSnapshot?.instances.find(({ key }) => sameInstance(key, origin.instance));
+    if (callingInstance && callingInstance.processGeneration !== origin.processGeneration) return;
+    const navigation = this.navigation;
+    let unavailable = false;
+    try {
+      this.updatePackages(await this.options.packageShell.refresh());
+    } catch {
+      unavailable = true;
+    }
+    if (navigation !== this.navigation || !this.currentSettingsOrigin(origin)) return;
+    const instance = this.packageSnapshot?.instances.find(({ key }) => sameInstance(key, origin.instance));
+    // A replaced generation is not the calling mount, even for the same Package/Workspace.
+    if (instance && instance.processGeneration !== origin.processGeneration) return;
+    unavailable ||= !this.canOpenPackageSettings(origin);
+    await this.navigate({
+      kind: "package-page", ...origin.instance, tab: "configuration",
+    }, unavailable);
+  }
+
+  private configurationAvailable(route: Extract<ShellRoute, { kind: "package-page" }>): boolean {
+    const instance = this.packageSnapshot?.instances.find(({ key }) => key.workspaceId === route.workspaceId && key.packageIdentity === route.packageIdentity);
+    return !this.packageSnapshotFailed && this.packageSnapshot?.state === "running"
+      && instance?.lifecycle === "active"
+      && buildPackagePagePresentation(this.packageSnapshot, route)?.settings === true;
+  }
+
+  public async navigate(requested: ShellRoute, unavailable = false): Promise<void> {
     if (this.applicationUpdating) return;
     this.recoveryNavigation = null;
     const navigation = ++this.navigation;
     const route = this.availableRoute(requested);
     this.setRoute(route);
+    this.configurationUnavailable = isPackageConfiguration(route) && (unavailable || !this.configurationAvailable(route));
     if (route.kind === "package-instance") {
       placePackageMount(this.shellFrame.packageMount, "pane");
       this.shellFrame.shellScreen.hidden = true;
@@ -215,7 +263,7 @@ export class Shell {
       return;
     }
 
-    if (route.kind === "package-page" && route.tab === "configuration") {
+    if (route.kind === "package-page" && route.tab === "configuration" && !this.configurationUnavailable) {
       // The settings view mounts below the page header and its tabs.
       placePackageMount(this.shellFrame.packageMount, "package-page");
       this.shellFrame.shellScreen.hidden = false;
@@ -240,10 +288,10 @@ export class Shell {
     if (await this.preparePresentation()) this.renderAll();
   }
 
-  /** The Configuration tab needs a declared settings view and an Instance here; otherwise the page opens on About. */
+  /** Keep unavailable Configuration explicit; never silently substitute About. */
   private availableRoute(route: ShellRoute): ShellRoute {
     if (route.kind !== "package-page" || route.tab === undefined) return route;
-    if (route.tab === "configuration" && buildPackagePagePresentation(this.packageSnapshot, route)?.settings === true) {
+    if (route.tab === "configuration") {
       return route;
     }
     return { kind: "package-page", workspaceId: route.workspaceId, packageIdentity: route.packageIdentity };
@@ -400,7 +448,7 @@ export class Shell {
     if (!this.workspacePresentation || this.selectedRoute.kind === "package-instance") return;
     if (this.selectedRoute.kind === "package-page") {
       this.shellFrame.shellScreen.innerHTML = renderShell(this.workspacePresentation, this.selectedRoute, {
-        packagePage: `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packagePage.render(this.packageSnapshot, this.selectedRoute.tab ?? "about")}`,
+        packagePage: `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packagePage.render(this.packageSnapshot, this.selectedRoute.tab ?? "about")}${this.configurationUnavailable ? '<p role="alert">Configuration is unavailable. The Package must be active and declare a settings view. Try reopening it after refreshing.</p>' : ""}`,
       });
       this.bindSelectedScreen();
       const pageOpened = this.packagePage.takeFocusRequest();
@@ -621,8 +669,8 @@ export class Shell {
   private renderPackageConsumers(): void {
     if (this.applicationUpdating) return;
     const route = this.selectedRoute;
-    // Configuration closes when its settings view is no longer available, for example after a Dispose.
-    if (isPackageConfiguration(route) && this.availableRoute(route) !== route) {
+    // Retire a settings frame when its destination disappears, keeping an explicit explanation.
+    if (isPackageConfiguration(route) && !this.configurationUnavailable && !this.configurationAvailable(route)) {
       void this.navigate(route);
       return;
     }
@@ -884,4 +932,8 @@ function escape(value: string): string {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function sameInstance(left: PackageInstanceKey, right: PackageInstanceKey): boolean {
+  return left.workspaceId === right.workspaceId && left.packageIdentity === right.packageIdentity;
 }

@@ -23,6 +23,12 @@ const packageShell = createPackageShell(
       matchMedia: (query) => window.matchMedia(query),
       preferences: theme,
     }),
+    undefined,
+    undefined,
+    {
+      available: (origin) => shell.canOpenPackageSettings(origin),
+      open: (origin) => shell.openPackageSettings(origin),
+    },
   ),
   frame.packageMount,
 );

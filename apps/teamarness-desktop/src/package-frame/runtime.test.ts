@@ -131,7 +131,8 @@ function mountMessage(entrypoint = "ui/index.js", theme = themeSnapshot()): unkn
     },
     workspace: { id: "ff".repeat(16), name: "Workspace" },
     view: "main",
-    uiHostVersion: 2,
+    uiHostVersion: 3,
+    openSettings: false,
     theme,
   };
 }
@@ -184,10 +185,11 @@ describe("Package UI frame runtime", () => {
 
     const context = contexts[0];
     expect(context).toBeDefined();
+    expect(Object.keys(context ?? {}).sort()).toEqual(["client", "package", "root", "themeTokens", "uiHostVersion", "view", "workspace"]);
     expect(context?.root).toBe(test.shadowRoots[0]);
     expect(Object.isFrozen(context)).toBe(true);
     expect(context?.themeTokens).toBe(TEAMARNESS_THEME_TOKENS);
-    expect(context?.uiHostVersion).toBe(2);
+    expect(context?.uiHostVersion).toBe(3);
     expect(context?.view).toBe("main");
     expect(context?.package.displayName).toBe("Reference Package");
     expect(context?.workspace.name).toBe("Workspace");
@@ -315,4 +317,20 @@ describe("Package UI frame runtime", () => {
     expect(events).toEqual(["root", "package", "workspace", "view", "uiHostVersion", "themeTokens", "client"]);
     expect(test.posted.filter((message) => message.kind === "fault")).toEqual([]);
   });
+});
+
+it("offers only a target-free void settings intent and retires it before unmount cleanup", async () => {
+  let context: PackageMountContext | undefined;
+  const test = harness({ module: { mount: (value) => { context = value; return () => { context?.navigation?.openSettings(); }; } } });
+  test.connect();
+  test.toFrame({ ...mountMessage() as object, openSettings: true });
+  await settle();
+  expect(Object.keys(context ?? {}).sort()).toEqual(["client", "navigation", "package", "root", "themeTokens", "uiHostVersion", "view", "workspace"]);
+  expect(Object.keys(context?.navigation ?? {})).toEqual(["openSettings"]);
+  expect(context?.navigation?.openSettings()).toBeUndefined();
+  expect(test.posted.at(-1)).toEqual({ kind: "open_settings" });
+  test.toFrame({ kind: "unmount" });
+  await settle();
+  context?.navigation?.openSettings();
+  expect(test.posted.filter((message) => message.kind === "open_settings")).toEqual([{ kind: "open_settings" }]);
 });

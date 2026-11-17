@@ -61,7 +61,8 @@ it("reports whether a mount may nest content frames", () => {
 it("covers both Package UI views with the loader shape", () => {
   const loaders = [fixture.loader, fixture.openMount.loader];
   for (const loader of loaders) {
-    expectKeys(loader, loaderKeys);
+    expect(Object.keys(loader).sort()).toEqual(Object.keys(loaderKeys).sort());
+    expect(loader.uiHostVersion).toBe(3);
     expect(Object.keys(loader)).toHaveLength(Object.keys(loaderKeys).length);
     expect(loader.view in views).toBe(true);
   }

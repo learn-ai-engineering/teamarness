@@ -35,7 +35,17 @@ Use the semantic purpose rather than assuming a particular light or dark value:
 
 ## Views
 
-`context.view` is the view the mount shows: `"main"`, or `"settings"` for a Package whose manifest declares `"views": ["settings"]` in its `ui` object. A UI that declares no views can ignore it. `PACKAGE_UI_VIEWS` lists both values, and `PACKAGE_UI_HOST_VERSION` is the mount contract version this SDK describes, 2. Version 2 adds `context.view`, and a UI written for version 1 keeps working (ADR 0037). In tests, `createTestMountContext` takes an optional `view`, which defaults to `"main"`.
+`context.view` is the view the mount shows: `"main"`, or `"settings"` for a Package whose manifest declares `"views": ["settings"]` in its `ui` object. A UI that declares no views can ignore it. `PACKAGE_UI_VIEWS` lists both values, and `PACKAGE_UI_HOST_VERSION` is the mount contract version this SDK describes, 3. Version 3 adds optional `context.navigation.openSettings(): void`; version 2 added `context.view`. Earlier UIs keep working (ADRs 0037/0043). In tests, `createTestMountContext` takes an optional `view`, which defaults to `"main"`.
+
+`context.navigation` is offered only on a main mount when the Shell can offer that Package's
+own declared settings destination. Feature-detect it; older/unavailable contexts and settings
+mounts omit it. Call `context.navigation?.openSettings()` from your settings control. It accepts
+no target and returns no promise: it requests Shell-owned Configuration navigation, which may
+unmount this UI. Repeated pending intents coalesce. The Shell rechecks the live mount, Workspace,
+Instance/generation, settings declaration, lifecycle and update gate; retired mounts cannot
+navigate. A disappearing destination gets a Shell-owned unavailable explanation, not About.
+Do not use Tauri, URLs or parent DOM access as a fallback. Test the offered case with
+`createTestMountContext({ root, client, navigation: { openSettings } })`; by default it is omitted.
 
 ## Optional CSS kit
 
@@ -179,4 +189,4 @@ Build the Package's information architecture in Package markup. For example, thi
 </article>
 ```
 
-The Shell continues to own Workspace and Package selection, the right-pane mount, the Package UI Frame and its runtime, delivered token values, and generic mount recovery. Hiding or unmounting this UI does not suspend its Package Backend. Package UI code runs in a sandboxed frame with an opaque origin: the Shell's DOM, Tauri, browser storage, and the network are all unreachable, and `context.client` is the only way out. A Shadow Root still provides style locality, not a security boundary.
+The Shell continues to own Workspace and Package selection, the right-pane mount, the Package UI Frame and its runtime, delivered token values, and generic mount recovery. Hiding or unmounting this UI does not suspend its Package Backend. Package UI code runs in a sandboxed frame with an opaque origin: the Shell's DOM, Tauri, browser storage, and the network are all unreachable, and `context.client` and the optional own-settings navigation intent are the only supported ways out. A Shadow Root still provides style locality, not a security boundary.

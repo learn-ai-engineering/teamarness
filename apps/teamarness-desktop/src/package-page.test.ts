@@ -242,8 +242,9 @@ describe("Package page layout", () => {
     const html = test.html();
     expect(html).toContain('role="tab" id="package-page-tab-about" aria-controls="package-page-panel-about" aria-selected="true" tabindex="0" data-package-page-tab="about">About</button>');
     expect(html).not.toContain("Configuration");
-    // Asking for Configuration falls back to About.
-    expect(test.html("configuration")).toContain('role="tabpanel" aria-labelledby="package-page-tab-about"');
+    // The Shell owns the unavailable explanation; never silently show About instead.
+    expect(test.html("configuration")).not.toContain('role="tabpanel" aria-labelledby="package-page-tab-about"');
+    expect(test.html("configuration")).not.toContain("Capabilities and Ports");
   });
 
   it("offers Configuration when the Package declares a settings view and runs in this Workspace", async () => {

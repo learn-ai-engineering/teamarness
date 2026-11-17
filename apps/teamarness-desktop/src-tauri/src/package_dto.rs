@@ -627,7 +627,7 @@ mod tests {
             )
             .unwrap(),
             entrypoint: "ui/index.js".into(),
-            ui_host_version: 2,
+            ui_host_version: 3,
             contract_digest: "a".repeat(64),
             package: teamarness_package_host::UiPackageContext {
                 identity: "com.example.fixture".parse().unwrap(),

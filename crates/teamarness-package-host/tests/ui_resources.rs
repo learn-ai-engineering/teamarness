@@ -25,7 +25,7 @@ async fn opaque_mount_token_resolves_only_admitted_resources() {
     };
     assert_eq!(loader.token.as_str().len(), 32);
     assert_eq!(loader.entrypoint, "ui/index.js");
-    assert_eq!(loader.ui_host_version, 2);
+    assert_eq!(loader.ui_host_version, 3);
     assert_eq!(loader.package.identity.as_str(), "dev.teamarness.fixture");
     assert!(!loader.contract_digest.is_empty());
 
@@ -219,7 +219,7 @@ async fn a_mount_shows_only_a_declared_view() {
             other => panic!("unexpected outcome: {other:?}"),
         };
     assert_eq!(main_loader.view, PackageUiView::Main);
-    assert_eq!(main_loader.ui_host_version, 2);
+    assert_eq!(main_loader.ui_host_version, 3);
 
     // An undeclared view is refused, and the open main mount is left alone.
     let refused = open(instance("dev.teamarness.plain"), PackageUiView::Settings)
@@ -247,7 +247,7 @@ async fn a_mount_shows_only_a_declared_view() {
         other => panic!("unexpected outcome: {other:?}"),
     };
     assert_eq!(loader.view, PackageUiView::Settings);
-    assert_eq!(loader.ui_host_version, 2);
+    assert_eq!(loader.ui_host_version, 3);
     assert_eq!(
         serde_json::to_value(&loader).unwrap()["view"],
         serde_json::json!("settings")

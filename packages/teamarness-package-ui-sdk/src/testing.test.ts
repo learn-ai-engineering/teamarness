@@ -111,7 +111,7 @@ describe("createTestMountContext", () => {
     expect(context.client).toBe(fake.client);
     expect(context.package.displayName).toBe("Demo");
     expect(context.package.processGeneration).toBe("1");
-    expect(context.uiHostVersion).toBe(2);
+    expect(context.uiHostVersion).toBe(3);
     expect(context.view).toBe("main");
     expect(context.themeTokens).toContain("--teamarness-color-accent");
   });
@@ -122,4 +122,16 @@ describe("createTestMountContext", () => {
     expect(context.view).toBe("settings");
     expect(Object.isFrozen(context)).toBe(true);
   });
+});
+
+it("omits unavailable navigation and passes only the optional own-settings callback", () => {
+  const client = createFakePackageClient().client;
+  const unavailable = createTestMountContext({ root: {}, client });
+  expect(Object.keys(unavailable).sort()).toEqual(["client", "package", "root", "themeTokens", "uiHostVersion", "view", "workspace"]);
+  let opened = 0;
+  const available = createTestMountContext({ root: {}, client, navigation: { openSettings: () => { opened += 1; } } });
+  expect(Object.keys(available).sort()).toEqual(["client", "navigation", "package", "root", "themeTokens", "uiHostVersion", "view", "workspace"]);
+  expect(Object.keys(available.navigation ?? {})).toEqual(["openSettings"]);
+  expect(available.navigation?.openSettings()).toBeUndefined();
+  expect(opened).toBe(1);
 });

@@ -163,7 +163,7 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             loader: teamarness_package_host::UiLoaderDescriptor {
                 token: UiResourceToken::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
                 entrypoint: "ui/index.js".into(),
-                ui_host_version: 2,
+                ui_host_version: 3,
                 contract_digest: "digest".into(),
                 package: teamarness_package_host::UiPackageContext {
                     identity: PackageIdentity::from_str("dev.teamarness.reference").unwrap(),

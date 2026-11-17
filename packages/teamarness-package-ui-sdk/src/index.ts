@@ -407,10 +407,10 @@ export type PackageUiView = "main" | "settings";
 export const PACKAGE_UI_VIEWS: readonly PackageUiView[] = Object.freeze(["main", "settings"]);
 
 /**
- * The version of the mount contract this SDK describes. Version 2 added `view`; a UI written for
- * version 1 ignores it and keeps working.
+ * The version of the mount contract this SDK describes. Version 3 adds optional own-Package
+ * settings navigation; version 2 added `view`. Earlier UIs keep working.
  */
-export const PACKAGE_UI_HOST_VERSION = 2;
+export const PACKAGE_UI_HOST_VERSION = 3;
 
 export type PackageMountContext = Readonly<{
   root: ShadowRoot;
@@ -421,6 +421,8 @@ export type PackageMountContext = Readonly<{
   uiHostVersion: number;
   themeTokens: readonly TeamarnessThemeToken[];
   client: PackageClient;
+  /** Omitted when own-Package Configuration is unavailable. An intent, not a completion promise. */
+  navigation?: Readonly<{ openSettings(): void }>;
 }>;
 
 export type PackageUnmount = () => void | Promise<void>;

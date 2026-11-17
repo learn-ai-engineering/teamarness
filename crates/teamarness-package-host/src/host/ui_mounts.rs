@@ -17,7 +17,7 @@ use crate::{
 ///
 /// Version 2 adds `view` to the mount context. A UI written for version 1 ignores it and keeps
 /// working.
-const UI_HOST_VERSION: u16 = 2;
+const UI_HOST_VERSION: u16 = 3;
 
 #[allow(clippy::result_large_err)]
 impl PackageHost {

@@ -1512,15 +1512,15 @@ describe("Package page Configuration tab", () => {
     expect(test.frame.packageMount.hidden).toBe(true);
   });
 
-  it("offers no Configuration and mounts nothing for a Package that declares no settings view", async () => {
+  it("explains unavailable Configuration and mounts nothing for a Package that declares no settings view", async () => {
     const screen = new AttributeRegion();
     const test = harness(screen as unknown as HTMLElement);
     await test.shell.updateWorkspace(model());
     test.shell.updatePackages(packages);
     await test.shell.navigate(configuration);
-    expect(test.shell.route()).toEqual(page);
-    await vi.waitFor(() => expect(screen.innerHTML).toContain("Capabilities and Ports"));
-    expect(screen.innerHTML).not.toContain("Configuration");
+    expect(test.shell.route()).toEqual(configuration);
+    await vi.waitFor(() => expect(screen.innerHTML).toContain("Configuration is unavailable"));
+    expect(screen.innerHTML).not.toContain("Capabilities and Ports");
     expect(test.calls).not.toContain("mount:com.example.one:settings");
     expect(test.frame.packageMount.hidden).toBe(true);
   });
@@ -1535,7 +1535,8 @@ describe("Package page Configuration tab", () => {
       revision: declaring.revision + 1,
       instances: declaring.instances.filter(({ key }) => key.packageIdentity !== packageKey.packageIdentity || key.workspaceId !== workspace.id),
     });
-    await vi.waitFor(() => expect(test.shell.route()).toEqual(page));
+    await vi.waitFor(() => expect(test.frame.shellScreen.innerHTML).toContain("Configuration is unavailable"));
+    expect(test.shell.route()).toEqual(configuration);
     expect(test.calls.at(-1)).toBe("unmount");
     await vi.waitFor(() => expect(test.frame.packageMount.hidden).toBe(true));
   });
@@ -1588,5 +1589,116 @@ describe("Packages section messages on the Workspace page", () => {
 
     screen.control("data-package-message-dismiss", "").click();
     expect(screen.innerHTML).not.toContain("A file the manifest lists is missing.");
+  });
+});
+
+describe("mount-bound own-Package settings navigation", () => {
+  const declaring: PackageHostSnapshot = {
+    ...packages,
+    packages: packages.packages.map((entry) => entry.identity === packageKey.packageIdentity ? { ...entry, views: ["settings"] } : entry),
+  };
+  const origin = () => ({ instance: packageKey, processGeneration: 414, isCurrent: () => true });
+  const destination: ShellRoute = { kind: "package-page", workspaceId: workspace.id, packageIdentity: packageKey.packageIdentity, tab: "configuration" };
+
+  it("routes only the current own mount through one real Configuration mount and Shell header/focus", async () => {
+    const screen = new AttributeRegion();
+    const test = harness(screen as unknown as HTMLElement, { refresh: async () => declaring });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(declaring);
+    await test.shell.navigate({ kind: "package-instance", instance: packageKey });
+    expect(test.shell.canOpenPackageSettings(origin())).toBe(true);
+    await test.shell.openPackageSettings(origin());
+    expect(test.shell.route()).toEqual(destination);
+    expect(test.calls.filter((call) => call === "mount:com.example.one:settings")).toEqual(["mount:com.example.one:settings"]);
+    expect(screen.innerHTML).toContain('data-package-page-tab="configuration"');
+    expect(screen.focusedSelector).toBe("[data-package-page-focus]");
+    expect(test.shell.canOpenPackageSettings(origin())).toBe(false);
+  });
+
+  it("refuses stale generation, retired mounts, foreign Workspace and update-gated origins", async () => {
+    const test = harness(new AttributeRegion() as unknown as HTMLElement, { refresh: async () => declaring });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(declaring);
+    await test.shell.navigate({ kind: "package-instance", instance: packageKey });
+    for (const invalid of [
+      { ...origin(), processGeneration: 413 },
+      { ...origin(), isCurrent: () => false },
+      { ...origin(), instance: { ...packageKey, workspaceId: otherWorkspace.id } },
+    ]) {
+      expect(test.shell.canOpenPackageSettings(invalid)).toBe(false);
+      await test.shell.openPackageSettings(invalid);
+    }
+    test.shell.setApplicationUpdating(true);
+    await test.shell.openPackageSettings(origin());
+    expect(test.calls).not.toContain("mount:com.example.one:settings");
+  });
+
+  it("rechecks after refresh and cannot route a later Workspace or replaced generation", async () => {
+    let finish: ((snapshot: PackageHostSnapshot) => void) | undefined;
+    const test = harness(new AttributeRegion() as unknown as HTMLElement, { refresh: () => new Promise((resolve) => { finish = resolve; }) });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(declaring);
+    await test.shell.navigate({ kind: "package-instance", instance: packageKey });
+    const pending = test.shell.openPackageSettings(origin());
+    await test.shell.updateWorkspace(model(otherWorkspace.id));
+    finish?.(declaring);
+    await pending;
+    expect(test.shell.route()).toEqual({ kind: "workspace-settings", workspaceId: otherWorkspace.id });
+    await test.shell.updateWorkspace(model());
+    await test.shell.navigate({ kind: "package-instance", instance: packageKey });
+    const replaced = test.shell.openPackageSettings(origin());
+    finish?.({ ...declaring, revision: declaring.revision + 1, instances: declaring.instances.map((entry) => ({ ...entry, processGeneration: 999 })) });
+    await replaced;
+    expect(test.calls).not.toContain("mount:com.example.one:settings");
+  });
+
+  it.each(["retired", "updating"])("revokes a pending refresh when %s", async (reason) => {
+    let current = true;
+    let finish: ((snapshot: PackageHostSnapshot) => void) | undefined;
+    const test = harness(new AttributeRegion() as unknown as HTMLElement, { refresh: () => new Promise((resolve) => { finish = resolve; }) });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(declaring);
+    await test.shell.navigate({ kind: "package-instance", instance: packageKey });
+    const pending = test.shell.openPackageSettings({ ...origin(), isCurrent: () => current });
+    if (reason === "retired") current = false;
+    else test.shell.setApplicationUpdating(true);
+    finish?.(declaring);
+    await pending;
+    expect(test.calls).not.toContain("mount:com.example.one:settings");
+  });
+
+  it("explains a destination that disappeared after it was offered but before dispatch", async () => {
+    const test = harness(new AttributeRegion() as unknown as HTMLElement, { refresh: async () => packages });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(declaring);
+    await test.shell.navigate({ kind: "package-instance", instance: packageKey });
+    expect(test.shell.canOpenPackageSettings(origin())).toBe(true);
+    test.shell.updatePackages({ ...packages, revision: packages.revision + 1 });
+    await test.shell.openPackageSettings(origin());
+    expect(test.shell.route()).toEqual(destination);
+    expect(test.frame.shellScreen.innerHTML).toContain("Configuration is unavailable");
+    expect(test.calls).not.toContain("mount:com.example.one:settings");
+  });
+
+  it.each(["settings", "instance", "suspended", "snapshot"])("explains unavailable %s without silent About fallback", async (missing) => {
+    const unavailable: PackageHostSnapshot = {
+      ...declaring, revision: declaring.revision + 1,
+      ...(missing === "settings" ? { packages: packages.packages } : {}),
+      ...(missing === "instance" ? { instances: [] } : {}),
+      ...(missing === "suspended" ? { instances: declaring.instances.map((entry) => ({ ...entry, lifecycle: "suspended" as const })) } : {}),
+    };
+    const test = harness(new AttributeRegion() as unknown as HTMLElement, { refresh: async () => {
+      if (missing === "snapshot") throw new Error("unavailable");
+      return unavailable;
+    } });
+    await test.shell.updateWorkspace(model());
+    test.shell.updatePackages(declaring);
+    await test.shell.navigate({ kind: "package-instance", instance: packageKey });
+    await test.shell.openPackageSettings(origin());
+    expect(test.shell.route()).toEqual(destination);
+    expect(test.frame.shellScreen.innerHTML).toContain("Configuration is unavailable");
+    expect(test.frame.shellScreen.innerHTML).not.toContain("Capabilities and Ports");
+    expect(test.calls).not.toContain("mount:com.example.one:settings");
+    expect(test.frame.packageMount.hidden).toBe(true);
   });
 });

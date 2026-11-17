@@ -28,6 +28,17 @@ Workspace creation and join SHALL collect a Workspace-local Person Name before C
 
 The Shell SHALL expose only generic, typed contracts over Tauri invoke and event channels. It SHALL NOT expose secrets, database handles, Core Runtime types, or raw transport handles. Package UI requests, responses, subscriptions, and events SHALL use Package-owned contracts routed through the generic bridge without product-specific branches. A Package UI SHALL reach Package-owned contracts only through a mount-scoped frame bridge whose identity comes from the Shell-held channel, and SHALL NOT reach Tauri invoke or event channels. The Shell SHALL admit no more open subscriptions per mount than the Package Host serves. A bridge message naming a request or a subscription the Shell has already retired SHALL be dropped, within a bounded window of retired identifiers; a message naming an identifier the Shell never issued SHALL remain a Package UI fault.
 
+Mount contract 3's optional own-Package settings navigation SHALL use private bridge 4's exact
+`{kind:"open_settings"}` message, without any URL, route, Workspace or Package selector. The
+Shell SHALL derive identity and process generation from the live mount and SHALL recheck the
+selected Workspace, current mount, active Instance/generation, declared settings and update
+gate immediately before routing. At most one intent SHALL be pending per mount; routing SHALL
+run outside awaited bridge cleanup, preserving existing unmount, request/subscription cleanup,
+focus, header/tabs and settings mounting. Retired or late valid intents SHALL not revive mounts;
+malformed shapes SHALL remain faults. A disappearing Configuration destination SHALL show a
+Shell-owned unavailable explanation rather than silently substituting About. No frame authority
+SHALL be widened.
+
 ## TEAM.SYS.SHELL-R06 — Package Error Containment
 
 Beginning in Phase 3, a returned Package Backend error, lifecycle task failure, Package Process exit, missed execution deadline, failed mount, terminal Package UI stream error, or JavaScript exception in a trusted Package SHALL NOT terminate the Shell or Core Runtime. A terminal Package UI stream error owned by Teamarness SHALL cross the generic desktop bridge, close the affected stream, and cause the Shell to present Package UI Mount recovery without stopping or recovering the Package Backend. A stream that the Package Backend completes or closes with a Package-owned error code SHALL be delivered to the subscribing Package UI, with that code, and SHALL NOT by itself cause Package UI Mount recovery. For other failures, the Shell SHALL present the failure and allow Teamarness to recover or dispose the Package Instance according to its lifecycle state. This requirement does not promise safe execution of hostile code, an operating-system sandbox, or recovery from system-wide resource exhaustion.

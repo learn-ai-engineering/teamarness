@@ -124,3 +124,11 @@ A Package Manifest MAY declare an optional description, author, and homepage in 
 The Shell SHALL give every admitted Package and every refused installation registration a Package page. The page SHALL show the Package's name, Package Identity, version, the optional metadata it declares, its admission tier (Team or Personal), Package Trust, declared Semantic Capabilities, nonfatal capability compatibility warnings, and provided and consumed Ports, with the availability of each consumed Port. The page of a Personal Package SHALL also offer Reload, Restart, pause and resume or start, and Remove. The page of a Team Package SHALL NOT offer them. Remove SHALL state that the Package's data stays on this device.
 
 A Package Manifest MAY declare UI views beside its implicit main view in `ui.views`. In manifest version 1 the only declarable view SHALL be `settings`, at most once; any other value or a repeat SHALL fail validation with `manifest_malformed`. A UI mount SHALL open the main view unless it names another view. A view the manifest does not declare SHALL be refused with `ui_view_not_declared` and SHALL leave any existing mount unchanged. The mount context SHALL carry the view. When a Package declares the settings view and has a Package Instance in the current Workspace, its Package page SHALL link to that view, and the Shell SHALL name the view and offer a way back to the main view.
+
+
+Mount contract 3 SHALL add optional `context.navigation.openSettings(): void`, without changing
+previous mount fields or requiring older UIs to adopt it. The Shell SHALL offer it only for a
+main mount with its own declared settings destination available. It SHALL carry no target
+selector and SHALL add no Backend operation, Tauri command or Semantic Capability. A settings
+mount and an unavailable context SHALL omit it. The intent SHALL not return a promise that
+outlives destruction of its own frame (ADRs 0015, 0037, 0043).
