@@ -7,7 +7,15 @@ export type DocumentFolder = {
   children: DocumentFolder[];
 };
 
-/** Canonical paths supply implicit parents; Documents keep the Backend's Order Key listing order. */
+// Compare case-insensitively without locale variation, then break ties by original spelling.
+function compareLabels(a: string, b: string): number {
+  const lowerA = a.toLowerCase();
+  const lowerB = b.toLowerCase();
+  if (lowerA !== lowerB) return lowerA < lowerB ? -1 : 1;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** Canonical paths supply implicit parents; only the derived sibling arrays are sorted. */
 export function documentFolders(documents: readonly Document[]): DocumentFolder {
   const root: DocumentFolder = { path: "", name: "", documents: [], children: [] };
   const folders = new Map<string, DocumentFolder>([["", root]]);
@@ -25,8 +33,10 @@ export function documentFolders(documents: readonly Document[]): DocumentFolder 
     }
     parent.documents.push(document);
   }
-  // Code-unit order is stable across locales and Installations.
-  for (const folder of folders.values()) folder.children.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  for (const folder of folders.values()) {
+    folder.children.sort((a, b) => compareLabels(a.name, b.name));
+    folder.documents.sort((a, b) => compareLabels(a.title, b.title) || compareLabels(a.id, b.id));
+  }
   return root;
 }
 

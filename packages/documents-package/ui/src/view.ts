@@ -1043,7 +1043,6 @@ export class DocumentsView {
   }
 
   private appendFolderContents(list: HTMLUListElement, folder: DocumentFolder, collection: Collection): void {
-    list.append(...folder.documents.map((d) => this.documentRow(d, collection)));
     for (const child of folder.children) {
       const item = document.createElement("li");
       item.className = "folder-group";
@@ -1067,6 +1066,7 @@ export class DocumentsView {
       }
       list.append(item);
     }
+    list.append(...folder.documents.map((d) => this.documentRow(d, collection)));
   }
 
   private documentRow(document_: Document, collection: Collection): HTMLLIElement {

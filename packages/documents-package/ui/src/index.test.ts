@@ -88,24 +88,44 @@ function texts(root: ParentNode, selector: string): string[] {
 
 describe("Documents mount", () => {
   // Verifies: TEAM.SYS.DOCS-R15, TEAM.SYS.DOCS-R04
-  it("groups visible Documents by folder with implicit parents, stable folder order and listing order inside each group", async () => {
+  it("renders folders first and Documents second alphabetically ignoring case at root and nested levels", async () => {
     const base = snapshot();
     const current = { ...base, documents: [
       { ...base.documents[0]!, folder: "Z/Deep", title: "Same" },
-      { ...base.documents[0]!, id: "4".repeat(64), folder: "A", title: "Same" },
-      { ...base.documents[0]!, id: "5".repeat(64), title: "Root" },
-      { ...base.documents[0]!, id: "6".repeat(64), folder: "A", title: "Later" },
+      { ...base.documents[0]!, id: "4".repeat(64), folder: "alpha", title: "Zulu" },
+      { ...base.documents[0]!, id: "5".repeat(64), title: "zulu" },
+      { ...base.documents[0]!, id: "6".repeat(64), folder: "alpha", title: "apple" },
       { ...base.documents[0]!, id: "7".repeat(64), folder: "Past/Only", title: "Archived", archived: true },
+      { ...base.documents[0]!, id: "8".repeat(64), folder: "alpha/zulu/Leaf", title: "Leaf" },
+      { ...base.documents[0]!, id: "9".repeat(64), folder: "alpha/beta", title: "Leaf" },
+      { ...base.documents[0]!, id: "a".repeat(64), folder: "alpha/Beta", title: "Leaf" },
+      { ...base.documents[0]!, id: "b".repeat(64), title: "apple" },
+      { ...base.documents[0]!, id: "c".repeat(64), title: "Apple" },
+      { ...base.documents[0]!, id: "e".repeat(64), title: "Same" },
+      { ...base.documents[0]!, id: "d".repeat(64), title: "Same" },
     ] };
+    const original = structuredClone(current);
     const { fake } = backend(() => current);
     const host = document.createElement("div");
     document.body.append(host);
     const root = host.attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
     const disclosure = (path: string) => root.querySelector<HTMLButtonElement>(`[aria-label="Folder ${path}"]`)!;
-    expect(texts(root, ".folder-button")).toEqual(["A", "Z", "Deep"]);
-    expect(texts(root, '.document-list > .document-row > .document-title')).toEqual(["Root"]);
-    expect(texts(root, '[aria-label="Documents in folder A"] > .document-row > .document-title')).toEqual(["Same", "Later"]);
+    const childOrder = (selector: string) => [...root.querySelector(selector)!.children].map((child) => {
+      const control = child.querySelector<HTMLButtonElement>(":scope > .folder-button, :scope > .document-title")!;
+      return `${child.classList.contains("folder-group") ? "folder" : "document"}:${control.textContent}`;
+    });
+    expect(childOrder('.document-list')).toEqual([
+      "folder:alpha", "folder:Z", "document:Apple", "document:apple", "document:Same", "document:Same", "document:zulu",
+    ]);
+    expect(childOrder('[aria-label="Documents in folder alpha"]')).toEqual([
+      "folder:Beta", "folder:beta", "folder:zulu", "document:apple", "document:Zulu",
+    ]);
+    expect(disclosure("alpha/zulu/Leaf")).not.toBeNull();
+    expect([...root.querySelectorAll<HTMLButtonElement>('.document-list > .document-row > .document-title')]
+      .filter((control) => control.textContent === "Same").map((control) => control.dataset.treeFocus))
+      .toEqual([`document:select:${"d".repeat(64)}`, `document:select:${"e".repeat(64)}`]);
+    expect(current).toEqual(original);
     disclosure("Z").focus();
     disclosure("Z").click();
     expect(disclosure("Z").getAttribute("aria-expanded")).toBe("false");
@@ -129,7 +149,7 @@ describe("Documents mount", () => {
     const { fake } = backend(() => current);
     const root = document.createElement("div").attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
-    (root.querySelector('.document-title') as HTMLButtonElement).click();
+    (root.querySelector(`[data-tree-focus="document:select:${doc}"]`) as HTMLButtonElement).click();
     await tick();
     await opened(fake, { snapshot: ALL_NODES });
     const editor = root.querySelector('.ProseMirror');
@@ -398,7 +418,7 @@ describe("Documents mount", () => {
     await fake.emit("documents.changes", current);
     expect(texts(root, ".collection-button")).toEqual(["Planning", "Research"]);
     expect(root.querySelector(".collection-button")?.getAttribute("data-selected")).toBe("true");
-    expect(texts(root, ".document-title")).toEqual(["Q4 plan", "OKRs"]);
+    expect(texts(root, ".document-title")).toEqual(["OKRs", "Q4 plan"]);
     (root.querySelector('[aria-label="Actions for Q4 plan"]') as HTMLButtonElement).click();
     expect(root.querySelector(".document-move")).not.toBeNull();
     // A Collection this Installation created is selected once its record is listed.
@@ -411,7 +431,7 @@ describe("Documents mount", () => {
     current = { ...current, collections: [...current.collections, { id: "9".repeat(64), name: "Mine", archived: false }] };
     await fake.emit("documents.changes", current);
     expect(root.querySelector(".collection-button[data-selected=true]")?.textContent).toBe("Mine");
-    expect(texts(root, ".document-title")).toEqual(["Q4 plan", "OKRs"]);
+    expect(texts(root, ".document-title")).toEqual(["OKRs", "Q4 plan"]);
     expect(texts(root, ".documents-empty")).toEqual(["No documents yet."]);
     await unmount();
   });
@@ -764,7 +784,7 @@ describe("Documents mount", () => {
     }, subscriptions: { 'documents.changes': () => undefined, 'documents.document.session': () => undefined } });
     const root = document.createElement('div').attachShadow({ mode: 'open' });
     const unmount = await mount(createTestMountContext({ client: fake.client, root }));
-    (root.querySelector('.document-title') as HTMLButtonElement).click();
+    (root.querySelector(`[data-tree-focus="document:select:${doc}"]`) as HTMLButtonElement).click();
     await tick();
     await opened(fake);
     const composer = root.querySelector('.comment-input') as HTMLTextAreaElement;
@@ -778,7 +798,7 @@ describe("Documents mount", () => {
     expect(root.querySelector('.comment-input')).toBe(composer);
     expect(composer.value).toBe('Still writing');
     expect(root.querySelector('.comment-quote--draft')?.textContent).toContain('Replying to a comment');
-    (root.querySelectorAll('.document-title')[1] as HTMLButtonElement).click();
+    (root.querySelector(`[data-tree-focus="document:select:${other}"]`) as HTMLButtonElement).click();
     await tick();
     expect((root.querySelector('.comment-quote--draft') as HTMLElement).hidden).toBe(true);
     expect(root.querySelector('.comment-input')).toBe(composer);
