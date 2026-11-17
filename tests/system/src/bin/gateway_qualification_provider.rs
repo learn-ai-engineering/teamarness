@@ -124,6 +124,22 @@ async fn main() -> ExitCode {
             )
             .port_request(
                 contract,
+                "sample.raw",
+                "query",
+                |_: Context<Provider>, _: PortActor, _: Empty| async {
+                    Ok::<_, BackendError>(json!({"large":9007199254740993_u64,"maximum":u64::MAX,"nested":[null,false,{"version":"opaque:v7/+=not-a-counter"}]}))
+                },
+            )
+            .port_request(
+                contract,
+                "sample.refuse",
+                "command",
+                |_: Context<Provider>, _: PortActor, _: Empty| async {
+                    Err::<Value, _>(BackendError::new("proof.precondition", true, json!({"version":"opaque:v7/+=not-a-counter","nested":{"large":9007199254740993_u64},"reasons":["not-ready",null]})))
+                },
+            )
+            .port_request(
+                contract,
                 "added.read",
                 "query",
                 |_: Context<Provider>, _: PortActor, _: Empty| async {

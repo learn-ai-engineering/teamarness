@@ -1,5 +1,7 @@
 //! Explicit cross-repository proof. The external artifact must be freshly built by
 //! scripts/verify-external-gateway.mjs; default suites never depend on its presence.
+//! All live activations use separately admitted injected-home fixture bytes. Production
+//! dist is qualified offline and hashed unchanged; production-home behavior is manual M1.
 #![cfg(unix)]
 #[allow(dead_code)]
 mod support;
@@ -31,10 +33,48 @@ fn gateway_directory() -> PathBuf {
         std::env::var_os("TEAMARNESS_EXTERNAL_GATEWAY_PACKAGE_DIR")
             .expect("explicit qualification requires TEAMARNESS_EXTERNAL_GATEWAY_PACKAGE_DIR"),
     );
+    let root = PathBuf::from(
+        std::env::var_os("TEAMARNESS_FIXTURE_ROOT").expect("private fixture root required"),
+    );
+    assert_eq!(root.canonicalize().unwrap(), root);
+    assert_eq!(
+        root.metadata().unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
+    assert_ne!(
+        path,
+        PathBuf::from(
+            std::env::var_os("TEAMARNESS_EXTERNAL_GATEWAY_PRODUCTION_DIR")
+                .expect("production artifact evidence required")
+        )
+    );
     assert!(
         path.join("teamarness.package.json").is_file(),
         "missing assembled gateway manifest"
     );
+    let production =
+        PathBuf::from(std::env::var_os("TEAMARNESS_EXTERNAL_GATEWAY_PRODUCTION_DIR").unwrap());
+    assert_ne!(
+        path.canonicalize().unwrap(),
+        production.canonicalize().unwrap()
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(path.join("teamarness.package.json")).unwrap()).unwrap();
+    let original: Value =
+        serde_json::from_slice(&fs::read(production.join("teamarness.package.json")).unwrap())
+            .unwrap();
+    let fixture_hash = std::env::var("TEAMARNESS_EXTERNAL_GATEWAY_BACKEND_FIXTURE_HASH")
+        .expect("built fixture digest required before activation");
+    assert_eq!(manifest["backends"][0]["sha256"], fixture_hash);
+    assert_ne!(
+        manifest["backends"][0]["sha256"],
+        original["backends"][0]["sha256"]
+    );
+    assert_eq!(
+        digest(&fs::read(path.join(manifest["backends"][0]["path"].as_str().unwrap())).unwrap()),
+        fixture_hash
+    );
+
     path
 }
 async fn ui(host: &PackageHost, mount: &UiMountId, operation: &str, payload: Value) -> Value {
@@ -104,6 +144,10 @@ async fn select(host: &PackageHost, mount: &UiMountId, contract: &str, port: &st
     .await;
 }
 async fn http(port: u16, bearer: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    let (status, bytes) = http_raw(port, bearer, path, body).await;
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+async fn http_raw(port: u16, bearer: &str, path: &str, body: Option<Value>) -> (u16, Vec<u8>) {
     let body = body.map(|body| serde_json::to_vec(&body).unwrap());
     let mut wire = format!(
         "{} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {bearer}\r\n",
@@ -138,7 +182,7 @@ async fn http(port: u16, bearer: &str, path: &str, body: Option<Value>) -> (u16,
     );
     let response = (
         head.split_whitespace().nth(1).unwrap().parse().unwrap(),
-        serde_json::from_str(body).unwrap(),
+        body.as_bytes().to_vec(),
     );
     // negative-wait: client pacing at the documented 8 requests/second, not a readiness guess.
     tokio::time::sleep(Duration::from_millis(125)).await;
@@ -405,6 +449,8 @@ fn provider(root: &Path) {
     update_ports(root, |ports| {
         ports["contracts"][0]["ports"].as_array_mut().unwrap().push(json!({"name":"sample.wait","kind":"query","description":"A controlled pending read.","request":{"type":"object","additionalProperties":false},"response":{"type":"object"}}));
         ports["contracts"][0]["ports"].as_array_mut().unwrap().extend([
+            json!({"name":"sample.raw","kind":"query","description":"Independent exact raw JSON fixture.","request":{"type":"object","additionalProperties":false},"response":{"type":"object"}}),
+            json!({"name":"sample.refuse","kind":"command","description":"Independent detailed upstream refusal.","request":{"type":"object","additionalProperties":false},"response":{"type":"object"}}),
             json!({"name":"sample.events","kind":"event","description":"Held listener setup and controlled values.","event":{}}),
             json!({"name":"sample.stream","kind":"query","description":"Arbitrary streamed JSON with controlled terminal.","request":{"type":"object","additionalProperties":false},"event":{}}),
         ]);
@@ -1641,6 +1687,7 @@ struct GatewayProof {
     gateway: UiMountId,
     port: u16,
     bearer: String,
+    via_cli: bool,
 }
 impl GatewayProof {
     async fn new() -> Self {
@@ -1669,6 +1716,7 @@ impl GatewayProof {
             gateway,
             port,
             bearer,
+            via_cli: false,
         }
     }
     fn key(&self, identity: &str) -> PackageInstanceKey {
@@ -1683,6 +1731,26 @@ impl GatewayProof {
         }
     }
     async fn call(&self, contract: &str, major: u16, port: &str, request: Value) -> (u16, Value) {
+        if self.via_cli {
+            let (exit, bytes) = self
+                .cli(&[
+                    "call",
+                    contract,
+                    port,
+                    "--major",
+                    &major.to_string(),
+                    "--json",
+                    &request.to_string(),
+                ])
+                .await;
+            // Shared business assertions below use HTTP success/refusal classes. CLI
+            // exit itself is asserted separately, never claimed to be an HTTP status.
+            assert!([0, 1].contains(&exit));
+            return (
+                if exit == 0 { 200 } else { 400 },
+                serde_json::from_slice(&bytes).unwrap(),
+            );
+        }
         http(
             self.port,
             &self.bearer,
@@ -1696,9 +1764,255 @@ impl GatewayProof {
         assert_eq!(status, 200, "{port}: {body}");
         body["result"].clone()
     }
+    fn home(&self) -> PathBuf {
+        PathBuf::from(std::env::var_os("TEAMARNESS_FIXTURE_ROOT").unwrap()).join(digest(
+            self.core
+                .public_identity()
+                .to_string()
+                .to_lowercase()
+                .as_bytes(),
+        ))
+    }
+    fn connection_path(&self) -> PathBuf {
+        self.home()
+            .join(".local/share/teamarness/external-gateway")
+            .join(format!(
+                "{}.json",
+                digest(self.workspace.to_string().as_bytes())
+            ))
+    }
+    // Secret-bearing records stay inside private test memory; never Debug-print them.
+    fn connection(&self) -> Value {
+        serde_json::from_slice(&fs::read(self.connection_path()).unwrap()).unwrap()
+    }
+    fn cli_command(&self, installed: bool) -> tokio::process::Command {
+        let executable = if installed {
+            self.home().join(".local/bin/tmx")
+        } else {
+            PathBuf::from(
+                std::env::var_os("TEAMARNESS_EXTERNAL_GATEWAY_CLI_FIXTURE")
+                    .expect("built CLI fixture required"),
+            )
+        };
+        let mut command = tokio::process::Command::new(executable);
+        command
+            .env("TEAMARNESS_FIXTURE_HOME", self.home())
+            .env_remove("TEAMARNESS_FIXTURE_ROOT")
+            .arg("--workspace")
+            .arg(self.workspace.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        command
+    }
+    async fn cli(&self, args: &[&str]) -> (i32, Vec<u8>) {
+        let output = tokio::time::timeout(
+            Duration::from_secs(45),
+            self.cli_command(true).args(args).output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let secret = self.connection()["bearer"].as_str().unwrap().to_owned();
+        assert!(
+            !output
+                .stdout
+                .windows(secret.len())
+                .any(|w| w == secret.as_bytes())
+        );
+        assert!(
+            !output
+                .stderr
+                .windows(secret.len())
+                .any(|w| w == secret.as_bytes())
+        );
+        // negative-wait: two sockets per invocation, paced to documented 8/s admission.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        (output.status.code().unwrap(), output.stdout)
+    }
+    async fn managed() -> Self {
+        let mut proof = Self::new().await;
+        let before = ui(
+            &proof.host,
+            &proof.gateway,
+            "external-gateway.status.get",
+            json!({}),
+        )
+        .await;
+        setup(&proof.host, &proof.gateway, "connect").await;
+        let after = ui(
+            &proof.host,
+            &proof.gateway,
+            "external-gateway.status.get",
+            json!({}),
+        )
+        .await;
+        for field in [
+            "port",
+            "desiredEnabled",
+            "running",
+            "selectedContracts",
+            "selectedTools",
+        ] {
+            assert_eq!(
+                before[field], after[field],
+                "setup must not add grants or start/change the listener"
+            );
+        }
+        assert_eq!(
+            after["tokens"].as_array().unwrap().len(),
+            before["tokens"].as_array().unwrap().len() + 1
+        );
+        proof.via_cli = true;
+        proof
+    }
+    async fn subscribe(
+        &self,
+        contract: &str,
+        major: u16,
+        port: &str,
+        request: Value,
+        lifetime: &[&str],
+    ) -> CliStream {
+        // negative-wait: opening uses two sockets; preserve documented 8/s admission.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut child = self
+            .cli_command(true)
+            .args([
+                "subscribe",
+                contract,
+                port,
+                "--major",
+                &major.to_string(),
+                "--json",
+                &request.to_string(),
+            ])
+            .args(lifetime)
+            .spawn()
+            .unwrap();
+        let lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        CliStream { child, lines }
+    }
     async fn finish(self) {
         shutdown(self.host).await;
         self.core.shutdown().await.unwrap();
+    }
+}
+
+async fn proof_request_error(
+    host: &PackageHost,
+    mount: &UiMountId,
+    operation: &str,
+    payload: Value,
+) -> teamarness_package_host::PackageErrorEnvelope {
+    host.execute(PackageHostCommand::UiRequest(
+        teamarness_package_host::UiRequest {
+            mount: mount.clone(),
+            request: teamarness_package_host::UiRequestId::new("expected-refusal").unwrap(),
+            operation: operation.into(),
+            payload: serde_json::from_value(payload).unwrap(),
+        },
+    ))
+    .await
+    .unwrap_err()
+}
+
+/// Typed setup is observed separately from acceptance, through the real mounted Backend.
+async fn setup(host: &PackageHost, mount: &UiMountId, intent: &str) -> Value {
+    let preview = ui(
+        host,
+        mount,
+        "external-gateway.setup.preview",
+        json!({"intent":intent}),
+    )
+    .await;
+    let accepted = ui(
+        host,
+        mount,
+        "external-gateway.setup.apply",
+        json!({"planId":preview["planId"]}),
+    )
+    .await;
+    assert_eq!(
+        ui(
+            host,
+            mount,
+            "external-gateway.setup.apply",
+            json!({"planId":preview["planId"]})
+        )
+        .await,
+        accepted
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status = ui(host, mount, "external-gateway.setup.status", json!({})).await;
+            if !["accepted", "prepared", "outputs", "committed"]
+                .contains(&status["phase"].as_str().unwrap())
+            {
+                assert_eq!(status["phase"], "complete", "{status}");
+                return status;
+            }
+            // poll-interval: status, not elapsed time, determines completion under the outer deadline.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("bounded real setup completion")
+}
+
+struct CliStream {
+    child: tokio::process::Child,
+    lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+}
+impl CliStream {
+    async fn next(&mut self) -> Option<Value> {
+        tokio::time::timeout(Duration::from_secs(20), self.lines.next_line())
+            .await
+            .expect("bounded CLI frame")
+            .unwrap()
+            .map(|line| serde_json::from_str(&line).unwrap())
+    }
+    async fn ready(&mut self, contract: &str, port: &str, kind: &str, major: u16) {
+        assert_eq!(
+            self.next().await,
+            Some(
+                json!({"type":"ready","contract":contract,"major":major,"port":port,"kind":kind,"delivery":"stream"})
+            )
+        );
+    }
+    async fn ended(self, success: bool) {
+        self.ended_with_pending_invalidation(success, false).await;
+    }
+    async fn ended_with_pending_invalidation(mut self, success: bool, pending: bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match self.next().await {
+                    Some(frame) if frame["type"] == "heartbeat" => continue,
+                    Some(frame) if frame["type"] == "value" && pending => {
+                        // Backlog invalidations are coalescible, not a write counter.
+                        // Only already-admitted empty values may precede idle closure.
+                        assert_eq!(frame["value"], json!({}));
+                    }
+                    Some(frame) => {
+                        assert!(
+                            ["end", "client_end", "client_error"]
+                                .contains(&frame["type"].as_str().unwrap()),
+                            "{frame}"
+                        );
+                        break;
+                    }
+                    None => panic!("CLI must deliver a terminal while stdout remains available"),
+                }
+            }
+            assert_eq!(self.child.wait().await.unwrap().success(), success);
+            assert!(
+                self.next().await.is_none(),
+                "no reconnect or second terminal"
+            );
+        })
+        .await
+        .expect("idle CLI closure, including queued invalidations, within five seconds");
     }
 }
 
@@ -1835,7 +2149,10 @@ async fn unknown_provider_confirmed_setup_is_held_until_listener_registration() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "requires freshly built TEAMARNESS_EXTERNAL_GATEWAY_PACKAGE_DIR; run scripts/verify-external-gateway.mjs"]
 async fn real_ticket_writes_conflicts_and_backlog_event_follow_confirmed_ready() {
-    let proof = GatewayProof::new().await;
+    ticket_write_assertions(GatewayProof::new().await).await;
+}
+
+async fn ticket_write_assertions(proof: GatewayProof) {
     let native = open_mount(&proof.host, &proof.key(BACKLOG)).await;
     // Epic creation remains native, not a gateway business operation.
     let epic = ui(
@@ -1873,6 +2190,21 @@ async fn real_ticket_writes_conflicts_and_backlog_event_follow_confirmed_ready()
     .await;
     let mut stream = Ndjson::established(socket).await;
     stream.ready(BACKLOG, "backlog.changed", "event").await;
+    let mut cli_event = if proof.via_cli {
+        let mut event = proof
+            .subscribe(
+                BACKLOG,
+                1,
+                "backlog.changed",
+                Value::Null,
+                &["--until-cancelled"],
+            )
+            .await;
+        event.ready(BACKLOG, "backlog.changed", "event", 1).await;
+        Some(event)
+    } else {
+        None
+    };
     // Initial read follows confirmed ready. The next change needs no prior event.
     let current = proof
         .result(
@@ -1891,6 +2223,9 @@ async fn real_ticket_writes_conflicts_and_backlog_event_follow_confirmed_ready()
         stream.next().await,
         Some(json!({"type":"value","value":{}}))
     );
+    if let Some(event) = &mut cli_event {
+        assert_eq!(event.next().await, Some(json!({"type":"value","value":{}})));
+    }
     let maintained = proof
         .result(
             BACKLOG,
@@ -1938,6 +2273,11 @@ async fn real_ticket_writes_conflicts_and_backlog_event_follow_confirmed_ready()
         .unwrap();
     ui(&proof.host, &proof.gateway, "external-gateway.tool.set", json!({"contract":BACKLOG,"major":1,"provider":BACKLOG,"port":"backlog.changed","fingerprint":event["fingerprint"],"enabled":false})).await;
     assert_stream_closed(&mut stream).await;
+    if let Some(event) = cli_event {
+        // Invalidations can coalesce or repeat while projections catch up; they
+        // are not a write counter. Assert empty payloads and bounded idle closure.
+        event.ended_with_pending_invalidation(false, true).await;
+    }
     assert_eq!(
         proof
             .result(
@@ -2003,9 +2343,12 @@ async fn assert_stream_closed(stream: &mut Ndjson) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "requires freshly built TEAMARNESS_EXTERNAL_GATEWAY_PACKAGE_DIR; run scripts/verify-external-gateway.mjs"]
 async fn real_document_create_then_revise_preserves_opaque_versions_and_person_records() {
+    document_write_assertions(GatewayProof::new().await).await;
+}
+
+async fn document_write_assertions(proof: GatewayProof) {
     use support::harness::{PackageStage, stage_package_with};
     const DOCUMENTS: &str = "dev.teamarness.documents";
-    let proof = GatewayProof::new().await;
     let app = stage_package_with(&proof.profile.join("documents"), &PackageStage::documents());
     install(&proof.host, app.join(DOCUMENTS), DOCUMENTS).await;
     let native = open_mount(&proof.host, &proof.key(DOCUMENTS)).await;
@@ -2094,9 +2437,12 @@ async fn real_document_create_then_revise_preserves_opaque_versions_and_person_r
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "requires freshly built TEAMARNESS_EXTERNAL_GATEWAY_PACKAGE_DIR; run scripts/verify-external-gateway.mjs"]
 async fn real_draft_text_and_128kib_binary_updates_preserve_revision_conflict_details() {
+    draft_write_assertions(GatewayProof::new().await).await;
+}
+
+async fn draft_write_assertions(proof: GatewayProof) {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     const EXHIBITS: &str = "dev.teamarness.exhibits";
-    let proof = GatewayProof::new().await;
     support::harness::stage_exhibits(&proof.profile.join("application"));
     install(
         &proof.host,
@@ -2500,5 +2846,666 @@ async fn held_command_observer_loss_and_policy_change_execute_once_with_host_per
         1,
         "reconciliation never replays the command"
     );
+    proof.finish().await;
+}
+
+// Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires freshly built isolated fixtures; run scripts/verify-external-gateway.mjs"]
+async fn cli_setup_round_trip_and_rotation_recover_through_real_host() {
+    use teamarness_package_host::RestartPersonal;
+    let mut proof = GatewayProof::managed().await;
+    assert!(
+        proof
+            .core
+            .bound_agent(proof.workspace, GATEWAY)
+            .unwrap()
+            .is_none()
+    );
+    let initial = proof.connection();
+    assert_eq!(
+        proof.home().metadata().unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
+    assert_eq!(
+        proof
+            .connection_path()
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+    let admitted: Value = serde_json::from_slice(
+        &fs::read(gateway_directory().join("teamarness.package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        digest(&fs::read(proof.home().join(".local/bin/tmx")).unwrap()),
+        admitted["backends"][0]["sha256"]
+    );
+    let output = tokio::process::Command::new(proof.home().join(".local/bin/tmx"))
+        .env("TEAMARNESS_FIXTURE_HOME", proof.home())
+        .env_remove("TEAMARNESS_FIXTURE_ROOT")
+        .arg("workspaces")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let listing: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        listing,
+        json!({"workspaces":[{"id":proof.workspace.to_string(),"name":"Confirmed gateway proof","port":proof.port}]})
+    );
+    assert_eq!(proof.cli(&["status"]).await.0, 0);
+    proof.select(BACKLOG, &["ticket.list"]).await;
+    assert_eq!(
+        proof.result(BACKLOG, 1, "ticket.list", json!({})).await["tickets"],
+        json!([])
+    );
+    // The distinct CLI fixture links the same library and sees the exact managed record.
+    assert!(
+        proof
+            .cli_command(false)
+            .arg("status")
+            .output()
+            .await
+            .unwrap()
+            .status
+            .success()
+    );
+    proof
+        .host
+        .execute(PackageHostCommand::RestartPersonal(RestartPersonal {
+            instance: proof.key(GATEWAY),
+        }))
+        .await
+        .unwrap();
+    proof.gateway = open_mount(&proof.host, &proof.key(GATEWAY)).await;
+    assert_eq!(proof.cli(&["status"]).await.0, 0);
+    assert!(
+        proof.connection()["bearer"] == initial["bearer"],
+        "restart must not rotate"
+    );
+    setup(&proof.host, &proof.gateway, "rotate").await;
+    let rotated = proof.connection();
+    assert_eq!(rotated["tokenId"], initial["tokenId"]);
+    assert_eq!(
+        rotated["generation"].as_u64().unwrap(),
+        initial["generation"].as_u64().unwrap() + 1
+    );
+    assert!(
+        rotated["bearer"] != initial["bearer"],
+        "no overlapping generation"
+    );
+    assert_eq!(
+        http(proof.port, initial["bearer"].as_str().unwrap(), "/v1", None)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        http(proof.port, &proof.bearer, "/v1", None).await.0,
+        200,
+        "manual token survives"
+    );
+    assert_eq!(proof.cli(&["status"]).await.0, 0);
+    // Same Installation, same Workspace, a different physical profile is a conflict.
+    let application = stage_backlog(&proof.profile.join("duplicate"));
+    let duplicate = open_host(
+        &application,
+        proof.profile.join("duplicate-host"),
+        proof.core.clone(),
+    )
+    .await;
+    install(&duplicate, gateway_directory(), GATEWAY).await;
+    let other = open_mount(&duplicate, &proof.key(GATEWAY)).await;
+    endpoint(&duplicate, &other).await;
+    let error = proof_request_error(
+        &duplicate,
+        &other,
+        "external-gateway.setup.preview",
+        json!({"intent":"connect"}),
+    )
+    .await;
+    assert_eq!(
+        error.package_error.unwrap().code,
+        "external_gateway.connection_origin_conflict"
+    );
+    assert!(
+        proof.connection()["bearer"] == rotated["bearer"],
+        "conflict preserves credential"
+    );
+    shutdown(duplicate).await;
+    setup(&proof.host, &proof.gateway, "disconnect").await;
+    assert!(!proof.connection_path().exists());
+    assert_eq!(
+        http(proof.port, rotated["bearer"].as_str().unwrap(), "/v1", None)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(http(proof.port, &proof.bearer, "/v1", None).await.0, 200);
+    proof
+        .host
+        .execute(PackageHostCommand::RestartPersonal(RestartPersonal {
+            instance: proof.key(GATEWAY),
+        }))
+        .await
+        .unwrap();
+    assert!(
+        !proof.connection_path().exists(),
+        "restart cannot recreate disconnected access"
+    );
+    let output = proof
+        .cli_command(true)
+        .arg("status")
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    proof.finish().await;
+}
+
+// Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires freshly built isolated fixtures; run scripts/verify-external-gateway.mjs"]
+async fn cli_discovers_unknown_provider_and_all_four_shapes() {
+    use support::harness::QUALIFICATION;
+    let proof = GatewayProof::managed().await;
+    let before = gateway_artifacts();
+    let (exit, page) = proof.cli(&["contracts"]).await;
+    assert_eq!(exit, 0);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&page).unwrap()["contracts"],
+        json!([])
+    );
+    let filler = proof.profile.join("filler");
+    provider(&filler);
+    update_ports(&filler, |ports| {
+        let template = ports["contracts"][0].clone();
+        ports["contracts"] = (0..32)
+            .map(|index| {
+                let mut row = template.clone();
+                row["identity"] = format!("dev.example.page-{index:02}").into();
+                row
+            })
+            .collect::<Vec<_>>()
+            .into();
+    });
+    let manifest = filler.join("teamarness.package.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    value["identity"] = "dev.example.pagination-provider".into();
+    fs::write(manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    install(&proof.host, filler, "dev.example.pagination-provider").await;
+    let unknown = proof.profile.join("new-provider");
+    provider(&unknown);
+    install(&proof.host, unknown, QUALIFICATION).await;
+    let control = open_mount(&proof.host, &proof.key(QUALIFICATION)).await;
+    proof
+        .select(
+            QUALIFICATION,
+            &[
+                "sample.read",
+                "sample.write",
+                "sample.stream",
+                "sample.events",
+            ],
+        )
+        .await;
+    let (exit, bytes) = proof.cli(&["contracts"]).await;
+    assert_eq!(exit, 0);
+    let first: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(first["contracts"], json!([]));
+    let mut cursor = first["nextCursor"].clone();
+    assert!(cursor.is_string(), "empty filtered page is not completion");
+    let mut found = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..4 {
+        let text = cursor.as_str().unwrap();
+        assert!(seen.insert(text.to_owned()));
+        let (exit, bytes) = proof.cli(&["contracts", "--cursor", text]).await;
+        assert_eq!(exit, 0);
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        found.extend(page["contracts"].as_array().unwrap().iter().cloned());
+        cursor = page["nextCursor"].clone();
+        if cursor.is_null() {
+            break;
+        }
+    }
+    assert!(cursor.is_null());
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0]["contract"], QUALIFICATION);
+    for command in ["schema", "guide"] {
+        let (exit, bytes) = proof.cli(&[command, QUALIFICATION, "--major", "3"]).await;
+        assert_eq!(exit, 0);
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        if command == "schema" {
+            assert_schema_references(&result["schema"], &result["schema"]);
+            assert_eq!(
+                result["schema"]["contracts"][0]["ports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                [
+                    "runtime.guide",
+                    "sample.events",
+                    "sample.read",
+                    "sample.stream",
+                    "sample.write"
+                ]
+            );
+        } else {
+            assert!(result.to_string().contains("offset seven"));
+        }
+    }
+    assert_eq!(
+        proof
+            .result(QUALIFICATION, 3, "sample.read", json!({"offset":7}))
+            .await,
+        json!({"answer":42,"actor":{"kind":"person","identity":proof.core.public_identity().to_string()}})
+    );
+    assert_eq!(
+        proof
+            .result(QUALIFICATION, 3, "sample.write", json!({"value":"once"}))
+            .await,
+        json!({"written":true})
+    );
+    let mut live = proof
+        .subscribe(
+            QUALIFICATION,
+            3,
+            "sample.stream",
+            json!({}),
+            &["--for", "10s", "--max-events", "1"],
+        )
+        .await;
+    live.ready(QUALIFICATION, "sample.stream", "query", 3).await;
+    ui(
+        &proof.host,
+        &control,
+        "proof.emit",
+        json!({"value":[null,false,{"nested":42}]}),
+    )
+    .await;
+    assert_eq!(
+        live.next().await,
+        Some(json!({"type":"value","value":[null,false,{"nested":42}]}))
+    );
+    assert_eq!(live.next().await.unwrap()["reason"], "event_limit");
+    assert!(live.child.wait().await.unwrap().success());
+    assert!(live.next().await.is_none());
+    ui(&proof.host, &control, "proof.release", json!({})).await;
+    let mut event = proof
+        .subscribe(
+            QUALIFICATION,
+            3,
+            "sample.events",
+            Value::Null,
+            &["--until-cancelled"],
+        )
+        .await;
+    event
+        .ready(QUALIFICATION, "sample.events", "event", 3)
+        .await;
+    ui(
+        &proof.host,
+        &control,
+        "proof.emit",
+        json!({"value":"actual event"}),
+    )
+    .await;
+    assert_eq!(
+        event.next().await,
+        Some(json!({"type":"value","value":"actual event"}))
+    );
+    ui(&proof.host, &control, "proof.end", json!({"error":false})).await;
+    event.ended(true).await;
+    assert_eq!(
+        ui(&proof.host, &control, "proof.status", json!({})).await["writes"],
+        1
+    );
+    assert_eq!(gateway_artifacts(), before, "no Provider allowlist rebuild");
+    proof.finish().await;
+}
+
+// Verifies: TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14, TEAM.SYS.PKG-R18
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires freshly built isolated fixtures; run scripts/verify-external-gateway.mjs"]
+async fn cli_preserves_real_provider_results_errors_and_versions() {
+    // The same independent business expectations run once through raw HTTP above,
+    // and again through real managed CLI subprocesses here, with fresh real Providers.
+    ticket_write_assertions(GatewayProof::managed().await).await;
+    document_write_assertions(GatewayProof::managed().await).await;
+    draft_write_assertions(GatewayProof::managed().await).await;
+    use support::harness::QUALIFICATION;
+    let proof = GatewayProof::managed().await;
+    let path = proof.profile.join("raw-provider");
+    provider(&path);
+    install(&proof.host, path, QUALIFICATION).await;
+    proof
+        .select(QUALIFICATION, &["sample.raw", "sample.refuse"])
+        .await;
+    let expected = json!({"result":{"large":9007199254740993_u64,"maximum":u64::MAX,"nested":[null,false,{"version":"opaque:v7/+=not-a-counter"}]}});
+    let (exit, bytes) = proof
+        .cli(&[
+            "call",
+            QUALIFICATION,
+            "sample.raw",
+            "--major",
+            "3",
+            "--json",
+            "{}",
+        ])
+        .await;
+    assert_eq!(exit, 0);
+    let (_, raw_bytes) = http_raw(
+        proof.port,
+        &proof.bearer,
+        "/v1/call",
+        Some(call(QUALIFICATION, 3, "sample.raw", json!({}))),
+    )
+    .await;
+    assert_eq!(bytes.strip_suffix(b"\n").unwrap_or(&bytes), raw_bytes);
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
+    assert!(
+        std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("9007199254740993")
+    );
+    assert_eq!(
+        http(
+            proof.port,
+            &proof.bearer,
+            "/v1/call",
+            Some(call(QUALIFICATION, 3, "sample.raw", json!({})))
+        )
+        .await
+        .1,
+        expected
+    );
+    let (_, raw_bytes) = http_raw(
+        proof.port,
+        &proof.bearer,
+        "/v1/call",
+        Some(call(QUALIFICATION, 3, "sample.refuse", json!({}))),
+    )
+    .await;
+    let raw: Value = serde_json::from_slice(&raw_bytes).unwrap();
+    let (exit, bytes) = proof
+        .cli(&[
+            "call",
+            QUALIFICATION,
+            "sample.refuse",
+            "--major",
+            "3",
+            "--json",
+            "{}",
+        ])
+        .await;
+    assert_eq!(exit, 1);
+    assert_eq!(bytes.strip_suffix(b"\n").unwrap_or(&bytes), raw_bytes);
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), raw);
+    assert_eq!(
+        raw["error"],
+        json!({"source":"provider","code":"proof.precondition","retryable":true,"outcomeUncertain":false,"details":{"version":"opaque:v7/+=not-a-counter","nested":{"large":9007199254740993_u64},"reasons":["not-ready",null]}})
+    );
+    // A real signal after Provider admission is uncertain, never a safe replay.
+    proof.select(QUALIFICATION, &["sample.write"]).await;
+    let control = open_mount(&proof.host, &proof.key(QUALIFICATION)).await;
+    let child = proof
+        .cli_command(true)
+        .args([
+            "call",
+            QUALIFICATION,
+            "sample.write",
+            "--major",
+            "3",
+            "--json",
+            "{\"value\":\"held\"}",
+        ])
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert!(
+        support::harness::poll_short(|| async {
+            ui(&proof.host, &control, "proof.status", json!({})).await["commandWaiting"] == 1
+        })
+        .await
+    );
+    assert!(
+        tokio::process::Command::new("/bin/kill")
+            .args(["-INT", &pid.to_string()])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    let uncertain: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(uncertain["error"]["code"], "cli.command_outcome_unknown");
+    assert_eq!(uncertain["error"]["outcomeUncertain"], true);
+    assert_eq!(uncertain["error"]["retryable"], false);
+    ui(&proof.host, &control, "proof.command-release", json!({})).await;
+    assert!(
+        support::harness::poll_short(|| async {
+            ui(&proof.host, &control, "proof.status", json!({})).await["rows"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await
+    );
+    assert_eq!(
+        ui(&proof.host, &control, "proof.status", json!({})).await["writes"],
+        1
+    );
+    proof.finish().await;
+}
+
+// Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R13, TEAM.SYS.PKG-R14
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "requires freshly built isolated fixtures; run scripts/verify-external-gateway.mjs"]
+async fn cli_stream_lifecycle_and_idle_revocation() {
+    use teamarness_package_host::{RecoverPackage, SuspendPackage};
+    let mut proof = GatewayProof::managed().await;
+    proof
+        .select(BACKLOG, &["ticket.list", "backlog.changed"])
+        .await;
+    let second = proof
+        .core
+        .create_workspace("Unaffected CLI Workspace")
+        .unwrap()
+        .id();
+    proof
+        .host
+        .execute(PackageHostCommand::ReconcileWorkspaces(
+            teamarness_package_host::ReconcileWorkspaces {},
+        ))
+        .await
+        .unwrap();
+    let other_key = PackageInstanceKey::new(
+        GATEWAY.parse().unwrap(),
+        WorkspaceId::new(second.to_string()).unwrap(),
+    );
+    let other_mount = open_mount(&proof.host, &other_key).await;
+    let (other_port, other_bearer) = endpoint(&proof.host, &other_mount).await;
+    setup(&proof.host, &other_mount, "connect").await;
+    assert!(
+        proof
+            .home()
+            .join(".local/share/teamarness/external-gateway")
+            .join(format!("{}.json", digest(second.to_string().as_bytes())))
+            .is_file(),
+        "Workspaces of one Installation share the same private client home"
+    );
+    let command_hash = digest(&fs::read(proof.home().join(".local/bin/tmx")).unwrap());
+    let mut finite = proof
+        .subscribe(
+            BACKLOG,
+            1,
+            "backlog.changed",
+            Value::Null,
+            &["--for", "50ms"],
+        )
+        .await;
+    finite.ready(BACKLOG, "backlog.changed", "event", 1).await;
+    assert_eq!(
+        finite.next().await.unwrap(),
+        json!({"type":"client_end","reason":"duration_limit"})
+    );
+    assert!(finite.child.wait().await.unwrap().success());
+    assert!(finite.next().await.is_none());
+    for action in [
+        "rotate",
+        "revoke",
+        "tool-disable",
+        "pause",
+        "reload",
+        "stop",
+        "disconnect",
+    ] {
+        let before = proof.connection();
+        let mut stream = proof
+            .subscribe(
+                BACKLOG,
+                1,
+                "backlog.changed",
+                Value::Null,
+                &["--until-cancelled"],
+            )
+            .await;
+        stream.ready(BACKLOG, "backlog.changed", "event", 1).await;
+        // No Provider value or heartbeat is needed for any idle closure.
+        match action {
+            "rotate" | "disconnect" => {
+                setup(&proof.host, &proof.gateway, action).await;
+            }
+            "revoke" => {
+                ui(
+                    &proof.host,
+                    &proof.gateway,
+                    "external-gateway.token.revoke",
+                    json!({"id":before["tokenId"]}),
+                )
+                .await;
+            }
+            "tool-disable" => {
+                let page = ui(
+                    &proof.host,
+                    &proof.gateway,
+                    "external-gateway.catalog.page",
+                    json!({"contract":BACKLOG}),
+                )
+                .await;
+                let event = page["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|t| t["port"] == "backlog.changed")
+                    .unwrap();
+                ui(&proof.host, &proof.gateway, "external-gateway.tool.set", json!({"contract":BACKLOG,"major":1,"provider":BACKLOG,"port":"backlog.changed","fingerprint":event["fingerprint"],"enabled":false})).await;
+            }
+            "pause" => {
+                proof
+                    .host
+                    .execute(PackageHostCommand::Suspend(SuspendPackage {
+                        instance: proof.key(GATEWAY),
+                    }))
+                    .await
+                    .unwrap();
+            }
+            "reload" => reload(&proof.host, GATEWAY).await,
+            "stop" => {
+                ui(
+                    &proof.host,
+                    &proof.gateway,
+                    "external-gateway.listener.set",
+                    json!({"enabled":false}),
+                )
+                .await;
+            }
+            _ => unreachable!(),
+        }
+        stream.ended(false).await;
+        assert_eq!(
+            http(other_port, &other_bearer, "/v1", None).await.0,
+            200,
+            "other Workspace survives {action}"
+        );
+        if action == "pause" {
+            proof
+                .host
+                .execute(PackageHostCommand::Recover(RecoverPackage {
+                    instance: proof.key(GATEWAY),
+                }))
+                .await
+                .unwrap();
+        }
+        if ["pause", "reload"].contains(&action) {
+            proof.gateway = open_mount(&proof.host, &proof.key(GATEWAY)).await;
+        }
+        if action == "stop" {
+            assert!(TcpStream::connect(("127.0.0.1", proof.port)).await.is_err());
+            ui(
+                &proof.host,
+                &proof.gateway,
+                "external-gateway.listener.set",
+                json!({"enabled":true}),
+            )
+            .await;
+        }
+        assert_eq!(
+            http(proof.port, &proof.bearer, "/v1", None).await.0,
+            200,
+            "unrelated manual token survives {action}"
+        );
+        if ["rotate", "revoke", "disconnect"].contains(&action) {
+            assert_eq!(
+                http(proof.port, before["bearer"].as_str().unwrap(), "/v1", None)
+                    .await
+                    .0,
+                401
+            );
+        }
+        if action == "rotate" {
+            assert_eq!(
+                proof.connection()["generation"].as_u64().unwrap(),
+                before["generation"].as_u64().unwrap() + 1
+            );
+        }
+        if action == "revoke" {
+            reload(&proof.host, GATEWAY).await;
+            proof.gateway = open_mount(&proof.host, &proof.key(GATEWAY)).await;
+            assert!(
+                proof.connection()["bearer"] == before["bearer"],
+                "activation cannot mint access after revoke"
+            );
+            assert_eq!(proof.cli(&["status"]).await.0, 1);
+            setup(&proof.host, &proof.gateway, "connect").await; // New explicit credential consent.
+        }
+        if action == "tool-disable" {
+            assert_eq!(
+                proof.result(BACKLOG, 1, "ticket.list", json!({})).await["tickets"],
+                json!([])
+            );
+            proof.select(BACKLOG, &["backlog.changed"]).await;
+        }
+        assert_eq!(
+            digest(&fs::read(proof.home().join(".local/bin/tmx")).unwrap()),
+            command_hash
+        );
+    }
+    assert!(!proof.connection_path().exists());
     proof.finish().await;
 }

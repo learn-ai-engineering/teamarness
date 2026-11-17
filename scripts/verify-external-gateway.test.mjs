@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseArgs, requireExecutedTests, validateProvenance } from "./verify-external-gateway.mjs";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parseArgs, qualify, requireExecutedTests, validateProvenance } from "./verify-external-gateway.mjs";
 
 // Verifies: TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R13 — explicit artifacts, never a silent skip.
 test("qualification requires exactly one explicit project", () => {
@@ -23,4 +27,21 @@ test("SDK provenance must be clean and all four exact vendor trees must agree", 
   assert.throws(() => validateProvenance({ ...provenance, sdkRevision: "HEAD" }, report), /revision/);
   assert.throws(() => validateProvenance(provenance, { trees: {} }), /vendor/);
   assert.throws(() => validateProvenance({ ...provenance, vendorDigests: {} }, report), /vendor/);
+});
+test("qualification counts every discovered test and rejects mixed or incomplete reports", () => {
+  const summary = "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;";
+  assert.throws(() => requireExecutedTests(summary, ["first", "second"]), /every/);
+  assert.throws(() => requireExecutedTests(`test first ... ok\n${summary}`, ["first", "second"]), /every/);
+  assert.equal(requireExecutedTests(`test first ... ok\ntest second ... ok\n${summary}`, ["first", "second"]), 2);
+  assert.throws(() => requireExecutedTests(`${summary}\ntest result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out;`), /executed/);
+  assert.throws(() => requireExecutedTests("test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out;"), /executed/);
+});
+
+test("dirty gateway source is refused before any build or activation", async () => {
+  const project = await mkdtemp(join(tmpdir(), "gateway-runner-guard-"));
+  try {
+    assert.equal(spawnSync("git", ["init", "--quiet", project]).status, 0);
+    await writeFile(join(project, "untracked-source"), "dirty");
+    await assert.rejects(qualify(project), /source must be clean before build/);
+  } finally { await rm(project, { recursive: true, force: true }); }
 });

@@ -132,3 +132,22 @@ main mount with its own declared settings destination available. It SHALL carry 
 selector and SHALL add no Backend operation, Tauri command or Semantic Capability. A settings
 mount and an unavailable context SHALL omit it. The intent SHALL not return a promise that
 outlives destruction of its own frame (ADRs 0015, 0037, 0043).
+
+
+**Onboarding qualification (not installed acceptance):** The explicit paired runner
+`node scripts/verify-external-gateway.mjs --project <clean standalone G>` extends
+`tests/system/tests/external_gateway_flow.rs` with managed setup/rotation/restart/
+disconnect, live-added guided Provider discovery/all four shapes, real Backlog,
+Documents and Exhibit writes/conflicts/versions, and idle CLI lifecycle denial.
+Every live Gateway activation uses separately hashed/admitted fixture bytes with
+mandatory injected private homes; production activation automatically resolves the
+OS user's home and is deliberately not run under the developer's ordinary account.
+The final production Package is freshly built, offline-qualified and hashed before
+and after the live cases; fixture hashes never stand in for production hashes.
+The runner discovers and executes all external cases with zero ignored/filtered
+results and records truthful source/SDK/lock/artifact provenance. These checks do
+not qualify acquired signing/quarantine, production-home installation, AppKit focus,
+actual agent discovery/lifetime, or packaged frame isolation. Don-owned M1–M5 in
+[the runbook](../../../docs/test-external-gateway-onboarding.md) remain pending;
+the unchanged packaged native/isolation smoke remains blocked under the accepted
+execution addendum, not passed or waived. Fresh independent Verify is required.
