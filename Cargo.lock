@@ -8652,6 +8652,7 @@ dependencies = [
  "teamarness-core",
  "teamarness-documents-package",
  "teamarness-exhibits-package",
+ "teamarness-headless",
  "teamarness-package-host",
  "teamarness-package-protocol",
  "teamarness-package-sdk",

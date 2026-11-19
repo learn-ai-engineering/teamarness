@@ -105,34 +105,10 @@ pub fn bundle(fixture: &super::Fixture) {
 }
 
 pub fn request_contract() -> serde_json::Value {
-    let empty = json!({"type":"object","additionalProperties":false});
-    let settings = json!({"type":"object","properties":{"value":{"type":"string","maxLength":262132}},"required":["value"],"additionalProperties":false});
-    let mut requests = serde_json::Map::new();
-    for name in [
-        "proof.settings.get",
-        "proof.status",
-        "proof.secret",
-        "proof.error",
-        "proof.invalid",
-        "proof.binding.current",
-        "proof.binding.clear",
-    ] {
-        requests.insert(
-            name.into(),
-            json!({"request":empty,"response":{"type":"object"}}),
-        );
-    }
-    requests["proof.settings.get"]["response"] = json!({"$ref":"#/$defs/settings"});
-    requests["proof.invalid"]["response"] = settings.clone();
-    requests["proof.secret"]["response"] = json!({"type":"object","required":["secret"],"additionalProperties":false,"properties":{"secret":{"type":["string","null"],"maxLength":64}}});
-    requests.insert(
-        "proof.settings.set".into(),
-        json!({"request":{"$ref":"#/$defs/settings"},"response":{"$ref":"#/$defs/settings"}}),
-    );
-    requests.insert("proof.mutate".into(), json!({"request":{"type":"object","additionalProperties":false,"required":["delayMs"],"properties":{"delayMs":{"type":"integer","minimum":0,"maximum":5000}}},"response":{"type":"object"}}));
-    requests.insert("proof.binding.set".into(), json!({"request":{"type":"object","additionalProperties":false,"required":["principalId"],"properties":{"principalId":{"type":"string","pattern":"^[a-f0-9]{64}$"}}},"response":{"type":"object"}}));
-    json!({"schemaVersion":1,"$defs":{"settings":settings,"unused":{"type":"string","description":"complete definitions retained"}},"requests":requests,
-        "subscriptions":{"proof.watch":{"request":empty,"event":{"$ref":"#/$defs/settings"}}}})
+    serde_json::from_str(include_str!(
+        "../../../../tests/system/fixtures/headless-personal-ui-contract.json"
+    ))
+    .unwrap()
 }
 
 pub fn write_contract(directory: &Path, document: &serde_json::Value) -> String {

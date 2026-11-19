@@ -71,7 +71,13 @@ path = "src/bin/gateway_qualification_provider.rs"
 # The optional standalone Agent is qualified through an explicitly supplied Package Directory;
 # it is not a source dependency or prerequisite of the default Teamarness suite.
 
+# Source-current production CLI, built with every system test target.
+[[bin]]
+name = "headless-cli-under-test"
+path = "../../apps/teamarness-headless/src/main.rs"
+
 [dependencies]
+teamarness-headless = { path = "../../apps/teamarness-headless" }
 base64.workspace = true
 teamarness-backlog-package = { path = "../../packages/backlog-package/backend" }
 teamarness-conversations-package = { path = "../../packages/conversations-package/backend" }

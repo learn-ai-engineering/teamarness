@@ -2,6 +2,8 @@
 
 Use the headless application as a continuously available peer without a graphical session. It uses the same Core Runtime and Package Host as desktop. Agent and External Gateway source, artifacts, and registrations are not required. They remain independent Personal Packages; their native product compatibility is not established by this application build.
 
+Use the [canonical verification runbook](verification.md) for source-current loopback tests, final Mac M, native Ubuntu N, and Don's M1–M5 observations. Independent Package work starts from the [Agent](follow-ups/agent.md) or [External Gateway](follow-ups/external-gateway.md) handoff. Generic fixture evidence is not actual product compatibility.
+
 ## Build one native application
 
 Use the repository's pinned Rust 1.99.1 and Node.js 24.20.0, npm, and a native C/C++ toolchain. SQLite builds from bundled source. On Mac, use Apple Silicon with Xcode Command Line Tools. The Linux qualification target is Ubuntu 26.04 Server x86_64 GNU/Linux. No display server, Tauri, browser runtime, or virtual display is needed for headless execution. Building complete Package Directories still needs npm for their inert UI assets.
@@ -30,10 +32,10 @@ target/teamarness-applications/headless/<target>/
 
 Keep this complete directory together. Each Package contains one native Backend and its complete validated UI and contracts. The UI is not executed. Assembly verifies final file digests, sizes, native executable headers, and private permissions. Mac ad-hoc signing happens before hashing. Linux never invokes codesign. These are local distributions, not a public signing, publishing, or update service. Mac ad-hoc signatures are not Developer ID signing or notarization.
 
-Run the final artifact smoke from the checkout, replacing `<target>` with the native selection:
+Run the final artifact smoke from the checkout. Set `TARGET` to your native selection (`aarch64-apple-darwin` or `x86_64-unknown-linux-gnu`):
 
 ```sh
-node scripts/smoke-headless.mjs target/teamarness-applications/headless/<target>
+node scripts/smoke-headless.mjs "target/teamarness-applications/headless/$TARGET"
 ```
 
 The smoke copies the final distribution outside the checkout, removes GUI environment variables, tests offline help/version, starts disposable storage, checks admitted Team Packages, and verifies SIGTERM, SIGINT, and persistent identity. It does not join a Workspace or prove domain synchronization. Linux native build, smoke, systemd syntax, and actual Ubuntu service/logout/reboot observations remain pending native qualification; Mac checks cannot qualify Linux.
