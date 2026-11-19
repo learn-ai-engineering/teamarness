@@ -483,3 +483,110 @@ async fn secret_input_canaries_do_not_reach_routine_cli_stderr_or_service_logs()
     assert!(log.contains("operation=workspace_join"));
     assert!(log.contains("operation=packages_install"));
 }
+
+#[tokio::test]
+async fn package_request_stdin_secrets_and_results_do_not_reach_service_or_cli_diagnostics() {
+    use std::io::Read;
+    use teamarness_headless::control::{Operation, Request};
+    use tokio::io::AsyncWriteExt;
+    let fixture = support::Fixture::new();
+    let directory = support::packages::stage(
+        &fixture.root.path().join("independent"),
+        support::packages::PERSONAL,
+    );
+    let mut server = child(&fixture, "serve-package");
+    let status = wait_status(&fixture, &mut server).await;
+    let call = |operation| {
+        control::request(
+            &fixture.config.data_directory,
+            Request {
+                major: 1,
+                id: 21,
+                operation,
+            },
+        )
+    };
+    call(Operation::PackagesInstall {
+        directory,
+        expected_identity: support::packages::PERSONAL.parse().unwrap(),
+        accepted_risks: vec!["filesystem".into(), "network".into(), "process".into()],
+    })
+    .await
+    .unwrap()
+    .result
+    .unwrap();
+    let workspaces = call(Operation::WorkspaceList {})
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let workspace = workspaces[0]["id"].as_str().unwrap();
+    let metadata = call(Operation::PackageOperations {
+        workspace: workspace.into(),
+        package: support::packages::PERSONAL.parse().unwrap(),
+    })
+    .await
+    .unwrap()
+    .result
+    .unwrap();
+    let digest = metadata["contractDigest"].as_str().unwrap();
+    for (operation, input, expected) in [
+        (
+            "proof.settings.set",
+            br#"{"value":"PRIVATE_REQUEST_CANARY"}"#.as_slice(),
+            serde_json::json!({"value":"PRIVATE_REQUEST_CANARY"}),
+        ),
+        (
+            "proof.secret",
+            b"{}".as_slice(),
+            serde_json::json!({"secret":"ONE_TIME_SECRET_CANARY"}),
+        ),
+    ] {
+        let mut cli = tokio::process::Command::new(env!("CARGO_BIN_EXE_teamarness-headless"))
+            .arg("--data-dir")
+            .arg(&fixture.config.data_directory)
+            .args([
+                "package",
+                "request",
+                "--workspace",
+                workspace,
+                "--package",
+                support::packages::PERSONAL,
+                "--operation",
+                operation,
+                "--contract-digest",
+                digest,
+                "--input",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        cli.stdin.take().unwrap().write_all(input).await.unwrap();
+        let output = cli.wait_with_output().await.unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            expected
+        );
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(!diagnostic.contains("PRIVATE_REQUEST_CANARY"));
+        assert!(!diagnostic.contains("ONE_TIME_SECRET_CANARY"));
+    }
+    assert!(!status.installation.is_empty());
+    kill(Pid::from_raw(server.0.id() as i32), Signal::SIGTERM).unwrap();
+    assert!(wait_exit(&mut server).await.success());
+    let mut log = String::new();
+    server
+        .0
+        .stderr
+        .as_mut()
+        .unwrap()
+        .read_to_string(&mut log)
+        .unwrap();
+    assert!(log.contains("operation=package_request"));
+    assert!(!log.contains("PRIVATE_REQUEST_CANARY"));
+    assert!(!log.contains("ONE_TIME_SECRET_CANARY"));
+}

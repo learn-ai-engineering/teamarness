@@ -207,3 +207,51 @@ fn validates_payload_bounds_and_schema() {
         .unwrap_err();
     assert_eq!(too_deep.rule, "ui_contract.payload_too_large");
 }
+
+#[test]
+fn admitted_metadata_keeps_exact_schemas_definitions_and_sorted_kinds() {
+    let document = json!({"schemaVersion":1,"$defs":{"value":{"type":"string","description":"retained"}},
+        "requests":{"z.last":{"request":{"$ref":"#/$defs/value"},"response":true},"a.first":{"request":false,"response":{"$ref":"#/$defs/value"}}},
+        "subscriptions":{"a.first":{"request":true,"event":{"$ref":"#/$defs/value"}}}});
+    let compiled = compile_ui_contract(&serde_json::to_vec(&document).unwrap()).unwrap();
+    assert_eq!(
+        compiled.operations(),
+        vec![
+            ("a.first", "request"),
+            ("a.first", "subscription"),
+            ("z.last", "request")
+        ]
+    );
+    let mut expected = document.clone();
+    expected["requests"]
+        .as_object_mut()
+        .unwrap()
+        .remove("z.last");
+    assert_eq!(compiled.operation_schema("a.first"), Some(expected));
+    assert_eq!(compiled.operation_schema("unknown"), None);
+    assert!(
+        compiled
+            .validate_request("a.first", &json!("anything"))
+            .is_err()
+    );
+    assert!(
+        compiled
+            .validate_response("a.first", &json!("value"))
+            .is_ok()
+    );
+}
+
+#[test]
+fn maximum_contract_metadata_is_bounded_by_the_admitted_document() {
+    let mut document = json!({"schemaVersion":1,"$defs":{"retained":{"description":""}},"requests":{"proof.read":{"request":true,"response":false}},"subscriptions":{}});
+    let base = serde_json::to_vec(&document).unwrap().len();
+    document["$defs"]["retained"]["description"] = json!("x".repeat(1024 * 1024 - base));
+    let bytes = serde_json::to_vec(&document).unwrap();
+    assert_eq!(bytes.len(), 1024 * 1024);
+    let compiled = compile_ui_contract(&bytes).unwrap();
+    let metadata = compiled.operation_schema("proof.read").unwrap();
+    assert_eq!(metadata, document);
+    assert_eq!(serde_json::to_vec(&metadata).unwrap().len(), bytes.len());
+    document["$defs"]["retained"]["description"] = json!("x".repeat(1024 * 1024 - base + 1));
+    assert_eq!(reject(&document).rule, "ui_contract.too_large");
+}

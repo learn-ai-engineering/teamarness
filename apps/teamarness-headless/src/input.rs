@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 
 use crate::{ControlError, ErrorCode};
 
-pub const MAX_INPUT_BYTES: usize = 256 * 1024;
+pub const MAX_INPUT_BYTES: usize = teamarness_package_host::MAX_UI_PAYLOAD_BYTES;
 pub const MAX_INVITATION_BYTES: usize = 8 * 1024;
 
 pub fn read_private(path: &Path, limit: usize) -> Result<Vec<u8>, ControlError> {

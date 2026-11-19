@@ -39,6 +39,7 @@ const MAX_OPERATIONS: usize = 256;
 
 /// A compiled, admitted UI contract.
 pub struct CompiledUiContract {
+    document: Value,
     requests: BTreeMap<String, DirectionalRequest>,
     subscriptions: BTreeMap<String, DirectionalSubscription>,
 }
@@ -95,6 +96,38 @@ fn violation(rule: &'static str) -> ContractError {
 }
 
 impl CompiledUiContract {
+    /// Admitted operation names and kinds, sorted by name then kind.
+    #[must_use]
+    pub fn operations(&self) -> Vec<(&str, &str)> {
+        let mut operations: Vec<_> = self
+            .request_operations()
+            .map(|name| (name, "request"))
+            .chain(
+                self.subscription_operations()
+                    .map(|name| (name, "subscription")),
+            )
+            .collect();
+        operations.sort_unstable();
+        operations
+    }
+
+    /// One operation's exact admitted descriptors and complete local definitions.
+    /// A name declared in both directions retains both descriptors. No source file is reread.
+    #[must_use]
+    pub fn operation_schema(&self, operation: &str) -> Option<Value> {
+        if !self.requests.contains_key(operation) && !self.subscriptions.contains_key(operation) {
+            return None;
+        }
+        let mut document = self.document.clone();
+        for direction in ["requests", "subscriptions"] {
+            document[direction]
+                .as_object_mut()
+                .expect("admitted object")
+                .retain(|name, _| name == operation);
+        }
+        Some(document)
+    }
+
     /// Validates a UI request payload.
     ///
     /// # Errors
@@ -171,7 +204,7 @@ pub fn compile_ui_contract(bytes: &[u8]) -> Result<CompiledUiContract, ContractE
     }
     let value = strict_json(bytes).map_err(|_| violation("ui_contract.malformed"))?;
     let document: ContractDocument =
-        serde_json::from_value(value).map_err(|_| violation("ui_contract.malformed"))?;
+        serde_json::from_value(value.clone()).map_err(|_| violation("ui_contract.malformed"))?;
     if document.schema_version != 1 {
         return Err(violation("ui_contract.schema_version").at("/schemaVersion"));
     }
@@ -268,6 +301,7 @@ pub fn compile_ui_contract(bytes: &[u8]) -> Result<CompiledUiContract, ContractE
         })
         .collect::<Result<_, ContractError>>()?;
     Ok(CompiledUiContract {
+        document: value,
         requests,
         subscriptions,
     })

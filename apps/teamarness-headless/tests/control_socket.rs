@@ -491,3 +491,67 @@ async fn local_pretransmission_frame_refusal_is_certain_even_for_a_mutation() {
     );
     drop(listener);
 }
+
+#[tokio::test]
+async fn package_operator_ownership_includes_blocked_response_writing_but_not_other_operations() {
+    let fixture = support::Fixture::new();
+    let app = fixture.open().await;
+    let server = ControlServer::bind(&app).await.unwrap();
+    let entered = Arc::new(Notify::new());
+    let (stop, stopped) = oneshot::channel();
+    let dispatch = {
+        let entered = entered.clone();
+        move |operation| {
+            let entered = entered.clone();
+            async move {
+                if matches!(operation, control::Operation::PackageRequest { .. }) {
+                    entered.notify_one();
+                    // Larger than the Unix send buffer: the observer must read before completion.
+                    Ok(serde_json::json!({"value":"x".repeat(1536 * 1024)}))
+                } else {
+                    Ok(serde_json::json!({"ordinary":"not blocked by operator ownership"}))
+                }
+            }
+        }
+    };
+    let request = || Request {
+        major: 1,
+        id: 1,
+        operation: control::Operation::PackageRequest {
+            workspace: "a".repeat(32),
+            package: "org.unfamiliar.proof".parse().unwrap(),
+            operation: "proof.read".into(),
+            contract_digest: "b".repeat(64),
+            payload: serde_json::json!({}),
+        },
+    };
+    let accepting = server.accept_until(dispatch, async { stopped.await.unwrap() });
+    let client = async {
+        let mut first = UnixStream::connect(fixture.socket()).await.unwrap();
+        write_frame(&mut first, &request()).await.unwrap();
+        entered.notified().await;
+        let busy = control::request(&fixture.config.data_directory, request())
+            .await
+            .unwrap()
+            .result
+            .unwrap_err();
+        assert_eq!(busy.code, ErrorCode::Busy);
+        assert!(!busy.outcome_uncertain);
+        let ordinary = control::request(&fixture.config.data_directory, support::request(2))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(ordinary["ordinary"], "not blocked by operator ownership");
+        let response: Response = read_frame(&mut first).await.unwrap();
+        assert_eq!(
+            response.result.unwrap()["value"].as_str().unwrap().len(),
+            1536 * 1024
+        );
+        stop.send(Instant::now()).unwrap();
+    };
+    let (mut drain, ()) = tokio::join!(accepting, client);
+    drain.finish().await.unwrap();
+    app.shutdown_by(Instant::now() + control::SHUTDOWN_TIMEOUT)
+        .await;
+}

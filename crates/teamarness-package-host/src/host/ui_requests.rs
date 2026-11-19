@@ -13,6 +13,53 @@ use crate::{
 
 #[allow(clippy::result_large_err)]
 impl PackageHost {
+    /// Bounded, read-only operation metadata from this Instance's admitted contract.
+    /// This neither activates a Backend nor opens a mount or reads source files.
+    pub async fn package_operations(
+        &self,
+        instance: &crate::PackageInstanceKey,
+    ) -> Result<serde_json::Value, PackageErrorEnvelope> {
+        self.actor(instance).await?;
+        let ui = self
+            .admitted_ui(&instance.package_identity)
+            .ok_or_else(|| host_error(PackageErrorCode::UiLoadFailed, PackageErrorStage::Ui))?;
+        let operations: Vec<_> = ui
+            .contract
+            .operations()
+            .into_iter()
+            .map(|(name, kind)| serde_json::json!({"name":name,"kind":kind}))
+            .collect();
+        Ok(serde_json::json!({"contractDigest":ui.cache.contract_digest,"operations":operations}))
+    }
+
+    /// One admitted operation, including both kinds if declared, and complete local `$defs`.
+    /// The schema and digest belong to the same immutable admission as request validation.
+    pub async fn package_schema(
+        &self,
+        instance: &crate::PackageInstanceKey,
+        operation: &str,
+    ) -> Result<serde_json::Value, PackageErrorEnvelope> {
+        self.actor(instance).await?;
+        let ui = self
+            .admitted_ui(&instance.package_identity)
+            .ok_or_else(|| host_error(PackageErrorCode::UiLoadFailed, PackageErrorStage::Ui))?;
+        let schema = ui.contract.operation_schema(operation).ok_or_else(|| {
+            host_error(PackageErrorCode::UiContractViolation, PackageErrorStage::Ui)
+        })?;
+        Ok(serde_json::json!({"contractDigest":ui.cache.contract_digest,"schema":schema}))
+    }
+
+    /// Checks against the exact live lease's existing admitted validator, without dispatch.
+    /// Non-rendering adapters can distinguish proven input refusals from response failures.
+    pub async fn validate_ui_request(&self, input: &UiRequest) -> Result<(), PackageErrorEnvelope> {
+        let (lease, _) = self.live_mount(&input.mount).await?;
+        lease
+            .ui
+            .contract
+            .validate_request(&input.operation, &input.payload)
+            .map_err(|_| host_error(PackageErrorCode::UiContractViolation, PackageErrorStage::Ui))
+    }
+
     pub(crate) async fn ui_request(
         &self,
         input: UiRequest,

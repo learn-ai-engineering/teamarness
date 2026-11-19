@@ -21,6 +21,34 @@ pub(crate) async fn dispatch(
     operation: Operation,
 ) -> Result<Value, ControlError> {
     match operation {
+        Operation::PackageOperations { workspace, package } => host
+            .package_operations(&instance(&workspace, package)?)
+            .await
+            .map_err(host_error),
+        Operation::PackageSchema {
+            workspace,
+            package,
+            operation,
+        } => host
+            .package_schema(&instance(&workspace, package)?, &operation)
+            .await
+            .map_err(host_error),
+        Operation::PackageRequest {
+            workspace,
+            package,
+            operation,
+            contract_digest,
+            payload,
+        } => {
+            crate::package_requests::request(
+                &host,
+                instance(&workspace, package)?,
+                operation,
+                contract_digest,
+                payload,
+            )
+            .await
+        }
         Operation::PackagesList {} => encode(host.snapshot().await),
         Operation::PackagesInspect { directory } => encode(
             host.inspect_directory(directory)
@@ -214,7 +242,7 @@ pub(crate) fn parse_workspace(value: &str) -> Result<teamarness_core::WorkspaceI
         .map_err(|_| ControlError::new(ErrorCode::InvalidInput))
 }
 
-fn instance(
+pub(crate) fn instance(
     workspace: &str,
     package: teamarness_package_host::PackageIdentity,
 ) -> Result<PackageInstanceKey, ControlError> {
@@ -282,7 +310,7 @@ fn uncertain_internal() -> ControlError {
     error
 }
 
-fn host_error(envelope: PackageErrorEnvelope) -> ControlError {
+pub(crate) fn host_error(envelope: PackageErrorEnvelope) -> ControlError {
     let mut error = ControlError::new(
         if matches!(
             envelope.code,

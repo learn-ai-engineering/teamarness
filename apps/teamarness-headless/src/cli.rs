@@ -34,9 +34,16 @@ Usage:
   teamarness-headless --data-dir <private-dir> packages reload|remove --package <identity>
   teamarness-headless --data-dir <private-dir> packages restart|pause|resume --workspace <id> --package <identity>
 
+  teamarness-headless --data-dir <private-dir> package operations --workspace <id> --package <identity>
+  teamarness-headless --data-dir <private-dir> package schema --workspace <id> --package <identity> --operation <name>
+  teamarness-headless --data-dir <private-dir> package request --workspace <id> --package <identity> --operation <name> --contract-digest <digest> --input <file|->
+
 Install input: {\"acceptedRisks\":[\"filesystem\",\"network\",\"process\"]}.
 Input files must be owned regular non-symlink files with no group/other bits.
 Results are JSON. Upstream errors include details on stdout, never routine stderr.
+Package request failures after validation are conservatively outcome-uncertain and nonretryable.
+Embedded Host/Package errors retain their original details and retryability; they do not prove no effect.
+Known input/digest/busy refusals do not dispatch. Inspect Package state; never replay automatically.
 Clients never initialize storage or retry mutations.
 A lost mutation reply means outcome unknown. Inspect state before taking further action.
 ";
@@ -61,6 +68,13 @@ pub enum OperatorCommand {
     Join {
         person_name: String,
         invitation_file: PathBuf,
+    },
+    Request {
+        workspace: String,
+        package: teamarness_package_host::PackageIdentity,
+        operation: String,
+        contract_digest: String,
+        input: PathBuf,
     },
     Install {
         directory: PathBuf,
@@ -143,6 +157,22 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, C
                     workspace: workspace(value("--workspace")?)?,
                     agent: agent(value("--agent")?)?,
                 }),
+                ["package", "operations"] => OperatorCommand::Ready(Operation::PackageOperations {
+                    workspace: workspace(value("--workspace")?)?,
+                    package: text(value("--package")?)?.parse().map_err(|_| invalid())?,
+                }),
+                ["package", "schema"] => OperatorCommand::Ready(Operation::PackageSchema {
+                    workspace: workspace(value("--workspace")?)?,
+                    package: text(value("--package")?)?.parse().map_err(|_| invalid())?,
+                    operation: text(value("--operation")?)?,
+                }),
+                ["package", "request"] => OperatorCommand::Request {
+                    workspace: workspace(value("--workspace")?)?,
+                    package: text(value("--package")?)?.parse().map_err(|_| invalid())?,
+                    operation: text(value("--operation")?)?,
+                    contract_digest: text(value("--contract-digest")?)?,
+                    input: value("--input")?.into(),
+                },
                 ["packages", "list"] => OperatorCommand::Ready(Operation::PackagesList {}),
                 ["packages", "inspect"] => OperatorCommand::Ready(Operation::PackagesInspect {
                     directory: value("--directory")?.into(),
@@ -219,6 +249,25 @@ impl OperatorCommand {
                 Ok(Operation::WorkspaceJoin {
                     invitation: invitation.to_owned(),
                     person_name,
+                })
+            }
+            Self::Request {
+                workspace,
+                package,
+                operation,
+                contract_digest,
+                input,
+            } => {
+                let payload = crate::input::json(&crate::input::read_private(
+                    &input,
+                    crate::input::MAX_INPUT_BYTES,
+                )?)?;
+                Ok(Operation::PackageRequest {
+                    workspace,
+                    package,
+                    operation,
+                    contract_digest,
+                    payload,
                 })
             }
             Self::Install {

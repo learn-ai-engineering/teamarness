@@ -70,6 +70,7 @@ pub use crate::values::{
     PackageValue, PendingRegistrationChange, RegistrationRequest, RegistrationStatus, UiMountId,
     UiRequestId, UiResourceToken, UiSubscriptionId, ValueParseError, WorkspaceId,
 };
+pub use teamarness_package_contract::ui_contract::MAX_UI_PAYLOAD_BYTES;
 
 use crate::errors::host_error;
 

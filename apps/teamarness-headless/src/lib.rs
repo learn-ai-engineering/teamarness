@@ -6,6 +6,7 @@ pub mod application;
 pub mod cli;
 pub mod control;
 pub mod input;
+mod package_requests;
 mod socket;
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,7 @@ pub enum ErrorCode {
     CoreFailure,
     HostFailure,
     ReconciliationFailed,
+    ContractDigestMismatch,
 }
 
 /// Upstream failures are returned to the explicit observer, never copied to routine logs.

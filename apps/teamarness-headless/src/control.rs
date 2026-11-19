@@ -15,7 +15,7 @@ use crate::application::Application;
 use crate::{ControlError, ErrorCode, socket};
 use serde_json::Value;
 use std::path::PathBuf;
-use teamarness_package_host::PackageIdentity;
+use teamarness_package_host::{PackageIdentity, PackageInstanceKey};
 
 pub const PROTOCOL_MAJOR: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
@@ -84,6 +84,22 @@ pub enum Operation {
         workspace: String,
         package: PackageIdentity,
     },
+    PackageOperations {
+        workspace: String,
+        package: PackageIdentity,
+    },
+    PackageSchema {
+        workspace: String,
+        package: PackageIdentity,
+        operation: String,
+    },
+    PackageRequest {
+        workspace: String,
+        package: PackageIdentity,
+        operation: String,
+        contract_digest: String,
+        payload: Value,
+    },
     PackagesResume {
         workspace: String,
         package: PackageIdentity,
@@ -101,6 +117,8 @@ impl Operation {
                 | Self::AgentList { .. }
                 | Self::PackagesList {}
                 | Self::PackagesInspect { .. }
+                | Self::PackageOperations { .. }
+                | Self::PackageSchema { .. }
         )
     }
 
@@ -125,6 +143,9 @@ impl Operation {
             Self::PackagesRestart { .. } => "packages_restart",
             Self::PackagesPause { .. } => "packages_pause",
             Self::PackagesResume { .. } => "packages_resume",
+            Self::PackageOperations { .. } => "package_operations",
+            Self::PackageSchema { .. } => "package_schema",
+            Self::PackageRequest { .. } => "package_request",
         }
     }
 }
@@ -245,6 +266,7 @@ impl<'a> ControlServer<'a> {
         let dispatch = Arc::new(dispatch);
         let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let operations = Arc::new(Semaphore::new(MAX_OPERATIONS));
+        let package_requests = Arc::new(OperatorRequestOwners::default());
         let mut tasks = JoinSet::new();
         let mut failed = false;
         tokio::pin!(stop);
@@ -264,6 +286,7 @@ impl<'a> ControlServer<'a> {
                     };
                     let operations = operations.clone();
                     let dispatch = dispatch.clone();
+                    let package_requests = package_requests.clone();
                     tasks.spawn(async move {
                         let _connection = connection;
                         if socket::check_peer(&stream).is_err() { return; }
@@ -282,11 +305,15 @@ impl<'a> ControlServer<'a> {
                                     // This task owns the permit through dispatch AND terminal response writing.
                                     let started = Instant::now();
                                     let name = request.operation.name();
-                                    let result = dispatch(request.operation).await;
+                                    let (result, owner) = match OperatorRequestOwner::acquire(&request.operation, package_requests) {
+                                        Ok(owner) => (dispatch(request.operation).await, owner),
+                                        Err(error) => (Err(error), None),
+                                    };
                                     let outcome = match &result { Ok(_) => "ok".to_owned(), Err(error) => format!("{:?} uncertain={}", error.code, error.outcome_uncertain) };
                                     eprintln!("operator_complete id={} operation={} outcome={} durationMs={}", request.id, name, outcome, started.elapsed().as_millis());
-                                    let response = Response { major: PROTOCOL_MAJOR, id: request.id, result };
+                                    let response: Response<T> = Response { major: PROTOCOL_MAJOR, id: request.id, result };
                                     send_response(&mut stream, response).await;
+                                    drop(owner);
                                     drop(permit);
                                     return;
                                 }
@@ -307,6 +334,48 @@ impl<'a> ControlServer<'a> {
             failed,
             _server: self,
         }
+    }
+}
+
+/// Only operator requests share this gate. Port traffic and Package background work do not.
+#[derive(Default)]
+struct OperatorRequestOwners {
+    instances: std::sync::Mutex<std::collections::BTreeSet<PackageInstanceKey>>,
+}
+struct OperatorRequestOwner {
+    key: PackageInstanceKey,
+    owners: Arc<OperatorRequestOwners>,
+}
+impl OperatorRequestOwner {
+    fn acquire(
+        operation: &Operation,
+        owners: Arc<OperatorRequestOwners>,
+    ) -> Result<Option<Self>, ControlError> {
+        let Operation::PackageRequest {
+            workspace, package, ..
+        } = operation
+        else {
+            return Ok(None);
+        };
+        let key = crate::administration::instance(workspace, package.clone())?;
+        if !owners
+            .instances
+            .lock()
+            .expect("operator ownership poisoned")
+            .insert(key.clone())
+        {
+            return Err(ControlError::new(ErrorCode::Busy));
+        }
+        Ok(Some(Self { key, owners }))
+    }
+}
+impl Drop for OperatorRequestOwner {
+    fn drop(&mut self) {
+        self.owners
+            .instances
+            .lock()
+            .expect("operator ownership poisoned")
+            .remove(&self.key);
     }
 }
 
