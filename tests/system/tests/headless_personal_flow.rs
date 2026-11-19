@@ -31,9 +31,14 @@ async fn canonical_runbook_fixture_settings_lifecycle_and_retention() {
     let directory = root.path().join("runbook-fixture");
     let output = tokio::process::Command::new("node")
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        // Cargo already built this exact fixture for this test's feature graph. Assemble it
+        // through the manual preparer's shared path without relinking live sibling binaries.
         .args([
-            "scripts/prepare-headless-fixture.mjs",
+            "--input-type=module",
+            "-e",
+            "import { prepareCargoFixture } from './scripts/prepare-headless-fixture.mjs'; await prepareCargoFixture(process.argv[1], process.argv[2]);",
             directory.to_str().unwrap(),
+            env!("CARGO_BIN_EXE_headless-personal-fixture"),
         ])
         .output()
         .await

@@ -44,6 +44,32 @@ test("manual fixture preparation builds current native bytes, shares the tested 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("Cargo-owned runbook fixture assembly preserves live caller executables without nested builds", async () => {
+  const { prepareCargoFixture } = await import("./prepare-headless-fixture.mjs");
+  assert.equal(typeof prepareCargoFixture, "function", "runbook must assemble its Cargo-owned input without rebuilding live binaries");
+  const [command, args] = qualificationCommands()[0];
+  const built = spawnSync(command, args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  assert.equal(built.status, 0, built.stderr);
+  const artifacts = built.stdout.split("\n").map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(row => row?.reason === "compiler-artifact" && row.executable);
+  const fixture = artifacts.find(row => row.target.name === "headless-personal-fixture");
+  assert.ok(fixture, "Cargo reports the source-current fixture input");
+  const hash = bytes => createHash("sha256").update(bytes).digest("hex");
+  const before = await Promise.all(artifacts.map(async row => hash(await readFile(row.executable))));
+  const root = await mkdtemp(join(tmpdir(), "headless-cargo-fixture-"));
+  try {
+    const directory = join(root, "fixture");
+    const manifest = await prepareCargoFixture(directory, fixture.executable);
+    assert.equal(hash(await readFile(join(directory, "backend/fixture"))), hash(await readFile(fixture.executable)));
+    assert.equal(manifest.backends[0].sha256, hash(await readFile(fixture.executable)));
+    assert.deepEqual(await Promise.all(artifacts.map(async row => hash(await readFile(row.executable)))), before);
+    await assert.rejects(prepareCargoFixture(directory, fixture.executable), /EEXIST/);
+    // Normal manual CLI offers no arbitrary prebuilt-executable bypass.
+    const refused = spawnSync(process.execPath, ["scripts/prepare-headless-fixture.mjs", join(root, "other"), fixture.executable], { encoding: "utf8" });
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /usage:/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("qualification refuses zero, ignored, filtered, failed or missing named cases", () => {
   const name = "sync_only_two_headless_and_desktop_backends_cover_two_workspaces_offline_restart_and_late_join";
   const summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;";

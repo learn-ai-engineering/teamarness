@@ -547,6 +547,225 @@ async fn team_pause_resume_are_refused_before_dispatch_without_changing_generati
     issuer.stop().await;
 }
 
+async fn lifecycle_effect_then_lost_reply(command: &str, fault: &str, counter: &str) {
+    let fixture = support::Fixture::new();
+    packages::bundle(&fixture);
+    let (app, workspace, _) = support::inviter(&fixture).await;
+    let running = support::Running::start(app).await;
+    let directory = packages::stage(&fixture.root.path().join("personal"), PERSONAL);
+    running.call(install(&directory, PERSONAL)).await.unwrap();
+    let before = running.call(Operation::PackagesList {}).await.unwrap();
+    let team = instance(&before, TEAM).clone();
+    let data = data_directory(
+        &fixture,
+        &running.app.status().await.installation,
+        &workspace,
+    );
+    // The ordinary public lifecycle remains successful before arming the one-shot fixture fault.
+    for action in ["pause", "resume", "restart"] {
+        let output = running
+            .cli(&[
+                "packages",
+                action,
+                "--workspace",
+                &workspace,
+                "--package",
+                PERSONAL,
+            ])
+            .await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if command == "resume" {
+        assert!(
+            running
+                .cli(&[
+                    "packages",
+                    "pause",
+                    "--workspace",
+                    &workspace,
+                    "--package",
+                    PERSONAL
+                ])
+                .await
+                .status
+                .success()
+        );
+    }
+    let count = || -> u64 {
+        if counter == "activations" {
+            std::fs::read_to_string(data.join(counter))
+                .unwrap()
+                .parse()
+                .unwrap()
+        } else {
+            serde_json::from_slice::<Value>(&std::fs::read(data.join("state.json")).unwrap())
+                .unwrap()[counter]
+                .as_u64()
+                .unwrap()
+        }
+    };
+    // Restart starts a fresh State, so ensure the saved counters exist even in the new process.
+    let prior = count();
+    std::fs::write(data.join("lose-lifecycle-reply"), fault).unwrap();
+    let output = running
+        .cli(&[
+            "packages",
+            command,
+            "--workspace",
+            &workspace,
+            "--package",
+            PERSONAL,
+        ])
+        .await;
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        count(),
+        prior + 1,
+        "effect committed exactly once before terminal reply loss"
+    );
+    let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+    // Check the unchanged original Host envelope independently of the outer conservative verdict.
+    let envelope = &error["details"]["envelope"];
+    assert_eq!(envelope["code"], "process_exited", "{error}");
+    assert_eq!(
+        envelope["retryable"], true,
+        "original Host retryability retained"
+    );
+    assert_eq!(envelope["stage"], "lifecycle");
+    assert_eq!(envelope["namespace"], "teamarness.package-host");
+    assert_eq!(envelope["version"], 2);
+    assert_eq!(envelope["affectedInstance"]["packageIdentity"], PERSONAL);
+    assert_eq!(envelope["affectedInstance"]["workspaceId"], workspace);
+    assert_eq!(error["outcomeUncertain"], true, "{error}");
+    assert_eq!(error["retryable"], false, "{error}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("outcome_unknown: inspect state; do not replay automatically")
+    );
+    assert_eq!(
+        instance(
+            &running.call(Operation::PackagesList {}).await.unwrap(),
+            TEAM
+        ),
+        &team
+    );
+    assert_eq!(
+        count(),
+        prior + 1,
+        "read-only observation never replays the lifecycle mutation"
+    );
+    running.stop().await;
+    assert_eq!(
+        count(),
+        prior + 1,
+        "shutdown retains the effect without replay"
+    );
+}
+
+#[tokio::test]
+async fn public_lifecycle_selector_team_missing_and_invalid_state_refusals_remain_certain() {
+    let fixture = support::Fixture::new();
+    packages::bundle(&fixture);
+    let (app, workspace, _) = support::inviter(&fixture).await;
+    let running = support::Running::start(app).await;
+    let directory = packages::stage(&fixture.root.path().join("personal"), PERSONAL);
+    running.call(install(&directory, PERSONAL)).await.unwrap();
+    assert!(
+        running
+            .cli(&[
+                "packages",
+                "pause",
+                "--workspace",
+                &workspace,
+                "--package",
+                PERSONAL
+            ])
+            .await
+            .status
+            .success()
+    );
+    for (action, selected_workspace, package, code) in [
+        (
+            "restart",
+            workspace.as_str(),
+            PERSONAL,
+            "invalid_lifecycle_state",
+        ),
+        (
+            "pause",
+            "00000000000000000000000000000000",
+            PERSONAL,
+            "invalid_lifecycle_state",
+        ),
+        (
+            "resume",
+            "00000000000000000000000000000000",
+            PERSONAL,
+            "invalid_lifecycle_state",
+        ),
+        (
+            "restart",
+            workspace.as_str(),
+            "org.unregistered.proof",
+            "not_registered",
+        ),
+        ("pause", workspace.as_str(), TEAM, "override_required"),
+        ("resume", workspace.as_str(), TEAM, "override_required"),
+        ("restart", workspace.as_str(), TEAM, "override_required"),
+    ] {
+        let output = running
+            .cli(&[
+                "packages",
+                action,
+                "--workspace",
+                selected_workspace,
+                "--package",
+                package,
+            ])
+            .await;
+        assert_eq!(output.status.code(), Some(1));
+        let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(error["details"]["envelope"]["code"], code);
+        assert_eq!(error["outcomeUncertain"], false, "{error}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("outcome_unknown"));
+    }
+    let invalid = running
+        .cli(&[
+            "packages",
+            "pause",
+            "--workspace",
+            "invalid",
+            "--package",
+            PERSONAL,
+        ])
+        .await;
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(!String::from_utf8_lossy(&invalid.stderr).contains("outcome_unknown"));
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn public_pause_retains_durable_effect_and_reports_unknown_after_lost_reply() {
+    lifecycle_effect_then_lost_reply("pause", "suspend", "suspends").await;
+}
+#[tokio::test]
+async fn public_resume_retains_durable_effect_and_reports_unknown_after_lost_reply() {
+    lifecycle_effect_then_lost_reply("resume", "recover", "recovers").await;
+}
+#[tokio::test]
+async fn public_restart_retains_activation_effect_and_reports_unknown_after_lost_reply() {
+    lifecycle_effect_then_lost_reply("restart", "restart", "activations").await;
+}
+
 #[tokio::test]
 async fn local_team_override_keeps_team_lifecycle_restrictions() {
     use std::os::unix::fs::PermissionsExt;

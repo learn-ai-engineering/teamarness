@@ -20,7 +20,18 @@ export async function prepareFixture(directory) {
   if (build.error || build.status !== 0) throw new Error(`source fixture build failed: ${build.stderr ?? build.error}`);
   const binary = build.stdout.split("\n").map(line => { try { return JSON.parse(line); } catch { return null; } }).find(row => row?.target?.name === "headless-personal-fixture" && row.executable)?.executable;
   if (!binary) throw new Error("Cargo did not report the source-current fixture");
-  const bytes = await readFile(binary);
+  return writeFixture(directory, await readFile(binary));
+}
+
+// The integration harness supplies only its compile-time CARGO_BIN_EXE fixture. Rebuilding
+// here can temporarily unlink a different caller-owned executable while another test runs.
+// This embedding entry is not a manual CLI option; ordinary preparation still source-builds.
+export async function prepareCargoFixture(directory, executable) {
+  await mkdir(directory, { mode: 0o700 });
+  return writeFixture(directory, await readFile(executable));
+}
+
+async function writeFixture(directory, bytes) {
   const contract = await readFile(join(repositoryRoot, "tests/system/fixtures/headless-personal-ui-contract.json"));
   const ui = Buffer.from("throw new Error('UI_MUST_NOT_EXECUTE');");
   const hash = bytes => createHash("sha256").update(bytes).digest("hex");

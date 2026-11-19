@@ -291,13 +291,46 @@ async fn require_personal_instance(
 }
 
 async fn execute(host: &PackageHost, command: PackageHostCommand) -> Result<Value, ControlError> {
+    let lifecycle = matches!(
+        command,
+        PackageHostCommand::Suspend(_)
+            | PackageHostCommand::Recover(_)
+            | PackageHostCommand::RestartPersonal(_)
+    );
     let outcome = host.execute(command).await.map_err(|envelope| {
+        if lifecycle {
+            return lifecycle_error(envelope);
+        }
         let uncertain_storage = envelope.code == PackageErrorCode::DataDirectoryUnavailable;
         let mut error = host_error(envelope);
         error.outcome_uncertain |= uncertain_storage;
         error
     })?;
     encode(outcome)
+}
+
+fn lifecycle_error(envelope: PackageErrorEnvelope) -> ControlError {
+    use teamarness_package_host::PackageErrorStage;
+    // The Host envelope omits the internal dispatch-uncertainty bit. Only these lifecycle
+    // refusals prove no dispatch. In particular Overloaded/BackendError can follow dispatch.
+    // ShuttingDown from an Instance may follow activation; only the Host's Shutdown-stage
+    // refusal proves it was already stopped. Keep the original envelope unchanged in details.
+    let refused = matches!(
+        (envelope.code, envelope.stage),
+        (
+            PackageErrorCode::InvalidLifecycleState | PackageErrorCode::Disposed,
+            PackageErrorStage::Lifecycle
+        ) | (
+            PackageErrorCode::NotRegistered | PackageErrorCode::OverrideRequired,
+            PackageErrorStage::Admission
+        ) | (PackageErrorCode::ShuttingDown, PackageErrorStage::Shutdown)
+    );
+    let mut error = host_error(envelope);
+    if !refused {
+        error.outcome_uncertain = true;
+        error.retryable = false;
+    }
+    error
 }
 
 fn encode(value: impl serde::Serialize) -> Result<Value, ControlError> {
@@ -411,4 +444,133 @@ fn core_error(
         code: format!("{value:?}"),
     });
     error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use teamarness_package_host::{
+        DiagnosticId, PackageErrorStage, PackageOwnedError, RecoveryAction,
+    };
+
+    fn envelope(code: PackageErrorCode, stage: PackageErrorStage) -> PackageErrorEnvelope {
+        PackageErrorEnvelope::new(
+            code,
+            stage,
+            true,
+            RecoveryAction::Retry,
+            DiagnosticId::new("original-lifecycle-diagnostic").unwrap(),
+        )
+    }
+
+    #[test]
+    fn lifecycle_ambiguous_errors_are_unknown_nonretryable_with_exact_original_details() {
+        for code in [
+            PackageErrorCode::ProcessExited,
+            PackageErrorCode::Overloaded,
+            PackageErrorCode::BackendError,
+            PackageErrorCode::Cancelled,
+            PackageErrorCode::DeadlineExceeded,
+            PackageErrorCode::OutcomeUncertain,
+            PackageErrorCode::ShuttingDown,
+        ] {
+            let mut original = envelope(code, PackageErrorStage::Lifecycle);
+            original.package_error = Some(PackageOwnedError {
+                code: "proof.late".into(),
+                retryable: true,
+                details: serde_json::from_value(json!({"reason":"original"})).unwrap(),
+            });
+            let error = lifecycle_error(original.clone());
+            assert!(error.outcome_uncertain, "{code:?}");
+            assert!(!error.retryable, "{code:?}");
+            let Some(ErrorDetails::Host { envelope }) = error.details else {
+                panic!("Host details");
+            };
+            assert_eq!(
+                serde_json::to_value(envelope).unwrap(),
+                serde_json::to_value(original).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_stopped_host_refuses_certainly_before_dispatch() {
+        use teamarness_core::CoreRuntimeConfig;
+        use teamarness_package_host::{
+            InstallationPublicIdentity, PackageHostConfig, ShutdownHost,
+        };
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let data = root.path().join("data");
+        let resources = root.path().join("app");
+        std::fs::create_dir_all(&resources).unwrap();
+        let manifest = resources.join("application-packages.v1.json");
+        std::fs::write(&manifest, br#"{"schemaVersion":1,"packages":[]}"#).unwrap();
+        let core = Arc::new(
+            CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&data))
+                .await
+                .unwrap(),
+        );
+        let host = PackageHost::open(
+            PackageHostConfig::new(
+                &resources,
+                &manifest,
+                &data,
+                InstallationPublicIdentity::new(core.public_identity().to_string()).unwrap(),
+            ),
+            core.clone(),
+        )
+        .await
+        .unwrap();
+        host.execute(PackageHostCommand::Shutdown(ShutdownHost))
+            .await
+            .unwrap();
+        for operation in [
+            Operation::PackagesPause {
+                workspace: "0".repeat(32),
+                package: "org.absent.proof".parse().unwrap(),
+            },
+            Operation::PackagesResume {
+                workspace: "0".repeat(32),
+                package: "org.absent.proof".parse().unwrap(),
+            },
+            Operation::PackagesRestart {
+                workspace: "0".repeat(32),
+                package: "org.absent.proof".parse().unwrap(),
+            },
+        ] {
+            let error = dispatch(core.clone(), host.clone(), operation)
+                .await
+                .unwrap_err();
+            assert!(!error.outcome_uncertain);
+            let Some(ErrorDetails::Host { envelope }) = error.details else {
+                panic!("Host details");
+            };
+            assert_eq!(envelope.code, PackageErrorCode::ShuttingDown);
+            assert_eq!(envelope.stage, PackageErrorStage::Shutdown);
+        }
+        core.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn lifecycle_proven_refusals_remain_certain() {
+        for (code, stage) in [
+            (
+                PackageErrorCode::InvalidLifecycleState,
+                PackageErrorStage::Lifecycle,
+            ),
+            (PackageErrorCode::Disposed, PackageErrorStage::Lifecycle),
+            (
+                PackageErrorCode::NotRegistered,
+                PackageErrorStage::Admission,
+            ),
+            (
+                PackageErrorCode::OverrideRequired,
+                PackageErrorStage::Admission,
+            ),
+            (PackageErrorCode::ShuttingDown, PackageErrorStage::Shutdown),
+        ] {
+            let error = lifecycle_error(envelope(code, stage));
+            assert!(!error.outcome_uncertain, "{code:?}");
+        }
+    }
 }

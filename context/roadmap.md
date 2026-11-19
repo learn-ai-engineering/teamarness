@@ -76,6 +76,11 @@ The `headless` workstream uses the integrated gateway Host baseline `2039693` an
 
 The accepted native matrix is Apple Silicon desktop, Apple Silicon headless, and Ubuntu 26.04 x86_64 GNU/Linux headless. A selected build must build only that application/target. Agent and External Gateway production changes remain independent workstreams and are not synchronization dependencies. Native Linux automation and real service/logout/reboot observations remain pending their qualification lane; Mac tests do not establish them. Existing core roadmap Phase 5 ordering and desktop release tooling are unchanged.
 
+Headless compatibility intake ownership (independent Package work, not Host acceptance):
+
+- **Agent:** Agent Package maintainer (Don), workstream intake `agent-headless`. Pick up the [Agent brief](../docs/headless/follow-ups/agent.md) with the corrected Host commit and artifact ledger from the headless workstream. Record native artifact, model/configuration, and real Agent compatibility evidence there.
+- **External Gateway:** External Gateway maintainer (Don), workstream intake `external-gateway-headless`. Pick up the [gateway brief](../docs/headless/follow-ups/external-gateway.md) with the same pinned Host evidence. Record native home resolution, managed `tmx`, and real gateway compatibility evidence there. Neither intake is qualified by the generic Host fixture.
+
 ### External Gateway (full access verified locally; not integrated)
 
 Started in workstream `external-gateway` on branch `don-smith/external_gateway`. The standalone Personal Package will expose selected read-only Workspace Ports to external coding agents through one authenticated localhost endpoint per Workspace. Backlog is the first real Provider qualification; a newly installed eligible Provider must appear without rebuilding the gateway. Runtime guides are required, Packages and tools are explicitly enabled, and all independently revocable tokens share one configured scope. Conversations, external writes, MCP, and LAN access are excluded from the initial delivery.

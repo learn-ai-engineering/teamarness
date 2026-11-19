@@ -427,35 +427,64 @@ where
                     return 1;
                 }
             };
-            let result = tokio::select! {
-                result = control::request(&data_directory, Request { major: PROTOCOL_MAJOR, id: 1, operation }) => result,
-                _ = stop => { eprintln!("client_interrupted outcomeUncertain={mutation}"); return 130; }
-            };
-            match result.and_then(|response| response.result) {
-                Ok(value) => output_json(&value, mutation),
-                Err(error) => {
-                    let mut diagnostic = error.clone();
-                    diagnostic.details = None;
-                    eprintln!("{diagnostic}");
-                    if error.details.is_some() && output_json(&error, mutation) != 0 {
-                        return 1;
-                    }
-                    if error.outcome_uncertain {
-                        eprintln!("outcome_unknown: inspect state; do not replay automatically");
-                    }
-                    if error.outcome_uncertain {
-                        1
-                    } else if matches!(
-                        error.code,
-                        ErrorCode::InvalidInput
-                            | ErrorCode::UnsupportedVersion
-                            | ErrorCode::FrameTooLarge
-                    ) {
-                        2
-                    } else {
-                        1
-                    }
+            let observe_and_output = async {
+                let result = control::request(
+                    &data_directory,
+                    Request {
+                        major: PROTOCOL_MAJOR,
+                        id: 1,
+                        operation,
+                    },
+                )
+                .await;
+                let (send, receive) = tokio::sync::oneshot::channel();
+                // A pipe can block forever. A dedicated thread is deliberately not joined: unlike
+                // spawn_blocking it cannot hold Tokio runtime shutdown before main's process exit.
+                if std::thread::Builder::new()
+                    .name("operator-output".into())
+                    .spawn(move || {
+                        let _ = send.send(operator_output(
+                            result.and_then(|response| response.result),
+                            mutation,
+                        ));
+                    })
+                    .is_err()
+                {
+                    eprintln!("output_thread_failed outcomeUncertain={mutation}");
+                    return 1;
                 }
+                receive.await.unwrap_or(1)
+            };
+            tokio::select! {
+                code = observe_and_output => code,
+                _ = stop => { eprintln!("client_interrupted outcomeUncertain={mutation}"); 130 }
+            }
+        }
+    }
+}
+
+fn operator_output(result: Result<serde_json::Value, ControlError>, mutation: bool) -> i32 {
+    match result {
+        Ok(value) => output_json(&value, mutation),
+        Err(error) => {
+            let mut diagnostic = error.clone();
+            diagnostic.details = None;
+            eprintln!("{diagnostic}");
+            if error.details.is_some() && output_json(&error, mutation) != 0 {
+                return 1;
+            }
+            if error.outcome_uncertain {
+                eprintln!("outcome_unknown: inspect state; do not replay automatically");
+            }
+            if error.outcome_uncertain {
+                1
+            } else if matches!(
+                error.code,
+                ErrorCode::InvalidInput | ErrorCode::UnsupportedVersion | ErrorCode::FrameTooLarge
+            ) {
+                2
+            } else {
+                1
             }
         }
     }

@@ -21,6 +21,10 @@ struct Durable {
     mutations: u64,
     started: u64,
     secret_issued: bool,
+    #[serde(default)]
+    suspends: u64,
+    #[serde(default)]
+    recovers: u64,
 }
 
 impl State {
@@ -35,6 +39,29 @@ impl State {
         std::fs::File::open(&self.directory)
             .and_then(|file| file.sync_all())
             .map_err(|_| storage())
+    }
+    async fn lifecycle(&self, operation: &str) -> Result<(), BackendError> {
+        let mut durable = self.durable.lock().await;
+        match operation {
+            "suspend" => durable.suspends += 1,
+            "recover" => durable.recovers += 1,
+            _ => unreachable!(),
+        }
+        self.save(&durable)?;
+        self.lose_reply_if_armed(operation)
+    }
+    fn lose_reply_if_armed(&self, operation: &str) -> Result<(), BackendError> {
+        let fault = self.directory.join("lose-lifecycle-reply");
+        match std::fs::read_to_string(&fault) {
+            Ok(armed) if armed == operation => {
+                std::fs::remove_file(fault).map_err(|_| storage())?;
+                // The durable Package-owned effect precedes loss of the terminal protocol reply.
+                std::process::exit(73);
+            }
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(storage()),
+        }
     }
     async fn called(&self) -> Result<(), BackendError> {
         let mut durable = self.durable.lock().await;
@@ -63,8 +90,13 @@ async fn main() -> ExitCode {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Durable::default(),
             Err(_) => return Err(storage()),
         };
-        Ok(State { directory: directory.to_owned(), durable: Mutex::new(durable) })
+        let state = State { directory: directory.to_owned(), durable: Mutex::new(durable) };
+        // Restart qualification uses the existing durable activation count before dropping reply.
+        state.lose_reply_if_armed("restart")?;
+        Ok(state)
     })
+    .on_suspend(|state| async move { state.lifecycle("suspend").await })
+    .on_resume(|state| async move { state.lifecycle("recover").await })
     .request("proof.settings.get", |context: Context<State>, _: Empty| async move {
         context.state().called().await?;
         Ok(json!({"value":context.state().durable.lock().await.value}))
