@@ -125,7 +125,11 @@ Pause/resume are Personal-only; Team instances and overrides are refused. Instal
 
 Results are JSON on stdout. Routine stderr and service logs omit request/response bodies. Explicit success responses and bounded error details can contain sensitive Package output; protect redirected output too.
 
-Exits are 0 for success, 1 for operational failures or uncertain outcomes, 2 for invalid invocation/input/compatibility, and 130 for an interrupted client, including when terminal output blocks on an open pipe. Losing a reply or interrupting observation after dispatch does not prove that a mutation failed. The client neither reconnects nor retries mutations.
+Continuously drain both stdout and stderr when running operator clients, including from automation. The supported observation and interruption contract requires responsive output consumption. Exits are 0 for success, 1 for operational failures or uncertain outcomes, 2 for invalid invocation/input/compatibility, and 130 for an interrupted client under that contract.
+
+A full, open output destination that stops draining is unsupported. In particular, a full shared pipe from `2>&1` can block the interruption warning and prevent prompt client termination. Diagnostic delivery into a full pipe is not guaranteed. Some separate-output arrangements permit interruption, but that behavior is not a guarantee for all blocked destinations. This operator-client limitation does not waive foreground server signal handling or the service shutdown budget below.
+
+Keep both streams draining while your caller supervises the client. The caller can terminate the client according to its own policy. Lost observation, interruption, or termination after mutation dispatch leaves an **unknown outcome**, not proof of no effect. Inspect domain state before another intentional action. Never automatically replay the mutation. The client neither reconnects nor retries mutations.
 
 Personal pause, resume, and restart failures are conservatively unknown and nonretryable in the outer operator error unless the Host proves a pre-dispatch refusal: missing or invalid-state Instance, disposed Instance, Team restriction, missing registration, or already stopped Host. An Instance reporting shutdown during activation does not prove refusal. The original Host envelope stays unchanged in `details`, even when its code or embedded retryability cannot express the lost dispatch uncertainty. Inspect Package-owned state before acting. This policy is local to these operator lifecycle commands, not a change to shared Host callers.
 

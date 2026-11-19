@@ -2,6 +2,8 @@
 
 Use this canonical runbook for automated gates and Don's M1–M5 observations. Use disposable data, not an ordinary profile. Keep invitations, keys, request bodies, and private database contents out of evidence. Record identifiers and independently observed content instead.
 
+Continuously drain operator-client stdout and stderr throughout these procedures, including under caller supervision. The [operator output and error policy](README.md#handle-errors-without-replay) limits the interruption/exit130 contract to responsive output consumption. A full, open non-draining destination, including a shared `2>&1` pipe, can prevent prompt client termination or warning delivery. Delivery into a full pipe is not guaranteed. Caller termination or lost observation after mutation dispatch leaves an unknown outcome. Inspect domain state before another intentional action. Never automatically replay the mutation. This limitation does not waive foreground server signals, service shutdown, native lane N, or M1–M5.
+
 ## Record the candidate
 
 Record the source commit, dirty status, OS release, architecture, Rust/Cargo, Node/npm, command exit codes, executed test names, and SHA-256 hashes of final artifacts. Do not call a modified checkout the committed candidate.
