@@ -70,6 +70,12 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### Native headless application (implementation in progress)
+
+The `headless` workstream uses the integrated gateway Host baseline `2039693` and shared Core Runtime, Package Host and Package contracts (ADR 0047). Its first workstream step implements exclusive application ownership and desktop restart handoff, compiled native Backend targets, target-aware Package assembly with isolated resource roots, and fail-closed Linux process evidence. Affected Core/Host/contract/desktop/system suites, strict checks, Node suites and native Mac app/DMG smoke pass locally; native Linux execution remains pending lane N, not inferred from those Mac results. Server, private operator transport, onboarding, generic Package requests, explicit application build selection and sync-only qualification follow in separate steps; they are not yet delivered by the native prerequisites.
+
+The accepted native matrix is Apple Silicon desktop, Apple Silicon headless, and Ubuntu 26.04 x86_64 GNU/Linux headless. A selected build must build only that application/target. Agent and External Gateway production changes remain independent workstreams and are not synchronization dependencies. Native Linux automation and real service/logout/reboot observations remain pending their qualification lane; Mac tests do not establish them. Existing core roadmap Phase 5 ordering and desktop release tooling are unchanged.
+
 ### External Gateway (full access verified locally; not integrated)
 
 Started in workstream `external-gateway` on branch `don-smith/external_gateway`. The standalone Personal Package will expose selected read-only Workspace Ports to external coding agents through one authenticated localhost endpoint per Workspace. Backlog is the first real Provider qualification; a newly installed eligible Provider must appear without rebuilding the gateway. Runtime guides are required, Packages and tools are explicitly enabled, and all independently revocable tokens share one configured scope. Conversations, external writes, MCP, and LAN access are excluded from the initial delivery.
@@ -340,7 +346,8 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 - Custom relay server configuration for teams (`TEAM-R11`, `TEAM.SYS.TRANS-R02`).
 - System tray and native menus (`TEAM.SYS.SHELL-R01`, ADR 0002).
 - One-hour update adoption (vision success criterion 6), Developer ID signing and notarization (`TEAM.DEL`); see **Stable application releases and updates** for the consent-driven tooling, not an adoption guarantee.
-- Builds for platforms other than macOS on Apple silicon.
+- Linux desktop: qualify Tauri, native UI dependencies, bundle delivery and desktop lifecycle separately after the headless workstream. It is not an accepted build selection in that workstream.
+- Other CPU/libc targets, cross-compilation, launchd integration and public headless distribution/signing/update delivery.
 - Published, versioned Rust and TypeScript SDK artifacts and a generated-project upgrade policy (Phase 3 external authoring condition, ADR 0010).
 - Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted eager Package runs one Backend per Workspace (5 eager bundled Packages × 3 Workspaces = 15 processes); the on-demand Exhibits Package starts only on first use. Measure before scheduling.
 - Documents maintenance and wider qualification: Filesystem Docs is closed with owner-accepted limitations. Don/the next Documents maintainer owns DELTA-023 group 12's CR-301/302, three P2 improvements and deferred manual/platform checks. Prioritize from real use or wider-release needs rather than restarting the completed workstream automatically (ADRs 0041 and 0043).

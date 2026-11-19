@@ -5,6 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+/// Backend target of the compiled Host; applications cannot override it.
+pub const NATIVE_BACKEND_TARGET: &str = env!("TEAMARNESS_HOST_TARGET");
+
 mod admission;
 mod authority;
 #[cfg(feature = "test-hooks")]

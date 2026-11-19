@@ -256,7 +256,14 @@ fn snapshots_and_errors_expose_only_host_values() {
         PathBuf::from("/private"),
         teamarness_package_host::InstallationPublicIdentity::new("installation1").unwrap(),
     );
+    assert_eq!(
+        config.target(),
+        teamarness_package_host::NATIVE_BACKEND_TARGET
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     assert_eq!(config.target(), "aarch64-apple-darwin");
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    assert_eq!(config.target(), "x86_64-unknown-linux-gnu");
 
     let snapshot = PackageHostSnapshot {
         revision: HostRevision::INITIAL,

@@ -134,3 +134,37 @@ async fn exact_lease_evidence_terminates_the_process_group_and_removes_the_lease
         .unwrap();
     assert_eq!(count, 0);
 }
+
+#[tokio::test]
+async fn gone_process_lease_is_cleared_without_blocking_relaunch() {
+    let fixture = common::Fixture::node(&[("orphan", "dev.teamarness.orphan")]).await;
+    let workspace = fixture.core.list_workspaces().unwrap()[0].id().to_string();
+    // A reaped child gives an actually gone PID, rather than a guessed unused one.
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    insert_lease(
+        &fixture._private,
+        pid,
+        i32::try_from(pid).unwrap(),
+        "old-start",
+        std::path::Path::new("/gone"),
+        "old-digest",
+        "old-token",
+        &workspace,
+    );
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let snapshot = host.snapshot().await;
+    assert!(
+        !snapshot
+            .diagnostics
+            .iter()
+            .any(|error| error.code == PackageErrorCode::OrphanUnresolved)
+    );
+    assert_eq!(snapshot.instances.len(), 1);
+}

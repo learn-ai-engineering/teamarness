@@ -8,7 +8,7 @@ The system SHALL keep product-domain Package behavior separate from Core Runtime
 
 ## TEAM.SYS-R02 — Technology Stack
 
-The Core Runtime and Shell SHALL be written in Rust. The desktop Shell SHALL use Tauri v2. Teamarness SHALL provide a Rust Package Backend SDK; the Package Process Protocol SHALL be language-neutral. Package UIs SHALL use TypeScript. Iroh SHALL be the Core Runtime's P2P transport layer.
+The Core Runtime and Shell SHALL be written in Rust. The desktop Shell SHALL use Tauri v2. The Headless Application SHALL use the same Rust Core Runtime and Package Host without Tauri or a graphical runtime (ADR 0047). Teamarness SHALL provide a Rust Package Backend SDK; the Package Process Protocol SHALL be language-neutral. Package UIs SHALL use TypeScript. Iroh SHALL be the Core Runtime's P2P transport layer.
 
 ## TEAM.SYS-R03 — Local-First
 

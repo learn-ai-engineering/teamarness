@@ -41,3 +41,8 @@ The Core Runtime SHALL refuse a data directory that is a symbolic link, is owned
 ## TEAM.SYS.ID-R08 — Recipient-Bound Protection Grants
 
 A Protection Grant SHALL be decryptable only with the recipient Installation's private key. It SHALL bind its kind, scope, Workspace, author, recipient, admission, and Content Key identifier, and its author SHALL sign it through the domain-separated signing interface.
+
+
+## TEAM.SYS.ID-R11 — Exclusive Application Ownership
+
+Production desktop and headless applications SHALL acquire exclusive ownership of their private data directory before identity recovery, database migrations, or network startup. Core SHALL offer this as an opt-in library configuration, preserving nonexclusive transactional callers. Ownership SHALL use a nonwaiting kernel lock on a stable owner-only regular file, SHALL reject symlinks, foreign ownership and additional hardlinks, SHALL NOT unlink the lock during cleanup, and SHALL NOT pass it through child exec. A duplicate application SHALL fail before recovery effects. Ownership SHALL remain held until application work has drained and Host and Core cleanup have succeeded, or until process exit. Desktop replacement MAY explicitly retire ownership after successful cleanup; the old application SHALL remain terminal and its retired Core SHALL refuse further local commands. Failed, timed-out or uncertain cleanup SHALL NOT retire ownership (ADR 0047).

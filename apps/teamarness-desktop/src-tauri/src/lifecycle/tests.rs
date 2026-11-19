@@ -12,6 +12,7 @@ struct Fixture {
     host_error: bool,
     install_error: bool,
     installs: AtomicUsize,
+    retirements: AtomicUsize,
     exits: AtomicUsize,
 }
 impl TerminalAdapter for Fixture {
@@ -41,6 +42,10 @@ impl TerminalAdapter for Fixture {
         } else {
             pending()
         }
+    }
+    fn retire_ownership(&self) -> Result<(), ()> {
+        self.retirements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
     fn restart(&self) {
         self.order.lock().unwrap().push("restart");
@@ -132,6 +137,7 @@ async fn timeout_keeps_cleanup_owned_and_late_success_cannot_install() {
     adapter.release.notify_one();
     lifecycle.finished().await;
     assert_eq!(adapter.installs.load(Ordering::SeqCst), 0);
+    assert_eq!(adapter.retirements.load(Ordering::SeqCst), 0);
     assert_eq!(adapter.exits.load(Ordering::SeqCst), 1);
     assert!(lifecycle.admit().is_err());
 }
@@ -244,6 +250,9 @@ async fn installation_has_no_abandon_deadline_and_recovery_quit_cannot_race_it()
         }
         fn install(&self, pending: Install) -> Result<(), InstallFailure> {
             pending()
+        }
+        fn retire_ownership(&self) -> Result<(), ()> {
+            Ok(())
         }
         fn restart(&self) {
             panic!("failed installation must not restart")

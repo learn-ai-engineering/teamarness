@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { STAGING_ROOT, readBundledPackages } from "./bundled-packages.mjs";
-import { stagePackageDirectory, verifyPackageDirectory } from "./package-directory.mjs";
+import { nativeBackendTarget, requireNativeBackendTarget, validateBackendTarget, stagePackageDirectory, verifyPackageDirectory } from "./package-directory.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 export const repositoryRoot = resolve(dirname(scriptPath), "..");
@@ -20,7 +20,10 @@ export async function buildPackage({
   skipUiBuild = false,
   backendSigner,
   version,
+  target = nativeBackendTarget(),
 } = {}) {
+  validateBackendTarget(target);
+  if (!skipBuilds) requireNativeBackendTarget(target);
   if (!sourceDirectory) throw new Error("Package sourceDirectory is required");
   const source = join(root, sourceDirectory);
   const manifestPath = join(source, "teamarness.package.json");
@@ -34,8 +37,8 @@ export async function buildPackage({
   let builtBackend = backendPath;
   if (!skipBuilds) {
     if (!cargoPackage) throw new Error(`Package ${identity} cargoPackage is required to build its Backend`);
-    run(root, "cargo", ["build", "-p", cargoPackage, "--release", "--locked"]);
-    builtBackend = join(cargoTargetDirectory(root), "release", cargoPackage);
+    run(root, "cargo", ["build", "-p", cargoPackage, "--release", "--locked", "--target", target]);
+    builtBackend = join(cargoTargetDirectory(root), target, "release", cargoPackage);
   }
   if (!skipUiBuild) {
     const uiPackage = JSON.parse(await readFile(join(source, "ui/package.json"), "utf8"));
@@ -58,6 +61,7 @@ export async function buildPackage({
     outputDirectory: output,
     backendSigner,
     version,
+    target,
   });
   const verified = await verifyPackageDirectory(output);
   if (staged.identity !== identity || verified.identity !== identity) {

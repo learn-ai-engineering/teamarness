@@ -69,7 +69,7 @@ fn stage_consumer(application: &Path, min_minor: u16, max_minor: u16) {
         "schemaVersion":1,"identity":CONSUMER,"version":"1.0.0",
         "presentation":{"displayName":"Documents port proof"},
         "protocol":{"major":1,"minMinor":0,"maxMinor":0},
-        "backends":[{"target":"aarch64-apple-darwin","path":backend,"size":binary.len(),"sha256":digest(&binary)}],
+        "backends":[{"target":teamarness_package_host::NATIVE_BACKEND_TARGET,"path":backend,"size":binary.len(),"sha256":digest(&binary)}],
         "ui":{"entrypoint":{"path":"ui/index.js","size":ui.len(),"sha256":digest(ui)},"assets":[],
             "contract":{"path":"ui-contract.json","sha256":digest(contract)}},
         "capabilities":[{"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0}],

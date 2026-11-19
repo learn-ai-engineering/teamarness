@@ -88,6 +88,8 @@ pub(crate) struct RuntimeState {
     principal_sync_init_faults: u8,
     next_subscriber_id: u64,
     pub(crate) poisoned: bool,
+    application_ownership: Option<ownership::ApplicationOwnership>,
+    shutdown_complete: bool,
 }
 
 pub(crate) trait Clock: Send + Sync {
@@ -146,7 +148,13 @@ impl CoreRuntime {
         // blocking SQLite and signature work, so they run together on a
         // blocking thread and never on an asynchronous worker.
         let directory = config.private_data_directory().to_path_buf();
+        let exclusive = config.exclusive_application_ownership;
         let opened: Result<_, CoreError> = tokio::task::spawn_blocking(move || {
+            let ownership = if exclusive {
+                Some(ownership::ApplicationOwnership::acquire(&directory)?)
+            } else {
+                None
+            };
             let crate::storage::StoredRuntime {
                 mut connection,
                 secret_key,
@@ -162,11 +170,18 @@ impl CoreRuntime {
                 opened_at_unix_ms,
                 crate::synchronization::parking::ParkingLimits::CURRENT,
             );
-            Ok((connection, secret_key, display_name, memberships, recovery))
+            Ok((
+                connection,
+                secret_key,
+                display_name,
+                memberships,
+                recovery,
+                ownership,
+            ))
         })
         .await
         .map_err(fault!(CoreError::Storage(StorageError::Database)))?;
-        let (connection, secret_key, display_name, memberships, recovery) = opened?;
+        let (connection, secret_key, display_name, memberships, recovery, ownership) = opened?;
         #[cfg(not(test))]
         let _ = recovery;
         let public_identity = PublicIdentity(secret_key.public());
@@ -196,6 +211,8 @@ impl CoreRuntime {
             principal_sync_init_faults: 0,
             next_subscriber_id: 0,
             poisoned: false,
+            application_ownership: ownership,
+            shutdown_complete: false,
         }));
         {
             let state = Arc::clone(&state);
@@ -345,7 +362,35 @@ impl CoreRuntime {
         self.transport
             .shutdown()
             .await
-            .map_err(|_| crate::ShutdownError::Transport)
+            .map_err(|_| crate::ShutdownError::Transport)?;
+        self.state
+            .lock()
+            .map_err(fault!(crate::ShutdownError::Transport))?
+            .shutdown_complete = true;
+        Ok(())
+    }
+
+    /// Permanently fences local commands and releases exclusive application ownership.
+    ///
+    /// The application must first close admission, drain its operations, and
+    /// successfully shut down its Package Host. Core shutdown must also have
+    /// succeeded. Failed or uncertain application cleanup must never call this.
+    /// This explicit handoff permits a replacement process to open before the
+    /// old application's retained Arcs are dropped.
+    pub fn retire_application_ownership(&self) -> Result<(), StorageError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(fault!(StorageError::RuntimePoisoned))?;
+        if !state.shutdown_complete {
+            return Err(StorageError::RuntimePoisoned);
+        }
+        state.poisoned = true;
+        if let Some(ownership) = &mut state.application_ownership {
+            ownership.retire()?;
+        }
+        state.application_ownership.take();
+        Ok(())
     }
 }
 
@@ -358,6 +403,7 @@ impl Drop for CoreRuntime {
 mod identity;
 mod membership;
 mod onboarding;
+mod ownership;
 pub(crate) mod principal_sync;
 mod records;
 mod replication;

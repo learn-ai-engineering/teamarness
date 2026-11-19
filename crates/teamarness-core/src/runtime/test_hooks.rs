@@ -395,6 +395,8 @@ impl RuntimeState {
             principal_sync_init_faults: 0,
             next_subscriber_id: 0,
             poisoned: false,
+            application_ownership: None,
+            shutdown_complete: false,
         }
     }
 

@@ -61,6 +61,8 @@ pub(crate) trait TerminalAdapter: Send + Sync + 'static {
     fn stop_updates(&self);
     fn cleanup(&self) -> BoxFuture<'_, ShutdownErrors>;
     fn install(&self, pending: Install) -> Result<(), InstallFailure>;
+    /// Called only after admission closes, work drains, and cleanup succeeds.
+    fn retire_ownership(&self) -> Result<(), ()>;
     fn restart(&self);
     fn exit(&self);
 }
@@ -320,15 +322,13 @@ impl Lifecycle {
             // There is intentionally no timeout/abandon path for replacement.
             match tokio::task::spawn_blocking(move || installer.install(pending)).await {
                 Ok(Ok(())) => {
-                    self.phase(Phase::Restarting);
-                    adapter.restart();
+                    self.restart_after_cleanup(adapter.as_ref());
                 }
                 Ok(Err(error)) => self.fail(FailureCategory::Install, error.previous_app),
                 Err(_) => self.fail(FailureCategory::Uncertain, None),
             }
         } else if matches!(&self.0.inner.lock().unwrap().intent, Some(Intent::Restart)) {
-            self.phase(Phase::Restarting);
-            adapter.restart();
+            self.restart_after_cleanup(adapter.as_ref());
         } else {
             self.phase(Phase::Stopped);
             self.0.inner.lock().unwrap().exit_allowed = true;
@@ -346,6 +346,15 @@ impl Lifecycle {
             adapter.exit();
         }
     }
+    fn restart_after_cleanup(&self, adapter: &dyn TerminalAdapter) {
+        if adapter.retire_ownership().is_err() {
+            self.fail(FailureCategory::Shutdown, None);
+            return;
+        }
+        self.phase(Phase::Restarting);
+        adapter.restart();
+    }
+
     fn phase(&self, phase: Phase) {
         let mut inner = self.0.inner.lock().unwrap();
         inner.status.phase = phase;

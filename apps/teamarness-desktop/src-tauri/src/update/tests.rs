@@ -586,6 +586,9 @@ async fn update_apply_rechecks_pending_version_and_lifecycle_quit_cancels_downlo
         ) -> Result<(), crate::lifecycle::InstallFailure> {
             panic!("Quit cannot install")
         }
+        fn retire_ownership(&self) -> Result<(), ()> {
+            Ok(())
+        }
         fn restart(&self) {
             panic!("Quit cannot restart")
         }

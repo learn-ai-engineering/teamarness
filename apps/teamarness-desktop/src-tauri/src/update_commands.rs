@@ -223,6 +223,9 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(lifecycle::InstallFailure { previous_app: None })
         }
+        fn retire_ownership(&self) -> Result<(), ()> {
+            Ok(())
+        }
         fn restart(&self) {
             panic!("no restart on failure");
         }

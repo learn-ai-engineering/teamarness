@@ -658,6 +658,9 @@ mod tests {
             ) -> Result<(), crate::lifecycle::InstallFailure> {
                 panic!("Quit never installs")
             }
+            fn retire_ownership(&self) -> Result<(), ()> {
+                Ok(())
+            }
             fn restart(&self) {
                 panic!("Quit never restarts")
             }

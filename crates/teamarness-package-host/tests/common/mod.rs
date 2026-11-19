@@ -178,7 +178,7 @@ pub fn write_node_package_with_capabilities(
         "presentation": {"displayName": identity},
         "protocol": {"major": 1, "minMinor": 0, "maxMinor": 0},
         "backends": [{
-            "target":"aarch64-apple-darwin", "path":"backend/package.mjs",
+            "target":teamarness_package_host::NATIVE_BACKEND_TARGET, "path":"backend/package.mjs",
             "size":backend.len(), "sha256":digest(&backend)
         }],
         "ui": {

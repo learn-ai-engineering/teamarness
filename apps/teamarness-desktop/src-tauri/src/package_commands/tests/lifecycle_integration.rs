@@ -42,6 +42,12 @@ impl TerminalAdapter for RealShutdown {
         assert!(!self.installed.swap(true, Ordering::SeqCst));
         Ok(())
     }
+    fn retire_ownership(&self) -> Result<(), ()> {
+        self.state
+            .runtime
+            .retire_application_ownership()
+            .map_err(|_| ())
+    }
     fn restart(&self) {
         assert!(self.installed.load(Ordering::SeqCst));
         self.restarted.store(true, Ordering::SeqCst);

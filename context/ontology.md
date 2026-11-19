@@ -7,11 +7,19 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | Term | Definition |
 |---|---|
 | **Teamarness** | The application: a local-first, P2P, package-extensible team workspace |
-| **Installation** | One running instance of Teamarness on one device. Identified by an Ed25519 keypair that doubles as an Iroh `EndpointId` |
+| **Installation** | The persistent Teamarness identity and state on one device, owned by at most one production application at a time. Identified by an Ed25519 keypair that doubles as an Iroh `EndpointId` |
 | **Workspace** | A named team context with canonical membership. Contains packages, conversations, and shared context. A single installation may belong to multiple workspaces |
 | **Package** | A vertical module that owns one product domain, including its model, records, schemas, projections, policy, UI, and Package-specific membership. A Package consumes Semantic Capabilities for Teamarness-owned authority and generic services |
 | **Core Runtime** | The application kernel that owns Installation identity, Workspace creation and invitations, Canonical Membership, Package lifecycle, and the authority and state behind Semantic Capabilities |
 | **Shell** | The Tauri desktop host that owns Package navigation and UI mounting in Package UI Frames, Workspace controls, Workspace-level theming, and the desktop window lifecycle |
+
+## Application hosting
+
+| Term | Definition |
+|---|---|
+| **Headless Application** | The foreground Rust application that composes the same Core Runtime and Package Host without Tauri or a graphical runtime. Its operator clients do not open separate runtimes |
+| **Local Operator** | An authenticated same-user client of the headless application's private Unix socket, with full local application authority. It is not the gateway's restricted external data client and grants no new Package capability |
+| **Application Ownership** | Exclusive kernel ownership of one Installation's private data directory, acquired before Core recovery and retained through application cleanup. Explicit terminal retirement permits desktop replacement without waiting for retained runtime Arcs to drop (ADR 0047) |
 
 ## Identity and Membership
 
@@ -65,7 +73,7 @@ Canonical terminology for the Teamarness domain. When a term appears in requirem
 | **Package Source** | The concrete Package Directory from which an Installation discovers and validates a Package. A Package Source is `bundled` or `local` in Phase 3 |
 | **Package Distribution** | The means by which a Package Directory reaches an Installation. Distribution does not determine Package Identity, Package Trust, or runtime behavior |
 | **Package Registration** | A binding that makes one Package Source available to Teamarness under a stated Package Registration Scope |
-| **Package Registration Scope** | The authority boundary for a Package Registration: `application`, `installation`, or `workspace`. Application registrations hold bundled sources. Installation registrations hold local sources; the Shell writes them, or a person writes the file by hand. Workspace scope is not implemented |
+| **Package Registration Scope** | The authority boundary for a Package Registration: `application`, `installation`, or `workspace`. Application registrations hold bundled sources. Installation registrations hold local sources; the Shell or authenticated Local Operator writes them, or a person writes the file by hand (ADR 0047). Workspace scope is not implemented |
 | **Team tier** | The Package Admission tier that holds every application registration and every installation registration that overrides one (`overrideApplication`). It is admitted at Host open and does not change while the Host runs. Its Packages are Team Packages. A Team Package never routes to a Personal Provider (ADR 0036) |
 | **Personal tier** | The Package Admission tier that holds every installation registration without an override. It is admitted after the Team tier, and a person installs, reloads, and removes its Packages while the Host runs. Its Packages are Personal Packages. The tier is a lifecycle boundary, not a trust verdict (ADR 0036) |
 | **Package Admission** | The Teamarness decision to accept a validated Package Source for execution as a Package Identity |

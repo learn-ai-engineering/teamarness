@@ -246,7 +246,7 @@ fn directory_acceptable(
 /// temporary paths reach through system links such as `/var` to
 /// `/private/var`, so an ancestor link is normal and is not a signal.
 #[cfg(unix)]
-fn prepare_private_directory(path: &Path) -> Result<(), StorageError> {
+pub(crate) fn prepare_private_directory(path: &Path) -> Result<(), StorageError> {
     prepare_private_directory_inner(path, || {})
 }
 
@@ -304,7 +304,7 @@ fn prepare_private_directory_inner(
 
 /// Fails closed where the directory cannot be restricted to its owner.
 #[cfg(not(unix))]
-fn prepare_private_directory(_path: &Path) -> Result<(), StorageError> {
+pub(crate) fn prepare_private_directory(_path: &Path) -> Result<(), StorageError> {
     Err(StorageError::Permission)
 }
 

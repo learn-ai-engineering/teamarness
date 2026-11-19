@@ -160,6 +160,14 @@ impl lifecycle::TerminalAdapter for DesktopTerminal {
         }
         pending()
     }
+    fn retire_ownership(&self) -> Result<(), ()> {
+        self.state
+            .runtime
+            .retire_application_ownership()
+            .map_err(|error| {
+                eprintln!("teamarness-desktop ownership retirement failed error={error}");
+            })
+    }
     fn restart(&self) {
         if update::probe_enabled() {
             eprintln!("application-update-probe terminal=restart-blocked");
@@ -193,7 +201,7 @@ async fn open_runtime_modules(
     application_index: PathBuf,
 ) -> Result<(Arc<CoreRuntime>, Arc<PackageHost>), &'static str> {
     let runtime = Arc::new(
-        CoreRuntime::open(CoreRuntimeConfig::new(data_directory.clone()))
+        CoreRuntime::open(CoreRuntimeConfig::new(data_directory.clone()).with_exclusive_application_ownership())
             .await
             .map_err(|error| {
                 // The user-facing text stays deliberately vague; the cause is
@@ -205,6 +213,12 @@ async fn open_runtime_modules(
             .map_err(|error| match error {
                 CoreError::Storage(StorageError::LegacyProtectionState) => {
                     "This data directory was created by an older development build whose key grants are no longer supported. Delete it to start fresh."
+                }
+                CoreError::Storage(StorageError::ApplicationAlreadyOwned) => {
+                    "Another application already owns this Teamarness data directory"
+                }
+                CoreError::Storage(StorageError::InvalidApplicationLock) => {
+                    "The application ownership lock is unsafe (symlink, other owner, links, type, or permissions)"
                 }
                 CoreError::Storage(StorageError::InvalidDataDirectory) => {
                     "The data directory is not a private Teamarness directory (symlink, other owner, or unrelated contents)"

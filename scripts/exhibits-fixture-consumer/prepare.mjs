@@ -15,6 +15,7 @@ import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { nativeBackendTarget } from "../package-directory.mjs";
 import { ensurePrivateDirectory, resolveDevelopmentDataDir } from "../dev-profile.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -58,6 +59,7 @@ export async function prepareExhibitsFixtureConsumer(dataDirectory, { backend = 
   await writeFile(join(packageDirectory, manifest.ui.entrypoint.path), entrypoint, { mode: 0o600 });
   await writeFile(join(packageDirectory, manifest.ui.contract.path), contract, { mode: 0o600 });
 
+  manifest.backends[0].target = nativeBackendTarget();
   manifest.backends[0].size = backendBytes.length;
   manifest.backends[0].sha256 = digest(backendBytes);
   manifest.ui.entrypoint.size = entrypoint.length;
