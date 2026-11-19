@@ -94,3 +94,8 @@ teamarness-package-protocol = { path = "../../crates/teamarness-package-protocol
 tempfile.workspace = true
 # `net` is for the stub completion endpoint the Agent reply flow binds on loopback.
 tokio = { workspace = true, features = ["net"] }
+
+# Generic Personal Package qualification only. Never included in application resources.
+[[bin]]
+name = "headless-personal-fixture"
+path = "src/bin/headless_personal_fixture.rs"

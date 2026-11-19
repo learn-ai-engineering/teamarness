@@ -165,7 +165,7 @@ async fn wait_status(
             if let Ok(response) =
                 control::request(&fixture.config.data_directory, support::request(1)).await
             {
-                return response.result.unwrap();
+                return serde_json::from_value(response.result.unwrap()).unwrap();
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -281,7 +281,7 @@ fn headless_process_entry() {
         let server = ControlServer::bind(&app).await.unwrap();
         let entered = Arc::new(Notify::new());
         let (stop, stopped) = oneshot::channel();
-        let dispatch = { let entered = entered.clone(); move |_| { let entered = entered.clone(); async move { entered.notify_one(); assert!(!panic_cleanup, "fixture dispatch panic"); std::future::pending().await } } };
+        let dispatch = { let entered = entered.clone(); move |_| { let entered = entered.clone(); async move { entered.notify_one(); assert!(!panic_cleanup, "fixture dispatch panic"); std::future::pending::<Result<serde_json::Value, teamarness_headless::ControlError>>().await } } };
         let accepting = server.accept_until(dispatch, async { stopped.await.unwrap() });
         let client = async {
             let mut stream = tokio::net::UnixStream::connect(root.join("data/control.sock")).await.unwrap();
@@ -411,4 +411,75 @@ async fn admission_diagnostics_are_degraded_not_global_synchronization_success()
     assert!(!status.host.diagnostics.is_empty());
     app.shutdown_by(Instant::now() + control::SHUTDOWN_TIMEOUT)
         .await;
+}
+
+#[tokio::test]
+async fn secret_input_canaries_do_not_reach_routine_cli_stderr_or_service_logs() {
+    use std::io::Read;
+    use teamarness_headless::control::{Operation, Request};
+    use tokio::io::AsyncWriteExt;
+    let fixture = support::Fixture::new();
+    let directory = support::packages::stage(
+        &fixture.root.path().join("independent"),
+        support::packages::PERSONAL,
+    );
+    let mut server = child(&fixture, "serve");
+    wait_status(&fixture, &mut server).await;
+    let error = control::request(
+        &fixture.config.data_directory,
+        Request {
+            major: 1,
+            id: 20,
+            operation: Operation::WorkspaceJoin {
+                invitation: "SECRET_INVITATION_CANARY".into(),
+                person_name: "Ada".into(),
+            },
+        },
+    )
+    .await
+    .unwrap()
+    .result
+    .unwrap_err();
+    assert!(!error.to_string().contains("SECRET_INVITATION_CANARY"));
+    let mut cli = tokio::process::Command::new(env!("CARGO_BIN_EXE_teamarness-headless"))
+        .arg("--data-dir")
+        .arg(&fixture.config.data_directory)
+        .args(["packages", "install", "--directory"])
+        .arg(directory)
+        .args(["--package", support::packages::PERSONAL, "--input", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    cli.stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"acceptedRisks":["SECRET_CONSENT_CANARY"]}"#)
+        .await
+        .unwrap();
+    let output = cli.wait_with_output().await.unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("Host consent error, not a parser refusal");
+    assert_eq!(
+        error["details"]["envelope"]["code"],
+        "trust_evidence_missing"
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("SECRET_CONSENT_CANARY"));
+    kill(Pid::from_raw(server.0.id() as i32), Signal::SIGTERM).unwrap();
+    assert!(wait_exit(&mut server).await.success());
+    let mut log = String::new();
+    server
+        .0
+        .stderr
+        .as_mut()
+        .unwrap()
+        .read_to_string(&mut log)
+        .unwrap();
+    for canary in ["SECRET_INVITATION_CANARY", "SECRET_CONSENT_CANARY"] {
+        assert!(!log.contains(canary));
+    }
+    assert!(log.contains("operation=workspace_join"));
+    assert!(log.contains("operation=packages_install"));
 }

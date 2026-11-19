@@ -1218,6 +1218,30 @@ impl CoreRuntime {
         Self::open_inner(config, Box::new(SystemClock), Some(true)).await
     }
 
+    /// Produces an authentic, already-expired unused invitation for public onboarding tests.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn expired_workspace_invitation_for_tests(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<crate::WorkspaceInvitation, crate::OnboardingError> {
+        let now = self.clock.now_unix_ms();
+        let (token, genesis) = self
+            .issue_invitation_with_genesis_at(
+                workspace,
+                now.saturating_sub(120_000),
+                now.saturating_sub(60_000),
+            )
+            .map_err(map_invitation_onboarding_error)?;
+        let verified = token.verified().map_err(map_invitation_onboarding_error)?;
+        crate::WorkspaceInvitation::from_parts(
+            &verified,
+            genesis,
+            self.transport.endpoint_address(),
+        )
+        .map_err(|_| crate::OnboardingError::InvalidInput)
+    }
+
     /// Teaches this loopback Installation how to reach `peer`.
     ///
     /// Both Installations must come from [`Self::open_loopback_for_tests`]; on

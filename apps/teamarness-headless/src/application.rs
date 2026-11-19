@@ -145,8 +145,12 @@ impl Application {
                     let failures = failures.clone();
                     async move {
                         match operation {
-                            Operation::Status {} => {
-                                Ok(status(&core, &host, failures.load(Ordering::Relaxed)).await)
+                            Operation::Status {} => serde_json::to_value(
+                                status(&core, &host, failures.load(Ordering::Relaxed)).await,
+                            )
+                            .map_err(|_| ControlError::new(crate::ErrorCode::Internal)),
+                            operation => {
+                                crate::administration::dispatch(core, host, operation).await
                             }
                         }
                     }

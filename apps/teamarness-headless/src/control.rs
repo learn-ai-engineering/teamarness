@@ -11,8 +11,11 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout};
 
-use crate::application::{Application, Status};
+use crate::application::Application;
 use crate::{ControlError, ErrorCode, socket};
+use serde_json::Value;
+use std::path::PathBuf;
+use teamarness_package_host::PackageIdentity;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
@@ -22,16 +25,106 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(90);
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(120);
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Status {},
+    IdentityShow {},
+    IdentitySetName {
+        name: String,
+    },
+    WorkspaceList {},
+    WorkspaceJoin {
+        invitation: String,
+        person_name: String,
+    },
+    WorkspaceMembers {
+        workspace: String,
+    },
+    WorkspaceRenameSelf {
+        workspace: String,
+        name: String,
+    },
+    AgentList {
+        workspace: String,
+    },
+    AgentAdd {
+        workspace: String,
+        name: String,
+    },
+    AgentRename {
+        workspace: String,
+        agent: String,
+        name: String,
+    },
+    AgentRemove {
+        workspace: String,
+        agent: String,
+    },
+    PackagesList {},
+    PackagesInspect {
+        directory: PathBuf,
+    },
+    PackagesInstall {
+        directory: PathBuf,
+        expected_identity: PackageIdentity,
+        accepted_risks: Vec<String>,
+    },
+    PackagesReload {
+        package: PackageIdentity,
+    },
+    PackagesRemove {
+        package: PackageIdentity,
+    },
+    PackagesRestart {
+        workspace: String,
+        package: PackageIdentity,
+    },
+    PackagesPause {
+        workspace: String,
+        package: PackageIdentity,
+    },
+    PackagesResume {
+        workspace: String,
+        package: PackageIdentity,
+    },
 }
 
 impl Operation {
-    fn name(self) -> &'static str {
+    pub fn is_mutation(&self) -> bool {
+        !matches!(
+            self,
+            Self::Status {}
+                | Self::IdentityShow {}
+                | Self::WorkspaceList {}
+                | Self::WorkspaceMembers { .. }
+                | Self::AgentList { .. }
+                | Self::PackagesList {}
+                | Self::PackagesInspect { .. }
+        )
+    }
+
+    fn name(&self) -> &'static str {
         match self {
             Self::Status {} => "status",
+            Self::IdentityShow {} => "identity_show",
+            Self::IdentitySetName { .. } => "identity_set_name",
+            Self::WorkspaceList {} => "workspace_list",
+            Self::WorkspaceJoin { .. } => "workspace_join",
+            Self::WorkspaceMembers { .. } => "workspace_members",
+            Self::WorkspaceRenameSelf { .. } => "workspace_rename_self",
+            Self::AgentList { .. } => "agent_list",
+            Self::AgentAdd { .. } => "agent_add",
+            Self::AgentRename { .. } => "agent_rename",
+            Self::AgentRemove { .. } => "agent_remove",
+            Self::PackagesList {} => "packages_list",
+            Self::PackagesInspect { .. } => "packages_inspect",
+            Self::PackagesInstall { .. } => "packages_install",
+            Self::PackagesReload { .. } => "packages_reload",
+            Self::PackagesRemove { .. } => "packages_remove",
+            Self::PackagesRestart { .. } => "packages_restart",
+            Self::PackagesPause { .. } => "packages_pause",
+            Self::PackagesResume { .. } => "packages_resume",
         }
     }
 }
@@ -46,10 +139,10 @@ pub struct Request {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Response {
+pub struct Response<T = Value> {
     pub major: u16,
     pub id: u64,
-    pub result: Result<Status, ControlError>,
+    pub result: Result<T, ControlError>,
 }
 
 /// Reads the complete frame under one deadline, checking the prefix before allocation.
@@ -80,6 +173,11 @@ pub async fn write_frame<T: Serialize>(
     writer: &mut (impl AsyncWrite + Unpin),
     value: &T,
 ) -> Result<(), ControlError> {
+    let bytes = encode_frame(value)?;
+    write_encoded(writer, &bytes).await
+}
+
+fn encode_frame(value: &impl Serialize) -> Result<Vec<u8>, ControlError> {
     let mut buffer = FrameBuffer(Vec::new());
     serde_json::to_writer(&mut buffer, value).map_err(|error| {
         ControlError::new(if error.is_io() {
@@ -88,12 +186,18 @@ pub async fn write_frame<T: Serialize>(
             ErrorCode::Internal
         })
     })?;
-    let bytes = buffer.0;
+    Ok(buffer.0)
+}
+
+async fn write_encoded(
+    writer: &mut (impl AsyncWrite + Unpin),
+    bytes: &[u8],
+) -> Result<(), ControlError> {
     timeout(IO_TIMEOUT, async {
         writer
             .write_all(&(bytes.len() as u32).to_be_bytes())
             .await?;
-        writer.write_all(&bytes).await?;
+        writer.write_all(bytes).await?;
         writer.flush().await
     })
     .await
@@ -130,10 +234,11 @@ impl<'a> ControlServer<'a> {
     }
 
     /// Stops admission at the first stop event. The returned drain owns every accepted task.
-    pub async fn accept_until<D, F, S>(mut self, dispatch: D, stop: S) -> Drain<'a>
+    pub async fn accept_until<D, F, S, T>(mut self, dispatch: D, stop: S) -> Drain<'a>
     where
         D: Fn(Operation) -> F + Send + Sync + 'static,
-        F: Future<Output = Result<Status, ControlError>> + Send + 'static,
+        F: Future<Output = Result<T, ControlError>> + Send + 'static,
+        T: Serialize + Send + Sync + 'static,
         S: Future<Output = Instant>,
     {
         let listener = self.endpoint.listener.take().expect("bound listener");
@@ -165,7 +270,7 @@ impl<'a> ControlServer<'a> {
                         let request: Request = match read_frame(&mut stream).await {
                             Ok(request) => request,
                             Err(error) => {
-                                let _ = write_frame(&mut stream, &Response { major: PROTOCOL_MAJOR, id: 0, result: Err(error) }).await;
+                                let _ = write_frame(&mut stream, &Response::<Value> { major: PROTOCOL_MAJOR, id: 0, result: Err(error) }).await;
                                 return;
                             }
                         };
@@ -176,9 +281,10 @@ impl<'a> ControlServer<'a> {
                                 Ok(permit) => {
                                     // This task owns the permit through dispatch AND terminal response writing.
                                     let started = Instant::now();
+                                    let name = request.operation.name();
                                     let result = dispatch(request.operation).await;
-                                    let outcome = match &result { Ok(_) => "ok".to_owned(), Err(error) => error.to_string() };
-                                    eprintln!("operator_complete id={} operation={} outcome={} durationMs={}", request.id, request.operation.name(), outcome, started.elapsed().as_millis());
+                                    let outcome = match &result { Ok(_) => "ok".to_owned(), Err(error) => format!("{:?} uncertain={}", error.code, error.outcome_uncertain) };
+                                    eprintln!("operator_complete id={} operation={} outcome={} durationMs={}", request.id, name, outcome, started.elapsed().as_millis());
                                     let response = Response { major: PROTOCOL_MAJOR, id: request.id, result };
                                     send_response(&mut stream, response).await;
                                     drop(permit);
@@ -187,7 +293,7 @@ impl<'a> ControlServer<'a> {
                                 Err(_) => Err(ControlError::new(if operations.is_closed() { ErrorCode::ShuttingDown } else { ErrorCode::Busy })),
                             }
                         };
-                        send_response(&mut stream, Response { major: PROTOCOL_MAJOR, id: request.id, result }).await;
+                        send_response(&mut stream, Response::<T> { major: PROTOCOL_MAJOR, id: request.id, result }).await;
                     });
                 }
             }
@@ -204,7 +310,7 @@ impl<'a> ControlServer<'a> {
     }
 }
 
-async fn send_response(stream: &mut UnixStream, response: Response) {
+async fn send_response<T: Serialize>(stream: &mut UnixStream, response: Response<T>) {
     if let Err(error) = write_frame(stream, &response).await
         && error.code == ErrorCode::FrameTooLarge
     {
@@ -212,7 +318,7 @@ async fn send_response(stream: &mut UnixStream, response: Response) {
         error.outcome_uncertain = true;
         let _ = write_frame(
             stream,
-            &Response {
+            &Response::<Value> {
                 major: PROTOCOL_MAJOR,
                 id: response.id,
                 result: Err(error),
@@ -248,6 +354,7 @@ impl Drain<'_> {
 
 /// Connects without touching storage or retrying an exchange.
 pub async fn request(directory: &Path, request: Request) -> Result<Response, ControlError> {
+    let encoded = encode_frame(&request)?;
     let path = socket::validate_endpoint(directory)?;
     let mut stream = timeout(IO_TIMEOUT, UnixStream::connect(path))
         .await
@@ -255,16 +362,24 @@ pub async fn request(directory: &Path, request: Request) -> Result<Response, Con
         .map_err(|_| ControlError::new(ErrorCode::Unavailable))?;
     socket::check_peer(&stream)?;
     socket::validate_endpoint(directory)?;
-    write_frame(&mut stream, &request).await?;
-    let response: Response = timeout(OBSERVATION_TIMEOUT, read_frame_observation(&mut stream))
-        .await
-        .map_err(|_| ControlError::new(ErrorCode::Timeout))??;
-    if response.major != PROTOCOL_MAJOR {
-        return Err(ControlError::new(ErrorCode::UnsupportedVersion));
+    let exchanged = async {
+        write_encoded(&mut stream, &encoded).await?;
+        let response: Response = timeout(OBSERVATION_TIMEOUT, read_frame_observation(&mut stream))
+            .await
+            .map_err(|_| ControlError::new(ErrorCode::Timeout))??;
+        if response.major != PROTOCOL_MAJOR {
+            return Err(ControlError::new(ErrorCode::UnsupportedVersion));
+        }
+        if response.id != request.id {
+            return Err(ControlError::new(ErrorCode::InvalidInput));
+        }
+        Ok(response)
     }
-    if response.id != request.id {
-        return Err(ControlError::new(ErrorCode::InvalidInput));
-    }
+    .await;
+    let response = exchanged.map_err(|mut error| {
+        error.outcome_uncertain |= request.operation.is_mutation();
+        error
+    })?;
     Ok(response)
 }
 

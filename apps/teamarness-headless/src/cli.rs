@@ -12,7 +12,34 @@ use crate::application::{Application, ApplicationConfig, fatal_shutdown};
 use crate::control::{self, Operation, PROTOCOL_MAJOR, Request, SHUTDOWN_TIMEOUT};
 use crate::{ControlError, ErrorCode};
 
-pub const HELP: &str = "teamarness-headless\n\nUsage:\n  teamarness-headless --help\n  teamarness-headless --version\n  teamarness-headless serve --data-dir <private-dir> [--application-root <resource-root>]\n  teamarness-headless --data-dir <private-dir> status\n\nResults are JSON. Clients never initialize storage.\n";
+pub const HELP: &str = "teamarness-headless
+
+Usage:
+  teamarness-headless --help | --version
+  teamarness-headless serve --data-dir <private-dir> [--application-root <resource-root>]
+  teamarness-headless --data-dir <private-dir> status
+  teamarness-headless --data-dir <private-dir> identity show
+  teamarness-headless --data-dir <private-dir> identity set-name --name <name>
+  teamarness-headless --data-dir <private-dir> workspace list
+  teamarness-headless --data-dir <private-dir> workspace join --person-name <name> --invitation-file <file|->
+  teamarness-headless --data-dir <private-dir> workspace members --workspace <id>
+  teamarness-headless --data-dir <private-dir> workspace rename-self --workspace <id> --name <name>
+  teamarness-headless --data-dir <private-dir> agent list --workspace <id>
+  teamarness-headless --data-dir <private-dir> agent add --workspace <id> --name <name>
+  teamarness-headless --data-dir <private-dir> agent rename --workspace <id> --agent <id> --name <name>
+  teamarness-headless --data-dir <private-dir> agent remove --workspace <id> --agent <id>
+  teamarness-headless --data-dir <private-dir> packages list
+  teamarness-headless --data-dir <private-dir> packages inspect --directory <absolute-path>
+  teamarness-headless --data-dir <private-dir> packages install --directory <absolute-path> --package <expected-identity> --input <file|->
+  teamarness-headless --data-dir <private-dir> packages reload|remove --package <identity>
+  teamarness-headless --data-dir <private-dir> packages restart|pause|resume --workspace <id> --package <identity>
+
+Install input: {\"acceptedRisks\":[\"filesystem\",\"network\",\"process\"]}.
+Input files must be owned regular non-symlink files with no group/other bits.
+Results are JSON. Upstream errors include details on stdout, never routine stderr.
+Clients never initialize storage or retry mutations.
+A lost mutation reply means outcome unknown. Inspect state before taking further action.
+";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -22,8 +49,23 @@ pub enum Command {
         data_directory: PathBuf,
         application_root: Option<PathBuf>,
     },
-    Status {
+    Operator {
         data_directory: PathBuf,
+        command: OperatorCommand,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum OperatorCommand {
+    Ready(Operation),
+    Join {
+        person_name: String,
+        invitation_file: PathBuf,
+    },
+    Install {
+        directory: PathBuf,
+        expected_identity: teamarness_package_host::PackageIdentity,
+        input: PathBuf,
     },
 }
 
@@ -35,40 +77,171 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, C
     if args == [OsString::from("--version")] || args == [OsString::from("-V")] {
         return Ok(Command::Version);
     }
-    let mut data_directory = None;
-    let mut application_root = None;
-    let mut command = None;
+    let mut options = std::collections::BTreeMap::new();
+    let mut words = Vec::new();
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
-        match argument.to_str() {
-            Some("--data-dir") if data_directory.is_none() => {
-                data_directory = Some(path_argument(args.next())?);
+        if argument.as_encoded_bytes().starts_with(b"--") {
+            let name = argument.into_string().map_err(|_| invalid())?;
+            let value = args.next().ok_or_else(invalid)?;
+            if value.is_empty()
+                || value.as_encoded_bytes().starts_with(b"--")
+                || options.insert(name, value).is_some()
+            {
+                return Err(invalid());
             }
-            Some("--application-root") if application_root.is_none() => {
-                application_root = Some(path_argument(args.next())?);
-            }
-            Some("serve" | "status") if command.is_none() => command = Some(argument),
-            _ => return Err(ControlError::new(ErrorCode::InvalidInput)),
+        } else {
+            words.push(argument.into_string().map_err(|_| invalid())?);
         }
     }
-    let data_directory =
-        data_directory.ok_or_else(|| ControlError::new(ErrorCode::InvalidInput))?;
-    match command.as_deref().and_then(|value| value.to_str()) {
-        Some("serve") => Ok(Command::Serve {
+    let data_directory = PathBuf::from(options.remove("--data-dir").ok_or_else(invalid)?);
+    let mut value = |name: &str| options.remove(name).ok_or_else(invalid);
+    let command = match words
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["serve"] => Command::Serve {
             data_directory,
-            application_root,
-        }),
-        Some("status") if application_root.is_none() => Ok(Command::Status { data_directory }),
-        _ => Err(ControlError::new(ErrorCode::InvalidInput)),
+            application_root: options.remove("--application-root").map(PathBuf::from),
+        },
+        words => {
+            let command = match words {
+                ["status"] => OperatorCommand::Ready(Operation::Status {}),
+                ["identity", "show"] => OperatorCommand::Ready(Operation::IdentityShow {}),
+                ["identity", "set-name"] => OperatorCommand::Ready(Operation::IdentitySetName {
+                    name: text(value("--name")?)?,
+                }),
+                ["workspace", "list"] => OperatorCommand::Ready(Operation::WorkspaceList {}),
+                ["workspace", "join"] => OperatorCommand::Join {
+                    person_name: text(value("--person-name")?)?,
+                    invitation_file: value("--invitation-file")?.into(),
+                },
+                ["workspace", "members"] => OperatorCommand::Ready(Operation::WorkspaceMembers {
+                    workspace: workspace(value("--workspace")?)?,
+                }),
+                ["workspace", "rename-self"] => {
+                    OperatorCommand::Ready(Operation::WorkspaceRenameSelf {
+                        workspace: workspace(value("--workspace")?)?,
+                        name: text(value("--name")?)?,
+                    })
+                }
+                ["agent", "list"] => OperatorCommand::Ready(Operation::AgentList {
+                    workspace: workspace(value("--workspace")?)?,
+                }),
+                ["agent", "add"] => OperatorCommand::Ready(Operation::AgentAdd {
+                    workspace: workspace(value("--workspace")?)?,
+                    name: text(value("--name")?)?,
+                }),
+                ["agent", "rename"] => OperatorCommand::Ready(Operation::AgentRename {
+                    workspace: workspace(value("--workspace")?)?,
+                    agent: agent(value("--agent")?)?,
+                    name: text(value("--name")?)?,
+                }),
+                ["agent", "remove"] => OperatorCommand::Ready(Operation::AgentRemove {
+                    workspace: workspace(value("--workspace")?)?,
+                    agent: agent(value("--agent")?)?,
+                }),
+                ["packages", "list"] => OperatorCommand::Ready(Operation::PackagesList {}),
+                ["packages", "inspect"] => OperatorCommand::Ready(Operation::PackagesInspect {
+                    directory: value("--directory")?.into(),
+                }),
+                ["packages", "install"] => OperatorCommand::Install {
+                    directory: value("--directory")?.into(),
+                    expected_identity: text(value("--package")?)?.parse().map_err(|_| invalid())?,
+                    input: value("--input")?.into(),
+                },
+                ["packages", "reload"] => OperatorCommand::Ready(Operation::PackagesReload {
+                    package: text(value("--package")?)?.parse().map_err(|_| invalid())?,
+                }),
+                ["packages", "remove"] => OperatorCommand::Ready(Operation::PackagesRemove {
+                    package: text(value("--package")?)?.parse().map_err(|_| invalid())?,
+                }),
+                ["packages", verb @ ("restart" | "pause" | "resume")] => {
+                    let workspace = workspace(value("--workspace")?)?;
+                    let package = text(value("--package")?)?.parse().map_err(|_| invalid())?;
+                    OperatorCommand::Ready(match *verb {
+                        "restart" => Operation::PackagesRestart { workspace, package },
+                        "pause" => Operation::PackagesPause { workspace, package },
+                        _ => Operation::PackagesResume { workspace, package },
+                    })
+                }
+                _ => return Err(invalid()),
+            };
+            Command::Operator {
+                data_directory,
+                command,
+            }
+        }
+    };
+    if !options.is_empty() {
+        return Err(invalid());
     }
+    Ok(command)
 }
 
-fn path_argument(value: Option<OsString>) -> Result<PathBuf, ControlError> {
-    match value {
-        Some(value) if !value.is_empty() && !value.as_encoded_bytes().starts_with(b"--") => {
-            Ok(value.into())
+fn invalid() -> ControlError {
+    ControlError::new(ErrorCode::InvalidInput)
+}
+fn text(value: OsString) -> Result<String, ControlError> {
+    value.into_string().map_err(|_| invalid())
+}
+fn workspace(value: OsString) -> Result<String, ControlError> {
+    let value = text(value)?;
+    crate::administration::parse_workspace(&value)?;
+    Ok(value)
+}
+fn agent(value: OsString) -> Result<String, ControlError> {
+    let value = text(value)?;
+    value
+        .parse::<teamarness_core::PrincipalId>()
+        .map_err(|_| invalid())?;
+    Ok(value)
+}
+
+impl OperatorCommand {
+    fn resolve(self) -> Result<Operation, ControlError> {
+        match self {
+            Self::Ready(operation) => Ok(operation),
+            Self::Join {
+                person_name,
+                invitation_file,
+            } => {
+                let bytes = crate::input::read_private(
+                    &invitation_file,
+                    crate::input::MAX_INVITATION_BYTES,
+                )?;
+                let invitation = std::str::from_utf8(&bytes).map_err(|_| invalid())?.trim();
+                invitation
+                    .parse::<teamarness_core::WorkspaceInvitation>()
+                    .map_err(|_| invalid())?;
+                Ok(Operation::WorkspaceJoin {
+                    invitation: invitation.to_owned(),
+                    person_name,
+                })
+            }
+            Self::Install {
+                directory,
+                expected_identity,
+                input,
+            } => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct Consent {
+                    accepted_risks: Vec<String>,
+                }
+                let consent: Consent = crate::input::json(&crate::input::read_private(
+                    &input,
+                    crate::input::MAX_INPUT_BYTES,
+                )?)?;
+                Ok(Operation::PackagesInstall {
+                    directory,
+                    expected_identity,
+                    accepted_risks: consent.accepted_risks,
+                })
+            }
         }
-        _ => Err(ControlError::new(ErrorCode::InvalidInput)),
     }
 }
 
@@ -182,7 +355,22 @@ where
                 }
             }
         }
-        Command::Status { data_directory } => {
+        Command::Operator {
+            data_directory,
+            command,
+        } => {
+            let operation = match tokio::task::spawn_blocking(move || command.resolve()).await {
+                Ok(Ok(operation)) => operation,
+                Ok(Err(error)) => {
+                    eprintln!("{error}");
+                    return 2;
+                }
+                Err(_) => {
+                    eprintln!("input_failed");
+                    return 2;
+                }
+            };
+            let mutation = operation.is_mutation();
             let stop = match terminal_signal() {
                 Ok(stop) => stop,
                 Err(error) => {
@@ -191,23 +379,24 @@ where
                 }
             };
             let result = tokio::select! {
-                result = control::request(&data_directory, Request { major: PROTOCOL_MAJOR, id: 1, operation: Operation::Status {} }) => result,
-                _ = stop => { eprintln!("client_interrupted"); return 130; }
+                result = control::request(&data_directory, Request { major: PROTOCOL_MAJOR, id: 1, operation }) => result,
+                _ = stop => { eprintln!("client_interrupted outcomeUncertain={mutation}"); return 130; }
             };
             match result.and_then(|response| response.result) {
-                Ok(status) => match serde_json::to_vec(&status) {
-                    Ok(mut bytes) => {
-                        bytes.push(b'\n');
-                        output(&bytes)
-                    }
-                    Err(error) => {
-                        eprintln!("output_encoding: {error}");
-                        1
-                    }
-                },
+                Ok(value) => output_json(&value, mutation),
                 Err(error) => {
-                    eprintln!("{error}");
-                    if matches!(
+                    let mut diagnostic = error.clone();
+                    diagnostic.details = None;
+                    eprintln!("{diagnostic}");
+                    if error.details.is_some() && output_json(&error, mutation) != 0 {
+                        return 1;
+                    }
+                    if error.outcome_uncertain {
+                        eprintln!("outcome_unknown: inspect state; do not replay automatically");
+                    }
+                    if error.outcome_uncertain {
+                        1
+                    } else if matches!(
                         error.code,
                         ErrorCode::InvalidInput
                             | ErrorCode::UnsupportedVersion
@@ -221,6 +410,23 @@ where
             }
         }
     }
+}
+
+fn output_json(value: &impl serde::Serialize, mutation: bool) -> i32 {
+    let result = match serde_json::to_vec(value) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            output(&bytes)
+        }
+        Err(_) => {
+            eprintln!("output_encoding_failed");
+            1
+        }
+    };
+    if result != 0 && mutation {
+        eprintln!("outcome_unknown outcomeUncertain=true");
+    }
+    result
 }
 
 fn output(bytes: &[u8]) -> i32 {

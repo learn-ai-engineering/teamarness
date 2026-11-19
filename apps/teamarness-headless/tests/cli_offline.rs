@@ -89,3 +89,39 @@ fn unavailable_client_does_not_restrict_or_initialize_an_existing_unrelated_dire
     );
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
+
+#[tokio::test]
+async fn mutation_reply_compatibility_loss_is_exit_one_uncertain_not_invalid_invocation() {
+    use std::os::unix::fs::PermissionsExt;
+    use teamarness_headless::control::{self, Request};
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = tokio::net::UnixListener::bind(root.path().join("control.sock")).unwrap();
+    std::fs::set_permissions(
+        root.path().join("control.sock"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let serving = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _: Request = control::read_frame(&mut stream).await.unwrap();
+        control::write_frame(
+            &mut stream,
+            &serde_json::json!({"major":2,"id":1,"result":{"Ok":{}}}),
+        )
+        .await
+        .unwrap();
+    };
+    let client = async {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_teamarness-headless"))
+            .arg("--data-dir")
+            .arg(root.path())
+            .args(["identity", "set-name", "--name", "Once"])
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("outcome_unknown"));
+    };
+    tokio::join!(serving, client);
+}

@@ -59,6 +59,7 @@ async fn frame_prefix_bound_and_closed_json_shapes_are_enforced() {
         serde_json::json!({"major":1,"id":1,"operation":{"kind":"arbitrary_host_command"}}),
         serde_json::json!({"major":1,"id":1,"operation":{"kind":"status"},"extra":true}),
         serde_json::json!({"major":1,"operation":{"kind":"status"}}),
+        serde_json::json!({"major":1,"id":1,"operation":{"kind":"agent_add","workspace":"a".repeat(32),"name":"Helper","acting_principal":"b".repeat(64)}}),
     ] {
         let (mut writer, mut reader) = tokio::io::duplex(1024);
         write_frame(&mut writer, &value).await.unwrap();
@@ -124,7 +125,7 @@ async fn unsupported_version_returns_matching_id_and_same_uid_peers_can_exchange
             .unwrap();
         assert_eq!(response.id, 43);
         assert_eq!(
-            response.result.unwrap().installation,
+            response.result.unwrap()["installation"],
             app.status().await.installation
         );
         stop.send(Instant::now()).unwrap();
@@ -330,7 +331,7 @@ async fn terminal_dispatch_failure_is_reported_and_shutdown_drain_is_uncertain()
                 |_| async {
                     panic!("fixture dispatch failure");
                     #[allow(unreachable_code)]
-                    Ok(std::future::pending().await)
+                    Ok(std::future::pending::<serde_json::Value>().await)
                 },
                 async { stopped.await.unwrap() },
             )
@@ -417,4 +418,76 @@ async fn client_observes_for_ninety_seconds_not_the_incoming_request_five_second
     assert!(!client.is_finished());
     tokio::time::advance(Duration::from_secs(1)).await;
     assert_eq!(client.await.unwrap().unwrap_err().code, ErrorCode::Timeout);
+}
+
+#[tokio::test]
+async fn mutation_lost_terminal_reply_is_uncertain_without_reconnect_or_replay() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = tokio::net::UnixListener::bind(root.path().join("control.sock")).unwrap();
+    std::fs::set_permissions(
+        root.path().join("control.sock"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let server = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request: Request = read_frame(&mut stream).await.unwrap();
+        assert!(request.operation.is_mutation());
+        drop(stream);
+        assert!(
+            timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err(),
+            "client did not reconnect"
+        );
+    };
+    let client = async {
+        let error = control::request(
+            root.path(),
+            Request {
+                major: 1,
+                id: 1,
+                operation: control::Operation::IdentitySetName {
+                    name: "Once".into(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.outcome_uncertain);
+    };
+    tokio::join!(server, client);
+}
+
+#[tokio::test]
+async fn local_pretransmission_frame_refusal_is_certain_even_for_a_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = tokio::net::UnixListener::bind(root.path().join("control.sock")).unwrap();
+    std::fs::set_permissions(
+        root.path().join("control.sock"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let error = control::request(
+        root.path(),
+        Request {
+            major: 1,
+            id: 1,
+            operation: control::Operation::IdentitySetName {
+                name: "x".repeat(control::MAX_FRAME_BYTES),
+            },
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::FrameTooLarge);
+    assert!(
+        !error.outcome_uncertain,
+        "encoding refused before writing a frame prefix"
+    );
+    drop(listener);
 }
