@@ -204,6 +204,47 @@ fn smoke_reports_a_backend_that_never_initializes() {
     assert!(started.elapsed().as_secs() < 7, "{:?}", started.elapsed());
 }
 
+// Verifies: TEAM.SYS.PKG-R03
+#[test]
+fn capability_major_diagnostics_warn_without_forcing_supported_consumers_to_migrate() {
+    for mode in ["source", "directory"] {
+        for major in [2, 3, 4] {
+            let temp = TempDir::new().unwrap();
+            if mode == "source" {
+                template_source(temp.path(), |_| {});
+            } else {
+                package_directory(temp.path());
+            }
+            let path = temp.path().join("teamarness.package.json");
+            let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            manifest["capabilities"] = serde_json::json!([{
+                "identity":"teamarness.package-ports","major":major,"minMinor":0,"maxMinor":0
+            }]);
+            fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let output = validate(&[mode, &temp.path().to_string_lossy(), "--json"]);
+            let report: Value = serde_json::from_str(&stdout(&output)).unwrap();
+            assert_eq!(output.status.success(), major != 4, "{mode}: {report}");
+            let warnings: Vec<_> = report["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|note| {
+                    note.as_str()
+                        .unwrap()
+                        .contains("capability.superseded_major")
+                })
+                .collect();
+            assert_eq!(warnings.len(), usize::from(major == 2), "{mode}: {report}");
+            if major == 4 {
+                assert_eq!(
+                    report["errors"][0]["rule"],
+                    "capability.version_unsupported"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn usage_errors_exit_two() {
     for arguments in [

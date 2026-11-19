@@ -27,3 +27,15 @@ Run the host and full failure matrices from the repository root:
 cargo test -p teamarness-package-host --locked
 cargo test --workspace --locked
 ```
+
+## Confirmed stream setup
+
+The Host supports process 1.0–1.1 and selects the highest common minor at admission
+and launch. Process 1.1 `requireReady:true` confirms Provider setup and Consumer
+registration before values. Confirmed event subscribers share a confirmed upstream;
+a legacy Provider or unconfirmed upstream refuses with
+`capability_version_unsupported`. Existing unconfirmed methods and process 1.0
+traffic retain their behavior. One 20-second setup budget includes activation;
+nested waits use its remaining time, and cancelled or late setup closes its
+routes and listeners. The [process reference](../../contracts/package-process/v1/README.md#confirmed-stream-setup-11)
+defines ordering, retirement, and the live-only guarantee.

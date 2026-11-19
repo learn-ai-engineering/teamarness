@@ -65,10 +65,19 @@ pub struct CapabilityGrant {
     pub minor: u16,
 }
 
+/// The exact Package Process Protocol selected by the Host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessProtocol {
+    pub major: u16,
+    pub minor: u16,
+}
+
 /// Initialization values bound to the current process generation.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Initialization {
+    protocol: ProcessProtocol,
     package: PackageInfo,
     workspace: WorkspaceInfo,
     installation: InstallationInfo,
@@ -80,6 +89,12 @@ pub struct Initialization {
 impl Initialization {
     pub(crate) fn from_frame(frame: &Frame) -> Result<Self, SdkError> {
         serde_json::from_value(frame.as_value()).map_err(|_| SdkError::Protocol("malformed_frame"))
+    }
+
+    /// The exact process version selected for this generation.
+    #[must_use]
+    pub const fn protocol(&self) -> ProcessProtocol {
+        self.protocol
     }
 
     /// The Package the host admitted.

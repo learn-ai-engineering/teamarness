@@ -5,6 +5,8 @@ import {
   isPackageRequestError,
   packageErrorCode,
   type PackageClient,
+  type PackageMountContext,
+  type PackageUnmount,
   type PackageValue,
 } from "@teamarness/package-ui-sdk";
 import type { HostUiEvent, PackageHostTransport, PackageInstanceKey } from "../package-contracts";
@@ -76,6 +78,7 @@ function mountFrame(
   mount: string,
   transport: PackageHostTransport,
   packageMount: (client: PackageClient) => void | Promise<void> = () => undefined,
+  settings?: { onOpenSettings(): Promise<void>; context(value: PackageMountContext): PackageUnmount },
 ): Mount {
   const channel = new MessageChannel();
   const faults: PackageUiFaultSource[] = [];
@@ -100,10 +103,10 @@ function mountFrame(
     },
     runtimeUrl: `teamarness-package://localhost/${"A".repeat(32)}/__teamarness/frame-runtime.js`,
     importModule: async () => ({
-      mount: async (context: { client: PackageClient }) => {
+      mount: async (context: PackageMountContext) => {
         resolveClient(context.client);
         await packageMount(context.client);
-        return () => undefined;
+        return settings?.context(context) ?? (() => undefined);
       },
     }),
     createStyleSheet: () => ({ replaceSync: () => undefined }) as unknown as CSSStyleSheet,
@@ -116,6 +119,7 @@ function mountFrame(
     port: channel.port1,
     transport,
     onFault: (source) => faults.push(source),
+    onOpenSettings: settings?.onOpenSettings,
   });
   host.start();
   runPackageFrame(env);
@@ -141,7 +145,7 @@ const settle = async (): Promise<void> => {
   for (let index = 0; index < 6; index += 1) await new Promise((resolve) => setTimeout(resolve, 0));
 };
 
-async function sendMount(mount: Mount): Promise<void> {
+async function sendMount(mount: Mount, openSettings = false): Promise<void> {
   await mount.host.ready;
   mount.host.sendMount({
     entrypoint: "ui/index.js",
@@ -156,7 +160,8 @@ async function sendMount(mount: Mount): Promise<void> {
     },
     workspace: { id: instance.workspaceId, name: "Workspace" },
     view: "main",
-    uiHostVersion: 2,
+    uiHostVersion: 3,
+    openSettings,
     theme: themeSnapshot(),
   });
   await mount.host.mounted;
@@ -254,4 +259,42 @@ describe("Package UI frame and Shell host over a real channel", () => {
     expect(first.faults).toEqual(["protocol"]);
     expect(second.faults).toEqual([]);
   });
+});
+
+it("delivers the public settings intent and completes its own runtime/request/stream cleanup without a response promise", async () => {
+  const transport = sharedTransport();
+  let context: PackageMountContext | undefined;
+  const abort = new AbortController();
+  let navigated = 0;
+  let finish: (() => void) | undefined;
+  const done = new Promise<void>((resolve) => { finish = resolve; });
+  const mount = mountFrame("settings-origin", transport.transport, undefined, {
+    context: (value) => {
+      context = value;
+      return async () => { abort.abort(); await subscription.close(); };
+    },
+    onOpenSettings: async () => {
+      navigated += 1;
+      expect(await mount.host.requestUnmount()).toBe(true);
+      await mount.host.dispose();
+      finish?.();
+    },
+  });
+  await sendMount(mount, true);
+  const client = await mount.client;
+  const subscription = await client.subscribe("reference.changes", {}, () => undefined);
+  const pending = client.request("reference.read", {}, { signal: abort.signal }).catch((error: unknown) => error);
+  await settle();
+  expect(context?.navigation?.openSettings()).toBeUndefined();
+  context?.navigation?.openSettings();
+  await done;
+  expect(navigated).toBe(1);
+  expect((await pending as Error).name).toBe("AbortError");
+  expect(transport.calls).toEqual([
+    { method: "openSubscription", mount: "settings-origin", input: { mount: "settings-origin", subscription: "s1", operation: "reference.changes", payload: {} } },
+    { method: "request", mount: "settings-origin", input: { mount: "settings-origin", request: "r1", operation: "reference.read", payload: {} } },
+    { method: "cancelRequest", mount: "settings-origin", input: { mount: "settings-origin", request: "r1" } },
+    { method: "closeSubscription", mount: "settings-origin", input: { mount: "settings-origin", subscription: "s1" } },
+  ]);
+  expect(mount.faults).toEqual([]);
 });

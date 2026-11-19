@@ -1,7 +1,7 @@
 {
   "templateVersion": 2,
-  "packageProcessProtocol": "1.0",
-  "uiHostVersion": 2,
+  "packageProcessProtocol": "1.1",
+  "uiHostVersion": 3,
   "sdkSource": "vendored-from-teamarness-checkout",
   "sdkUpgrade": "unsupported-in-place",
   "sdkRevision": "__SDK_REVISION__",

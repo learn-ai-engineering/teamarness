@@ -73,8 +73,10 @@
   "authoringCatalog": [
     {
       "identity": "com.example.notes",
+      "compatibilityWarnings": ["capability.superseded_major: teamarness.package-ports major 2 remains supported; a newer major is available"],
       "capabilities": [
-        { "identity": "teamarness.workspace-context", "major": 1, "minMinor": 0, "maxMinor": 0 }
+        { "identity": "teamarness.workspace-context", "major": 1, "minMinor": 0, "maxMinor": 0 },
+        { "identity": "teamarness.package-ports", "major": 2, "minMinor": 0, "maxMinor": 0 }
       ],
       "provided": [
         { "identity": "com.example.notes", "major": 1, "minor": 2, "description": "Read and write Workspace notes." }
@@ -108,7 +110,7 @@
     "loader": {
       "token": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
       "entrypoint": "ui/index.js",
-      "uiHostVersion": 2,
+      "uiHostVersion": 3,
       "contractDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "package": {
         "identity": "com.example.fixture",
@@ -130,7 +132,7 @@
   "loader": {
     "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "entrypoint": "ui/index.js",
-    "uiHostVersion": 2,
+    "uiHostVersion": 3,
     "contractDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "package": {
       "identity": "com.example.fixture",

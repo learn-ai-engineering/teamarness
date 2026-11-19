@@ -24,6 +24,7 @@ impl PortAccess {
 pub(crate) struct AccessState {
     pub(crate) actor: Value,
     pub(crate) selections: BTreeMap<String, u16>,
+    pub(crate) scope: Value,
 }
 
 pub(crate) struct ResolvedPort {
@@ -65,6 +66,8 @@ impl PortBroker {
         core: Arc<CoreRuntime>,
         key: PackageInstanceKey,
         authority: &GenerationAuthority,
+        generation: u64,
+        person: bool,
         work: impl FnOnce(
             &Self,
             &crate::host_store::HostStore,
@@ -74,20 +77,54 @@ impl PortBroker {
         + 'static,
     ) -> Result<T, PackageErrorCode> {
         let leases = authority.leases().await?;
+        let revision = authority.revision();
         let broker = self.clone();
         self.access
             .store
             .run(move |store| {
                 let _leases = leases;
                 let actor = actor(&core, &key)?;
+                if person {
+                    if actor["kind"] == "agent" {
+                        return Err(PackageErrorCode::PortActorModeInvalid);
+                    }
+                    let workspace =
+                        teamarness_core::WorkspaceId::from_str(key.workspace_id.as_str())
+                            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)?;
+                    if core
+                        .workspace_person(workspace, core.public_identity())
+                        .map_err(crate::capability::binding_error)?
+                        .is_none()
+                    {
+                        return Err(PackageErrorCode::PersonNotCurrent);
+                    }
+                }
                 let selections = store
                     .port_selections(
-                        &core.public_identity().to_string(),
-                        key.workspace_id.as_str(),
-                        key.package_identity.as_str(),
+                        crate::host_store::PortSelectionScope {
+                            installation: &core.public_identity().to_string(),
+                            workspace: key.workspace_id.as_str(),
+                            package: key.package_identity.as_str(),
+                        },
+                        person,
                     )
                     .map_err(|_| PackageErrorCode::CapabilityUnavailable)?;
-                work(&broker, store, AccessState { actor, selections })
+                let scope = json!([
+                    core.public_identity().to_string(),
+                    key.workspace_id.as_str(),
+                    key.package_identity.as_str(),
+                    generation,
+                    revision
+                ]);
+                work(
+                    &broker,
+                    store,
+                    AccessState {
+                        actor,
+                        selections,
+                        scope,
+                    },
+                )
             })
             .await
             .map_err(|_| PackageErrorCode::CapabilityUnavailable)?
@@ -98,62 +135,94 @@ impl PortBroker {
         core: Arc<CoreRuntime>,
         key: PackageInstanceKey,
         authority: &GenerationAuthority,
-        contract: String,
-        major: Option<u16>,
+        generation: u64,
+        input: Map<String, Value>,
     ) -> Result<Value, PackageErrorCode> {
         let installation = core.public_identity().to_string();
-        self.access_work(core, key.clone(), authority, move |broker, store, state| {
-            if state.actor["kind"] != "agent" {
-                return Err(PackageErrorCode::AgentNotBound);
-            }
-            if let Some(major) = major {
-                let (_, _, selected, _) = broker
-                    .snapshot()
-                    .agent_contract(&key.package_identity, &contract)?;
-                if selected != major {
-                    return Err(PackageErrorCode::PortVersionMismatch);
+        let person = input.get("access").and_then(Value::as_str) == Some("person");
+        let contract = input["contract"]
+            .as_str()
+            .ok_or(PackageErrorCode::CapabilityRequestInvalid)?
+            .to_owned();
+        let major = input
+            .get("major")
+            .and_then(Value::as_u64)
+            .map(|major| major as u16);
+        self.access_work(
+            core,
+            key.clone(),
+            authority,
+            generation,
+            person,
+            move |broker, store, state| {
+                if !person && state.actor["kind"] != "agent" {
+                    return Err(PackageErrorCode::AgentNotBound);
                 }
-            }
-            #[cfg(feature = "test-hooks")]
-            let failed_completion = {
-                let pause = {
-                    let mut pending = broker
-                        .selection_pause
-                        .lock()
-                        .expect("selection pause poisoned");
-                    if pending
-                        .as_ref()
-                        .is_some_and(|(package, _)| package == &key.package_identity)
-                    {
-                        pending.take().map(|(_, pause)| pause)
-                    } else {
-                        None
+                if let Some(major) = major {
+                    let snapshot = broker.snapshot();
+                    let (_, schemas, selected, _) =
+                        snapshot.dynamic_contract(&key.package_identity, &contract, !person)?;
+                    broker.check_route_revision(
+                        &snapshot,
+                        &key.package_identity,
+                        &input,
+                        &state,
+                    )?;
+                    if selected != major {
+                        return Err(PackageErrorCode::PortVersionMismatch);
                     }
+                    if person && !schemas.has_guide(&contract) {
+                        return Err(PackageErrorCode::PortGuideRequired);
+                    }
+                }
+                #[cfg(feature = "test-hooks")]
+                let failed_completion = {
+                    let pause = {
+                        let mut pending = broker
+                            .selection_pause
+                            .lock()
+                            .expect("selection pause poisoned");
+                        if pending
+                            .as_ref()
+                            .is_some_and(|(package, _)| package == &key.package_identity)
+                        {
+                            pending.take().map(|(_, pause)| pause)
+                        } else {
+                            None
+                        }
+                    };
+                    pause.is_some_and(|pause| pause.wait())
                 };
-                pause.is_some_and(|pause| pause.wait())
-            };
-            store
-                .select_port(
-                    &installation,
-                    key.workspace_id.as_str(),
-                    key.package_identity.as_str(),
-                    &contract,
-                    major,
-                )
-                .map_err(|_| PackageErrorCode::CapabilityUnavailable)?;
-            if major.is_none() {
-                broker.revoke_contract(&key, &contract);
-            }
-            #[cfg(feature = "test-hooks")]
-            if failed_completion {
-                return Err(PackageErrorCode::CapabilityUnavailable);
-            }
-            Ok(if let Some(major) = major {
-                json!({"contract":contract,"major":major,"enabled":true})
-            } else {
-                json!({"contract":contract,"enabled":false})
-            })
-        })
+                store
+                    .select_port(
+                        crate::host_store::PortSelectionScope {
+                            installation: &installation,
+                            workspace: key.workspace_id.as_str(),
+                            package: key.package_identity.as_str(),
+                        },
+                        &contract,
+                        major,
+                        person,
+                    )
+                    .map_err(|_| PackageErrorCode::CapabilityUnavailable)?;
+                if major.is_none() {
+                    broker.revoke_contract(&key, &contract);
+                }
+                #[cfg(feature = "test-hooks")]
+                if failed_completion {
+                    return Err(PackageErrorCode::CapabilityUnavailable);
+                }
+                let mut result = if let Some(major) = major {
+                    json!({"contract":contract,"major":major,"enabled":true})
+                } else {
+                    json!({"contract":contract,"enabled":false})
+                };
+                if let Some(access) = input.get("access") {
+                    result["access"] = access.clone();
+                }
+                Ok(result)
+            },
+        )
         .await
     }
 
@@ -181,10 +250,12 @@ impl PortBroker {
         let is_agent = state.actor["kind"] == "agent";
         // One snapshot for the whole check; a later publish never changes this route.
         let snapshot = self.snapshot();
+        self.check_route_revision(&snapshot, caller, input, state)?;
         let (provider, schemas, major, minor) = match input.get("access").and_then(Value::as_str) {
             Some("declared") => self.resolve(&snapshot, caller, workspace, contract, port, kind)?,
-            Some("agent") => {
-                if !is_agent {
+            Some("agent" | "person") => {
+                let person = input["access"] == "person";
+                if !person && !is_agent {
                     return Err(PackageErrorCode::AgentNotBound);
                 }
                 let requested = input
@@ -196,7 +267,7 @@ impl PortBroker {
                     return Err(PackageErrorCode::PortNotEnabled);
                 }
                 let (identity, schemas, major, minor) =
-                    snapshot.agent_contract(caller, contract)?;
+                    snapshot.dynamic_contract(caller, contract, !person)?;
                 if major != requested {
                     return Err(PackageErrorCode::PortUnavailable);
                 }
@@ -247,6 +318,7 @@ pub(crate) struct SubscriptionLease {
     provider: PackageInstanceKey,
     contract: String,
     binding: Option<String>,
+    person_identity: Option<String>,
     enabled: bool,
     access: String,
     generation: u64,
@@ -291,8 +363,15 @@ impl PortBroker {
                 .expect("resolved access")
                 .to_owned(),
             key,
-            enabled: route.actor["kind"] == "agent" && route.schemas.has_guide(&contract),
+            enabled: input["access"] == "person"
+                || (route.actor["kind"] == "agent" && route.schemas.has_guide(&contract)),
             binding: route.actor["principal"].as_str().map(str::to_owned),
+            person_identity: (input["access"] == "person").then(|| {
+                route.actor["identity"]
+                    .as_str()
+                    .expect("Person actor")
+                    .to_owned()
+            }),
             contract,
             delivery: Arc::new(crate::protocol::PortStreamLease::default()),
         });
@@ -326,7 +405,7 @@ impl PortBroker {
         self.revoke_subscriptions(|lease| {
             (lease.key == *key
                 && lease.enabled
-                && matches!(lease.access.as_str(), "agent" | "declared")
+                && matches!(lease.access.as_str(), "agent" | "declared" | "person")
                 && lease.contract == contract)
                 .then_some(PackageErrorCode::PortNotEnabled)
         });
@@ -334,6 +413,9 @@ impl PortBroker {
     /// Called inside the same operation gate as the durable local binding transition.
     pub(crate) fn reconcile_binding(&self, key: &PackageInstanceKey, actor: &Value) {
         self.revoke_subscriptions(|lease| {
+            if lease.key == *key && lease.access == "person" && actor["kind"] == "agent" {
+                return Some(PackageErrorCode::PortActorModeInvalid);
+            }
             if lease.key != *key
                 || lease.binding.is_none()
                 || lease.binding.as_deref() == actor["principal"].as_str()
@@ -347,6 +429,34 @@ impl PortBroker {
             })
         });
     }
+    /// Recheck idle Person leases on canonical membership notifications, failing closed
+    /// when Core cannot establish current membership.
+    pub(crate) fn reconcile_person(&self, core: &CoreRuntime, key: &PackageInstanceKey) {
+        let current = teamarness_core::WorkspaceId::from_str(key.workspace_id.as_str())
+            .map_err(|_| PackageErrorCode::CapabilityRequestInvalid)
+            .and_then(|workspace| {
+                core.workspace_person(workspace, core.public_identity())
+                    .map_err(crate::capability::binding_error)
+            });
+        let identity = core.public_identity().to_string();
+        self.revoke_subscriptions(|lease| {
+            if lease.key != *key || lease.access != "person" {
+                return None;
+            }
+            match &current {
+                Ok(Some(_)) if lease.person_identity.as_deref() == Some(identity.as_str()) => None,
+                Ok(_) => Some(PackageErrorCode::PersonNotCurrent),
+                Err(code) => Some(*code),
+            }
+        });
+    }
+
+    pub(crate) fn revoke_person(&self, key: &PackageInstanceKey, code: PackageErrorCode) {
+        self.revoke_subscriptions(|lease| {
+            (lease.key == *key && lease.access == "person").then_some(code)
+        });
+    }
+
     pub(crate) fn revoke_consumer(
         &self,
         key: &PackageInstanceKey,

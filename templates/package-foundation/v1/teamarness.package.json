@@ -6,7 +6,7 @@
     "displayName": __PACKAGE_DISPLAY_NAME_JSON__,
     "description": "Describe what this Package does for a Workspace."
   },
-  "protocol": { "major": 1, "minMinor": 0, "maxMinor": 0 },
+  "protocol": { "major": 1, "minMinor": 0, "maxMinor": 1 },
   "backends": [{
     "target": "aarch64-apple-darwin",
     "path": "backend/teamarness-generated-package-backend-aarch64-apple-darwin",

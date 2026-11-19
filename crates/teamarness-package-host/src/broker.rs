@@ -82,6 +82,7 @@ pub(crate) struct CallerPorts {
     pub(crate) routes: Vec<PortAvailability>,
     pub(crate) consumed: Vec<ConsumedContract>,
     pub(crate) contracts: Option<Arc<CompiledPortContracts>>,
+    pub(crate) presentation: Value,
 }
 
 /// One immutable view of the admission-derived Port graph.
@@ -99,6 +100,7 @@ pub(crate) struct PortSnapshot {
     tiers: BTreeMap<PackageIdentity, PackageTier>,
     team_providers: BTreeMap<String, PackageIdentity>,
     personal_providers: BTreeMap<String, PackageIdentity>,
+    pub(crate) presentations: BTreeMap<PackageIdentity, Value>,
 }
 
 impl PortSnapshot {
@@ -110,6 +112,7 @@ impl PortSnapshot {
         tiers: BTreeMap<PackageIdentity, PackageTier>,
         team_providers: BTreeMap<String, PackageIdentity>,
         personal_providers: BTreeMap<String, PackageIdentity>,
+        presentations: BTreeMap<PackageIdentity, Value>,
     ) -> Self {
         Self {
             revision: fresh_revision(),
@@ -119,6 +122,7 @@ impl PortSnapshot {
             tiers,
             team_providers,
             personal_providers,
+            presentations,
         }
     }
 
@@ -139,9 +143,12 @@ impl PortSnapshot {
             tiers: keep(&self.tiers, team),
             team_providers: self.team_providers.clone(),
             personal_providers,
+            presentations: keep(&self.presentations, team),
         };
         for (identity, ports) in personal {
             debug_assert!(!team(&identity), "a Team caller's entries never change");
+            next.presentations
+                .insert(identity.clone(), ports.presentation);
             next.graph.insert(identity.clone(), ports.routes);
             next.consumed.insert(identity.clone(), ports.consumed);
             if let Some(contracts) = ports.contracts {
@@ -202,12 +209,11 @@ impl PortSnapshot {
         self.contracts.get(provider)
     }
 
-    /// The guided contract `caller` may reach through Agent access, with its
-    /// Provider, schemas, major, and minor.
-    pub(crate) fn agent_contract(
+    pub(crate) fn dynamic_contract(
         &self,
         caller: &PackageIdentity,
         contract: &str,
+        guide_required: bool,
     ) -> Result<(PackageIdentity, Arc<CompiledPortContracts>, u16, u16), PackageErrorCode> {
         let provider = self
             .providers_for(self.tier_of(caller))
@@ -217,7 +223,7 @@ impl PortSnapshot {
             .provided_contracts(&provider)
             .cloned()
             .ok_or(PackageErrorCode::PortUnavailable)?;
-        if !schemas.has_guide(contract) {
+        if guide_required && !schemas.has_guide(contract) {
             return Err(PackageErrorCode::PortUngranted);
         }
         let descriptor = schemas
@@ -739,7 +745,8 @@ impl PortBroker {
         &self,
         route: crate::port_access::ResolvedPort,
         input: &Map<String, Value>,
-    ) -> Result<PortQueryStream, PackageErrorCode> {
+        setup: Option<crate::protocol::ConfirmedSetup>,
+    ) -> Result<PortQueryStream, WireFailure> {
         if input.len() != 7
             || ![
                 "grant", "access", "major", "contract", "port", "kind", "request",
@@ -747,7 +754,7 @@ impl PortBroker {
             .iter()
             .all(|key| input.contains_key(*key))
         {
-            return Err(PackageErrorCode::CapabilityRequestInvalid);
+            return Err(PackageErrorCode::CapabilityRequestInvalid.into());
         }
         let contract = input
             .get("contract")
@@ -758,7 +765,7 @@ impl PortBroker {
             .and_then(Value::as_str)
             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
         if input.get("kind").and_then(Value::as_str) != Some("query") {
-            return Err(PackageErrorCode::PortUngranted);
+            return Err(PackageErrorCode::PortUngranted.into());
         }
         let request = input
             .get("request")
@@ -781,7 +788,7 @@ impl PortBroker {
             .and_then(|entry| entry.ports.iter().find(|entry| entry.name == port))
             .ok_or(PackageErrorCode::PortUngranted)?;
         if descriptor.event.is_none() {
-            return Err(PackageErrorCode::PortUngranted);
+            return Err(PackageErrorCode::PortUngranted.into());
         }
         schemas
             .validate(contract, port, "request", request)
@@ -800,9 +807,9 @@ impl PortBroker {
                 port.to_owned(),
                 permits,
                 lease,
+                setup,
             )
             .await
-            .map_err(|error| error.code)
     }
 }
 
@@ -823,6 +830,7 @@ pub(crate) async fn empty_broker() -> Arc<PortBroker> {
         .unwrap();
     PortBroker::new(
         PortSnapshot::new(
+            BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),

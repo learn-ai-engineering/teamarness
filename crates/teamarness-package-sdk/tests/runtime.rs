@@ -416,3 +416,242 @@ async fn malformed_initialize_ends_the_session_without_initializing() {
         "{error:?}"
     );
 }
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confirmed_open_waits_for_registered_provider_without_consuming_a_value() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (sender, subscription) = teamarness_package_sdk::event_channel(2);
+    let subscription = Arc::new(Mutex::new(Some(subscription)));
+    let router = teamarness_package_sdk::Router::new(|_| async { Ok(()) }).port_event(
+        "com.example.messages",
+        "message.changed",
+        {
+            let entered = entered.clone();
+            let release = release.clone();
+            move |_, _| {
+                let entered = entered.clone();
+                let release = release.clone();
+                let subscription = subscription.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(subscription.lock().await.take().unwrap())
+                }
+            }
+        },
+    );
+    let (mut host_read, sdk_write) = tokio::io::duplex(64 * 1024);
+    let (sdk_read, mut host_write) = tokio::io::duplex(64 * 1024);
+    let service =
+        tokio::spawn(Package::from_backend(router.into_backend()).serve_io(sdk_read, sdk_write));
+    write_json(
+        &mut host_write,
+        &INITIALIZE.replace("\"minor\":0", "\"minor\":1"),
+    )
+    .await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::Initialized
+    );
+    write_json(&mut host_write, &format!(r#"{{"kind":"request","id":"h:activate","operation":"lifecycle.activate","deadlineUnixMs":"{}","payload":{{}}}}"#, deadline_in(Duration::from_secs(8)))).await;
+    assert_eq!(read_frame(&mut host_read).await.kind(), FrameKind::Response);
+    write_json(&mut host_write, r#"{"kind":"stream_open","id":"h:confirmed","topic":"teamarness.port.event.v1","requireReady":true,"initialCredit":32,"payload":{"contract":"com.example.messages","major":1,"minor":0,"port":"message.changed","actor":{"kind":"person","identity":"installation1"},"request":{}}}"#).await;
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("Provider setup entered");
+    // negative-wait: setup is held at the handler, not inferred from an initial event.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), read_frame(&mut host_read))
+            .await
+            .is_err()
+    );
+    release.notify_one();
+    let ready = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut host_read))
+        .await
+        .unwrap();
+    assert_eq!(
+        ready.as_value(),
+        serde_json::json!({"kind":"stream_ready","streamId":"h:confirmed"})
+    );
+    sender.send(serde_json::json!({"order":1})).await.unwrap();
+    let value = read_frame(&mut host_read).await;
+    assert_eq!(value.kind(), FrameKind::Event);
+    assert_eq!(value.field("sequence").unwrap(), "1");
+    assert_eq!(
+        value.field("payload").unwrap()["$teamarnessPortValue"],
+        serde_json::json!({"order":1})
+    );
+    sender
+        .fail(BackendError::new(
+            "fixture.established_failed",
+            false,
+            empty(),
+        ))
+        .await
+        .unwrap();
+    let terminal = read_frame(&mut host_read).await;
+    assert_eq!(terminal.kind(), FrameKind::StreamClose);
+    assert_eq!(
+        terminal.field("code").unwrap(),
+        "fixture.established_failed"
+    );
+    write_json(&mut host_write, r#"{"kind":"shutdown","reason":"test"}"#).await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::ShutdownAck
+    );
+    service.await.unwrap().unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn host_death_fails_the_pending_confirmed_api_without_waiting_for_a_value() {
+    struct Capture(tokio::sync::mpsc::UnboundedSender<teamarness_package_sdk::CapabilityClient>);
+    impl Backend for Capture {
+        fn handle(
+            &self,
+            request: BackendRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<JsonValue, BackendError>> + Send + '_>> {
+            Box::pin(async move {
+                self.0.send(request.capabilities.clone()).unwrap();
+                Ok(empty())
+            })
+        }
+    }
+    let (clients, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (mut host_read, sdk_write) = tokio::io::duplex(64 * 1024);
+    let (sdk_read, mut host_write) = tokio::io::duplex(64 * 1024);
+    let service =
+        tokio::spawn(Package::builder(Arc::new(Capture(clients))).serve_io(sdk_read, sdk_write));
+    write_json(
+        &mut host_write,
+        &INITIALIZE.replace("\"minor\":0", "\"minor\":1"),
+    )
+    .await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::Initialized
+    );
+    write_json(&mut host_write, r#"{"kind":"request","id":"h:capture","operation":"fixture.capture","deadlineUnixMs":"9007199254740998","payload":{}}"#).await;
+    assert_eq!(read_frame(&mut host_read).await.kind(), FrameKind::Response);
+    let client = receiver.recv().await.unwrap();
+    let opening = tokio::spawn(async move {
+        client
+            .subscribe_confirmed("Z3JhbnQx", serde_json::json!({"method":"subscribe"}))
+            .await
+    });
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::StreamOpen
+    );
+    drop(host_write);
+    assert!(matches!(
+        service.await.unwrap(),
+        Err(SdkError::ParentClosed)
+    ));
+    let result = tokio::time::timeout(Duration::from_secs(2), opening)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.err().unwrap().code(), "host_unavailable");
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_provider_setup_drops_a_receiver_returned_by_late_blocking_work() {
+    struct Held {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        subscription: std::sync::Mutex<Option<EventSubscription>>,
+        token: std::sync::Mutex<Option<CancellationToken>>,
+    }
+    impl Backend for Held {
+        fn handle(
+            &self,
+            request: BackendRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<JsonValue, BackendError>> + Send + '_>> {
+            Box::pin(async move { Ok(request.payload) })
+        }
+        fn subscribe(
+            &self,
+            request: BackendRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<EventSubscription, BackendError>> + Send + '_>>
+        {
+            *self.token.lock().unwrap() = Some(request.cancellation().clone());
+            let subscription = self.subscription.lock().unwrap().take().unwrap();
+            let release = self.release.clone();
+            let entered = self.entered.clone();
+            Box::pin(async move {
+                Ok(tokio::task::spawn_blocking(move || {
+                    entered.notify_one();
+                    let (lock, signal) = &*release;
+                    let mut allowed = lock.lock().unwrap();
+                    while !*allowed {
+                        allowed = signal.wait(allowed).unwrap();
+                    }
+                    subscription
+                })
+                .await
+                .unwrap())
+            })
+        }
+    }
+    let (sender, subscription) = teamarness_package_sdk::event_channel(1);
+    let backend = Arc::new(Held {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+        subscription: std::sync::Mutex::new(Some(subscription)),
+        token: std::sync::Mutex::new(None),
+    });
+    let (mut host_read, sdk_write) = tokio::io::duplex(64 * 1024);
+    let (sdk_read, mut host_write) = tokio::io::duplex(64 * 1024);
+    let service = tokio::spawn(Package::builder(backend.clone()).serve_io(sdk_read, sdk_write));
+    write_json(
+        &mut host_write,
+        &INITIALIZE.replace("\"minor\":0", "\"minor\":1"),
+    )
+    .await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::Initialized
+    );
+    write_json(&mut host_write, r#"{"kind":"stream_open","id":"h:late","topic":"fixture.held","initialCredit":32,"requireReady":true,"payload":{}}"#).await;
+    tokio::time::timeout(Duration::from_secs(2), backend.entered.notified())
+        .await
+        .unwrap();
+    write_json(
+        &mut host_write,
+        r#"{"kind":"stream_close","streamId":"h:late","code":"closed"}"#,
+    )
+    .await;
+    write_json(&mut host_write, r#"{"kind":"ping","nonce":"cHJvYmU"}"#).await;
+    assert_eq!(read_frame(&mut host_read).await.kind(), FrameKind::Pong);
+    assert!(
+        backend
+            .token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_cancelled()
+    );
+    *backend.release.0.lock().unwrap() = true;
+    backend.release.1.notify_all();
+    tokio::time::timeout(Duration::from_secs(2), sender.closed())
+        .await
+        .expect("late registered receiver is dropped");
+    // negative-wait: retired setup cannot emit late ready or a domain value.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), read_frame(&mut host_read))
+            .await
+            .is_err()
+    );
+    write_json(&mut host_write, r#"{"kind":"shutdown","reason":"test"}"#).await;
+    assert_eq!(
+        read_frame(&mut host_read).await.kind(),
+        FrameKind::ShutdownAck
+    );
+    service.await.unwrap().unwrap();
+}

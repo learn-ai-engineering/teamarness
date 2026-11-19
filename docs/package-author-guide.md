@@ -110,6 +110,24 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
 }
 ```
 
+On mount contract 3, a main-view context may offer `context.navigation.openSettings(): void`.
+Call it from your settings control to request **only this Package's Configuration in this Workspace**:
+
+```ts
+settingsButton.disabled = context.navigation === undefined;
+settingsButton.addEventListener("click", () => context.navigation?.openSettings());
+```
+
+Feature-detect the optional object. Older Hosts and unavailable destinations omit it; show an
+update/unavailable explanation instead of trying Tauri, parent DOM access, or an invented route.
+Settings mounts omit it too. It is a fire-and-forget intent, not a completion promise: navigation
+may destroy the calling frame. The Shell coalesces pending clicks, derives identity and generation
+from the live mount, and rechecks Workspace, lifecycle, declaration and the application-update
+gate before routing. A stale mount cannot navigate a later Workspace. If Configuration disappears,
+the Shell explains its unavailability rather than opening About silently. Existing routing owns
+unmount/request/subscription cleanup, the page header/tabs and focus. No Backend operation,
+Tauri command, URL selector, Semantic Capability or frame permission is added.
+
 The Package page in the Shell then shows a **Configuration** tab. It mounts the settings view of the Package in the current Workspace, below the Shell's page header and tabs. Selecting **About** or leaving the page unmounts it. Both views use the same Backend, client, and UI contract.
 
 A manifest with another value, or with `"settings"` twice, fails admission with `manifest_malformed` and a pointer such as `/ui/views/0`. When the Shell asks for a view the manifest does not declare, the Host refuses the mount with `ui_view_not_declared`. A UI that declares no views can ignore `context.view`, because it is always `"main"`. In tests, `createTestMountContext({ root, client, view: "settings" })` from `@teamarness/package-ui-sdk/testing` builds a settings context. The view defaults to `"main"`.
@@ -220,7 +238,30 @@ Its `message.post` command (Conversations 1.1) signs as the Host-derived actor: 
 
 Conversations 1.3 adds `runtime.guide`, an ordinary query with request `{}` and a bounded `{markdown}` response. Declare it to retrieve complete guide metadata and read the Provider's recovery instructions through the same generic client. Its five existing operation shapes stay unchanged. The [Conversations Package reference](../packages/conversations-package/README.md) lists limits and the distinction between the page schema's 64-item ceiling and the Backend's 32-row cap. Adding this guide makes Conversations agent-facing: bound-Agent access is now default-denied even through declared Ports. Use `agent_contracts()` and `describe(PortAccess::Agent, ...)` for complete metadata after binding. Person-authored declared consumption remains supported.
 
+When successful opening must mean listening, use process 1.1 and the explicit
+confirmed SDK methods: `CapabilityClient::subscribe_confirmed` or
+`PortClientV3::{live_query_confirmed,subscribe_event_confirmed}`. The Host confirms
+the Provider listener and its Consumer registration before returning success,
+without consuming a first value. Existing methods remain enqueue-only. A legacy
+1.0 Provider or an existing unconfirmed event upstream returns
+`capability_version_unsupported`; do not silently downgrade. Rebuild older
+Providers with the compatible SDK and declare 1.1 support. New generated manifests
+allow 1.0–1.1, and the Host selects the highest common minor at admission and launch.
+A Provider handler must register listeners and initialize change-filter baselines
+before returning its `EventSubscription`. Ready proves setup, not durable history
+or replay. See the [process reference](../contracts/package-process/v1/README.md#confirmed-stream-setup-11).
+
 For local diagnosis, `PackageHost::observe_ports()` and `Package::observe_ports()` provide bounded receivers. Acquire the Host receiver before making calls. Match a Consumer process scope and `p:` ID to the Host's assigned Provider `h:` ID; a shared event upstream has multiple Consumer scopes. A slow receiver reports `Lagged` and does not block routing. Neither receiver carries payloads or proves a write committed. To log the Conversations Provider's SDK observations during development, start its Backend with `TEAMARNESS_CONVERSATIONS_PORT_DIAGNOSTICS=1`. The resulting structured lines go to the Host's private rotated stderr files under `packages/logs/`; normal operation emits no Port observations. These files are not an in-app diagnostics API. Do not copy Message text, actor identity, grants, keys, or records into your own diagnostics.
+
+## Discover Ports as the local Person
+
+Declare `teamarness.package-ports` 3.0 and use `ports_v3::PortClientV3::from_initialization`. Do not construct the major-2 client over a major-3 grant. `PortAccessV3::Person` requires an unbound Instance and current local Workspace Person; neither an Agent Package nor a model configuration is needed. The Host derives the Person and refuses actor, Workspace, and Provider selectors. Agent access still requires a binding and never falls back to Person.
+
+Read one `available(Person, cursor)` page at a time, within your operation's budgets. Summaries identify the Provider separately from the contract, guide eligibility, current offered major, saved selected major, complete metadata digest, and an opaque route revision. An admitted guide-less Provider appears with `GuideEligibility::Missing` but cannot be enabled. Team callers see Team Providers only; Personal callers see both tiers. Graph-rejected Providers are not offered.
+
+Keep `PortContractRef { access, contract, major, route_revision }` from the observed row. Use it for `describe`, `enable`, guide reads, and ordinary calls. `disable(access, contract)` needs no live Provider or revision. Person choices default empty and persist separately from Agent choices; an Agent choice never becomes Person permission. No capability grant or selector leaves the Package through this API.
+
+Treat `port_catalog_changed` as a refusal, not permission to replay work. Metadata may be rediscovered within a bounded operation; never automatically retry a tool call. `port_actor_mode_invalid`, `person_not_current`, and `port_guide_required` explain Person refusals. A read-only external product must still deny commands and streams itself. Current tests cover initial Person queries, schemas, isolation, durable choices and compatibility; authority-transition and stream stress qualification is phase 2, not implied by this reference.
 
 ## Act as a Workspace Agent
 
@@ -310,15 +351,15 @@ Three things cross the Package boundary, and each carries its own version.
 
 | Line | Version today | What it covers |
 |---|---|---|
-| Package Process Protocol | 1.0 | the frame set, the lifecycle operations, the `initialize` handshake |
+| Package Process Protocol | 1.0–1.1 | the frame set, the lifecycle operations, the `initialize` handshake |
 | Semantic Capability family | one per family, for example the record log's | that family's request and event shapes, bounds, vocabularies, and error codes |
-| Package UI bridge | `uiHostVersion` 2 | the mount contract your `mount(context)` is given. Version 2 added `context.view`; a UI written for version 1 keeps working |
+| Package UI bridge | `uiHostVersion` 3 | the mount contract your `mount(context)` is given. Version 3 adds optional `context.navigation.openSettings()`; version 2 added `context.view`. Earlier UIs keep working |
 
 A capability is negotiated at activation: you declare a family and the versions of it you accept, the Host offers a major and a range of minors, and the highest minor both accept is granted. Within a major, a minor only adds — new optional request fields, new event kinds you may ignore, wider bounds. Nothing is removed or narrowed, and a value added to a closed vocabulary such as the record log's `availability` states is a new major, not a minor, so your Package never has to interpret a state it does not know.
 
 A capability family the Host does not provide is an unavailable capability, not a version error. A **new** family — document-oriented synchronization, say — is added beside the existing ones. It changes no existing family, no lifecycle operation, no protocol version, and no UI contract, so a Package that does not declare it is unaffected.
 
-When a breaking change eventually lands, it comes with a deprecation window: the Host supports the previous major alongside the new one for one release cycle, the Package Catalog reports which Packages still use a superseded major, and these docs and `npm run validate` warn you before the Host refuses. Package-ports 2.0 is an explicit pre-release exception: only 2.0 is offered, and major-1 consumers must rebuild without a compatibility dispatcher (ADR 0035). Other seams retain ADR 0018's intended policy. An additive mount-contract change, such as `context.view` in version 2, raises `uiHostVersion` without a window, and this table says what each version adds. See ADR 0018, Package seam versioning, and ADR 0037.
+When a breaking change eventually lands, it comes with a deprecation window: the Host supports the previous major alongside the new one for one release cycle, the Package Catalog reports which Packages still use a superseded major, and these docs and `npm run validate` warn you before the Host refuses. Package-ports 2.0 and 3.0 now coexist (ADR 0044), with no removal scheduled in this workstream. Supported major-2 declarations produce the nonfatal `capability.superseded_major` author warning, also shown on the generic Package page. Existing 2.0 consumers need no rebuild; major-1 consumers still fail negotiation without a compatibility dispatcher (ADR 0035). Warnings never enter process grants or major-2 responses. Other seams retain ADR 0018's intended policy. An additive mount-contract change, such as `context.view` in version 2, raises `uiHostVersion` without a window, and this table says what each version adds. See ADR 0018, Package seam versioning, and ADR 0037.
 
 ## Trust limits
 

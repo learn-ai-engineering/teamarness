@@ -189,6 +189,10 @@ pub(crate) async fn run(
                             }
                         }
                     }
+                    FrameKind::StreamReady => {
+                        let id = string_field(&frame, "streamId")?;
+                        CapabilityClient::ready(&capability_streams, &id).await;
+                    }
                     FrameKind::Event => {
                         let id = string_field(&frame, "streamId")?;
                         let payload = frame
@@ -246,6 +250,7 @@ pub(crate) async fn run(
                             writer.data(stream_close(&id, "overloaded")).await?;
                             continue;
                         }
+                        let require_ready = frame.field("requireReady").is_some();
                         let cancellation = CancellationToken::new();
                         let operation = string_field(&frame, "topic")?;
                         let observed = port_observation::operation(&operation);
@@ -275,6 +280,7 @@ pub(crate) async fn run(
                                     return;
                                 }
                             };
+                            if require_ready && writer.data(serde_json::json!({"kind":"stream_ready","streamId":stream_id})).await.is_err() { return; }
                             emit(&observer, observed, &stream_id, ProviderPortStage::Opened, None);
                             let mut sequence = 0_u64;
                             while let Some(event) = subscription.receiver.recv().await {
@@ -572,11 +578,17 @@ mod tests {
         streams.lock().await.extend([
             (
                 "p:slow".into(),
-                crate::capability::CapabilityStreamRoute { sender: slow },
+                crate::capability::CapabilityStreamRoute {
+                    sender: slow,
+                    ready: None,
+                },
             ),
             (
                 "p:peer".into(),
-                crate::capability::CapabilityStreamRoute { sender: peer },
+                crate::capability::CapabilityStreamRoute {
+                    sender: peer,
+                    ready: None,
+                },
             ),
         ]);
         for (id, sequence) in [("p:slow", 1), ("p:slow", 2), ("p:peer", 1)] {

@@ -247,6 +247,14 @@ fn directory_acceptable(
 /// `/private/var`, so an ancestor link is normal and is not a signal.
 #[cfg(unix)]
 fn prepare_private_directory(path: &Path) -> Result<(), StorageError> {
+    prepare_private_directory_inner(path, || {})
+}
+
+#[cfg(unix)]
+fn prepare_private_directory_inner(
+    path: &Path,
+    before_directory_scan: impl FnOnce(),
+) -> Result<(), StorageError> {
     use std::os::unix::fs::MetadataExt;
 
     let write_marker = match fs::symlink_metadata(path) {
@@ -255,12 +263,16 @@ fn prepare_private_directory(path: &Path) -> Result<(), StorageError> {
             let is_symlink = file_type.is_symlink();
             let is_dir = file_type.is_dir();
             let (has_marker, is_empty, has_core_database) = if is_dir {
+                before_directory_scan();
+                let is_empty = fs::read_dir(path)
+                    .map_err(fault!(StorageError::Io))?
+                    .next()
+                    .is_none();
+                // Scan first: another opener may publish the marker before the
+                // scan, making an initially empty directory appear nonempty.
                 (
                     path.join(PRIVATE_DIRECTORY_MARKER).exists(),
-                    fs::read_dir(path)
-                        .map_err(fault!(StorageError::Io))?
-                        .next()
-                        .is_none(),
+                    is_empty,
                     path.join(DATABASE_FILE_NAME).exists(),
                 )
             } else {
@@ -438,6 +450,57 @@ mod tests {
         assert_eq!(secure_delete, 1);
         drop(stored);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    // Verifies: TEAM.SYS.ID-R01, TEAM.SYS.ID-R07
+    #[cfg(unix)]
+    #[test]
+    fn prepare_private_directory_accepts_concurrent_marker_publication() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("concurrent-marker");
+        fs::create_dir(&directory).unwrap();
+        let result = prepare_private_directory_inner(&directory, || {
+            assert!(fs::read_dir(&directory).unwrap().next().is_none());
+            // Complete another legitimate opener's preparation before this scan,
+            // but before either opener creates the database.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| prepare_private_directory(&directory))
+                    .join()
+                    .unwrap()
+                    .unwrap();
+            });
+            assert!(directory.join(PRIVATE_DIRECTORY_MARKER).is_file());
+            assert!(!directory.join(DATABASE_FILE_NAME).exists());
+        });
+        let marker_content = fs::read(directory.join(PRIVATE_DIRECTORY_MARKER)).unwrap();
+        let mode = fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+        fs::remove_dir_all(directory).unwrap();
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(marker_content, PRIVATE_DIRECTORY_MARKER_CONTENT);
+        assert_eq!(mode, 0o700);
+    }
+
+    // Verifies: TEAM.SYS.ID-R07
+    #[cfg(unix)]
+    #[test]
+    fn prepare_private_directory_refuses_regular_file_without_changing_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = test_directory("regular-file");
+        fs::write(&path, b"not a directory").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let result = prepare_private_directory(&path);
+        let content = fs::read(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(result, Err(StorageError::InvalidDataDirectory));
+        assert_eq!(content, b"not a directory");
+        assert_eq!(mode, 0o644);
     }
 
     // Verifies: TEAM.SYS.ID-R07

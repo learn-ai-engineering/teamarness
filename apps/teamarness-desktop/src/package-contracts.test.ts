@@ -19,7 +19,7 @@ const inspectedKeys = {
   homepage: true, capabilities: true, provided: true, consumed: true, kind: true,
 } satisfies Record<keyof InspectedPackage, true>;
 const authoringKeys = {
-  identity: true, capabilities: true, provided: true, consumed: true,
+  identity: true, compatibilityWarnings: true, capabilities: true, provided: true, consumed: true,
 } satisfies Record<keyof PackageAuthoringEntry, true>;
 const consumedAvailabilityKeys = {
   identity: true, major: true, minMinor: true, maxMinor: true, required: true, provider: true, minor: true,
@@ -61,7 +61,8 @@ it("reports whether a mount may nest content frames", () => {
 it("covers both Package UI views with the loader shape", () => {
   const loaders = [fixture.loader, fixture.openMount.loader];
   for (const loader of loaders) {
-    expectKeys(loader, loaderKeys);
+    expect(Object.keys(loader).sort()).toEqual(Object.keys(loaderKeys).sort());
+    expect(loader.uiHostVersion).toBe(3);
     expect(Object.keys(loader)).toHaveLength(Object.keys(loaderKeys).length);
     expect(loader.view in views).toBe(true);
   }
@@ -112,6 +113,8 @@ it("reads routed and unavailable consumed Ports from the authoring catalog", () 
   const [entry] = catalog;
   expect(entry).toBeDefined();
   expectKeys(entry!, authoringKeys);
+  expect(Object.keys(entry!)).toHaveLength(Object.keys(authoringKeys).length);
+  expect(entry!.compatibilityWarnings).toEqual(["capability.superseded_major: teamarness.package-ports major 2 remains supported; a newer major is available"]);
   for (const consumed of entry!.consumed) {
     expectKeys(consumed, consumedAvailabilityKeys);
     expect(Object.keys(consumed)).toHaveLength(Object.keys(consumedAvailabilityKeys).length);

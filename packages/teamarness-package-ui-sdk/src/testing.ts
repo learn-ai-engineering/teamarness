@@ -147,6 +147,7 @@ export function createTestMountContext(input: {
   client: PackageClient;
   displayName?: string;
   view?: PackageUiView;
+  navigation?: PackageMountContext["navigation"];
 }): PackageMountContext {
   return Object.freeze({
     root: input.root as ShadowRoot,
@@ -164,5 +165,6 @@ export function createTestMountContext(input: {
     uiHostVersion: PACKAGE_UI_HOST_VERSION,
     themeTokens: TEAMARNESS_THEME_TOKENS,
     client: input.client,
+    ...(input.navigation ? { navigation: Object.freeze({ openSettings: input.navigation.openSettings }) } : {}),
   });
 }

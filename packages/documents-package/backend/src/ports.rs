@@ -755,16 +755,14 @@ async fn comment_head(context: &Context<DocumentsActive>) -> Result<(String, u64
 }
 
 /// Live-only and coalescing: a payload-free event whenever the Comment history's head moves.
-pub(super) fn comments_changed(
+pub(super) async fn comments_changed(
     context: &Context<DocumentsActive>,
 ) -> Result<EventSubscription, BackendError> {
     let (sender, subscription) = event_channel(1);
     let mut metadata = context.state().changes.subscribe();
     let context = context.clone();
+    let mut seen = comment_head(&context).await?;
     tokio::spawn(async move {
-        let Ok(mut seen) = comment_head(&context).await else {
-            return;
-        };
         loop {
             tokio::select! {
                 () = sender.closed() => return,
@@ -803,18 +801,18 @@ fn listing_fingerprint(state: &DocumentsActive) -> Result<String, BackendError> 
 /// folded into the next. A body change names its Document; a listing change, a lagged feed or
 /// more than [`MAX_PAGE`] Documents send an event without `documentIds`, and the Consumer
 /// re-lists.
-pub(super) fn changed(
+pub(super) async fn changed(
     context: &Context<DocumentsActive>,
 ) -> Result<EventSubscription, BackendError> {
     let (sender, subscription) = event_channel(1);
     let mut bodies = context.state().hub.events.subscribe();
     let mut metadata = context.state().changes.subscribe();
     let context = context.clone();
+    let state = context.state().clone();
+    let mut listing = context
+        .blocking(move |_| listing_fingerprint(&state))
+        .await?;
     tokio::spawn(async move {
-        let state = context.state().clone();
-        let Ok(mut listing) = context.blocking(move |_| listing_fingerprint(&state)).await else {
-            return;
-        };
         loop {
             let mut documents = BTreeSet::new();
             let mut listing_changed = false;

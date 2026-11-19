@@ -21,14 +21,16 @@ fn declare(fixture: &common::Fixture, directory: &str, provider: bool) {
             "identity":"com.example.messages","major":1,"minor":0,"description":"Message fixture",
             "ports":[{"name":"message.created","kind":"event","description":"Message was created",
                 "event":{"type":"object","properties":{"order":{"type":"integer"},"padding":{"type":"string"}},
-                    "required":["order"],"additionalProperties":false}}
+                    "required":["order"],"additionalProperties":false}},
+                {"name":"message.title_watch","kind":"query","description":"Streaming arbitrary values",
+                    "request":{"type":"object","properties":{"count":{"type":"integer"},"code":{"type":"string"}},"additionalProperties":false},"event":{}}
             ]}]})).unwrap();
         fs::write(root.join("ports.json"), &bytes).unwrap();
         manifest["portContract"] = json!({"path":"ports.json","sha256":common::digest(&bytes)});
         manifest["activation"] = "on_demand".into();
     } else {
         manifest["consumedPorts"] = json!([{"identity":"com.example.messages","major":1,
-            "minMinor":0,"maxMinor":0,"ports":[{"name":"message.created","kind":"event"}]}]);
+            "minMinor":0,"maxMinor":0,"ports":[{"name":"message.created","kind":"event"},{"name":"message.title_watch","kind":"query"}]}]);
     }
     fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 }
@@ -1055,4 +1057,788 @@ async fn largest_schema_accepted_event_fits_bounded_process_and_fanout_queues_fo
     assert_eq!(received["closeCode"], Value::Null);
     assert_eq!(received["paddingLength"], padding.len());
     assert_eq!(received["lastOrder"], 2);
+}
+
+fn process_minor(fixture: &common::Fixture, directory: &str, min: u16, max: u16) {
+    let path = fixture
+        .config
+        .application_root()
+        .join(directory)
+        .join("teamarness.package.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["protocol"] = json!({"major":1,"minMinor":min,"maxMinor":max});
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn confirmed_consumers_wait_for_provider_registration_and_share_the_confirmed_upstream() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[
+            ("provider", "com.example.held-provider"),
+            ("a", "com.example.consumer-a"),
+            ("b", "com.example.consumer-b"),
+        ],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    for (dir, provider) in [("provider", true), ("a", false), ("b", false)] {
+        declare(&fixture, dir, provider);
+        process_minor(&fixture, dir, 0, 1);
+    }
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let snapshot = host.snapshot().await;
+    let key = |name| {
+        snapshot
+            .instances
+            .iter()
+            .find(|i| i.key.package_identity.as_str() == name)
+            .unwrap()
+            .key
+            .clone()
+    };
+    let a = mount(&host, key("com.example.consumer-a")).await;
+    let b = mount(&host, key("com.example.consumer-b")).await;
+    let p = mount(&host, key("com.example.held-provider")).await;
+    let open = request(
+        &host,
+        &a,
+        "confirmed-a",
+        "fixture.port_event_open",
+        json!({"confirmed":true}),
+    );
+    tokio::pin!(open);
+    // Drive the real Consumer open until the Provider reports its held handler.
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            tokio::select! {
+                value = &mut open => panic!("confirmation preceded Provider registration: {value}"),
+                value = stats(&host, &p, 1) => if value["pending"] == 1 { break; },
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // negative-wait: the Provider is positively held; no domain value is the barrier.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut open)
+            .await
+            .is_err()
+    );
+    request(&host, &p, "release", "fixture.port_release", json!({})).await;
+    assert_eq!(open.await["opened"], true);
+    assert_eq!(events(&host, &a, 1).await["events"], json!([]));
+    request(
+        &host,
+        &p,
+        "first-change",
+        "fixture.port_event_emit",
+        json!({"order":1}),
+    )
+    .await;
+    common::eventually(
+        Duration::from_secs(4),
+        "first post-ready Provider change",
+        || async { events(&host, &a, 2).await["events"] == json!([{"order":1}]) },
+    )
+    .await;
+    assert_eq!(
+        request(
+            &host,
+            &b,
+            "confirmed-b",
+            "fixture.port_event_open",
+            json!({"confirmed":true})
+        )
+        .await["opened"],
+        true
+    );
+    assert_eq!(stats(&host, &p, 2).await["opens"], 1);
+    request(&host, &a, "close-a", "fixture.port_event_close", json!({})).await;
+    request(
+        &host,
+        &p,
+        "peer-change",
+        "fixture.port_event_emit",
+        json!({"order":2}),
+    )
+    .await;
+    common::eventually(
+        Duration::from_secs(4),
+        "remaining confirmed peer receives",
+        || async { events(&host, &b, 3).await["events"] == json!([{"order":2}]) },
+    )
+    .await;
+    host.execute(PackageHostCommand::Shutdown(
+        teamarness_package_host::ShutdownHost,
+    ))
+    .await
+    .unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn legacy_provider_refuses_confirmation_but_retains_unconfirmed_events() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[
+            ("provider", "com.example.provider"),
+            ("consumer", "com.example.consumer"),
+        ],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    declare(&fixture, "provider", true);
+    declare(&fixture, "consumer", false);
+    process_minor(&fixture, "consumer", 1, 1);
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let snapshot = host.snapshot().await;
+    let key = |name| {
+        snapshot
+            .instances
+            .iter()
+            .find(|i| i.key.package_identity.as_str() == name)
+            .unwrap()
+            .key
+            .clone()
+    };
+    let c = mount(&host, key("com.example.consumer")).await;
+    let p = mount(&host, key("com.example.provider")).await;
+    assert_eq!(
+        request(
+            &host,
+            &c,
+            "confirmed",
+            "fixture.port_event_open",
+            json!({"confirmed":true})
+        )
+        .await,
+        json!({"opened":false,"code":"capability_version_unsupported"})
+    );
+    assert_eq!(stats(&host, &p, 1).await["opens"], 0);
+    let mut observed = host.observe_ports();
+    assert_eq!(
+        request(&host, &c, "legacy", "fixture.port_event_open", json!({})).await["opened"],
+        true
+    );
+    wait_subscribed(&mut observed, "com.example.consumer").await;
+    request(
+        &host,
+        &p,
+        "change",
+        "fixture.port_event_emit",
+        json!({"order":1}),
+    )
+    .await;
+    common::eventually(
+        Duration::from_secs(4),
+        "legacy event still delivered",
+        || async { events(&host, &c, 2).await["events"] == json!([{"order":1}]) },
+    )
+    .await;
+    host.execute(PackageHostCommand::Shutdown(
+        teamarness_package_host::ShutdownHost,
+    ))
+    .await
+    .unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn confirmed_pending_setup_cancel_timeout_and_late_release_leave_no_provider_listener() {
+    for cancel in [true, false] {
+        let fixture = common::Fixture::node_with_capabilities(
+            &[
+                ("provider", "com.example.held-provider"),
+                ("consumer", "com.example.consumer"),
+            ],
+            &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+        )
+        .await;
+        for (dir, provider) in [("provider", true), ("consumer", false)] {
+            declare(&fixture, dir, provider);
+            process_minor(&fixture, dir, 1, 1);
+        }
+        let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+            .await
+            .unwrap();
+        let snapshot = host.snapshot().await;
+        let key = |name| {
+            snapshot
+                .instances
+                .iter()
+                .find(|i| i.key.package_identity.as_str() == name)
+                .unwrap()
+                .key
+                .clone()
+        };
+        let c = mount(&host, key("com.example.consumer")).await;
+        let p = mount(&host, key("com.example.held-provider")).await;
+        let started = std::time::Instant::now();
+        let open = request(
+            &host,
+            &c,
+            "pending",
+            "fixture.port_event_open",
+            json!({"confirmed":true}),
+        );
+        tokio::pin!(open);
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                tokio::select! {
+                    value = &mut open => panic!("held setup returned: {value}"),
+                    value = stats(&host, &p, 1) => if value["pending"] == 1 { break; },
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if cancel {
+            request(&host, &c, "cancel", "fixture.port_event_close", json!({})).await;
+        } else {
+            let value = tokio::time::timeout(Duration::from_secs(22), &mut open)
+                .await
+                .unwrap();
+            assert_eq!(value, json!({"opened":false,"code":"deadline_exceeded"}));
+            assert!(
+                started.elapsed() < Duration::from_secs(22),
+                "one setup budget, not two"
+            );
+        }
+        common::eventually(
+            Duration::from_secs(4),
+            "pending Provider route closes",
+            || async { stats(&host, &p, 2).await["pending"] == 0 },
+        )
+        .await;
+        request(&host, &p, "late-release", "fixture.port_release", json!({})).await;
+        assert_eq!(stats(&host, &p, 3).await["active"], 0);
+        host.execute(PackageHostCommand::Shutdown(
+            teamarness_package_host::ShutdownHost,
+        ))
+        .await
+        .unwrap();
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn provider_setup_refusal_is_an_opening_error_not_confirmed_success() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[
+            ("provider", "com.example.refusing-provider"),
+            ("consumer", "com.example.consumer"),
+        ],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    for (dir, provider) in [("provider", true), ("consumer", false)] {
+        declare(&fixture, dir, provider);
+        process_minor(&fixture, dir, 0, 1);
+    }
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let key = host
+        .snapshot()
+        .await
+        .instances
+        .iter()
+        .find(|i| i.key.package_identity.as_str() == "com.example.consumer")
+        .unwrap()
+        .key
+        .clone();
+    let c = mount(&host, key).await;
+    let result = request(
+        &host,
+        &c,
+        "refusal",
+        "fixture.port_event_open",
+        json!({"confirmed":true}),
+    )
+    .await;
+    assert_eq!(result["opened"], false);
+    assert_eq!(result["code"], "fixture.setup_refused");
+    host.execute(PackageHostCommand::Shutdown(
+        teamarness_package_host::ShutdownHost,
+    ))
+    .await
+    .unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn confirmed_query_orders_ready_before_immediate_non_object_value_and_completion() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[
+            ("provider", "com.example.provider"),
+            ("consumer", "com.example.consumer"),
+        ],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    for (dir, provider) in [("provider", true), ("consumer", false)] {
+        declare(&fixture, dir, provider);
+        process_minor(&fixture, dir, 0, 1);
+    }
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let key = host
+        .snapshot()
+        .await
+        .instances
+        .iter()
+        .find(|i| i.key.package_identity.as_str() == "com.example.consumer")
+        .unwrap()
+        .key
+        .clone();
+    let c = mount(&host, key).await;
+    assert_eq!(
+        request(
+            &host,
+            &c,
+            "query",
+            "fixture.port_open",
+            json!({"confirmed":true,"port":"message.title_watch"})
+        )
+        .await["opened"],
+        true
+    );
+    common::eventually(Duration::from_secs(4), "confirmed query completes behind its value", || async {
+        request(&host, &c, "query-values", "fixture.port_events", json!({})).await ==
+            json!({"events":[{"$teamarnessPortEnvelope":1,"$teamarnessPortValue":[1,2]}],"closeCode":"completed"})
+    }).await;
+    host.execute(PackageHostCommand::Shutdown(
+        teamarness_package_host::ShutdownHost,
+    ))
+    .await
+    .unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn an_existing_unconfirmed_upstream_cannot_be_relabelled_confirmed() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[
+            ("provider", "com.example.provider"),
+            ("a", "com.example.consumer-a"),
+            ("b", "com.example.consumer-b"),
+        ],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    for (dir, provider) in [("provider", true), ("a", false), ("b", false)] {
+        declare(&fixture, dir, provider);
+        process_minor(&fixture, dir, 0, 1);
+    }
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let snapshot = host.snapshot().await;
+    let key = |name| {
+        snapshot
+            .instances
+            .iter()
+            .find(|i| i.key.package_identity.as_str() == name)
+            .unwrap()
+            .key
+            .clone()
+    };
+    let a = mount(&host, key("com.example.consumer-a")).await;
+    let b = mount(&host, key("com.example.consumer-b")).await;
+    let p = mount(&host, key("com.example.provider")).await;
+    let mut observed = host.observe_ports();
+    request(
+        &host,
+        &a,
+        "unconfirmed",
+        "fixture.port_event_open",
+        json!({}),
+    )
+    .await;
+    wait_subscribed(&mut observed, "com.example.consumer-a").await;
+    assert_eq!(
+        request(
+            &host,
+            &b,
+            "confirmed",
+            "fixture.port_event_open",
+            json!({"confirmed":true})
+        )
+        .await,
+        json!({"opened":false,"code":"capability_version_unsupported"})
+    );
+    assert_eq!(stats(&host, &p, 1).await["opens"], 1);
+    request(
+        &host,
+        &p,
+        "unchanged-peer",
+        "fixture.port_event_emit",
+        json!({"order":1}),
+    )
+    .await;
+    common::eventually(
+        Duration::from_secs(4),
+        "unconfirmed peer remains live",
+        || async { events(&host, &a, 2).await["events"] == json!([{"order":1}]) },
+    )
+    .await;
+    host.execute(PackageHostCommand::Shutdown(
+        teamarness_package_host::ShutdownHost,
+    ))
+    .await
+    .unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn pending_confirmation_cleans_up_after_consumer_disappearance_or_provider_death() {
+    for retire_provider in [false, true] {
+        let fixture = common::Fixture::node_with_capabilities(
+            &[
+                ("provider", "com.example.held-provider"),
+                ("consumer", "com.example.consumer"),
+            ],
+            &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+        )
+        .await;
+        for (dir, provider) in [("provider", true), ("consumer", false)] {
+            declare(&fixture, dir, provider);
+            process_minor(&fixture, dir, 1, 1);
+        }
+        let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+            .await
+            .unwrap();
+        let snapshot = host.snapshot().await;
+        let key = |name| {
+            snapshot
+                .instances
+                .iter()
+                .find(|i| i.key.package_identity.as_str() == name)
+                .unwrap()
+                .key
+                .clone()
+        };
+        let consumer = key("com.example.consumer");
+        let provider = key("com.example.held-provider");
+        let c = mount(&host, consumer.clone()).await;
+        let p = mount(&host, provider.clone()).await;
+        let open = request(
+            &host,
+            &c,
+            "pending",
+            "fixture.port_event_open",
+            json!({"confirmed":true}),
+        );
+        tokio::pin!(open);
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                tokio::select! {
+                    value = &mut open => panic!("held setup returned: {value}"),
+                    value = stats(&host, &p, 1) => if value["pending"] == 1 { break; },
+                }
+            }
+        })
+        .await
+        .unwrap();
+        host.execute(PackageHostCommand::Dispose(
+            teamarness_package_host::DisposePackage {
+                instance: if retire_provider { provider } else { consumer },
+            },
+        ))
+        .await
+        .unwrap();
+        if retire_provider {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(4), open)
+                    .await
+                    .unwrap(),
+                json!({"opened":false,"code":"provider_exited"})
+            );
+        } else {
+            common::eventually(
+                Duration::from_secs(4),
+                "Consumer disappearance closes pending Provider route",
+                || async { stats(&host, &p, 2).await["pending"] == 0 },
+            )
+            .await;
+            request(&host, &p, "late-release", "fixture.port_release", json!({})).await;
+            assert_eq!(stats(&host, &p, 3).await["active"], 0);
+        }
+        host.execute(PackageHostCommand::Shutdown(
+            teamarness_package_host::ShutdownHost,
+        ))
+        .await
+        .unwrap();
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn confirmed_setup_budget_includes_on_demand_activation_and_nested_provider_wait() {
+    let fixture = common::Fixture::node_with_capabilities(
+        &[
+            ("provider", "com.example.delayed-activation.held-provider"),
+            ("consumer", "com.example.consumer"),
+        ],
+        &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+    )
+    .await;
+    for (dir, provider) in [("provider", true), ("consumer", false)] {
+        declare(&fixture, dir, provider);
+        process_minor(&fixture, dir, 1, 1);
+    }
+    let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+        .await
+        .unwrap();
+    let snapshot = host.snapshot().await;
+    let key = |name| {
+        snapshot
+            .instances
+            .iter()
+            .find(|i| i.key.package_identity.as_str() == name)
+            .unwrap()
+            .key
+            .clone()
+    };
+    let provider = key("com.example.delayed-activation.held-provider");
+    assert_eq!(
+        snapshot
+            .instances
+            .iter()
+            .find(|i| i.key == provider)
+            .unwrap()
+            .lifecycle,
+        LifecycleState::Admitted
+    );
+    let c = mount(&host, key("com.example.consumer")).await;
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(23),
+        request(
+            &host,
+            &c,
+            "budget",
+            "fixture.port_event_open",
+            json!({"confirmed":true}),
+        ),
+    )
+    .await
+    .expect("activation and the nested wait share 20 seconds, not 5 + 20");
+    assert_eq!(result, json!({"opened":false,"code":"deadline_exceeded"}));
+    assert!(started.elapsed() < Duration::from_secs(23));
+    let p = mount(&host, provider).await;
+    common::eventually(
+        Duration::from_secs(4),
+        "expired nested open releases Provider setup",
+        || async { stats(&host, &p, 1).await["pending"] == 0 },
+    )
+    .await;
+    request(
+        &host,
+        &p,
+        "late-budget-release",
+        "fixture.port_release",
+        json!({}),
+    )
+    .await;
+    assert_eq!(stats(&host, &p, 2).await["active"], 0);
+    host.execute(PackageHostCommand::Shutdown(
+        teamarness_package_host::ShutdownHost,
+    ))
+    .await
+    .unwrap();
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn confirmed_query_preserves_provider_terminal_with_remaining_and_exhausted_credit() {
+    for count in [1, 32] {
+        for code in [
+            "proof.stream_failed",
+            "completed",
+            "overloaded",
+            "cancelled",
+        ] {
+            let fixture = common::Fixture::node_with_capabilities(
+                &[("provider", "com.example.provider"), ("consumer", "com.example.consumer")],
+                &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+            ).await;
+            for (dir, provider) in [("provider", true), ("consumer", false)] {
+                declare(&fixture, dir, provider);
+                process_minor(&fixture, dir, 0, 1);
+            }
+            let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+                .await
+                .unwrap();
+            let key = host
+                .snapshot()
+                .await
+                .instances
+                .iter()
+                .find(|i| i.key.package_identity.as_str() == "com.example.consumer")
+                .unwrap()
+                .key
+                .clone();
+            let c = mount(&host, key).await;
+            assert_eq!(request(&host, &c, "open", "fixture.port_open",
+                json!({"confirmed":true,"port":"message.title_watch","request":{"count":count,"code":code}})).await["opened"], true);
+            common::eventually(Duration::from_secs(4), "query terminal follows accepted values without more credit", || async {
+                !request(&host, &c, "terminal", "fixture.port_events", json!({})).await["closeCode"].is_null()
+            }).await;
+            assert_eq!(
+                request(
+                    &host,
+                    &c,
+                    "terminal-values",
+                    "fixture.port_events",
+                    json!({})
+                )
+                .await,
+                json!({"events":vec![json!({"$teamarnessPortEnvelope":1,"$teamarnessPortValue":[1,2]});count],"closeCode":code}),
+                "count={count}, code={code}"
+            );
+            let provider_key = host
+                .snapshot()
+                .await
+                .instances
+                .iter()
+                .find(|i| i.key.package_identity.as_str() == "com.example.provider")
+                .unwrap()
+                .key
+                .clone();
+            let provider = mount(&host, provider_key).await;
+            assert_eq!(
+                request(
+                    &host,
+                    &provider,
+                    "still-live",
+                    "fixture.port_query_stats",
+                    json!({})
+                )
+                .await["active"],
+                0,
+                "Provider terminal is stream-local, not a process exit"
+            );
+            host.execute(PackageHostCommand::Shutdown(
+                teamarness_package_host::ShutdownHost,
+            ))
+            .await
+            .unwrap();
+        }
+    }
+}
+
+// Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14
+#[tokio::test]
+async fn shared_events_drain_values_before_provider_terminal_and_release_upstream() {
+    for code in [
+        "proof.stream_failed",
+        "completed",
+        "overloaded",
+        "cancelled",
+    ] {
+        let fixture = common::Fixture::node_with_capabilities(
+            &[
+                ("provider", "com.example.provider"),
+                ("a", "com.example.consumer-a"),
+                ("b", "com.example.consumer-b"),
+            ],
+            &[json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})],
+        )
+        .await;
+        for (dir, provider) in [("provider", true), ("a", false), ("b", false)] {
+            declare(&fixture, dir, provider);
+            process_minor(&fixture, dir, 0, 1);
+        }
+        let host = PackageHost::open(fixture.config.clone(), fixture.core.clone())
+            .await
+            .unwrap();
+        let mut observations = host.observe_ports();
+        let snapshot = host.snapshot().await;
+        let key = |identity: &str| {
+            snapshot
+                .instances
+                .iter()
+                .find(|i| i.key.package_identity.as_str() == identity)
+                .unwrap()
+                .key
+                .clone()
+        };
+        let a = mount(&host, key("com.example.consumer-a")).await;
+        let b = mount(&host, key("com.example.consumer-b")).await;
+        for c in [&a, &b] {
+            assert_eq!(
+                request(
+                    &host,
+                    c,
+                    "open",
+                    "fixture.port_event_open",
+                    json!({"confirmed":true})
+                )
+                .await["opened"],
+                true
+            );
+        }
+        let p = mount(&host, key("com.example.provider")).await;
+        assert_eq!(stats(&host, &p, 1).await["opens"], 1);
+        assert_eq!(
+            request(
+                &host,
+                &p,
+                "emit",
+                "fixture.port_event_emit",
+                json!({"order":1,"closeCode":code})
+            )
+            .await["emitted"],
+            1
+        );
+        for c in [&a, &b] {
+            common::eventually(
+                Duration::from_secs(4),
+                "shared Provider terminal follows accepted value",
+                || async { !events(&host, c, 1).await["closeCode"].is_null() },
+            )
+            .await;
+        }
+        for c in [&a, &b] {
+            assert_eq!(
+                events(&host, c, 2).await,
+                json!({"events":[{"order":1}],"closeCode":code}),
+                "code={code}"
+            );
+        }
+        let closed: Vec<_> = std::iter::from_fn(|| observations.try_recv().ok())
+            .filter(|event| event.stage == teamarness_package_host::PortStage::Closed)
+            .collect();
+        assert_eq!(closed.len(), 2);
+        let diagnostic = if code == "proof.stream_failed" {
+            "provider_error"
+        } else {
+            code
+        };
+        assert!(closed.iter().all(|event| event.code == Some(diagnostic)));
+        // A fresh explicit subscription opens a fresh upstream, not a dead shared entry.
+        assert_eq!(
+            request(
+                &host,
+                &a,
+                "reopen",
+                "fixture.port_event_open",
+                json!({"confirmed":true})
+            )
+            .await["opened"],
+            true
+        );
+        assert_eq!(stats(&host, &p, 2).await["opens"], 2);
+        host.execute(PackageHostCommand::Shutdown(
+            teamarness_package_host::ShutdownHost,
+        ))
+        .await
+        .unwrap();
+    }
 }

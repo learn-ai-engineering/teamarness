@@ -108,7 +108,7 @@ type Harness = {
 
 const open: Harness[] = [];
 
-function harness(mount = MOUNT): Harness {
+function harness(mount = MOUNT, onOpenSettings?: () => Promise<void>): Harness {
   const channel = new MessageChannel();
   const transport = recorder();
   const faults: PackageUiFaultSource[] = [];
@@ -120,6 +120,7 @@ function harness(mount = MOUNT): Harness {
     port: channel.port1,
     transport: transport.transport,
     onFault: (source) => faults.push(source),
+    onOpenSettings,
   });
   channel.port2.onmessage = (event: MessageEvent) => { received.push(event.data as Record<string, unknown>); };
   channel.port2.start();
@@ -580,7 +581,8 @@ describe("Shell-side Package UI port host", () => {
       },
       workspace: { id: instance.workspaceId, name: "Workspace" },
       view: "main",
-      uiHostVersion: 2,
+      uiHostVersion: 3,
+      openSettings: false,
       theme: { colorScheme: "light", values: {} } as never,
     });
     test.fromFrame({ kind: "request", id: 1, operation: "reference.read", payload: {} });
@@ -609,4 +611,84 @@ describe("Shell-side Package UI port host", () => {
       });
     }
   });
+});
+
+function offerSettings(test: Harness): void {
+  test.host.sendMount({
+    entrypoint: "ui/index.js",
+    package: { identity: instance.packageIdentity, version: "1.0.0", displayName: "Reference Package", source: "bundled", trust: "application_bundled", lifecycle: "active", processGeneration: "1" },
+    workspace: { id: instance.workspaceId, name: "Workspace" },
+    view: "main", uiHostVersion: 3, openSettings: true,
+    theme: { colorScheme: "light", values: {} } as never,
+  });
+}
+
+it("coalesces settings intents outside dispatch so its own unmount can acknowledge and clean streams", async () => {
+  let opened = 0;
+  let finish: (() => void) | undefined;
+  const test = harness(MOUNT, async () => {
+    opened += 1;
+    await test.host.requestUnmount();
+    await test.host.dispose();
+    finish?.();
+  });
+  await test.greet();
+  offerSettings(test);
+  test.fromFrame({ kind: "subscribe", id: 1, operation: "reference.changes", payload: {} });
+  await settle();
+  const done = new Promise<void>((resolve) => { finish = resolve; });
+  test.fromFrame({ kind: "open_settings" });
+  test.fromFrame({ kind: "open_settings" });
+  await settle();
+  expect(opened).toBe(1);
+  expect(test.received.at(-1)).toEqual({ kind: "unmount" });
+  test.fromFrame({ kind: "open_settings" });
+  test.fromFrame({ kind: "unmounted", ok: true });
+  await done;
+  expect(test.transport.calls.filter(({ method }) => method === "closeSubscription")).toEqual([
+    { method: "closeSubscription", input: { mount: MOUNT, subscription: "s1" } },
+  ]);
+  expect(test.faults).toEqual([]);
+});
+
+it("ignores valid settings intents without an offer or after unmount, but faults exact-shape violations", async () => {
+  let opened = 0;
+  const test = harness(MOUNT, async () => { opened += 1; });
+  await test.greet();
+  test.fromFrame({ kind: "open_settings" });
+  await settle();
+  expect(opened).toBe(0);
+  offerSettings(test);
+  void test.host.requestUnmount();
+  test.fromFrame({ kind: "open_settings" });
+  await settle();
+  expect(opened).toBe(0);
+  test.fromFrame({ kind: "open_settings", target: "other" });
+  await settle();
+  expect(test.faults).toEqual(["protocol"]);
+});
+
+it("keeps exactly one pending settings intent even while navigation awaits availability without unmounting", async () => {
+  let opened = 0;
+  let release: (() => void) | undefined;
+  const test = harness(MOUNT, () => {
+    opened += 1;
+    return new Promise<void>((resolve) => { release = resolve; });
+  });
+  await test.greet();
+  offerSettings(test);
+  test.fromFrame({ kind: "open_settings" });
+  await settle();
+  test.fromFrame({ kind: "open_settings" });
+  test.fromFrame({ kind: "open_settings" });
+  await settle();
+  expect(opened).toBe(1);
+  release?.();
+  await settle();
+  test.fromFrame({ kind: "open_settings" });
+  await settle();
+  expect(opened).toBe(2);
+  release?.();
+  await test.dispose();
+  expect(test.faults).toEqual([]);
 });

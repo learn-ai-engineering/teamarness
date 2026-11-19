@@ -1,0 +1,29 @@
+{
+  "description": "Independent Person discovery fixture for an admitted guide-less Provider. Discovery and description are permitted, but Person enablement requires a guide. compactUtf8 and describeResult.data pin the same complete metadata bytes as the legacy projection, not a Host serializer.",
+  "compactUtf8": "{\"schemaVersion\":1,\"$defs\":{\"text\":{\"type\":\"string\"}},\"contracts\":[{\"identity\":\"dev.example.metadata\",\"major\":1,\"minor\":2,\"description\":\"Metadata\",\"ports\":[{\"name\":\"value.read\",\"kind\":\"query\",\"description\":\"Read\",\"request\":true,\"response\":{\"$ref\":\"#/$defs/text\"}}]}]}",
+  "document": {
+    "schemaVersion": 1,
+    "$defs": {"text": {"type": "string"}},
+    "contracts": [{"identity": "dev.example.metadata", "major": 1, "minor": 2, "description": "Metadata", "ports": [{"name": "value.read", "kind": "query", "description": "Read", "request": true, "response": {"$ref": "#/$defs/text"}}]}]
+  },
+  "availableCall": {"method": "available", "access": "person"},
+  "availableResult": {
+    "contracts": [{
+      "contract": "dev.example.metadata", "major": 1, "minor": 2, "description": "Metadata",
+      "available": true, "enabled": false, "enabledMajor": null,
+      "metadataSha256": "0de9112f997e9a8350b7bef09d9331815451382033e418f3954c614a42fdbbc7",
+      "provider": {"identity": "dev.example.provider", "version": "1.0.0", "displayName": "Example Provider", "description": null},
+      "guideEligibility": "missing",
+      "routeRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }]
+  },
+  "describeCall": {
+    "method": "describe", "access": "person", "contract": "dev.example.metadata", "major": 1,
+    "metadataSha256": "0de9112f997e9a8350b7bef09d9331815451382033e418f3954c614a42fdbbc7", "offset": 0,
+    "routeRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "describeResult": {
+    "metadataSha256": "0de9112f997e9a8350b7bef09d9331815451382033e418f3954c614a42fdbbc7", "totalBytes": 267, "offset": 0,
+    "data": "eyJzY2hlbWFWZXJzaW9uIjoxLCIkZGVmcyI6eyJ0ZXh0Ijp7InR5cGUiOiJzdHJpbmcifX0sImNvbnRyYWN0cyI6W3siaWRlbnRpdHkiOiJkZXYuZXhhbXBsZS5tZXRhZGF0YSIsIm1ham9yIjoxLCJtaW5vciI6MiwiZGVzY3JpcHRpb24iOiJNZXRhZGF0YSIsInBvcnRzIjpbeyJuYW1lIjoidmFsdWUucmVhZCIsImtpbmQiOiJxdWVyeSIsImRlc2NyaXB0aW9uIjoiUmVhZCIsInJlcXVlc3QiOnRydWUsInJlc3BvbnNlIjp7IiRyZWYiOiIjLyRkZWZzL3RleHQifX1dfV19"
+  }
+}

@@ -76,6 +76,7 @@ export type PackageChange = Readonly<{
 /** One admitted Package's declared Semantic Capabilities and Ports, for its Package page. */
 export type PackageAuthoringEntry = Readonly<{
   identity: string;
+  compatibilityWarnings: readonly string[];
   capabilities: readonly Readonly<{ identity: string; major: number; minMinor: number; maxMinor: number }>[];
   provided: readonly Readonly<{ identity: string; major: number; minor: number; description: string }>[];
   consumed: readonly Readonly<{

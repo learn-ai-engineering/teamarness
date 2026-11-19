@@ -51,6 +51,10 @@ name = "backlog-port-consumer-under-test"
 path = "src/bin/backlog_port_consumer.rs"
 
 [[bin]]
+name = "person-port-consumer-under-test"
+path = "src/bin/person_port_consumer.rs"
+
+[[bin]]
 name = "generic-port-consumer-under-test"
 path = "src/bin/generic_port_consumer.rs"
 
@@ -58,6 +62,11 @@ path = "src/bin/generic_port_consumer.rs"
 [[bin]]
 name = "agent-qualification-provider-under-test"
 path = "src/bin/agent_qualification_provider.rs"
+
+# Source-built only for external Gateway qualification; never an application resource.
+[[bin]]
+name = "gateway-qualification-provider-under-test"
+path = "src/bin/gateway_qualification_provider.rs"
 
 # The optional standalone Agent is qualified through an explicitly supplied Package Directory;
 # it is not a source dependency or prerequisite of the default Teamarness suite.

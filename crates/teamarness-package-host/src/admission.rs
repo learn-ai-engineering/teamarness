@@ -736,8 +736,23 @@ fn admit_tier(
                 .filter(|error| error.affected_package.as_ref() == Some(&package.identity))
                 .cloned()
                 .collect();
+            let requirements: Vec<_> = capabilities
+                .iter()
+                .map(
+                    |capability| teamarness_package_contract::manifest::CapabilityRequirement {
+                        family: capability.identity.clone(),
+                        major: capability.major,
+                        min_minor: capability.min_minor,
+                        max_minor: capability.max_minor,
+                    },
+                )
+                .collect();
             crate::AuthoringCatalogEntry {
                 package,
+                compatibility_warnings:
+                    teamarness_package_contract::capability_versions::compatibility_warnings(
+                        &requirements,
+                    ),
                 capabilities,
                 provided: document
                     .as_ref()

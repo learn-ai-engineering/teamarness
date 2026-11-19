@@ -78,6 +78,8 @@ pub struct AuthoringCatalogEntry {
     pub package: PackageCatalogEntry,
     /// The Semantic Capabilities the manifest declares.
     pub capabilities: Vec<InspectedCapability>,
+    /// Nonfatal supported-major diagnostics, separate from grants and runtime metadata.
+    pub compatibility_warnings: Vec<String>,
     pub provided: Vec<teamarness_package_contract::port_contract::ProvidedContract>,
     pub definitions: serde_json::Map<String, serde_json::Value>,
     pub consumed: Vec<teamarness_package_contract::manifest::ConsumedContract>,

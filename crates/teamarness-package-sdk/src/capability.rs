@@ -26,6 +26,7 @@ pub(crate) type CapabilityStreams = Arc<Mutex<BTreeMap<String, CapabilityStreamR
 
 pub(crate) struct CapabilityStreamRoute {
     pub(crate) sender: mpsc::Sender<Result<JsonValue, BackendError>>,
+    pub(crate) ready: Option<oneshot::Sender<Result<(), BackendError>>>,
 }
 
 /// A cloneable client for generation-scoped Semantic Capability calls.
@@ -46,6 +47,7 @@ pub struct CapabilitySubscription {
     streams: CapabilityStreams,
     state: SharedState,
     closed: bool,
+    sent: bool,
     port_values: bool,
 }
 
@@ -114,6 +116,9 @@ impl CapabilitySubscription {
         self.closed = true;
         self.state.lock().await.retire_stream(&self.id);
         self.streams.lock().await.remove(&self.id);
+        if !self.sent {
+            return;
+        }
         let _ = self
             .writer
             .control(object([
@@ -157,10 +162,14 @@ impl Drop for CapabilitySubscription {
         let streams = self.streams.clone();
         let writer = self.writer.clone();
         let state = self.state.clone();
+        let sent = self.sent;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 state.lock().await.retire_stream(&id);
                 streams.lock().await.remove(&id);
+                if !sent {
+                    return;
+                }
                 let _ = writer
                     .control(object([
                         ("kind", JsonValue::String("stream_close".into())),
@@ -203,6 +212,34 @@ impl CapabilityClient {
         grant: &str,
         payload: JsonValue,
     ) -> Result<CapabilitySubscription, BackendError> {
+        self.subscribe_inner(grant, payload, false).await
+    }
+
+    /// Opens only after the receiver confirms setup. Requires selected process 1.1.
+    pub async fn subscribe_confirmed(
+        &self,
+        grant: &str,
+        payload: JsonValue,
+    ) -> Result<CapabilitySubscription, BackendError> {
+        self.subscribe_inner(grant, payload, true).await
+    }
+
+    async fn subscribe_inner(
+        &self,
+        grant: &str,
+        payload: JsonValue,
+        require_ready: bool,
+    ) -> Result<CapabilitySubscription, BackendError> {
+        if require_ready
+            && self.state.lock().await.selected_version()
+                != Some(teamarness_package_protocol::ProtocolVersion::new(1, 1))
+        {
+            return Err(BackendError::new(
+                "capability_version_unsupported",
+                false,
+                object([]),
+            ));
+        }
         let JsonValue::Object(mut payload) = payload else {
             return Err(invalid_request());
         };
@@ -219,11 +256,25 @@ impl CapabilityClient {
         // The route holds exactly the credit window the contract grants, so a
         // conforming host can never overrun it.
         let (sender, receiver) = mpsc::channel(INITIAL_STREAM_CREDIT);
-        self.streams
-            .lock()
-            .await
-            .insert(id.clone(), CapabilityStreamRoute { sender });
-        let value = object([
+        let (ready, confirmation) = oneshot::channel();
+        self.streams.lock().await.insert(
+            id.clone(),
+            CapabilityStreamRoute {
+                sender,
+                ready: require_ready.then_some(ready),
+            },
+        );
+        let mut subscription = CapabilitySubscription {
+            id: id.clone(),
+            receiver,
+            writer: self.writer.clone(),
+            streams: self.streams.clone(),
+            state: self.state.clone(),
+            closed: false,
+            sent: false,
+            port_values: false,
+        };
+        let mut value = object([
             ("kind", JsonValue::String("stream_open".into())),
             ("id", JsonValue::String(id.clone())),
             ("topic", JsonValue::String("capability.stream".into())),
@@ -233,19 +284,32 @@ impl CapabilityClient {
             ),
             ("payload", JsonValue::Object(payload)),
         ]);
+        if require_ready {
+            value
+                .as_object_mut()
+                .expect("object")
+                .insert("requireReady".into(), JsonValue::Bool(true));
+        }
         if self.writer.control(value).await.is_err() {
-            self.streams.lock().await.remove(&id);
             return Err(unavailable());
         }
-        Ok(CapabilitySubscription {
-            id,
-            receiver,
-            writer: self.writer.clone(),
-            streams: self.streams.clone(),
-            state: self.state.clone(),
-            closed: false,
-            port_values: false,
-        })
+        subscription.sent = true;
+        if require_ready {
+            match tokio::time::timeout(Duration::from_secs(21), confirmation).await {
+                Ok(Ok(result)) => result?,
+                Ok(Err(_)) => return Err(unavailable()),
+                Err(_) => return Err(BackendError::new("deadline_exceeded", true, object([]))),
+            }
+        }
+        Ok(subscription)
+    }
+
+    pub(crate) async fn ready(streams: &CapabilityStreams, id: &str) {
+        if let Some(route) = streams.lock().await.get_mut(id)
+            && let Some(ready) = route.ready.take()
+        {
+            let _ = ready.send(Ok(()));
+        }
     }
 
     /// Routes one already-classified event to its stream.
@@ -284,9 +348,15 @@ impl CapabilityClient {
         id: &str,
         error: Option<BackendError>,
     ) {
-        if let Some(route) = streams.lock().await.remove(id)
-            && let Some(error) = error
-        {
+        if let Some(mut route) = streams.lock().await.remove(id) {
+            if let Some(ready) = route.ready.take() {
+                let _ = ready.send(Err(error
+                    .clone()
+                    .unwrap_or_else(|| BackendError::new("closed", false, object([])))));
+            }
+            let Some(error) = error else {
+                return;
+            };
             // The terminal follows accepted events, but a full stream must not
             // suspend the session reader (or another stream's close).
             tokio::spawn(async move {
@@ -384,7 +454,10 @@ pub(crate) async fn fail_all(pending: &PendingCapabilities, streams: &Capability
             .send(Err(unavailable_after_enqueue(pending.command)));
     }
     let routes = std::mem::take(&mut *streams.lock().await);
-    for (_, route) in routes {
+    for (_, mut route) in routes {
+        if let Some(ready) = route.ready.take() {
+            let _ = ready.send(Err(unavailable()));
+        }
         // A retained full receiver must not hold process shutdown open. The
         // terminal follows accepted events if that Consumer later drains them.
         tokio::spawn(async move {
@@ -437,7 +510,10 @@ mod tests {
         let pending = Arc::new(Mutex::new(BTreeMap::new()));
         let streams = Arc::new(Mutex::new(BTreeMap::from([(
             "p:full".to_owned(),
-            CapabilityStreamRoute { sender },
+            CapabilityStreamRoute {
+                sender,
+                ready: None,
+            },
         )])));
         tokio::time::timeout(Duration::from_millis(100), fail_all(&pending, &streams))
             .await
@@ -578,8 +654,20 @@ mod tests {
         let (slow, mut slow_rx) = mpsc::channel(LAG_TEST_QUEUE);
         let (peer, mut peer_rx) = mpsc::channel(LAG_TEST_QUEUE);
         let streams = Arc::new(Mutex::new(BTreeMap::from([
-            ("p:slow".to_owned(), CapabilityStreamRoute { sender: slow }),
-            ("p:peer".to_owned(), CapabilityStreamRoute { sender: peer }),
+            (
+                "p:slow".to_owned(),
+                CapabilityStreamRoute {
+                    sender: slow,
+                    ready: None,
+                },
+            ),
+            (
+                "p:peer".to_owned(),
+                CapabilityStreamRoute {
+                    sender: peer,
+                    ready: None,
+                },
+            ),
         ])));
         CapabilityClient::event(&streams, "p:slow", serde_json::json!({"order":1}))
             .await

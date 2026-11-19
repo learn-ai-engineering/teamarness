@@ -18,6 +18,7 @@ pub enum FrameKind {
     Error,
     Cancel,
     StreamOpen,
+    StreamReady,
     Event,
     Credit,
     StreamClose,
@@ -37,6 +38,7 @@ impl FrameKind {
             Self::Error => "error",
             Self::Cancel => "cancel",
             Self::StreamOpen => "stream_open",
+            Self::StreamReady => "stream_ready",
             Self::Event => "event",
             Self::Credit => "credit",
             Self::StreamClose => "stream_close",
@@ -56,6 +58,7 @@ impl FrameKind {
             "error" => Ok(Self::Error),
             "cancel" => Ok(Self::Cancel),
             "stream_open" => Ok(Self::StreamOpen),
+            "stream_ready" => Ok(Self::StreamReady),
             "event" => Ok(Self::Event),
             "credit" => Ok(Self::Credit),
             "stream_close" => Ok(Self::StreamClose),
@@ -264,7 +267,16 @@ fn validate_frame(kind: FrameKind, fields: &Map<String, Value>) -> Result<(), Pr
             "details",
         ],
         FrameKind::Cancel => &["kind", "id", "targetId"],
-        FrameKind::StreamOpen => &["kind", "id", "topic", "mountId", "initialCredit", "payload"],
+        FrameKind::StreamOpen => &[
+            "kind",
+            "id",
+            "topic",
+            "mountId",
+            "initialCredit",
+            "payload",
+            "requireReady",
+        ],
+        FrameKind::StreamReady => &["kind", "streamId"],
         FrameKind::Event => &["kind", "streamId", "sequence", "payload"],
         FrameKind::Credit => &["kind", "streamId", "amount"],
         FrameKind::StreamClose => &["kind", "streamId", "code"],
@@ -340,6 +352,12 @@ fn validate_frame(kind: FrameKind, fields: &Map<String, Value>) -> Result<(), Pr
         }
         FrameKind::StreamOpen => {
             identifier(required_str(fields, "id")?)?;
+            if fields
+                .get("requireReady")
+                .is_some_and(|value| value != &Value::Bool(true))
+            {
+                return Err(ProtocolError::new("malformed_frame"));
+            }
             token(required_str(fields, "topic")?)?;
             required_object(fields, "payload")?;
             fields
@@ -353,6 +371,9 @@ fn validate_frame(kind: FrameKind, fields: &Map<String, Value>) -> Result<(), Pr
                         .ok_or_else(|| ProtocolError::new("invalid_base64url"))?,
                 )?;
             }
+        }
+        FrameKind::StreamReady => {
+            identifier(required_str(fields, "streamId")?)?;
         }
         FrameKind::Event => {
             identifier(required_str(fields, "streamId")?)?;

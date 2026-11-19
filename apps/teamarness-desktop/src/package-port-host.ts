@@ -34,6 +34,7 @@ export type PackagePortHostOptions = Readonly<{
   port: MessagePort;
   transport: PackageHostTransport;
   onFault(source: PackageUiFaultSource): void;
+  onOpenSettings?: () => Promise<void>;
 }>;
 
 export type PackageMountMessage = Readonly<{
@@ -42,6 +43,7 @@ export type PackageMountMessage = Readonly<{
   workspace: WorkspacePresentation;
   view: PackageUiView;
   uiHostVersion: number;
+  openSettings: boolean;
   theme: ThemeSnapshot;
 }>;
 
@@ -68,6 +70,11 @@ export class PackagePortHost {
   private disposed = false;
   private faulted = false;
   private greeted = false;
+  private settingsOffered = false;
+  private unmounting = false;
+  private settingsPending = false;
+  private settingsTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly onOpenSettings: (() => Promise<void>) | undefined;
   private nextRequest = 0;
   private nextSubscription = 0;
 
@@ -96,6 +103,7 @@ export class PackagePortHost {
     this.port = options.port;
     this.transport = options.transport;
     this.onFault = options.onFault;
+    this.onOpenSettings = options.onOpenSettings;
     this.ready = new Promise<void>((resolve) => { this.resolveReady = resolve; });
     this.mounted = new Promise<void>((resolve, reject) => {
       this.settleMounted = (error) => { if (error === undefined) resolve(); else reject(error); };
@@ -111,6 +119,7 @@ export class PackagePortHost {
   }
 
   public sendMount(input: PackageMountMessage): void {
+    this.settingsOffered = input.openSettings;
     this.post({
       kind: "mount",
       entrypoint: input.entrypoint,
@@ -118,6 +127,7 @@ export class PackagePortHost {
       workspace: input.workspace,
       view: input.view,
       uiHostVersion: input.uiHostVersion,
+      openSettings: input.openSettings,
       theme: input.theme,
     });
   }
@@ -127,6 +137,7 @@ export class PackagePortHost {
   }
 
   public requestUnmount(): Promise<boolean> {
+    this.unmounting = true;
     if (this.disposed || !this.greeted) return Promise.resolve(false);
     if (this.settleUnmount !== null) return Promise.resolve(false);
     const acknowledged = new Promise<boolean>((resolve) => { this.settleUnmount = resolve; });
@@ -137,6 +148,8 @@ export class PackagePortHost {
   public async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.settingsTimer !== null) clearTimeout(this.settingsTimer);
+    this.settingsTimer = null;
     const closing = [...this.subscriptions.values()]
       .filter((entry) => !entry.closed)
       .map(async (entry) => {
@@ -204,6 +217,9 @@ export class PackagePortHost {
         this.settleMounted?.();
         this.settleMounted = null;
         return;
+      case "open_settings":
+        this.queueSettings();
+        return;
       case "request":
         this.startRequest(message.id, message.operation, message.payload);
         return;
@@ -229,6 +245,18 @@ export class PackagePortHost {
       default:
         this.fault("protocol");
     }
+  }
+
+  private queueSettings(): void {
+    if (!this.settingsOffered || this.settingsPending || this.unmounting || this.faulted || !this.onOpenSettings) return;
+    this.settingsPending = true;
+    // A task, not an awaited bridge handler: routing may destroy this very frame and
+    // must remain able to receive its unmount acknowledgement and stream cleanup.
+    this.settingsTimer = setTimeout(() => {
+      this.settingsTimer = null;
+      if (this.disposed || this.unmounting || this.faulted) return;
+      void this.onOpenSettings?.().catch(() => undefined).finally(() => { this.settingsPending = false; });
+    }, 0);
   }
 
   private isFreeId(id: number): boolean {

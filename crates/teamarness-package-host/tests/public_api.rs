@@ -163,7 +163,7 @@ fn complete_command_and_outcome_vocabulary_is_constructible() {
             loader: teamarness_package_host::UiLoaderDescriptor {
                 token: UiResourceToken::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
                 entrypoint: "ui/index.js".into(),
-                ui_host_version: 2,
+                ui_host_version: 3,
                 contract_digest: "digest".into(),
                 package: teamarness_package_host::UiPackageContext {
                     identity: PackageIdentity::from_str("dev.teamarness.reference").unwrap(),
@@ -378,6 +378,9 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::PortNotEnabled,
         PackageErrorCode::AgentNotBound,
         PackageErrorCode::AgentBindingChanged,
+        PackageErrorCode::PortActorModeInvalid,
+        PackageErrorCode::PersonNotCurrent,
+        PackageErrorCode::PortGuideRequired,
         PackageErrorCode::PortUngranted,
         PackageErrorCode::PortRequestInvalid,
         PackageErrorCode::PortResponseInvalid,
@@ -388,7 +391,7 @@ fn snapshots_and_errors_expose_only_host_values() {
         PackageErrorCode::StaleMount,
         PackageErrorCode::EventLagged,
     ];
-    assert_eq!(codes.len(), 67);
+    assert_eq!(codes.len(), 70);
     for code in codes {
         match code {
             PackageErrorCode::InvalidRegistration
@@ -448,6 +451,9 @@ fn snapshots_and_errors_expose_only_host_values() {
             | PackageErrorCode::PortNotEnabled
             | PackageErrorCode::AgentNotBound
             | PackageErrorCode::AgentBindingChanged
+            | PackageErrorCode::PortActorModeInvalid
+            | PackageErrorCode::PersonNotCurrent
+            | PackageErrorCode::PortGuideRequired
             | PackageErrorCode::PortUnavailable
             | PackageErrorCode::PortUngranted
             | PackageErrorCode::PortRequestInvalid

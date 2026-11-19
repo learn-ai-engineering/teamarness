@@ -137,6 +137,11 @@ function startBridge(env: FrameEnvironment, port: PortLike): void {
         uiHostVersion: message.uiHostVersion,
         themeTokens: TEAMARNESS_THEME_TOKENS,
         client: bridge.client,
+        ...(message.openSettings ? { navigation: Object.freeze({
+          openSettings: (): void => {
+            if (!unmountStarted) port.postMessage({ kind: "open_settings" });
+          },
+        }) } : {}),
       });
       const unmount = await module.mount(context);
       if (typeof unmount !== "function") throw new Error("Package UI mount did not return an unmount function");

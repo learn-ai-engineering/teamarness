@@ -191,6 +191,7 @@ pub(crate) struct UiEventRoute {
     contract: EventContract,
     operation: String,
     lease: Option<Arc<PortStreamLease>>,
+    ready: watch::Sender<bool>,
 }
 
 enum EventContract {
@@ -337,6 +338,7 @@ impl UiEventRoute {
         let route = Arc::new(Self {
             events,
             terminal,
+            ready: watch::channel(false).0,
             bytes: Arc::new(Semaphore::new(UI_EVENT_BYTES + port_overhead)),
             state: Mutex::new(UiEventRouteState {
                 highest_delivered: 0,
@@ -595,6 +597,25 @@ struct Writer {
     terminal_bytes: Arc<Semaphore>,
 }
 
+/// One setup budget, shared by activation and every nested Provider wait.
+#[derive(Clone)]
+pub(crate) struct ConfirmedSetup {
+    deadline: tokio::time::Instant,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+    cancelled: Arc<tokio::sync::Notify>,
+}
+impl ConfirmedSetup {
+    pub(crate) fn check(&self) -> Result<(), PackageErrorCode> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(PackageErrorCode::Cancelled);
+        }
+        if self.deadline <= tokio::time::Instant::now() {
+            return Err(PackageErrorCode::DeadlineExceeded);
+        }
+        Ok(())
+    }
+}
+
 /// The writing half of one Host-owned capability stream.
 ///
 /// Every method runs on the stream's own task, so all three wait for writer
@@ -605,6 +626,9 @@ struct Writer {
 pub(crate) struct HostStreamSender {
     writer: Writer,
     state: SharedState,
+    setup: Option<ConfirmedSetup>,
+    opening_closed: Arc<std::sync::atomic::AtomicBool>,
+    setup_done: watch::Sender<bool>,
 }
 
 #[cfg(test)]
@@ -632,9 +656,40 @@ impl HostStreamSender {
                     terminal_bytes: Arc::new(Semaphore::new(TERMINAL_RESERVE_BYTES)),
                 },
                 state: Arc::new(Mutex::new(ContractState::default())),
+                setup: None,
+                opening_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                setup_done: watch::channel(false).0,
             },
             TestStreamOutput(receiver),
         )
+    }
+
+    pub(crate) fn setup(&self) -> Option<ConfirmedSetup> {
+        self.setup.clone()
+    }
+
+    /// Setup and delivery use the same data lane, so values cannot overtake ready.
+    pub(crate) async fn ready(&self, id: &str) -> Result<(), PackageErrorCode> {
+        let Some(setup) = &self.setup else {
+            return Ok(());
+        };
+        setup.check()?;
+        if self
+            .opening_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(PackageErrorCode::Cancelled);
+        }
+        tokio::time::timeout_at(
+            setup.deadline,
+            self.writer
+                .send_waiting(json!({"kind":"stream_ready","streamId":id}), false),
+        )
+        .await
+        .map_err(|_| PackageErrorCode::DeadlineExceeded)?
+        .map_err(|failure| failure.code)?;
+        self.setup_done.send_replace(true);
+        Ok(())
     }
 
     pub(crate) async fn event(
@@ -660,12 +715,15 @@ impl HostStreamSender {
     /// it would overtake them, and the Package would be told the stream ended
     /// before the last events of it arrived.
     pub(crate) async fn close(&self, stream_id: &str, code: &str) -> Result<(), WireFailure> {
-        self.writer
+        let result = self
+            .writer
             .send_waiting(
                 json!({"kind":"stream_close","streamId":stream_id,"code":code}),
                 false,
             )
-            .await
+            .await;
+        self.setup_done.send_replace(true);
+        result
     }
 
     /// Records that this stream stops being served now.
@@ -835,9 +893,7 @@ pub(crate) trait CapabilityHandler: Send + Sync {
         initial_credit: u64,
         payload: &'a Value,
         output: HostStreamSender,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), WireFailure>> + Send + 'a>>;
 
     /// Routes one already-classified `credit` frame to its stream.
     ///
@@ -883,10 +939,9 @@ impl CapabilityHandler for RejectCapabilities {
         _initial_credit: u64,
         _payload: &'a Value,
         _output: HostStreamSender,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
-    > {
-        Box::pin(async { Err(PackageErrorCode::CapabilityRequestInvalid) })
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), WireFailure>> + Send + 'a>>
+    {
+        Box::pin(async { Err(WireFailure::new(PackageErrorCode::CapabilityRequestInvalid)) })
     }
 
     fn add_credit<'a>(
@@ -1028,6 +1083,7 @@ async fn writer_task<W>(
 struct PendingStreamOpen {
     task: tokio::task::JoinHandle<()>,
     closed: Arc<std::sync::atomic::AtomicBool>,
+    cancelled: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Default)]
@@ -1041,6 +1097,7 @@ impl Drop for PendingStreamOpens {
         for open in self.0.values() {
             open.closed
                 .store(true, std::sync::atomic::Ordering::Release);
+            open.cancelled.notify_waiters();
         }
     }
 }
@@ -1280,6 +1337,10 @@ async fn reader_task<R>(
                     .field("initialCredit")
                     .and_then(Value::as_u64)
                     .unwrap_or_default();
+                let setup_deadline = frame
+                    .field("requireReady")
+                    .is_some()
+                    .then(|| tokio::time::Instant::now() + Duration::from_secs(20));
                 let payload = frame.field("payload").cloned().unwrap_or_else(empty_object);
                 let Ok(slot) = pending_open_slots.clone().try_acquire_owned() else {
                     // The classifier accepts distinct stream IDs without a
@@ -1298,6 +1359,12 @@ async fn reader_task<R>(
                     continue;
                 };
                 let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let cancelled = Arc::new(tokio::sync::Notify::new());
+                let setup = setup_deadline.map(|deadline| ConfirmedSetup {
+                    deadline,
+                    closed: closed.clone(),
+                    cancelled: cancelled.clone(),
+                });
                 let task_closed = closed.clone();
                 let handler = capabilities.clone();
                 let task_writer = writer.clone();
@@ -1309,33 +1376,72 @@ async fn reader_task<R>(
                 // bounded stream task, never the process reader.
                 let task = tokio::spawn(async move {
                     let _slot = slot;
-                    let result = handler
-                        .open_stream(
-                            stream_id.clone(),
-                            &topic,
-                            initial_credit,
-                            &payload,
-                            HostStreamSender {
-                                writer: task_writer.clone(),
-                                state: task_state,
-                            },
-                        )
-                        .await;
+                    let (setup_done, mut setup_result) = watch::channel(false);
+                    let opening = async {
+                        handler
+                            .open_stream(
+                                stream_id.clone(),
+                                &topic,
+                                initial_credit,
+                                &payload,
+                                HostStreamSender {
+                                    writer: task_writer.clone(),
+                                    state: task_state,
+                                    setup,
+                                    opening_closed: task_closed.clone(),
+                                    setup_done,
+                                },
+                            )
+                            .await?;
+                        if setup_deadline.is_some() && !*setup_result.borrow() {
+                            let _ = setup_result.changed().await;
+                        }
+                        Ok::<(), WireFailure>(())
+                    };
+                    tokio::pin!(opening);
+                    let result = if let Some(deadline) = setup_deadline {
+                        tokio::select! {
+                            result = &mut opening => result,
+                            _ = tokio::time::sleep_until(deadline) => {
+                                task_closed.store(true, std::sync::atomic::Ordering::Release);
+                                let _ = task_writer.send_waiting(json!({"kind":"stream_close","streamId":stream_id,"code":"deadline_exceeded"}), false).await;
+                                // Activation is not cancellation-safe. Keep ownership until it
+                                // settles; nested confirmation waits use the same deadline.
+                                let _ = opening.await;
+                                handler.close_stream(&stream_id).await;
+                                return;
+                            }
+                        }
+                    } else {
+                        opening.await
+                    };
                     if task_closed.load(std::sync::atomic::Ordering::Acquire) {
                         handler.close_stream(&stream_id).await;
                     } else if let Err(code) = result {
                         let response = json!({
                             "kind":"stream_close", "streamId":stream_id,
-                            "code":capability_code(code)
+                            "code":code.package_error.as_ref().map(|error| error.code.as_str()).unwrap_or_else(|| capability_code(code.code))
                         });
                         if task_writer.send_waiting(response, true).await.is_err() {
                             let _ = task_failure.send(Some(PackageErrorCode::ProcessExited));
                         }
                     }
                 });
-                opening_streams
-                    .0
-                    .insert(id, PendingStreamOpen { task, closed });
+                opening_streams.0.insert(
+                    id,
+                    PendingStreamOpen {
+                        task,
+                        closed,
+                        cancelled,
+                    },
+                );
+            }
+            FrameKind::StreamReady => {
+                if let Some(id) = frame.field("streamId").and_then(Value::as_str)
+                    && let Some(route) = ui_event_routes.lock().await.get(id)
+                {
+                    route.ready.send_replace(true);
+                }
             }
             FrameKind::Credit => {
                 let Some(stream_id) = frame.field("streamId").and_then(Value::as_str) else {
@@ -1365,6 +1471,7 @@ async fn reader_task<R>(
                         // it after startup settles. Its permit remains held.
                         open.closed
                             .store(true, std::sync::atomic::Ordering::Release);
+                        open.cancelled.notify_waiters();
                     }
                     capabilities.close_stream(stream_id).await;
                 }
@@ -1490,6 +1597,9 @@ fn ui_stream_code(code: PackageErrorCode) -> &'static str {
         PackageErrorCode::UiContractViolation => "ui_contract_violation",
         PackageErrorCode::EventLagged => "event_lagged",
         PackageErrorCode::PortEventInvalid => "port_event_invalid",
+        PackageErrorCode::PortActorModeInvalid => "port_actor_mode_invalid",
+        PackageErrorCode::PersonNotCurrent => "person_not_current",
+        PackageErrorCode::PortGuideRequired => "port_guide_required",
         PackageErrorCode::PortNotEnabled => "port_not_enabled",
         PackageErrorCode::AgentNotBound => "agent_not_bound",
         PackageErrorCode::AgentBindingChanged => "agent_binding_changed",
@@ -1529,6 +1639,9 @@ pub(crate) fn capability_code(code: PackageErrorCode) -> &'static str {
         PackageErrorCode::Overloaded => "overloaded",
         PackageErrorCode::PortUnavailable => "port_unavailable",
         PackageErrorCode::PortCatalogChanged => "port_catalog_changed",
+        PackageErrorCode::PortActorModeInvalid => "port_actor_mode_invalid",
+        PackageErrorCode::PersonNotCurrent => "person_not_current",
+        PackageErrorCode::PortGuideRequired => "port_guide_required",
         PackageErrorCode::PortNotEnabled => "port_not_enabled",
         PackageErrorCode::AgentNotBound => "agent_not_bound",
         PackageErrorCode::AgentBindingChanged => "agent_binding_changed",
@@ -1561,6 +1674,36 @@ fn protocol_code(error: teamarness_package_protocol::ProtocolError) -> PackageEr
     }
 }
 
+struct PendingProviderStream {
+    client: ProcessClient,
+    id: String,
+    sent: bool,
+    armed: bool,
+}
+impl Drop for PendingProviderStream {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let client = self.client.clone();
+        let id = self.id.clone();
+        let sent = self.sent;
+        tokio::spawn(async move {
+            if sent {
+                let _ = client.stream_close(&id).await;
+            } else {
+                client.ui_event_routes.lock().await.remove(&id);
+            }
+        });
+    }
+}
+
+impl From<PackageErrorCode> for WireFailure {
+    fn from(code: PackageErrorCode) -> Self {
+        Self::new(code)
+    }
+}
+
 impl ProcessClient {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open_port_stream(
@@ -1572,24 +1715,58 @@ impl ProcessClient {
         contract: String,
         port: String,
         lease: Option<Arc<PortStreamLease>>,
+        setup: Option<ConfirmedSetup>,
     ) -> Result<UiEventReceiver, WireFailure> {
+        if setup.is_some()
+            && self.state.lock().await.selected_version()
+                != Some(teamarness_package_protocol::ProtocolVersion::new(1, 1))
+        {
+            return Err(WireFailure::new(
+                PackageErrorCode::CapabilityVersionUnsupported,
+            ));
+        }
+        if let Some(setup) = &setup {
+            setup.check().map_err(WireFailure::new)?;
+        }
         let (route, receiver) = UiEventRoute::new_port(schemas, contract, port, lease);
+        let mut ready = route.ready.subscribe();
+        let mut terminal = route.terminal.subscribe();
         self.ui_event_routes
             .lock()
             .await
             .insert(id.clone(), route.clone());
-        if let Err(error) = self
-            .writer
-            .control(json!({
-                "kind":"stream_open", "id":id, "topic":topic,
-                "initialCredit":INITIAL_STREAM_CREDIT, "payload":package_value_to_json(payload)
-            }))
-            .await
-        {
-            self.ui_event_routes.lock().await.remove(&id);
-            route.terminate(StreamEnd::Host(error.code));
-            return Err(error);
+        let mut guard = PendingProviderStream {
+            client: self.clone(),
+            id: id.clone(),
+            sent: false,
+            armed: true,
+        };
+        let mut value = json!({"kind":"stream_open", "id":id, "topic":topic,
+            "initialCredit":INITIAL_STREAM_CREDIT, "payload":package_value_to_json(payload)});
+        if setup.is_some() {
+            value["requireReady"] = true.into();
         }
+        self.writer.control(value).await?;
+        guard.sent = true;
+        if let Some(setup) = setup {
+            let result = tokio::time::timeout_at(setup.deadline, async {
+                loop {
+                    let cancelled = setup.cancelled.notified();
+                    setup.check().map_err(WireFailure::new)?;
+                    if *ready.borrow() { return Ok(()); }
+                    if let Some(end) = terminal.borrow().clone() {
+                        return Err(match end {
+                            StreamEnd::Host(code) => WireFailure::new(code),
+                            StreamEnd::Package(error) => { let mut failure = WireFailure::new(PackageErrorCode::BackendError); failure.package_error = Some(error); failure },
+                            StreamEnd::Completed => WireFailure::new(PackageErrorCode::CapabilityUnavailable),
+                        });
+                    }
+                    tokio::select! { _ = ready.changed() => {}, _ = terminal.changed() => {}, _ = cancelled => {} }
+                }
+            }).await.map_err(|_| WireFailure::new(PackageErrorCode::DeadlineExceeded))?;
+            result?;
+        }
+        guard.armed = false;
         Ok(receiver)
     }
 
@@ -1931,6 +2108,28 @@ fn empty_object() -> Value {
 
 #[cfg(test)]
 mod tests {
+    // Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R13
+    #[test]
+    fn person_refusals_keep_their_codes_on_calls_and_stream_terminals() {
+        for (code, wire) in [
+            (
+                crate::PackageErrorCode::PortActorModeInvalid,
+                "port_actor_mode_invalid",
+            ),
+            (
+                crate::PackageErrorCode::PersonNotCurrent,
+                "person_not_current",
+            ),
+            (
+                crate::PackageErrorCode::PortGuideRequired,
+                "port_guide_required",
+            ),
+        ] {
+            assert_eq!(super::capability_code(code), wire);
+            assert_eq!(super::ui_stream_code(code), wire);
+        }
+    }
+
     use super::{
         Duration, MAX_ID_BYTES, MAX_UI_PAYLOAD_BYTES, StreamEnd, TERMINAL_ERROR_BYTES, WireFailure,
         package_owned_error, start, stream_end,

@@ -8,10 +8,10 @@ import {
 } from "@teamarness/package-ui-sdk";
 
 /**
- * The private Package UI bridge protocol. Both halves ship in one Shell build. Version 3 added
- * `view` to the mount message.
+ * The private Package UI bridge protocol. Both halves ship in one Shell build. Version 4 adds
+ * target-free own-settings intents and mount availability; version 3 added `view`.
  */
-export const FRAME_BRIDGE_PROTOCOL = 3;
+export const FRAME_BRIDGE_PROTOCOL = 4;
 export const CONNECT_KIND = "teamarness.bridge.connect";
 
 /** Matches the Package Host bound `MAX_UI_PAYLOAD_BYTES`. */
@@ -98,6 +98,7 @@ export type BridgeErrorEnvelope = Readonly<{
 export type FrameToShellMessage =
   | Readonly<{ kind: "hello"; protocol: number }>
   | Readonly<{ kind: "mounted" }>
+  | Readonly<{ kind: "open_settings" }>
   | Readonly<{ kind: "request"; id: number; operation: string; payload: unknown }>
   | Readonly<{ kind: "cancel"; id: number }>
   | Readonly<{ kind: "subscribe"; id: number; operation: string; payload: unknown }>
@@ -114,6 +115,7 @@ export type ShellToFrameMessage =
     workspace: WorkspacePresentation;
     view: PackageUiView;
     uiHostVersion: number;
+    openSettings: boolean;
     theme: ThemeSnapshot;
   }>
   | Readonly<{ kind: "theme"; theme: ThemeSnapshot }>
@@ -263,6 +265,9 @@ export function parseFrameMessage(data: unknown): FrameToShellMessage | null {
       if (!hasExactKeys(data, ["kind", "protocol"])) return null;
       if (data.protocol !== FRAME_BRIDGE_PROTOCOL) return null;
       return Object.freeze({ kind: "hello", protocol: FRAME_BRIDGE_PROTOCOL });
+    case "open_settings":
+      if (!hasExactKeys(data, ["kind"])) return null;
+      return Object.freeze({ kind: "open_settings" });
     case "mounted":
       if (!hasExactKeys(data, ["kind"])) return null;
       return Object.freeze({ kind: "mounted" });
@@ -324,9 +329,10 @@ export function parseShellMessage(data: unknown): ShellToFrameMessage | null {
   if (!isPlainObject(data) || typeof data.kind !== "string") return null;
   switch (data.kind) {
     case "mount": {
-      const keys = ["kind", "entrypoint", "package", "workspace", "view", "uiHostVersion", "theme"];
+      const keys = ["kind", "entrypoint", "package", "workspace", "view", "uiHostVersion", "openSettings", "theme"];
       if (!hasExactKeys(data, keys)) return null;
       if (typeof data.entrypoint !== "string" || data.entrypoint.length === 0) return null;
+      if (typeof data.openSettings !== "boolean") return null;
       if (data.view !== "main" && data.view !== "settings") return null;
       if (typeof data.uiHostVersion !== "number" || !Number.isSafeInteger(data.uiHostVersion)) return null;
       const presentation = parsePresentation(data.package);
@@ -340,6 +346,7 @@ export function parseShellMessage(data: unknown): ShellToFrameMessage | null {
         workspace,
         view: data.view,
         uiHostVersion: data.uiHostVersion,
+        openSettings: data.openSettings,
         theme,
       });
     }

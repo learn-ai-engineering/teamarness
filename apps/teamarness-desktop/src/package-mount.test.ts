@@ -14,6 +14,8 @@ import {
   type PackageMountBridge,
   type PackageMountTimers,
   type PackageThemeSource,
+  type PackageSettingsNavigation,
+  type PackageSettingsOrigin,
 } from "./package-mount";
 
 const instance: PackageInstanceKey = {
@@ -39,7 +41,7 @@ function descriptor(number: number, view: PackageUiView = "main"): OpenPackageMo
       token: String(number).repeat(32),
       entrypoint: "ui/index.js",
       view,
-      uiHostVersion: 2,
+      uiHostVersion: 3,
       contractDigest: "a".repeat(64),
       package: {
         identity: instance.packageIdentity,
@@ -147,7 +149,7 @@ type Harness = {
   theme: PackageThemeSource;
   pushTheme(theme: ThemeSnapshot): void;
   themeSubscribers(): number;
-  controller(): PackageMountController;
+  controller(navigation?: PackageSettingsNavigation): PackageMountController;
 };
 
 const openPorts: MessagePort[] = [];
@@ -193,11 +195,11 @@ function harness(): Harness {
     theme,
     pushTheme: (snapshot) => { for (const listener of [...themeListeners]) listener(snapshot); },
     themeSubscribers: () => themeListeners.size,
-    controller: () => new PackageMountController(bridge, dom, theme, timers.timers, () => {
+    controller: (navigation) => new PackageMountController(bridge, dom, theme, timers.timers, () => {
       const channel = new MessageChannel();
       openPorts.push(channel.port1, channel.port2);
       return channel;
-    }),
+    }, navigation),
   };
   return test;
 }
@@ -342,7 +344,7 @@ describe("generic Package UI mount", () => {
     await shown.mounted;
     expect(settings.views).toEqual(["settings"]);
     expect(shown.frame.source.title).toBe("Fixture settings");
-    expect(shown.scripted.received[0]).toMatchObject({ kind: "mount", view: "settings", uiHostVersion: 2 });
+    expect(shown.scripted.received[0]).toEqual({ ...opened.scripted.received[0], view: "settings" });
   });
 
   it("mounts with the generic context, entrypoint and current theme values", async () => {
@@ -366,7 +368,8 @@ describe("generic Package UI mount", () => {
       },
       workspace: { id: instance.workspaceId, name: "Fixture Workspace" },
       view: "main",
-      uiHostVersion: 2,
+      uiHostVersion: 3,
+      openSettings: false,
       theme: themeSnapshot("#0b725d"),
     });
     expect(JSON.stringify(scripted.received)).not.toContain("1".repeat(32));
@@ -759,4 +762,61 @@ it("ignores a cancelled old opening before the serialized recovery mount creates
   await settle();
   scripted.send({ kind: "unmounted", ok: true });
   await hiding;
+});
+
+it("captures live mount identity and routes repeat intents outside its own unmount, then retires them", async () => {
+  const test = harness();
+  let captured: PackageSettingsOrigin | undefined;
+  let opened = 0;
+  const controller = test.controller({
+    available: (origin) => { captured = origin; return true; },
+    open: async (origin) => {
+      expect(origin.isCurrent()).toBe(true);
+      opened += 1;
+      await controller.unmount();
+    },
+  });
+  const shown = await mountThrough(test, controller);
+  await shown.mounted;
+  expect(captured?.instance).toEqual(instance);
+  expect(captured?.processGeneration).toBe(1);
+  expect(Object.keys(captured ?? {}).sort()).toEqual(["instance", "isCurrent", "processGeneration"]);
+  expect(shown.scripted.received[0]).toEqual({
+    kind: "mount", entrypoint: "ui/index.js",
+    package: { identity: instance.packageIdentity, version: "1.0.0", displayName: "Fixture", source: "bundled", trust: "application_bundled", lifecycle: "active", processGeneration: "1" },
+    workspace: { id: instance.workspaceId, name: "Fixture Workspace" },
+    view: "main", uiHostVersion: 3, openSettings: true, theme: themeSnapshot("#0b725d"),
+  });
+  shown.scripted.send({ kind: "open_settings" });
+  shown.scripted.send({ kind: "open_settings" });
+  await settle();
+  expect(opened).toBe(1);
+  expect(captured?.isCurrent()).toBe(false);
+  expect(shown.scripted.received.at(-1)).toEqual({ kind: "unmount" });
+  shown.scripted.send({ kind: "open_settings" });
+  shown.scripted.send({ kind: "unmounted", ok: true });
+  await settle();
+  expect(test.calls.filter((call) => call === "close:mount-1")).toEqual(["close:mount-1"]);
+  expect(test.themeSubscribers()).toBe(0);
+  expect(opened).toBe(1);
+});
+
+it("omits navigation for settings mounts and when not offered, and revokes origin on the update gate", async () => {
+  for (const view of ["main", "settings"] as const) {
+    const test = harness();
+    let opened = 0;
+    let captured: PackageSettingsOrigin | undefined;
+    const controller = test.controller({ available: (origin) => { captured = origin; return false; }, open: async () => { opened += 1; } });
+    const shown = await mountThrough(test, controller, undefined, view);
+    await shown.mounted;
+    expect(shown.scripted.received[0]?.openSettings).toBe(false);
+    shown.scripted.send({ kind: "open_settings" });
+    await settle();
+    expect(opened).toBe(0);
+    controller.setBlocked(true);
+    expect(captured?.isCurrent() ?? false).toBe(false);
+    shown.scripted.send({ kind: "open_settings" });
+    await settle();
+    expect(opened).toBe(0);
+  }
 });

@@ -371,6 +371,8 @@ impl GenerationCapabilities {
                 .ok_or(PackageErrorCode::CapabilityRequestInvalid)
                 .map_err(CapabilityFailure::certain)?;
             let method = string_field(object, "method").map_err(CapabilityFailure::certain)?;
+            validate_port_wire(bound.descriptor.major, false, object)
+                .map_err(CapabilityFailure::certain)?;
             let broker = self
                 .broker
                 .upgrade()
@@ -389,6 +391,7 @@ impl GenerationCapabilities {
                                 &self.scope.workspace_id,
                                 object,
                                 &state,
+                                bound.descriptor.major,
                             )
                             .await
                     } else {
@@ -398,13 +401,14 @@ impl GenerationCapabilities {
                                 &self.scope.workspace_id,
                                 object,
                                 &state,
+                                bound.descriptor.major,
                             )
                             .await
                     };
                     result.map_err(CapabilityFailure::certain)
                 }
                 "enable" | "disable" => self
-                    .port_selection(&broker, method, object)
+                    .port_selection(&broker, method, object, bound.descriptor.major)
                     .await
                     .map_err(CapabilityFailure::certain),
                 "invoke" => {
@@ -430,11 +434,13 @@ impl GenerationCapabilities {
                     broker
                         .pause_command_authorized(&self.scope.package_identity, object)
                         .await;
+                    let mut dispatch = object.clone();
+                    dispatch.remove("routeRevision");
                     broker
                         .call(
                             &self.scope.package_identity,
                             route,
-                            object,
+                            &dispatch,
                             started,
                             consumer_id,
                             self.generation,
@@ -504,20 +510,24 @@ impl GenerationCapabilities {
         initial_credit: u64,
         payload: &Value,
         output: HostStreamSender,
-    ) -> Result<(), PackageErrorCode> {
+    ) -> Result<(), crate::protocol::WireFailure> {
         if topic != "capability.stream" || initial_credit != MAX_STREAM_CREDIT {
-            return Err(PackageErrorCode::CapabilityRequestInvalid);
+            return Err(PackageErrorCode::CapabilityRequestInvalid.into());
         }
         let object = payload
             .as_object()
             .ok_or(PackageErrorCode::CapabilityRequestInvalid)?;
         let grant = self.bound_grant(Some(string_field(object, "grant")?))?;
         if grant.descriptor.kind == CapabilityKind::PackagePorts {
+            validate_port_wire(grant.descriptor.major, true, object)?;
             let broker = self
                 .broker
                 .upgrade()
                 .ok_or(PackageErrorCode::CapabilityUnavailable)?;
             let route = self.authorize_port(&broker, object).await?;
+            let mut normalized = object.clone();
+            normalized.remove("routeRevision");
+            let object = &normalized;
             #[cfg(feature = "test-hooks")]
             broker
                 .pause_port_work(&self.scope.package_identity, false)
@@ -531,6 +541,7 @@ impl GenerationCapabilities {
                         route,
                         object,
                         self.generation,
+                        output.setup(),
                     )
                     .await?;
                 let (commands, receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
@@ -538,9 +549,18 @@ impl GenerationCapabilities {
                 if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
                     drop(streams);
                     broker.drop_event_subscription(&subscription).await;
-                    return Err(PackageErrorCode::Overloaded);
+                    return Err(PackageErrorCode::Overloaded.into());
                 }
                 drop(streams);
+                let established = match subscription.check() {
+                    Ok(()) => output.ready(&stream_id).await,
+                    Err(code) => Err(code),
+                };
+                if let Err(code) = established {
+                    self.streams.lock().await.remove(&stream_id);
+                    broker.drop_event_subscription(&subscription).await;
+                    return Err(code.into());
+                }
                 broker.record_event_subscription(&subscription, &stream_id);
                 let all_streams = self.streams.clone();
                 let cancelled = self.cancelled.subscribe();
@@ -559,14 +579,28 @@ impl GenerationCapabilities {
                 });
                 return Ok(());
             }
-            let query = broker.query_stream(route, object).await?;
+            let query = broker.query_stream(route, object, output.setup()).await?;
             let (commands, receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
             let mut streams = self.streams.lock().await;
             if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
+                drop(streams);
                 let _ = query.client.stream_close(&query.id).await;
-                return Err(PackageErrorCode::Overloaded);
+                return Err(PackageErrorCode::Overloaded.into());
             }
             drop(streams);
+            let revoked = query
+                .receiver
+                .revocation()
+                .and_then(|watch| *watch.borrow());
+            let established = match revoked {
+                Some(code) => Err(code),
+                None => output.ready(&stream_id).await,
+            };
+            if let Err(code) = established {
+                self.streams.lock().await.remove(&stream_id);
+                let _ = query.client.stream_close(&query.id).await;
+                return Err(code.into());
+            }
             tokio::spawn(run_port_query(
                 stream_id,
                 query,
@@ -604,12 +638,12 @@ impl GenerationCapabilities {
             None
         };
         if after_epoch.is_none() && after_cursor.is_none() && after_profile_cursor.is_none() {
-            return Err(PackageErrorCode::CapabilityRequestInvalid);
+            return Err(PackageErrorCode::CapabilityRequestInvalid.into());
         }
         let (commands, command_receiver) = mpsc::channel(STREAM_COMMAND_QUEUE);
         let mut streams = self.streams.lock().await;
         if streams.len() >= 32 || streams.insert(stream_id.clone(), commands).is_some() {
-            return Err(PackageErrorCode::Overloaded);
+            return Err(PackageErrorCode::Overloaded.into());
         }
         drop(streams);
         let core = self.core.clone();
@@ -666,7 +700,7 @@ impl GenerationCapabilities {
             }
             _ => {
                 self.streams.lock().await.remove(&stream_id);
-                return Err(PackageErrorCode::CapabilityRequestInvalid);
+                return Err(PackageErrorCode::CapabilityRequestInvalid.into());
             }
         }
         Ok(())
@@ -934,6 +968,8 @@ impl GenerationCapabilities {
                         core.bind_agent_package(workspace, id, &package)
                             .map_err(binding_error)?;
                         if let Some(broker) = broker.upgrade() {
+                            // The bind is durable even if the following presentation lookup fails.
+                            broker.revoke_person(&key, PackageErrorCode::PortActorModeInvalid);
                             broker
                                 .reconcile_binding(&key, &crate::port_access::actor(&core, &key)?);
                         }
@@ -1006,9 +1042,10 @@ impl GenerationCapabilities {
         broker: &Arc<crate::broker::PortBroker>,
         object: &Map<String, Value>,
     ) -> Result<crate::port_access::AccessState, PackageErrorCode> {
+        let person = object.get("access").and_then(Value::as_str) == Some("person");
         let agent = match object.get("access").and_then(Value::as_str) {
             Some("agent") => true,
-            Some("declared") => false,
+            Some("declared" | "person") => false,
             _ => return Err(PackageErrorCode::CapabilityRequestInvalid),
         };
         broker
@@ -1016,6 +1053,8 @@ impl GenerationCapabilities {
                 self.core.clone(),
                 self.instance_key(),
                 &self.authority,
+                self.generation,
+                person,
                 move |_, _, state| {
                     if agent && state.actor["kind"] != "agent" {
                         return Err(PackageErrorCode::AgentNotBound);
@@ -1056,6 +1095,8 @@ impl GenerationCapabilities {
                 self.core.clone(),
                 key.clone(),
                 &self.authority,
+                self.generation,
+                object.get("access").and_then(Value::as_str) == Some("person"),
                 move |broker, _, state| {
                     broker.reconcile_binding(&resolved_key, &state.actor);
                     let mut route = broker.resolve_access(
@@ -1099,24 +1140,30 @@ impl GenerationCapabilities {
                     if ended.borrow().is_some() || *cancelled.borrow() {
                         break;
                     }
-                    tokio::select! {
-                        change = changes.changed() => if change.is_err() { break; },
+                    let notification_closed = tokio::select! {
+                        change = changes.changed() => change.is_err(),
                         _ = ended.changed() => break,
                         _ = cancelled.changed() => break,
-                    }
+                    };
                     let Some(broker) = broker.upgrade() else {
                         break;
                     };
                     if weak.strong_count() == 0 {
                         break;
                     }
+                    if notification_closed {
+                        broker.revoke_person(&key, PackageErrorCode::CapabilityUnavailable);
+                        break;
+                    }
                     let core = core.clone();
                     let key = key.clone();
                     let _ = authority
                         .run(&limiter, Arc::new(AtomicBool::new(false)), move || {
-                            if let Ok(actor) = crate::port_access::actor(&core, &key) {
-                                broker.reconcile_binding(&key, &actor);
+                            match crate::port_access::actor(&core, &key) {
+                                Ok(actor) => broker.reconcile_binding(&key, &actor),
+                                Err(code) => broker.revoke_person(&key, code),
                             }
+                            broker.reconcile_person(&core, &key);
                         })
                         .await;
                 }
@@ -1130,21 +1177,24 @@ impl GenerationCapabilities {
         broker: &Arc<crate::broker::PortBroker>,
         method: &str,
         object: &Map<String, Value>,
+        wire_major: u16,
     ) -> Result<Value, PackageErrorCode> {
         let enable = method == "enable";
-        exact_fields(
-            object,
-            if enable {
-                &["method", "contract", "major"]
-            } else {
-                &["method", "contract"]
-            },
-        )?;
+        if wire_major == 2 {
+            exact_fields(
+                object,
+                if enable {
+                    &["method", "contract", "major"]
+                } else {
+                    &["method", "contract"]
+                },
+            )?;
+        }
         let contract = string_field(object, "contract")?.to_owned();
         if !teamarness_package_contract::identity::is_valid_package_identity(&contract) {
             return Err(PackageErrorCode::CapabilityRequestInvalid);
         }
-        let major = if enable {
+        let _major = if enable {
             Some(
                 object
                     .get("major")
@@ -1161,8 +1211,8 @@ impl GenerationCapabilities {
                 self.core.clone(),
                 self.instance_key(),
                 &self.authority,
-                contract,
-                major,
+                self.generation,
+                object.clone(),
             )
             .await
     }
@@ -1418,7 +1468,7 @@ impl crate::protocol::CapabilityHandler for GenerationCapabilities {
         payload: &'a Value,
         output: HostStreamSender,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), PackageErrorCode>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<(), crate::protocol::WireFailure>> + Send + 'a>,
     > {
         Box::pin(GenerationCapabilities::open_stream(
             self,
@@ -1446,8 +1496,76 @@ impl crate::protocol::CapabilityHandler for GenerationCapabilities {
     }
 }
 
+fn validate_port_wire(
+    major: u16,
+    stream: bool,
+    input: &Map<String, Value>,
+) -> Result<(), PackageErrorCode> {
+    if major == 2 {
+        if input.contains_key("routeRevision")
+            || input.get("access").and_then(Value::as_str) == Some("person")
+            || (matches!(
+                input.get("method").and_then(Value::as_str),
+                Some("enable" | "disable")
+            ) && input.contains_key("access"))
+        {
+            return Err(PackageErrorCode::CapabilityRequestInvalid);
+        }
+        return Ok(());
+    }
+    static VALIDATORS: std::sync::OnceLock<BTreeMap<&'static str, jsonschema::Validator>> =
+        std::sync::OnceLock::new();
+    let validators = VALIDATORS.get_or_init(|| {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../contracts/package-capabilities/v1/package-ports-3.0.schema.json"
+        ))
+        .expect("major-3 schema");
+        [
+            "availableCall",
+            "describeCall",
+            "enableCall",
+            "disableCall",
+            "invokeCall",
+            "queryStream",
+            "eventStream",
+        ]
+        .into_iter()
+        .map(|name| {
+            (
+                name,
+                jsonschema::validator_for(
+                    &json!({"$defs":schema["$defs"],"$ref":format!("#/$defs/{name}")}),
+                )
+                .expect("major-3 wire validator"),
+            )
+        })
+        .collect()
+    });
+    let name = if stream {
+        if input.get("kind").and_then(Value::as_str) == Some("event") {
+            "eventStream"
+        } else {
+            "queryStream"
+        }
+    } else {
+        match input.get("method").and_then(Value::as_str) {
+            Some("available") => "availableCall",
+            Some("describe") => "describeCall",
+            Some("enable") => "enableCall",
+            Some("disable") => "disableCall",
+            Some("invoke") => "invokeCall",
+            _ => return Err(PackageErrorCode::CapabilityRequestInvalid),
+        }
+    };
+    if validators[name].is_valid(&Value::Object(input.clone())) {
+        Ok(())
+    } else {
+        Err(PackageErrorCode::CapabilityRequestInvalid)
+    }
+}
+
 struct Registry {
-    descriptors: BTreeMap<&'static str, Descriptor>,
+    descriptors: BTreeMap<&'static str, BTreeMap<u16, Descriptor>>,
 }
 
 impl Registry {
@@ -1490,13 +1608,18 @@ impl Registry {
             max_minor: 0,
             kind: CapabilityKind::Signing,
         });
-        registry.register(Descriptor {
-            family: CapabilityFamily::new("teamarness.package-ports"),
-            major: 2,
-            min_minor: 0,
-            max_minor: 0,
-            kind: CapabilityKind::PackagePorts,
-        });
+        for version in teamarness_package_contract::capability_versions::SUPPORTED_VERSIONS
+            .iter()
+            .filter(|version| version.family == "teamarness.package-ports")
+        {
+            registry.register(Descriptor {
+                family: CapabilityFamily::new(version.family),
+                major: version.major,
+                min_minor: version.min_minor,
+                max_minor: version.max_minor,
+                kind: CapabilityKind::PackagePorts,
+            });
+        }
         registry.register(Descriptor {
             family: CapabilityFamily::new(crate::content_views::FAMILY),
             major: 1,
@@ -1515,8 +1638,14 @@ impl Registry {
     }
 
     fn register(&mut self, descriptor: Descriptor) {
-        self.descriptors
-            .insert(descriptor.family.name(), descriptor);
+        let versions = self
+            .descriptors
+            .entry(descriptor.family.name())
+            .or_default();
+        assert!(
+            versions.insert(descriptor.major, descriptor).is_none(),
+            "duplicate capability family-major"
+        );
     }
 
     /// Selects one version of the requested family, or says why it cannot.
@@ -1529,13 +1658,13 @@ impl Registry {
         &self,
         requirement: &CapabilityRequirement,
     ) -> Result<(Descriptor, u16), PackageErrorCode> {
-        let descriptor = *self
+        let versions = self
             .descriptors
             .get(requirement.family.as_str())
             .ok_or(PackageErrorCode::CapabilityUnavailable)?;
-        if descriptor.major != requirement.major {
-            return Err(PackageErrorCode::CapabilityVersionUnsupported);
-        }
+        let descriptor = *versions
+            .get(&requirement.major)
+            .ok_or(PackageErrorCode::CapabilityVersionUnsupported)?;
         let low = descriptor.min_minor.max(requirement.min_minor);
         let high = descriptor.max_minor.min(requirement.max_minor);
         if low > high {
@@ -1675,19 +1804,19 @@ async fn run_port_query(
     let mut terminal = query.receiver.terminal();
     let mut credit = MAX_STREAM_CREDIT;
     let mut sequence = 0;
-    let reason = loop {
+    let reason: std::borrow::Cow<'static, str> = loop {
         if *cancelled.borrow() || !drain_commands(&mut commands, &mut credit).await {
-            break "closed";
+            break "closed".into();
         }
         if credit == 0 {
             if let Some(code) = revocation.as_ref().and_then(|watch| *watch.borrow()) {
-                break crate::protocol::capability_code(code);
+                break crate::protocol::capability_code(code).into();
             }
             if let Some(end) = terminal.borrow().clone() {
                 break match end {
-                    StreamEnd::Completed => "completed",
-                    StreamEnd::Host(code) => crate::protocol::capability_code(code),
-                    _ => "provider_exited",
+                    StreamEnd::Completed => "completed".into(),
+                    StreamEnd::Host(code) => crate::protocol::capability_code(code).into(),
+                    StreamEnd::Package(error) => error.code.into(),
                 };
             }
         }
@@ -1698,10 +1827,10 @@ async fn run_port_query(
                 else { std::future::pending::<()>().await; }
             }, if credit == 0 => {},
             _ = terminal.changed(), if credit == 0 => {},
-            change = cancelled.changed() => if change.is_err() || *cancelled.borrow() { break "closed"; },
+            change = cancelled.changed() => if change.is_err() || *cancelled.borrow() { break "closed".into(); },
             command = commands.recv() => match command {
                 Some(StreamCommand::Credit(amount)) => credit += amount,
-                Some(StreamCommand::Close) | None => break "closed",
+                Some(StreamCommand::Close) | None => break "closed".into(),
             },
             event = query.receiver.changed(), if credit > 0 => match event {
                 Ok(event) => {
@@ -1709,25 +1838,21 @@ async fn run_port_query(
                     credit -= 1;
                     let value = match serde_json::to_value(event.payload) {
                         Ok(value) => value,
-                        Err(_) => break "port_event_invalid",
+                        Err(_) => break "port_event_invalid".into(),
                     };
-                    if output.event(&id, sequence, value).await.is_err() { break "process_exited"; }
-                    if query.client.credit(&query.id, 1).await.is_err() { break "process_exited"; }
+                    if output.event(&id, sequence, value).await.is_err() { break "process_exited".into(); }
+                    if query.client.credit(&query.id, 1).await.is_err() { break "process_exited".into(); }
                 }
-                Err(StreamEnd::Completed) => break "completed",
-                Err(StreamEnd::Host(PackageErrorCode::PortEventInvalid)) => break "port_event_invalid",
-                Err(StreamEnd::Host(PackageErrorCode::Overloaded)) => break "overloaded",
-                Err(StreamEnd::Host(PackageErrorCode::PortNotEnabled)) => break "port_not_enabled",
-                Err(StreamEnd::Host(PackageErrorCode::AgentNotBound)) => break "agent_not_bound",
-                Err(StreamEnd::Host(PackageErrorCode::AgentBindingChanged)) => break "agent_binding_changed",
-                Err(_) => break "provider_exited",
+                Err(StreamEnd::Completed) => break "completed".into(),
+                Err(StreamEnd::Host(code)) => break crate::protocol::capability_code(code).into(),
+                Err(StreamEnd::Package(error)) => break error.code.into(),
             },
         }
     };
     let _ = query.client.stream_close(&query.id).await;
     output.retire(&id).await;
     streams.lock().await.remove(&id);
-    let _ = output.close(&id, reason).await;
+    let _ = output.close(&id, &reason).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1754,6 +1879,13 @@ async fn run_principal_stream(
             return;
         }
     };
+    if let Err(code) = output.ready(&stream_id).await {
+        streams.lock().await.remove(&stream_id);
+        let _ = output
+            .close(&stream_id, crate::protocol::capability_code(code))
+            .await;
+        return;
+    }
     let mut sequence = 0_u64;
     let mut reason = "capability_unavailable";
     loop {
@@ -1830,6 +1962,13 @@ async fn run_membership_stream(
             return;
         }
     };
+    if let Err(code) = output.ready(&stream_id).await {
+        streams.lock().await.remove(&stream_id);
+        let _ = output
+            .close(&stream_id, crate::protocol::capability_code(code))
+            .await;
+        return;
+    }
     let mut sequence = 0_u64;
     loop {
         if *cancelled.borrow() {
@@ -2084,6 +2223,13 @@ async fn run_record_stream(
             return;
         }
     };
+    if let Err(code) = output.ready(&stream_id).await {
+        streams.lock().await.remove(&stream_id);
+        let _ = output
+            .close(&stream_id, crate::protocol::capability_code(code))
+            .await;
+        return;
+    }
     // Page and availability reads advance the subscription's read cursor. Keep
     // notifications independent so a health change between reads cannot be lost.
     let mut changes = subscription.changes();
@@ -2950,6 +3096,34 @@ mod tests {
         }
     }
 
+    // Verifies: TEAM.SYS.PKG-R03
+    #[test]
+    fn supported_major_metadata_matches_every_production_descriptor() {
+        let registry = Registry::production();
+        let versions = teamarness_package_contract::capability_versions::SUPPORTED_VERSIONS;
+        assert_eq!(
+            registry
+                .descriptors
+                .values()
+                .map(BTreeMap::len)
+                .sum::<usize>(),
+            versions.len()
+        );
+        for version in versions {
+            let (descriptor, minor) = registry
+                .negotiate(&requirement(
+                    version.family,
+                    version.major,
+                    version.min_minor,
+                    version.max_minor,
+                ))
+                .unwrap();
+            assert_eq!(descriptor.min_minor, version.min_minor);
+            assert_eq!(descriptor.max_minor, version.max_minor);
+            assert_eq!(minor, version.max_minor);
+        }
+    }
+
     #[test]
     fn record_log_v11_negotiates_without_changing_v10_consumers() {
         let registry = Registry::production();
@@ -3032,7 +3206,7 @@ mod tests {
     }
 
     #[test]
-    fn package_ports_only_negotiates_the_current_major() {
+    fn package_ports_negotiates_both_supported_majors_without_legacy_fallback() {
         let registry = Registry::production();
         assert_eq!(
             registry
@@ -3047,6 +3221,39 @@ mod tests {
                 .0
                 .major,
             2
+        );
+    }
+
+    // Verifies: TEAM.SYS.PKG-R03
+    #[test]
+    #[should_panic(expected = "duplicate capability family-major")]
+    fn registry_rejects_duplicate_family_major() {
+        let mut registry = Registry::production();
+        registry.register(Descriptor {
+            family: CapabilityFamily::new("teamarness.package-ports"),
+            major: 2,
+            min_minor: 0,
+            max_minor: 0,
+            kind: CapabilityKind::PackagePorts,
+        });
+    }
+
+    // Verifies: TEAM.SYS.PKG-R03
+    #[test]
+    fn package_ports_major_three_negotiates_alongside_major_two() {
+        let registry = Registry::production();
+        for major in [2, 3] {
+            let (descriptor, minor) = registry
+                .negotiate(&requirement("teamarness.package-ports", major, 0, 0))
+                .unwrap();
+            assert_eq!(descriptor.major, major);
+            assert_eq!(minor, 0);
+        }
+        assert_eq!(
+            registry
+                .negotiate(&requirement("teamarness.package-ports", 4, 0, 0))
+                .unwrap_err(),
+            PackageErrorCode::CapabilityVersionUnsupported
         );
     }
 
@@ -3103,7 +3310,7 @@ mod tests {
         );
         assert_eq!(
             teamarness_package_contract::manifest::SUPPORTED_PROTOCOL,
-            (1, 0),
+            (1, 1),
             "adding a capability family must not move the Package Process Protocol version"
         );
         // The lifecycle contract and the UI bridge are declared elsewhere and unchanged: a UI

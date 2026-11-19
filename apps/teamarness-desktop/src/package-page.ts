@@ -242,7 +242,7 @@ export class PackagePageController {
     const presentation = buildPackagePagePresentation(snapshot, target);
     if (!presentation) return renderMissing(snapshot === null);
     return renderPackagePage(presentation, {
-      tab: tab === "configuration" && presentation.settings ? "configuration" : "about",
+      tab,
       catalog: this.catalog,
       working: this.working,
       feedback: this.feedback.current(),
@@ -552,7 +552,8 @@ function renderCatalog(presentation: PackagePagePresentation, state: RenderState
         : "Not available.";
     return `${escape(contract.identity)} ${range(contract.major, contract.minMinor, contract.maxMinor)}${optional}<br><small>${escape(availability)}</small>`;
   }), "None.");
-  return section(`<h3>Semantic Capabilities</h3>${capabilities}<h3>Provides Ports</h3>${provided}<h3>Uses Ports</h3>${consumed}`);
+  const warnings = entry.compatibilityWarnings.length === 0 ? "" : `<h3>Compatibility warnings</h3>${list(entry.compatibilityWarnings.map(escape), "")}`;
+  return section(`${warnings}<h3>Semantic Capabilities</h3>${capabilities}<h3>Provides Ports</h3>${provided}<h3>Uses Ports</h3>${consumed}`);
 }
 
 function renderMissing(loading: boolean): string {

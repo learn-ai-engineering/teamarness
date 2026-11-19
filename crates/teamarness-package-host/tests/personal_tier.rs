@@ -1380,6 +1380,93 @@ fn message_ports() -> serde_json::Value {
     ])
 }
 
+// Verifies: TEAM.SYS.PKG-R03, TEAM.SYS.PKG-R09, TEAM.SYS.PKG-R12, TEAM.SYS.PKG-R13
+#[tokio::test]
+async fn person_catalog_obeys_tiers_and_excludes_graph_rejected_providers() {
+    use serde_json::json;
+    let live = Live::open_with(|manifest| manifest["capabilities"][1]["major"] = 3.into()).await;
+    let provider = live.package("person-provider", "com.example.provider", Ports::None);
+    provide(&provider, CONTRACT, message_ports());
+    live.install(&provider, "com.example.provider")
+        .await
+        .unwrap();
+    let harness = live.package("person-harness", "com.example.harness", Ports::None);
+    edit_manifest(&harness, |manifest| {
+        manifest["capabilities"][1]["major"] = 3.into()
+    });
+    live.install(&harness, "com.example.harness").await.unwrap();
+    let key = instances(&live.host, "com.example.harness").await[0]
+        .key
+        .clone();
+    let target = mount(&live.host, key).await;
+    let personal = capability(&live.host, &target, "available", json!({"access":"person"})).await;
+    assert_eq!(
+        personal["result"]["contracts"].as_array().unwrap().len(),
+        1,
+        "{personal}"
+    );
+    assert_eq!(
+        personal["result"]["contracts"][0]["provider"]["identity"],
+        "com.example.provider"
+    );
+    assert_eq!(
+        capability(
+            &live.host,
+            &live.team_mount,
+            "available",
+            json!({"access":"person"})
+        )
+        .await["result"]["contracts"],
+        json!([])
+    );
+    assert_eq!(
+        capability(
+            &live.host,
+            &live.team_mount,
+            "enable",
+            json!({"access":"person","contract":CONTRACT,"major":1})
+        )
+        .await["error"],
+        "port_unavailable"
+    );
+    let rejected = live.package("person-rejected", "com.example.rejected", Ports::None);
+    provide(&rejected, "com.example.rejected", message_ports());
+    edit_manifest(
+        &rejected,
+        |manifest| manifest["consumedPorts"] = json!([{"identity":"com.example.missing","major":1,"minMinor":0,"maxMinor":0,"ports":[{"name":"message.post","kind":"command"}]}]),
+    );
+    assert!(
+        live.install(&rejected, "com.example.rejected")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        capability(&live.host, &target, "available", json!({"access":"person"})).await["result"]["contracts"],
+        personal["result"]["contracts"]
+    );
+    let entry = live
+        .host
+        .authoring_catalog()
+        .into_iter()
+        .find(|entry| entry.package.identity.as_str() == "com.example.harness")
+        .unwrap();
+    assert!(entry.compatibility_warnings.is_empty());
+    let legacy = live
+        .host
+        .authoring_catalog()
+        .into_iter()
+        .find(|entry| entry.package.identity.as_str() == "com.example.provider")
+        .unwrap();
+    assert_eq!(
+        legacy.compatibility_warnings,
+        vec![
+            "capability.superseded_major: teamarness.package-ports major 2 remains supported; a newer major is available"
+        ]
+    );
+    live.assert_team_undisturbed().await;
+    live.shutdown().await;
+}
+
 /// Declares the messages contract as consumed, optionally or required.
 fn consume_messages(manifest: &mut serde_json::Value, required: bool) {
     manifest["consumedPorts"] = serde_json::json!([{

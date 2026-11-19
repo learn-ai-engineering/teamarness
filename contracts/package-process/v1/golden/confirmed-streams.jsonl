@@ -1,0 +1,18 @@
+{"direction":"host","frame":{"kind":"initialize","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","package":{"identity":"dev.teamarness.fixture","version":"1.2.3","manifestDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","backendDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"uiContractDigest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","processGeneration":"9007199254740993","workspace":{"id":"workspace-fixture","name":"Fixture Workspace"},"installation":{"identity":"installation-fixture","displayName":"Fixture Installation"},"dataDirectory":{"path":"/tmp/teamarness-package-fixture","continuityId":"Y29udGludWl0eQ"},"protocol":{"major":1,"minor":1},"capabilities":[{"grant":"Z3JhbnQx","identity":"teamarness.workspace-context","major":1,"minor":0}],"limits":{"maxFrameBytes":1048576,"maxInFlightEachDirection":32,"maxWriterFrames":64,"maxWriterBytes":8388608,"initialStreamCredit":32}},"verdict":"deliver"}
+{"direction":"host","frame":{"kind":"stream_open","id":"h:confirmed","topic":"fixture.events","initialCredit":32,"payload":{},"requireReady":true},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"stream_ready","streamId":"h:confirmed"},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"event","streamId":"h:confirmed","sequence":"1","payload":{"quiet":false}},"verdict":"deliver"}
+{"direction":"host","frame":{"kind":"stream_close","streamId":"h:confirmed","code":"closed"},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"stream_ready","streamId":"h:confirmed"},"verdict":"ignore"}
+{"direction":"package","frame":{"kind":"stream_open","id":"p:confirmed","topic":"fixture.events","initialCredit":32,"payload":{},"requireReady":true},"verdict":"deliver"}
+{"direction":"host","frame":{"kind":"stream_ready","streamId":"p:confirmed"},"verdict":"deliver"}
+{"direction":"host","frame":{"kind":"event","streamId":"p:confirmed","sequence":"1","payload":{"quiet":false}},"verdict":"deliver"}
+{"retire":{"stream":"p:confirmed"}}
+{"direction":"host","frame":{"kind":"stream_ready","streamId":"p:confirmed"},"verdict":"ignore"}
+{"direction":"host","frame":{"kind":"stream_close","streamId":"p:confirmed","code":"closed"},"verdict":"deliver"}
+{"direction":"host","frame":{"kind":"stream_open","id":"h:quiet","topic":"fixture.events","initialCredit":32,"requireReady":true,"payload":{}},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"stream_ready","streamId":"h:quiet"},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"stream_close","streamId":"h:quiet","code":"completed"},"verdict":"deliver"}
+{"direction":"package","frame":{"kind":"stream_open","id":"p:refused","topic":"capability.stream","initialCredit":32,"requireReady":true,"payload":{}},"verdict":"deliver"}
+{"direction":"host","frame":{"kind":"stream_close","streamId":"p:refused","code":"capability_version_unsupported"},"verdict":"deliver"}
+{"direction":"host","frame":{"kind":"stream_ready","streamId":"p:refused"},"verdict":"ignore"}

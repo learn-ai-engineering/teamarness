@@ -1290,6 +1290,7 @@ mod tests {
     pub(super) async fn start(directory: &std::path::Path, ledger: &Ledger) -> Session {
         let log = scripted_log(ledger);
         let mut harness = HarnessBuilder::new(router().into_backend())
+            .process_minor(1)
             .package_identity("dev.teamarness.backlog")
             .installation(ALICE, "Alice")
             .data_directory(directory)

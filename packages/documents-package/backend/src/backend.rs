@@ -1761,13 +1761,13 @@ pub(crate) fn router_configured(
     .port_event(
         ports::CONTRACT, "documents.changed",
         |context: Context<DocumentsActive>, _actor: PortActor| async move {
-            ports::changed(&context)
+            ports::changed(&context).await
         },
     )
     .port_event(
         ports::CONTRACT, "comments.changed",
         |context: Context<DocumentsActive>, _actor: PortActor| async move {
-            ports::comments_changed(&context)
+            ports::comments_changed(&context).await
         },
     )
     .port_request(
@@ -4035,6 +4035,7 @@ mod tests {
         let mut harness = HarnessBuilder::new(
             router_configured(Some(observer.clone()), folder_sync).into_backend(),
         )
+        .process_minor(1)
         .package_identity("dev.teamarness.documents")
         .installation(installation, installation)
         .data_directory(directory)
@@ -8692,6 +8693,51 @@ mod tests {
             .unwrap(),
             before
         );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.PKG-R04, TEAM.SYS.PKG-R14, TEAM.SYS.DOCS-R12
+    #[tokio::test]
+    async fn confirmed_document_and_comment_listeners_observe_the_first_post_ready_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (collection, document) = ported_document(&mut session).await;
+        let mut documents = session
+            .harness
+            .subscribe_confirmed(
+                "teamarness.port.event.v1",
+                port_envelope("documents.changed", alice(), json!({})),
+            )
+            .await
+            .unwrap();
+        create_as(&mut session.harness, alice(), &collection, "After ready")
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), documents.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["$teamarnessPortValue"], json!({}));
+        let mut comments = session
+            .harness
+            .subscribe_confirmed(
+                "teamarness.port.event.v1",
+                port_envelope("comments.changed", alice(), json!({})),
+            )
+            .await
+            .unwrap();
+        session
+            .harness
+            .request(
+                "documents.comment.add",
+                json!({"documentId":document,"markdown":"First post-ready comment"}),
+            )
+            .await
+            .unwrap();
+        next_comment_event(&mut comments).await;
+        documents.close().await;
+        comments.close().await;
         session.harness.shutdown().await.unwrap();
     }
 

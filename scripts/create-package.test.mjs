@@ -140,8 +140,8 @@ test("copies canonical SDK production trees and records exact provenance", async
     const provenance = JSON.parse(await readFile(join(output, "teamarness-authoring.json"), "utf8"));
     assert.equal(provenance.templateVersion, FOUNDATION_TEMPLATE_VERSION);
     assert.equal(provenance.templateVersion, 2);
-    assert.equal(provenance.packageProcessProtocol, "1.0");
-    assert.equal(provenance.uiHostVersion, 2);
+    assert.equal(provenance.packageProcessProtocol, "1.1");
+    assert.equal(provenance.uiHostVersion, 3);
     assert.equal(provenance.sdkSource, "vendored-from-teamarness-checkout");
     assert.equal(provenance.sdkUpgrade, "unsupported-in-place");
     assert.equal(provenance.requestNamespace, "emojart");
@@ -158,6 +158,7 @@ test("copies canonical SDK production trees and records exact provenance", async
     const manifest = JSON.parse(await readFile(join(output, "teamarness.package.json"), "utf8"));
     assert.equal(manifest.presentation.displayName, "Emojart");
     assert.equal(manifest.capabilities.length, 0);
+    assert.deepEqual(manifest.protocol, { major: 1, minMinor: 0, maxMinor: 1 });
     const agentGuide = await readFile(join(output, "AGENTS.md"), "utf8");
     for (const phrase of [
       "Emojart",
