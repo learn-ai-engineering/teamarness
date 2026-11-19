@@ -8537,6 +8537,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "teamarness-headless"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "teamarness-core",
+ "teamarness-package-host",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "teamarness-package-contract"
 version = "0.1.0"
 dependencies = [

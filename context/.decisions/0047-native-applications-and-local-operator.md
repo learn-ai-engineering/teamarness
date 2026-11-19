@@ -36,7 +36,7 @@ The private data directory remains readable by same-user processes, including tr
 
 The existing desktop build/release path remains independent. Linux desktop, launchd integration, public headless signing/publication, Agent Linux behavior and gateway Linux behavior remain separate work. Native Linux execution and real service/logout/reboot observations are mandatory qualification, not inferred from Mac tests.
 
-Implementation is staged: native prerequisites precede the server, operator commands, admitted schema adapter, explicit application selector, and final sync-only qualification. This decision records accepted intent, not a claim those later components already ship.
+Implementation is staged. Native prerequisites and the foreground server/status transport are implemented; onboarding and Package administration, the admitted schema adapter, explicit application selector, and final sync-only qualification remain later steps. This decision does not claim those later components already ship.
 
 ## Evidence
 
@@ -44,4 +44,5 @@ Implementation is staged: native prerequisites precede the server, operator comm
 - `apps/teamarness-desktop/src-tauri/src/lifecycle.rs` and `lifecycle/tests/restart.rs`: ordinary/updater terminal handoff after drain and cleanup, including failed cleanup.
 - `crates/teamarness-package-host/{build.rs,src/values.rs,src/supervisor.rs,src/supervisor/linux_identity.rs}` and `tests/{orphan_reconciliation,macos_process_identity,linux_process_identity}.rs`: compiled target and platform lease evidence.
 - `scripts/{package-directory,build-package,build-application-packages}.mjs` and their tests: final-byte digests, target selection, signing order and isolated resource roots.
-- Weaknesses: Linux-specific tests require a native Linux runner; Mac execution does not qualify `/proc`, Linux locks or service behavior. Full desktop UI and installed restart observations remain separate from deterministic terminal tests.
+- `apps/teamarness-headless/src/{application,control,cli,socket}.rs` and `tests/{application_lifecycle,control_socket,cli_offline}.rs`: actual binary/library composition, exclusive open and rollback, owner-bound listener, bounded frames and admission, cancellation-surviving tasks, signal drain and Host/Core cleanup, nonzero uncertain deadline failure, and offline clients that do not initialize storage. `scripts/check-headless-dependencies.mjs` guards the normal/build dependency closure against graphical runtimes.
+- Weaknesses: Linux-specific tests require a native Linux runner; Mac execution does not qualify `/proc`, Linux locks, Linux peer credentials or service behavior. Native peer credential reads and a foreign-UID predicate refusal are automated without accessing another account or service. Full desktop UI and installed restart observations remain separate from deterministic terminal tests.

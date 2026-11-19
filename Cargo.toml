@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/teamarness-desktop/src-tauri",
+    "apps/teamarness-headless",
     "crates/teamarness-core",
     "crates/teamarness-package-contract",
     "crates/teamarness-package-host",
