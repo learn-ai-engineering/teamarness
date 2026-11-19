@@ -14,7 +14,7 @@ See ADR 0018, Package seam versioning, for the policy, including the deprecation
 
 ## `teamarness.package-ports` 3.0
 
-The closed [3.0 schema](package-ports-3.0.schema.json) adds Person access beside unchanged 2.0. Both majors remain supported with no removal scheduled here (ADR 0041). Negotiation matches family, then major, then the highest common minor. A grant's major controls wire validation. Unknown families return `capability_unavailable`; unsupported majors return `capability_version_unsupported`. Process Protocol 1.0, UI Host version, and Provider contract versions do not change.
+The closed [3.0 schema](package-ports-3.0.schema.json) adds Person access beside unchanged 2.0. Both majors remain supported with no removal scheduled here (ADR 0044). Negotiation matches family, then major, then the highest common minor. A grant's major controls wire validation. Unknown families return `capability_unavailable`; unsupported majors return `capability_version_unsupported`. Process Protocol 1.0, UI Host version, and Provider contract versions do not change.
 
 `available` accepts `access: declared | agent | person` and an optional cursor. Major-3 summaries retain every major-2 field and require:
 

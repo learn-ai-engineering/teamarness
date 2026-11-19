@@ -70,6 +70,17 @@ fn accepts_bundled_package_manifests() {
     assert_eq!(seen, 7, "expected seven bundled Package manifests");
 }
 
+/// Documents declares the settings view that holds its folder mappings, so the Shell offers
+/// its Configuration tab.
+#[test]
+fn the_documents_manifest_declares_its_settings_view() {
+    use teamarness_package_contract::manifest::UiView;
+
+    let path = repository_root().join("packages/documents-package/teamarness.package.json");
+    let document = parse_manifest(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(document.ui_views, vec![UiView::Settings]);
+}
+
 /// The schema's `maxLength` counts code points, so the manifest rule does too.
 ///
 /// Counting bytes rejected a display name the schema admits: 128 characters

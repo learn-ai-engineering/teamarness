@@ -162,7 +162,115 @@ const EXPECTED_ALL_NODES = [
   "",
 ].join("\n");
 
+const FRONT_MATTER = '---\ntitle: "a | b"\n---';
+const TABLE = "| a  | b |\n|:---|--:|\n| 1  | 2 |";
+const HTML_BLOCK = '<div class="x">\n  <b>kept</b>\n</div>';
+const PRESERVED_MARKDOWN = `${FRONT_MATTER}\n\nFirst paragraph.\n\n${TABLE}\n\nSecond paragraph.\n\n${HTML_BLOCK}\n\nThird paragraph.\n`;
+const PRESERVED_TOOLTIP = "Kept exactly as written. Edit it in a mapped file or ask an agent.";
+
+/** The frames of `view` as `[label, source]`, read from the DOM. */
+async function frames(h, view) {
+  const frame = h.frame(view).locator(".ProseMirror .preserved-block");
+  const shown = [];
+  for (let index = 0; index < await frame.count(); index += 1) {
+    shown.push([await frame.nth(index).locator("figcaption").innerText(), await frame.nth(index).locator("pre").textContent()]);
+  }
+  return shown;
+}
+
+/** Copies through "Copy as Markdown" and returns what reached the clipboard, or the visible fallback's copy. */
+async function copyMarkdown(h, view, engine, expected) {
+  if (engine === "chromium") await h.context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: new URL(h.page.url()).origin });
+  await h.frame(view).locator(".editor-copy-markdown").click();
+  const status = h.frame(view).locator(".editor-copy-status");
+  const panel = h.frame(view).locator(".markdown-copy");
+  await h.waitFor(async () => (await status.innerText()) === "Copied as Markdown" || await panel.isVisible(), "the copy outcome");
+  if (await panel.isVisible()) {
+    assert.equal(await panel.locator("textarea").inputValue(), expected);
+    await panel.getByRole("button", { name: "Copy", exact: true }).click();
+    await h.waitFor(async () => h.copied.length > 0, "the copy command");
+    return { path: "visible fallback", copied: h.copied.at(-1).text };
+  }
+  return { path: "clipboard", copied: await h.pasteClipboard() };
+}
+
 export const SCENARIOS = [
+  {
+    name: "folder navigation and placement controls",
+    async run(h) {
+      const listing = h.workspace.listing;
+      const collectionId = listing.collections[0].id;
+      const research = "4".repeat(64);
+      listing.collections.push({ id: research, name: "Research", archived: false });
+      listing.documents.push({ id: "5".repeat(64), collectionId, folder: "Plans/Quarter", title: "Nested", archived: false });
+      await h.addView("alice", "alice");
+      const frame = h.frame("alice");
+      const folder = frame.getByRole("button", { name: "Folder Plans", exact: true });
+      await folder.focus();
+      await press(h, "Enter");
+      assert.equal(await folder.getAttribute("aria-expanded"), "false");
+      h.workspace.publishListing();
+      await h.delivery;
+      assert.equal(await folder.getAttribute("aria-expanded"), "false");
+      await press(h, "Space");
+      assert.equal(await folder.getAttribute("aria-expanded"), "true");
+      await frame.getByRole("button", { name: "Add Document to Frame scenarios", exact: true }).click();
+      const create = frame.locator(".document-create");
+      await create.getByRole("textbox", { name: "New Document title", exact: true }).fill("Created in folder");
+      await create.getByRole("button", { name: "Choose folder", exact: true }).click();
+      await create.getByRole("button", { name: "Plans/Quarter", exact: true }).click();
+      const draft = create.getByRole("textbox", { name: "New Document folder", exact: true });
+      await draft.fill("Typed/Deep");
+      h.workspace.publishListing();
+      await h.delivery;
+      assert.equal(await draft.inputValue(), "Typed/Deep");
+      await draft.press("Enter");
+      await h.waitFor(() => h.workspace.metadataRequests.length === 1, "foldered create");
+      assert.deepEqual(h.workspace.metadataRequests[0], { operation: "documents.document.create", payload: { collectionId, title: "Created in folder", folder: "Typed/Deep" } });
+      await create.waitFor({ state: "detached" });
+      await frame.getByRole("button", { name: "Actions for Scenario document", exact: true }).click();
+      await frame.getByRole("button", { name: "Move to folder", exact: true }).click();
+      const placement = frame.getByRole("form", { name: "Move Document to folder" });
+      const destination = placement.getByRole("textbox", { name: "Destination folder", exact: true });
+      await destination.fill("Plans/Quarter");
+      await placement.getByRole("button", { name: "Move", exact: true }).click();
+      await h.waitFor(() => listing.documents[0].folder === "Plans/Quarter", "placement");
+      await placement.waitFor({ state: "hidden" });
+      await folder.click();
+      // A teammate's placement reveals the selected Document without losing the editor or its text.
+      await h.editor("alice").click();
+      await type(h, "pending survives");
+      listing.documents[0].folder = "Remote/New";
+      h.workspace.publishListing();
+      await h.delivery;
+      await frame.getByRole("button", { name: "Folder Remote/New", exact: true }).waitFor();
+      assert.equal(await frame.locator('[aria-current="true"]').innerText(), "Scenario document");
+      assert.match(await h.editor("alice").innerText(), /pending survives/);
+      await frame.getByRole("button", { name: "Actions for Scenario document", exact: true }).click();
+      await frame.getByRole("button", { name: "Move to folder", exact: true }).click();
+      assert.equal(await destination.inputValue(), "Remote/New");
+      await placement.getByRole("button", { name: "Choose folder", exact: true }).click();
+      await placement.getByRole("button", { name: "Collection root", exact: true }).click();
+      await destination.press("Enter");
+      await h.waitFor(() => listing.documents[0].folder === "", "root reset");
+      await placement.waitFor({ state: "hidden" });
+      await frame.getByRole("button", { name: "Actions for Scenario document", exact: true }).click();
+      await frame.getByRole("group", { name: "Move to Collection", exact: true }).getByRole("button", { name: "Research", exact: true }).click();
+      await h.waitFor(() => listing.documents[0].collectionId === research, "Collection move");
+      assert.equal(listing.documents[0].folder, "");
+      assert.equal(await frame.locator("select").count(), 0);
+      assert.equal(await frame.locator(".folder-group[style], .folder-chooser[style], .document-placement[style], style").count(), 0);
+      // The Package, not the Shell, must fit ordinary controls into the existing narrow frame.
+      await h.page.locator('iframe[title="alice"]').evaluate((iframe) => { iframe.width = "540"; });
+      assert.equal(await h.rawFrame("alice").evaluate(() => innerWidth), 540);
+      await frame.getByRole("button", { name: "Actions for Scenario document", exact: true }).click();
+      await frame.getByRole("button", { name: "Move to folder", exact: true }).click();
+      await destination.fill("Narrow/Folder");
+      await placement.getByRole("button", { name: "Move", exact: true }).click();
+      await h.waitFor(() => listing.documents[0].folder === "Narrow/Folder", "narrow placement");
+      return "keyboard disclosures, typed/chosen create, draft retention, remote reveal, root reset and separate Collection move; no native selects or CSP residue";
+    },
+  },
   {
     name: "every node and mark through real keyboard input",
     async run(h) {
@@ -533,26 +641,104 @@ export const SCENARIOS = [
       h.workspace.installation("B").revise(`${h.markdown("B")}\n${"A long paragraph of text. ".repeat(4000)}\n`);
       const expected = await h.converge(["A1", "B1"]);
       assert.ok(Buffer.byteLength(expected) > 3 * 24 * 1024);
-      if (engine === "chromium") await h.context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: new URL(h.page.url()).origin });
-      await h.frame("A1").locator(".editor-copy-markdown").click();
-      const status = h.frame("A1").locator(".editor-copy-status");
-      const panel = h.frame("A1").locator(".markdown-copy");
-      await h.waitFor(async () => (await status.innerText()) === "Copied as Markdown" || await panel.isVisible(), "the copy outcome");
-      let copied;
-      let path;
-      if (await panel.isVisible()) {
-        path = "visible fallback";
-        assert.equal(await panel.locator("textarea").inputValue(), expected);
-        await panel.getByRole("button", { name: "Copy", exact: true }).click();
-        await h.waitFor(async () => h.copied.length > 0, "the copy command");
-        copied = h.copied.at(-1).text;
-      } else {
-        path = "clipboard";
-        copied = await h.pasteClipboard();
-      }
+      const { path, copied } = await copyMarkdown(h, "A1", engine, expected);
       assert.equal(copied, expected);
       const markdownRequests = h.workspace.installation("A").markdownCache?.chunks.length;
       return `${path}: ${Buffer.byteLength(expected)} bytes in ${markdownRequests} chunks, equal to the Rust export`;
+    },
+  },
+  {
+    name: "Preserved Blocks show read-only, delete and move whole, and copy verbatim",
+    async run(h, { engine }) {
+      await h.addView("A1", "A");
+      await h.addView("B1", "B");
+      h.workspace.installation("A").revise(PRESERVED_MARKDOWN);
+      assert.equal(await h.converge(["A1", "B1"]), PRESERVED_MARKDOWN);
+
+      // Every frame shows on both Installations, labelled, with its exact source, read-only.
+      const everyFrame = [
+        ["Front matter · preserved Markdown", FRONT_MATTER],
+        ["Table · preserved Markdown", TABLE],
+        ["HTML · preserved Markdown", HTML_BLOCK],
+      ];
+      assert.deepEqual(await frames(h, "A1"), everyFrame);
+      assert.deepEqual(await frames(h, "B1"), everyFrame);
+      const table = h.frame("A1").locator(".ProseMirror .preserved-block").nth(1);
+      assert.equal(await table.getAttribute("contenteditable"), "false");
+      assert.equal(await table.getAttribute("role"), "figure");
+      assert.equal(await table.getAttribute("title"), PRESERVED_TOOLTIP);
+      assert.equal(await table.getAttribute("aria-label"), `Table · preserved Markdown. ${PRESERVED_TOOLTIP}`);
+      assert.equal(await table.getAttribute("style"), null);
+      assert.equal(await table.locator("pre").evaluate((pre) => getComputedStyle(pre).whiteSpace), "pre");
+
+      // A click selects the whole block, and typing changes nothing.
+      const records = h.workspace.records.length;
+      await table.locator("pre").click();
+      await sleep(SELECTION_SETTLE_MS);
+      await h.waitFor(() => table.evaluate((frame) => frame.classList.contains("ProseMirror-selectednode")), "the selected frame");
+      await type(h, "typed over");
+      await noticeMatches(h, "A1", /kept exactly as written/);
+      await clearNotice(h, "A1");
+      await h.settle();
+      assert.equal(h.workspace.records.length, records, "typing in a frame appended nothing");
+      assert.equal(h.markdown("A"), PRESERVED_MARKDOWN);
+      assert.deepEqual(await frames(h, "A1"), everyFrame);
+
+      // The rest of the Document stays editable.
+      // (Starting from the line's start: at its end, the line-end key moves on to the next block.)
+      await caret(h, "A1", 1, "start");
+      await press(h, LINE_END);
+      await type(h, " Edited.");
+      let markdown = await h.converge(["A1", "B1"]);
+      assert.equal(markdown, PRESERVED_MARKDOWN.replace("First paragraph.", "First paragraph. Edited."));
+
+      // A block typed above front matter is refused: the Backend would refuse the tree.
+      const edited = h.markdown("A");
+      await h.frame("A1").locator(".ProseMirror .preserved-block").first().locator("pre").click();
+      await sleep(SELECTION_SETTLE_MS);
+      await press(h, "ArrowLeft");
+      await type(h, "x");
+      await noticeMatches(h, "A1", /Front matter stays/);
+      await clearNotice(h, "A1");
+      // The gap cursor's widget is not part of the body: move off it before comparing the views.
+      await h.frame("A1").locator(".ProseMirror > p").first().click();
+      assert.equal(await h.converge(["A1", "B1"]), edited);
+
+      // A real drag moves the block whole, past the paragraph after it.
+      await table.dragTo(h.frame("A1").locator(".ProseMirror > p").last(), { targetPosition: { x: 20, y: 8 } });
+      markdown = await h.converge(["A1", "B1"]);
+      assert.ok(markdown.indexOf("Second paragraph.") < markdown.indexOf(TABLE), markdown);
+      assert.equal(markdown.split(TABLE).length, 2, "the block moved, not copied");
+
+      // A cell edit from another Installation's agent appears in the frame.
+      h.workspace.installation("B").revise(markdown.replace("| 1  |", "| 9  |"));
+      markdown = await h.converge(["A1", "B1"]);
+      assert.ok(markdown.includes(TABLE.replace("| 1  |", "| 9  |")), markdown);
+      assert.ok((await frames(h, "A1")).some(([, source]) => source === TABLE.replace("| 1  |", "| 9  |")));
+
+      // From the keyboard: the arrow moves onto the block as a whole, and Backspace removes it.
+      const withBlock = markdown;
+      await h.frame("A1").locator(".ProseMirror > p", { hasText: "Second paragraph." }).click();
+      await press(h, LINE_START);
+      await press(h, LINE_END);
+      await press(h, "ArrowRight");
+      const html = h.frame("A1").locator('.ProseMirror .preserved-block[data-kind="html"]');
+      await h.waitFor(() => html.evaluate((frame) => frame.classList.contains("ProseMirror-selectednode")), "the frame selected by keyboard");
+      await press(h, "Backspace");
+      markdown = await h.converge(["A1", "B1"]);
+      assert.equal(markdown, withBlock.replace(`${HTML_BLOCK}\n\n`, ""));
+      assert.equal(await h.frame("B1").locator('.ProseMirror .preserved-block[data-kind="html"]').count(), 0);
+      // Undo brings the source back, byte for byte.
+      await press(h, `${MOD}+z`);
+      markdown = await h.converge(["A1", "B1"]);
+      assert.equal(markdown, withBlock);
+
+      // Copy as Markdown gives the verbatim source.
+      const { path, copied } = await copyMarkdown(h, "A1", engine, markdown);
+      assert.equal(copied, markdown);
+      for (const source of [FRONT_MATTER, HTML_BLOCK, TABLE.replace("| 1  |", "| 9  |")]) assert.ok(copied.includes(source), source);
+      assert.deepEqual(h.workspace.refusals, []);
+      return `${path}: ${Buffer.byteLength(copied)} bytes; three frames on both Installations`;
     },
   },
   {

@@ -386,10 +386,16 @@ export class DocumentsController {
     return (await this.perform(() => this.client.request("documents.collection.restore", { collectionId }))) !== null;
   }
 
-  async createDocument(title: string): Promise<boolean> {
+  async createDocument(title: string, folder = ""): Promise<boolean> {
     const collectionId = this._state.selectedCollectionId;
     if (collectionId === null) return false;
-    return (await this.perform(() => this.client.request("documents.document.create", { collectionId, title: title.trim() }))) !== null;
+    return (await this.perform(() => this.client.request("documents.document.create", {
+      collectionId, title: title.trim(), ...(folder === "" ? {} : { folder: folder.normalize("NFC") }),
+    }))) !== null;
+  }
+
+  async placeDocument(documentId: string, folder: string): Promise<boolean> {
+    return (await this.perform(() => this.client.request("documents.document.place", { documentId, folder: folder.normalize("NFC") }))) !== null;
   }
 
   async renameDocument(documentId: string, title: string): Promise<boolean> {
@@ -498,6 +504,8 @@ function describeError(error: unknown): string {
   switch (code) {
     case "documents.invalid_name":
       return "Collection names are 1 to 128 characters with no leading or trailing spaces.";
+    case "documents.invalid_folder":
+      return "Use a relative folder path with at most 8 slash-separated segments and 512 UTF-8 bytes; no empty segments, dot segments, backslashes, or control characters. Leave it empty for Collection root.";
     case "documents.invalid_title":
       return "Document titles are 1 to 256 characters with no leading or trailing spaces.";
     case "documents.unknown_collection":

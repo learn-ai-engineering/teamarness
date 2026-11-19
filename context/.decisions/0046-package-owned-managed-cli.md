@@ -1,7 +1,7 @@
-# 0043 — Package-owned managed CLI and client credential custody
+# 0046 — Package-owned managed CLI and client credential custody
 
 **Status:** accepted (2026-11-17)
-**Refines:** ADR 0007 (Package-owned native filesystem behavior), ADR 0042 (external-client delivery and credential provisioning)
+**Refines:** ADR 0007 (Package-owned native filesystem behavior), ADR 0045 (external-client delivery and credential provisioning)
 
 ## Context
 
@@ -87,7 +87,7 @@ Most changes stay in the standalone gateway. It gains native entry modes, manage
 
 The separate generic own-Package Configuration navigation change follows ADRs 0015, 0018, and 0037: additive mount contract 3 and private bridge 4, with target identity derived from the calling mount. It adds no gateway-specific Shell route, broader filesystem authority, or new Semantic Capability. The Package-owned picker remains a cancellable helper subscription, not a longer ordinary request.
 
-CLI transport retains ADR 0042's upstream envelopes, shared authorization, live-only subscriptions, and no automatic replay or reconnect. A lost transmitted generic call response is conservatively uncertain; the CLI does not infer harmlessness from stale metadata. Continuous output alone does not guarantee model wakeups.
+CLI transport retains ADR 0045's upstream envelopes, shared authorization, live-only subscriptions, and no automatic replay or reconnect. A lost transmitted generic call response is conservatively uncertain; the CLI does not infer harmlessness from stale metadata. Continuous output alone does not guarantee model wakeups.
 
 Verification must exercise crash boundaries, response loss, concurrent setup/update attempts, modified files, stale credentials, rotation/revocation, duplicate local origins, Package path moves, and the actual acquired-artifact onboarding journey. Private temporary fixtures and automated checks do not replace installed macOS and external-agent observations. Signing/quarantine failure remains a delivery blocker, not permission to disable OS protections.
 

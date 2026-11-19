@@ -35,7 +35,7 @@ Use the semantic purpose rather than assuming a particular light or dark value:
 
 ## Views
 
-`context.view` is the view the mount shows: `"main"`, or `"settings"` for a Package whose manifest declares `"views": ["settings"]` in its `ui` object. A UI that declares no views can ignore it. `PACKAGE_UI_VIEWS` lists both values, and `PACKAGE_UI_HOST_VERSION` is the mount contract version this SDK describes, 3. Version 3 adds optional `context.navigation.openSettings(): void`; version 2 added `context.view`. Earlier UIs keep working (ADRs 0037/0043). In tests, `createTestMountContext` takes an optional `view`, which defaults to `"main"`.
+`context.view` is the view the mount shows: `"main"`, or `"settings"` for a Package whose manifest declares `"views": ["settings"]` in its `ui` object. A UI that declares no views can ignore it. `PACKAGE_UI_VIEWS` lists both values, and `PACKAGE_UI_HOST_VERSION` is the mount contract version this SDK describes, 3. Version 3 adds optional `context.navigation.openSettings(): void`; version 2 added `context.view`. Earlier UIs keep working (ADRs 0037/0046). In tests, `createTestMountContext` takes an optional `view`, which defaults to `"main"`.
 
 `context.navigation` is offered only on a main mount when the Shell can offer that Package's
 own declared settings destination. Feature-detect it; older/unavailable contexts and settings

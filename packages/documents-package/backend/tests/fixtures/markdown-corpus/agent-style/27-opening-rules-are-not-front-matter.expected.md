@@ -1,0 +1,7 @@
+-----
+
+Between *two* rules.
+
+-----
+
+After.

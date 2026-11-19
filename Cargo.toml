@@ -64,3 +64,6 @@ hpke-rs-rust-crypto = "=0.7.0"
 zeroize = "=1.9.0"
 unicode-segmentation = "=1.13.3"
 unicode-general-category = "=1.1.0"
+unicode-normalization = "=0.1.25"
+caseless = "=0.2.2"
+notify = { version = "=8.2.1", default-features = false, features = ["macos_fsevent"] }

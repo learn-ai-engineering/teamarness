@@ -1,4 +1,4 @@
-//! Documents Port Contract 1.3 (`dev.teamarness.documents`, `ports.json`): another Package lists
+//! Documents Port Contract 1.4 (`dev.teamarness.documents`, `ports.json`): another Package lists
 //! Documents, reads one as Canonical Markdown with a version token, creates one (1.2) and
 //! revises it against a base version as the Host-derived actor, observes changes, and reads the
 //! `runtime.guide` (1.2). It also reads the Workspace-wide Comment feed and a Comment's thread,
@@ -8,7 +8,8 @@
 //! through the same validation as an editor session's update. The local Installation Person's
 //! revise takes the editor's write path; a bound Agent's (1.1) is appended with its Principal ID
 //! before the body adopts it (ADR 0030, ADR 0033). A create is one `document.create` record with
-//! an empty body, signed the same way (ADR 0038).
+//! an empty body, signed the same way (ADR 0038); a non-root folder adds a placement record
+//! as that same actor (ADR 0043).
 
 use std::collections::BTreeSet;
 
@@ -105,7 +106,7 @@ pub(crate) fn decode_version(token: &str) -> Option<Frontiers> {
 
 /// What a Consumer can do with a Document's body.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BodyState {
+pub(super) enum BodyState {
     /// Every known record is imported: it can be read and revised.
     Available,
     /// Records this Installation holds cannot be opened yet.
@@ -125,6 +126,12 @@ impl BodyState {
 }
 
 fn body_state(hub: &BodyHub, document: &str) -> Result<BodyState, BackendError> {
+    body_availability(hub, document)
+}
+
+/// Whether `document`'s body can be read and revised now. It needs no request, so folder sync
+/// shares it with the Port.
+pub(super) fn body_availability(hub: &BodyHub, document: &str) -> Result<BodyState, BackendError> {
     if hub
         .store
         .identity_conflicted(document)
@@ -220,6 +227,7 @@ pub(super) async fn list(
         let mut value = json!({
             "id": document.id,
             "collectionId": document.collection_id,
+            "folder": document.folder,
             "title": document.title.unwrap_or_else(|| "Untitled".into()),
             "archived": document.archived,
             "body": state.as_str(),
@@ -431,9 +439,11 @@ pub(super) async fn revise(
 pub(super) struct CreateRequest {
     collection_id: String,
     title: String,
+    #[serde(default)]
+    folder: String,
 }
 
-/// Creates an empty Document as exactly one `document.create` record signed as `signer`, and
+/// Creates an empty Document, optionally followed by placement, signed as `signer`, and
 /// answers with its ID and the version of its genesis, the base for a first revise.
 ///
 /// Refusals before the append are certain. Core's `principal_not_bound` is too, because Core
@@ -444,6 +454,8 @@ pub(super) async fn create(
     signer: Signer,
     request: CreateRequest,
 ) -> Result<JsonValue, BackendError> {
+    let folder = crate::domain::normalize_folder(&request.folder).map_err(domain_error)?;
+    let operation_id = super::placement_id()?;
     let state = context.state().clone();
     let collection = request.collection_id.clone();
     let archived = context
@@ -481,6 +493,15 @@ pub(super) async fn create(
                 cause.with_outcome_uncertain(true)
             }
         })?;
+    super::place_created_document(
+        context,
+        &signer.identity,
+        signer.principal.as_deref(),
+        &created,
+        &folder,
+        operation_id,
+    )
+    .await?;
     Ok(json!({ "documentId": created["id"], "version": version }))
 }
 

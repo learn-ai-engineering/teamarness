@@ -1,0 +1,47 @@
+{
+ "type": "doc",
+ "content": [
+  {
+   "type": "preserved_block",
+   "attrs": {
+    "kind": "front_matter"
+   },
+   "content": [
+    {
+     "type": "text",
+     "text": "---\ntitle: \"a | b\"\n---"
+    }
+   ]
+  },
+  {
+   "type": "preserved_block",
+   "attrs": {
+    "kind": "table"
+   },
+   "content": [
+    {
+     "type": "text",
+     "text": "| a | b |\n|---|---|\n| 1 | 2 |"
+    }
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": [
+    {
+     "type": "text",
+     "text": "first"
+    }
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": [
+    {
+     "type": "text",
+     "text": "second"
+    }
+   ]
+  }
+ ]
+}

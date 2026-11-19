@@ -2,6 +2,7 @@
   "schemaVersion": 1,
   "$defs": {
     "recordId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "folder": { "type": "string", "maxLength": 512 },
     "version": { "type": "string", "pattern": "^[A-Za-z0-9_-]{16,1024}$" },
     "cursor": { "type": "string", "minLength": 1, "maxLength": 256 },
     "markdown": { "type": "string", "maxLength": 262144 },
@@ -10,9 +11,10 @@
       "name": { "type": "string", "minLength": 1, "maxLength": 128 },
       "archived": { "type": "boolean" }
     } },
-    "document": { "type": "object", "additionalProperties": false, "required": ["id", "collectionId", "title", "archived", "body"], "properties": {
+    "document": { "type": "object", "additionalProperties": false, "required": ["id", "collectionId", "title", "archived", "body", "folder"], "properties": {
       "id": { "$ref": "#/$defs/recordId" },
       "collectionId": { "$ref": "#/$defs/recordId" },
+      "folder": { "$ref": "#/$defs/folder" },
       "title": { "type": "string", "minLength": 1, "maxLength": 256 },
       "archived": { "type": "boolean" },
       "body": { "type": "string", "enum": ["available", "pending", "unavailable"] },
@@ -46,7 +48,7 @@
     } }
   },
   "contracts": [{
-    "identity": "dev.teamarness.documents", "major": 1, "minor": 3,
+    "identity": "dev.teamarness.documents", "major": 1, "minor": 4,
     "description": "Documents as Canonical Markdown with opaque version tokens: list, read, create (1.2) and base-versioned revise by the local Installation Person or a locally bound Workspace Agent (1.1), live change invalidation, runtime guidance (1.2), and Comments (1.3): a Workspace-wide Comment change feed, threads, and adding a Comment as the Host-derived actor.",
     "ports": [
       { "name": "runtime.guide", "kind": "query", "description": "Read bounded guidance for listing and reading Documents, creating then revising, base versions and merges, Host-derived authorship, errors and uncertain outcomes (1.2).",
@@ -55,7 +57,7 @@
           "markdown": { "type": "string", "maxLength": 32768 }
         } }
       },
-      { "name": "document.list", "kind": "query", "description": "List Collections and Documents in Order Key order, at most 64 per page; pass next as after for the following page. With collectionId, only that Collection's Documents. version is present only for an available body. Errors: documents.unknown_collection, documents.invalid_cursor.",
+      { "name": "document.list", "kind": "query", "description": "List Collections and Documents in Order Key order, at most 64 per page; pass next as after for the following page. With collectionId, only that Collection's Documents. folder is the canonical relative folder path, empty at root (1.4). version is present only for an available body. Errors: documents.unknown_collection, documents.invalid_cursor.",
         "request": { "type": "object", "additionalProperties": false, "properties": {
           "collectionId": { "$ref": "#/$defs/recordId" },
           "after": { "$ref": "#/$defs/cursor" },
@@ -71,8 +73,9 @@
           "markdown": { "$ref": "#/$defs/markdown" }, "version": { "$ref": "#/$defs/version" }
         } }
       },
-      { "name": "document.create", "kind": "command", "description": "Create an empty Document in a Collection as one record signed by the local Person or the caller's bound Agent (1.2). Returns documentId and version; pass version as baseVersion to document.revise to add content. Errors: documents.unknown_collection, documents.collection_archived, documents.invalid_title, documents.actor_unauthorized, documents.principal_not_bound. Every accepted create makes a new Document: an uncertain command must not be retried automatically; list and reconcile first.",
+      { "name": "document.create", "kind": "command", "description": "Create empty, optionally in folder (1.4), as the Host-derived actor. Root: create only; folder: create then place. Returns documentId and genesis version for revise. Errors: documents.unknown_collection, documents.collection_archived, documents.invalid_title, documents.invalid_folder, documents.actor_unauthorized, documents.principal_not_bound. Failure after create is uncertain and must not be retried automatically; list and reconcile. See runtime.guide.",
         "request": { "type": "object", "additionalProperties": false, "required": ["collectionId", "title"], "properties": {
+          "folder": { "$ref": "#/$defs/folder" },
           "collectionId": { "$ref": "#/$defs/recordId" },
           "title": { "type": "string", "minLength": 1, "maxLength": 256 }
         } },

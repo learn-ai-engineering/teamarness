@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,10 +21,14 @@ use teamarness_package_sdk::{
 };
 use tokio::sync::{Notify, broadcast, watch};
 
-use crate::body::{BodyError, DocumentBody};
+use crate::body::{BodyError, DocumentBody, FORMAT_GENERATION};
 use crate::domain::{DomainError, DomainRecord, MAX_UPDATE};
-use crate::store::{DocumentStore, ImportClassifier, IngestResult, Ingested, StoreError};
+use crate::store::{
+    DocumentStore, ImportClassifier, IngestResult, Ingested, Reevaluation, StoreError,
+};
 
+#[path = "folder_sync/mod.rs"]
+mod folder_sync;
 #[path = "guide.rs"]
 mod guide;
 #[path = "ports.rs"]
@@ -60,6 +65,7 @@ fn capability_error(operation: &str, cause: BackendError) -> BackendError {
 fn domain_error(cause: DomainError) -> BackendError {
     match cause {
         DomainError::InvalidName => error("documents.invalid_name", false),
+        DomainError::InvalidFolder => error("documents.invalid_folder", false),
         DomainError::InvalidTitle => error("documents.invalid_title", false),
         DomainError::InvalidUpdate | DomainError::InvalidGenesis => {
             error("documents.invalid_update", false)
@@ -723,8 +729,18 @@ pub struct DocumentsActive {
     session: Mutex<Option<Session>>,
     hub: BodyHub,
     flusher: Mutex<Option<Session>>,
+    /// The folder sync session, started and stopped beside the flusher.
+    folder_sync: Mutex<Option<Session>>,
+    folder_reconciler: Mutex<folder_sync::FolderSync>,
+    /// Whether this activation runs folder sync. Only reconciler tests, which drive it
+    /// directly, turn it off.
+    folder_sync_enabled: bool,
+    /// This Package's data directory, which no mapped folder may be inside.
+    data_directory: PathBuf,
     /// Where the UI last was: held in memory only, so it lasts while the Backend runs.
     place: Mutex<Place>,
+    /// The settings view's unsent mapping form, held in memory like `place`.
+    mapping_draft: Mutex<MappingDraft>,
 }
 
 /// The UI's remembered place: the selected Collection, the open Document and its scroll offset.
@@ -776,11 +792,52 @@ struct CollectionRenameRequest {
 struct CollectionRequest {
     collection_id: String,
 }
+/// Maps a Collection, or a new Collection named `new_collection_name`, to a folder on this
+/// Installation. Exactly one of the two is given. A dry run returns the pre-mapping report and
+/// changes nothing; a folder inside a git working tree is mapped only with `confirm_git`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MappingSetRequest {
+    #[serde(default)]
+    collection_id: Option<String>,
+    #[serde(default)]
+    new_collection_name: Option<String>,
+    path: String,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    confirm_git: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MappingEnableRecursiveRequest {
+    collection_id: String,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    confirm_git: bool,
+}
+
+/// The settings view's unsent mapping form, held in memory like [`Place`]: it survives a
+/// Package switch but never a Backend restart.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MappingDraft {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    collection_id: Option<String>,
+}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DocumentCreateRequest {
     collection_id: String,
     title: String,
+    #[serde(default)]
+    folder: String,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -793,6 +850,12 @@ struct DocumentRenameRequest {
 struct DocumentMoveRequest {
     document_id: String,
     collection_id: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DocumentPlaceRequest {
+    document_id: String,
+    folder: String,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1115,6 +1178,14 @@ pub fn router() -> Router<DocumentsActive> {
 ///
 /// Only a test passes an observer; the shipped router passes `None`.
 pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<DocumentsActive> {
+    router_configured(observer, true)
+}
+
+/// The Backend, publishing what each activation built, with folder sync on or off.
+pub(crate) fn router_configured(
+    observer: Option<ActivationObserver>,
+    folder_sync_enabled: bool,
+) -> Router<DocumentsActive> {
     Router::new(move |activation| {
         let observer = observer.clone();
         let initialization = activation.initialization().clone();
@@ -1122,6 +1193,7 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         let cancellation = activation.cancellation().clone();
         async move {
             let directory = initialization.data_directory().path().to_owned();
+            let data_directory = directory.clone();
             let store = teamarness_package_sdk::blocking(&cancellation, move |_| {
                 DocumentStore::open(directory.join("documents.sqlite3"))
                     .map_err(|_| storage_failed())
@@ -1156,6 +1228,7 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 identity_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
                 publication_gate: Arc::new(Mutex::new(())),
             };
+            reevaluate_after_upgrade(&store, &log, &cancellation).await?;
             rehydrate(&store, &log, &hub, &cancellation).await?;
 
             let sync = Arc::new(Mutex::new(SyncReport::catching_up()));
@@ -1180,6 +1253,9 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             }
             let session = start_session(&store, &log, &sync, &changes, &hub);
             let flusher = start_flusher(&log, &hub, &changes, installation.clone());
+            let folder_reconciler = folder_sync::FolderSync::new(&log, &hub, &changes, installation.clone(), CancellationToken::new());
+            let folder_sync = folder_sync_enabled
+                .then(|| start_folder_sync(folder_reconciler.clone(), &hub, &changes));
             Ok(DocumentsActive {
                 store,
                 log,
@@ -1190,16 +1266,23 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 session: Mutex::new(Some(session)),
                 hub,
                 flusher: Mutex::new(Some(flusher)),
+                folder_sync: Mutex::new(folder_sync),
+                folder_reconciler: Mutex::new(folder_reconciler),
+                folder_sync_enabled,
+                data_directory,
                 place: Mutex::new(Place::default()),
+                mapping_draft: Mutex::new(MappingDraft::default()),
             })
         }
     })
     .on_suspend(|state: Arc<DocumentsActive>| async move {
+        stop_folder_sync(&state).await;
         stop_session(&state).await;
         stop_flusher(&state).await;
         Ok(())
     })
     .on_resume(|state: Arc<DocumentsActive>| async move {
+        stop_folder_sync(&state).await;
         stop_session(&state).await;
         stop_flusher(&state).await;
         let replay_store = state.store.clone();
@@ -1228,9 +1311,16 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
             .flusher
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(flusher);
+        if state.folder_sync_enabled {
+            let reconciler = folder_sync::FolderSync::new(&state.log, &state.hub, &state.changes, state.installation.clone(), CancellationToken::new());
+            let folder_sync = start_folder_sync(reconciler.clone(), &state.hub, &state.changes);
+            *recover(&state.folder_reconciler) = reconciler;
+            *recover(&state.folder_sync) = Some(folder_sync);
+        }
         Ok(())
     })
     .on_dispose(|state: Arc<DocumentsActive>| async move {
+        stop_folder_sync(&state).await;
         stop_session(&state).await;
         stop_flusher(&state).await;
         Ok(())
@@ -1297,8 +1387,66 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
         },
     )
     .request(
+        "documents.mapping.list",
+        |context: Context<DocumentsActive>, _: Empty| async move {
+            let state = context.state().clone();
+            context
+                .blocking(move |_| folder_sync::list_mappings(&state.store))
+                .await
+        },
+    )
+    .request(
+        "documents.mapping.set",
+        |context: Context<DocumentsActive>, request: MappingSetRequest| async move {
+            set_mapping(&context, request).await
+        },
+    )
+    .request(
+        "documents.mapping.enable-recursive",
+        |context: Context<DocumentsActive>, request: MappingEnableRecursiveRequest| async move {
+            require_collection(&context, &request.collection_id).await?;
+            let reconciler = recover(&context.state().folder_reconciler).clone();
+            reconciler.enable_recursive(request.collection_id, folder_sync::SetOptions {
+                dry_run: request.dry_run, confirm_git: request.confirm_git,
+            }).await
+        },
+    )
+    .request(
+        "documents.mapping.clear",
+        |context: Context<DocumentsActive>, request: CollectionRequest| async move {
+            require_collection(&context, &request.collection_id).await?;
+            let state = context.state().clone();
+            let collection = request.collection_id.clone();
+            let cleared = context
+                .blocking(move |_| folder_sync::clear_mapping(&state.store, &collection))
+                .await?;
+            // The folder sync session stops watching the folder on the next catalog change.
+            context
+                .state()
+                .changes
+                .send_modify(|revision| *revision = revision.saturating_add(1));
+            Ok(json!({ "collectionId": request.collection_id, "cleared": cleared }))
+        },
+    )
+    .request(
+        "documents.mapping.draft.get",
+        |context: Context<DocumentsActive>, _: Empty| async move {
+            let draft = recover(&context.state().mapping_draft).clone();
+            serde_json::to_value(draft).map_err(|_| storage_failed())
+        },
+    )
+    .request(
+        "documents.mapping.draft.set",
+        |context: Context<DocumentsActive>, draft: MappingDraft| async move {
+            *recover(&context.state().mapping_draft) = draft;
+            Ok(json!({}))
+        },
+    )
+    .request(
         "documents.document.create",
         |context: Context<DocumentsActive>, request: DocumentCreateRequest| async move {
+            let folder = crate::domain::normalize_folder(&request.folder).map_err(domain_error)?;
+            let operation_id = placement_id()?;
             require_collection(&context, &request.collection_id).await?;
             let author = context.state().installation.clone();
             let record = DomainRecord::document_create(
@@ -1308,6 +1456,16 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
                 crate::body::genesis(),
             )
             .map_err(domain_error)?;
+            let created = append(&context, record).await?;
+            place_created_document(&context, &author, None, &created, &folder, operation_id).await?;
+            Ok(created)
+        },
+    )
+    .request(
+        "documents.document.place",
+        |context: Context<DocumentsActive>, request: DocumentPlaceRequest| async move {
+            let record = DomainRecord::document_place(&context.state().installation, &request.document_id, &request.folder, placement_id()?).map_err(domain_error)?;
+            require_document(&context, &request.document_id).await?;
             append(&context, record).await
         },
     )
@@ -1633,6 +1791,75 @@ pub(crate) fn router_observing(observer: Option<ActivationObserver>) -> Router<D
     )
 }
 
+/// `documents.mapping.set`: checks the folder, then reports (dry run) or maps it, creating the
+/// Collection first for "Create Collection from folder".
+async fn set_mapping(
+    context: &Context<DocumentsActive>,
+    request: MappingSetRequest,
+) -> Result<JsonValue, BackendError> {
+    let author = context.state().installation.clone();
+    let (existing, create) = match (request.collection_id, request.new_collection_name) {
+        (Some(collection), None) => {
+            require_collection(context, &collection).await?;
+            (Some(collection), None)
+        }
+        (None, Some(name)) => (
+            None,
+            Some(DomainRecord::collection_create(&author, &name).map_err(domain_error)?),
+        ),
+        _ => return Err(invalid_request()),
+    };
+    let options = folder_sync::SetOptions {
+        dry_run: request.dry_run,
+        confirm_git: request.confirm_git,
+    };
+    let plan = |collection: Option<String>| {
+        let state = context.state().clone();
+        let path = request.path.clone();
+        context.blocking(move |_| {
+            folder_sync::set_mapping(
+                &state.store,
+                &state.data_directory,
+                collection.as_deref(),
+                &path,
+                options,
+            )
+        })
+    };
+    // A new Collection is checked as an empty one before it is created, so a refused folder
+    // leaves no Collection behind.
+    let planned = plan(existing.clone()).await?;
+    if options.dry_run {
+        return Ok(json!({
+            "collectionId": existing, "path": planned.root,
+            "direction": planned.direction.as_str(), "dryRun": true,
+            "report": planned.report.map(|report| report.to_json()),
+        }));
+    }
+    let (collection, planned) = match (existing, create) {
+        (Some(collection), _) => (collection, planned),
+        (None, Some(record)) => {
+            let created = append(context, record).await?;
+            let collection = created["id"]
+                .as_str()
+                .ok_or_else(storage_failed)?
+                .to_owned();
+            let planned = plan(Some(collection.clone())).await?;
+            (collection, planned)
+        }
+        (None, None) => return Err(invalid_request()),
+    };
+    // The folder sync session sees the new mapping as a catalog change.
+    context
+        .state()
+        .changes
+        .send_modify(|revision| *revision = revision.saturating_add(1));
+    Ok(json!({
+        "collectionId": collection, "path": planned.root,
+        "direction": planned.direction.as_str(), "dryRun": false,
+    }))
+}
+
 async fn require_collection(
     context: &Context<DocumentsActive>,
     id: &str,
@@ -1839,16 +2066,37 @@ async fn reopen_unopened_edits(
     context: &Context<DocumentsActive>,
     document: &str,
 ) -> Result<(), BackendError> {
-    let hub = context.state().hub.clone();
+    reopen_unopened(context.state(), context.cancellation(), document).await
+}
+
+/// [`reopen_unopened_edits`] without a request. The store read runs on the blocking pool,
+/// raced against `cancellation`.
+async fn reopen_unopened(
+    active: &DocumentsActive,
+    cancellation: &CancellationToken,
+    document: &str,
+) -> Result<(), BackendError> {
+    reopen_document(&active.log, &active.hub, cancellation, document).await
+}
+
+/// [`reopen_unopened`] from the record log and the body hub alone, as folder sync holds them.
+async fn reopen_document(
+    log: &RecordLog,
+    hub: &BodyHub,
+    cancellation: &CancellationToken,
+    document: &str,
+) -> Result<(), BackendError> {
+    let hub = hub.clone();
     if hub.with_body(document, |body| body.unopened()) == 0 {
         return Ok(());
     }
-    let store = context.state().store.clone();
+    let store = hub.store.clone();
     let id = document.to_owned();
-    let rows = context
-        .blocking(move |_| store.body_records(Some(&id)).map_err(|_| storage_failed()))
-        .await?;
-    let unopened = import_edit_rows(&context.state().log, &hub, &rows).await?;
+    let rows = teamarness_package_sdk::blocking(cancellation, move |_| {
+        store.body_records(Some(&id)).map_err(|_| storage_failed())
+    })
+    .await?;
+    let unopened = import_edit_rows(log, &hub, &rows).await?;
     let changed = hub.with_body(document, |body| {
         let changed = body.unopened() != unopened;
         body.set_unopened(unopened);
@@ -2046,6 +2294,7 @@ impl DocumentsActive {
                 json!({
                     "id": document.id,
                     "collectionId": document.collection_id,
+                    "folder": document.folder,
                     "title": document.title.unwrap_or_else(|| "Untitled".into()),
                     "archived": document.archived,
                 })
@@ -2068,6 +2317,35 @@ impl DocumentsActive {
     }
 }
 
+fn placement_id() -> Result<[u8; 16], BackendError> {
+    let mut id = [0; 16];
+    getrandom::fill(&mut id).map_err(|_| error("documents.edit_failed", true))?;
+    Ok(id)
+}
+
+/// Creation has already committed: every subsequent failure is an uncertain whole command.
+async fn place_created_document(
+    context: &Context<DocumentsActive>,
+    author: &str,
+    principal: Option<&str>,
+    created: &JsonValue,
+    folder: &str,
+    operation_id: [u8; 16],
+) -> Result<(), BackendError> {
+    if folder.is_empty() {
+        return Ok(());
+    }
+    let document = created["id"]
+        .as_str()
+        .ok_or_else(|| storage_failed().with_outcome_uncertain(true))?;
+    let record = DomainRecord::document_place(author, document, folder, operation_id)
+        .map_err(|cause| domain_error(cause).with_outcome_uncertain(true))?;
+    append_as(context, record, principal)
+        .await
+        .map_err(|cause| cause.with_outcome_uncertain(true))?;
+    Ok(())
+}
+
 /// Appends one domain record and projects it locally, answering with the record identity,
 /// which is the Collection or Document identity when the record created one.
 async fn append(
@@ -2084,11 +2362,42 @@ async fn append_as(
     record: DomainRecord,
     principal: Option<&str>,
 ) -> Result<JsonValue, BackendError> {
+    append_record(context.state(), context.cancellation(), record, principal).await
+}
+
+/// [`append_as`] without a request: appends `record` to the record log, signed as `principal`
+/// or this Installation, and projects it. The projection runs on the blocking pool, raced
+/// against `cancellation`.
+async fn append_record(
+    active: &DocumentsActive,
+    cancellation: &CancellationToken,
+    record: DomainRecord,
+    principal: Option<&str>,
+) -> Result<JsonValue, BackendError> {
+    append_domain_record(
+        &active.log,
+        &active.hub,
+        &active.changes,
+        cancellation,
+        record,
+        principal,
+    )
+    .await
+}
+
+/// [`append_record`] from the record log, the body hub and the change counter alone, as folder
+/// sync holds them.
+async fn append_domain_record(
+    log: &RecordLog,
+    hub: &BodyHub,
+    changes: &watch::Sender<u64>,
+    cancellation: &CancellationToken,
+    record: DomainRecord,
+    principal: Option<&str>,
+) -> Result<JsonValue, BackendError> {
     let purpose = record.kind();
     let canonical = record.encode();
-    let appended = context
-        .state()
-        .log
+    let appended = log
         .append_with_principal(purpose, &canonical, principal)
         .await
         .map_err(|cause| {
@@ -2098,30 +2407,24 @@ async fn append_as(
             }
             capability_error(purpose, cause)
         })?;
-    let state = context.state().clone();
+    let hub = hub.clone();
+    let changes = changes.clone();
     let id = appended.record_id.as_str().to_owned();
-    let ingested = context
-        .blocking(move |_| {
-            state
-                .hub
-                .ingest_record(
-                    appended.record_id.as_str(),
-                    appended.order_key.as_str(),
-                    &appended.author,
-                    purpose,
-                    &appended.signature,
-                    &canonical,
-                    &appended.sealed_record,
-                    None,
-                    &|| {
-                        state
-                            .changes
-                            .send_modify(|revision| *revision = revision.saturating_add(1))
-                    },
-                )
-                .map_err(|_| storage_failed())
-        })
-        .await?;
+    let ingested = teamarness_package_sdk::blocking(cancellation, move |_| {
+        hub.ingest_record(
+            appended.record_id.as_str(),
+            appended.order_key.as_str(),
+            &appended.author,
+            purpose,
+            &appended.signature,
+            &canonical,
+            &appended.sealed_record,
+            None,
+            &|| changes.send_modify(|revision| *revision = revision.saturating_add(1)),
+        )
+        .map_err(|_| storage_failed())
+    })
+    .await?;
     match ingested.result {
         IngestResult::Applied | IngestResult::Duplicate => {}
         IngestResult::Deferred(_) => return Err(error("documents.deferred", true)),
@@ -2230,6 +2533,77 @@ async fn reopen_metadata(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Re-evaluates what an older build paused or quarantined, once per [`FORMAT_GENERATION`] and
+/// before any body opens (ADR 0042). It opens retained rows only; nothing is delivered again.
+async fn reevaluate_after_upgrade(
+    store: &DocumentStore,
+    log: &RecordLog,
+    cancellation: &CancellationToken,
+) -> Result<(), BackendError> {
+    let reader = store.clone();
+    let rows = teamarness_package_sdk::blocking(cancellation, move |_| {
+        if reader.format_generation().map_err(|_| storage_failed())? >= FORMAT_GENERATION {
+            return Ok(None);
+        }
+        reader
+            .malformed_records()
+            .map(Some)
+            .map_err(|_| storage_failed())
+    })
+    .await?;
+    let Some(rows) = rows else {
+        return Ok(());
+    };
+    let mut opened = HashMap::new();
+    let mut undecided = false;
+    for batch in open_batches(&rows) {
+        let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed_record.clone()).collect();
+        let results = log
+            .open(&sealed)
+            .await
+            .map_err(|cause| capability_error("open-malformed-records", cause))?;
+        if results.len() != batch.len() {
+            return Err(error("documents.document_pending", true));
+        }
+        for (row, result) in batch.iter().zip(results) {
+            match result {
+                OpenResult::Ready(record)
+                    if record.record_id.as_str() == row.record_id
+                        && record.order_key.as_str() == row.order_key
+                        && record.author == row.author
+                        && record.purpose == row.purpose
+                        && record.signature == row.signature =>
+                {
+                    opened.insert(row.record_id.clone(), record.canonical);
+                }
+                OpenResult::WaitingForHistoryAccess => undecided = true,
+                OpenResult::Ready(_) | OpenResult::WrongScope | OpenResult::Corrupt => {}
+            }
+        }
+    }
+    let writer = store.clone();
+    let outcome = teamarness_package_sdk::blocking(cancellation, move |_| {
+        writer
+            .reevaluate_after_upgrade(FORMAT_GENERATION, &opened, undecided)
+            .map_err(|_| storage_failed())
+    })
+    .await?;
+    if outcome != Reevaluation::default() {
+        eprintln!(
+            "{}",
+            json!({
+                "event": "documents.format_reevaluation",
+                "generation": FORMAT_GENERATION,
+                "reimported": outcome.reimported,
+                "reprojected": outcome.reprojected,
+                "stillFailed": outcome.still_failed,
+                "retrying": undecided,
+            })
+        );
     }
     Ok(())
 }
@@ -2928,6 +3302,33 @@ async fn submit_update(
     Ok(json!({ "revision": staged.revision.to_string(), "requestId": request_id }))
 }
 
+/// Starts the folder sync session: it waits for the qualified replay, reconciles every mapping,
+/// then follows file, body and catalog changes ([`folder_sync::watch::run`]).
+fn start_folder_sync(
+    sync: folder_sync::FolderSync,
+    hub: &BodyHub,
+    changes: &watch::Sender<u64>,
+) -> Session {
+    let cancellation = sync.cancellation();
+    let task = tokio::spawn(folder_sync::watch::run(
+        sync,
+        hub.clone(),
+        hub.events.subscribe(),
+        changes.subscribe(),
+        cancellation.clone(),
+    ));
+    Session { cancellation, task }
+}
+
+/// Cancels the folder sync session and waits for it, so no reconcile outlives the activation.
+async fn stop_folder_sync(state: &DocumentsActive) {
+    let session = recover(&state.folder_sync).take();
+    if let Some(session) = session {
+        session.cancellation.cancel();
+        let _ = session.task.await;
+    }
+}
+
 async fn stop_flusher(state: &DocumentsActive) {
     let flusher = state
         .flusher
@@ -3427,13 +3828,13 @@ mod tests {
     use teamarness_package_sdk::testing::{Harness, HarnessBuilder, ScriptedCapability};
 
     const RECORD_LOG: &str = "teamarness.synchronization.immutable-record-log";
-    const ALICE: &str = "alice";
+    pub(super) const ALICE: &str = "alice";
     /// A Workspace Agent's Principal ID and signing key, as the Host derives them.
     const AGENT_PRINCIPAL: &str =
         "a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7a9e7";
     const AGENT_KEY: &str = "4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f4e1f";
 
-    fn hex(length: usize, seed: u64) -> String {
+    pub(super) fn hex(length: usize, seed: u64) -> String {
         format!("{seed:0length$x}")
     }
 
@@ -3448,7 +3849,7 @@ mod tests {
 
     /// Another Installation's editor of one Document: each write revises the whole body to the
     /// given Markdown and returns the one update, from a fresh peer, that its record carries.
-    struct Writer {
+    pub(super) struct Writer {
         body: DocumentBody,
     }
 
@@ -3461,13 +3862,13 @@ mod tests {
         }
 
         /// A writer of a Document this activation holds, starting from its current body.
-        fn of(handles: &ActivationHandles, document: &str) -> Self {
+        pub(super) fn of(handles: &ActivationHandles, document: &str) -> Self {
             Self {
                 body: handles.bodies.lock().unwrap()[document].writer_copy(),
             }
         }
 
-        fn write(&mut self, markdown: &str) -> Vec<u8> {
+        pub(super) fn write(&mut self, markdown: &str) -> Vec<u8> {
             let base = self.body.frontiers();
             assert!(
                 self.body
@@ -3483,7 +3884,7 @@ mod tests {
 
     /// What one UI session would submit: the body's Markdown revised to `markdown`, as one
     /// update from a fresh session peer.
-    fn session_update(
+    pub(super) fn session_update(
         handles: &ActivationHandles,
         document: &str,
         markdown: &str,
@@ -3495,7 +3896,7 @@ mod tests {
     }
 
     /// Submits a session update through the one local write path, as Alice's Installation.
-    async fn submit(
+    pub(super) async fn submit(
         handles: &ActivationHandles,
         document: &str,
         request_id: &str,
@@ -3592,14 +3993,26 @@ mod tests {
         })
     }
 
-    struct Session {
-        harness: Harness,
-        handles: ActivationHandles,
-        scripted: ScriptedCapability,
+    pub(super) struct Session {
+        pub(super) harness: Harness,
+        pub(super) handles: ActivationHandles,
+        pub(super) scripted: ScriptedCapability,
     }
 
-    async fn start(directory: &std::path::Path, scripted: ScriptedCapability) -> Session {
+    pub(super) async fn start(
+        directory: &std::path::Path,
+        scripted: ScriptedCapability,
+    ) -> Session {
         start_as(directory, scripted, ALICE).await
+    }
+
+    /// An activation whose folder sync session never starts, for tests that drive the
+    /// reconciler directly.
+    pub(super) async fn start_without_folder_sync(
+        directory: &std::path::Path,
+        scripted: ScriptedCapability,
+    ) -> Session {
+        start_configured(directory, scripted, ALICE, false).await
     }
 
     /// An activation on the Installation whose Person is `installation`, granted record-log 1.1
@@ -3609,17 +4022,27 @@ mod tests {
         scripted: ScriptedCapability,
         installation: &str,
     ) -> Session {
+        start_configured(directory, scripted, installation, true).await
+    }
+
+    async fn start_configured(
+        directory: &std::path::Path,
+        scripted: ScriptedCapability,
+        installation: &str,
+        folder_sync: bool,
+    ) -> Session {
         let observer: ActivationObserver = Arc::new(Mutex::new(None));
-        let mut harness =
-            HarnessBuilder::new(router_observing(Some(observer.clone())).into_backend())
-                .process_minor(1)
-                .package_identity("dev.teamarness.documents")
-                .installation(installation, installation)
-                .data_directory(directory)
-                .capability_minor(RECORD_LOG, scripted.clone(), 1)
-                .capability("teamarness.principals", ScriptedCapability::new())
-                .start()
-                .await;
+        let mut harness = HarnessBuilder::new(
+            router_configured(Some(observer.clone()), folder_sync).into_backend(),
+        )
+        .process_minor(1)
+        .package_identity("dev.teamarness.documents")
+        .installation(installation, installation)
+        .data_directory(directory)
+        .capability_minor(RECORD_LOG, scripted.clone(), 1)
+        .capability("teamarness.principals", ScriptedCapability::new())
+        .start()
+        .await;
         harness.activate().await.unwrap();
         let handles = observer
             .lock()
@@ -3633,7 +4056,7 @@ mod tests {
         }
     }
 
-    async fn wait_until(mut ready: impl FnMut() -> bool, what: &str) {
+    pub(super) async fn wait_until(mut ready: impl FnMut() -> bool, what: &str) {
         for _ in 0..600 {
             if ready() {
                 return;
@@ -3643,7 +4066,7 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
-    async fn qualify_empty_history(session: &Session) {
+    pub(super) async fn qualify_empty_history(session: &Session) {
         let stream = session.scripted.stream();
         tokio::time::timeout(Duration::from_secs(2), stream.opened())
             .await
@@ -4441,11 +4864,14 @@ mod tests {
             }
             drop(store);
             let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch("DROP TABLE file_relocations;")
+                .unwrap();
             if old_version == 4 {
-                connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;").unwrap();
+                connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;").unwrap();
             } else {
                 connection
-                    .execute_batch("DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=5;")
+                    .execute_batch("DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=5;")
                     .unwrap();
             }
             drop(connection);
@@ -4482,6 +4908,457 @@ mod tests {
                 hex(64, 5)
             );
         }
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05, TEAM.SYS.DOCS-R15 — genuine kind 12 recovers without redelivery.
+    #[tokio::test]
+    async fn upgrade_recovers_retained_placement_and_retries_unopenable_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let records = [
+            DomainRecord::collection_create("bob", "Plans").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap(),
+            DomainRecord::document_place("bob", &hex(64, 2), "Plans/été", [3; 16]).unwrap(),
+        ];
+        let store = DocumentStore::open(&path).unwrap();
+        for (i, record) in records.iter().enumerate() {
+            ingest_as_seen(&store, i as u64 + 1, record);
+        }
+        drop(store);
+        // The sealed row holds real kind-12 bytes. Simulate the older decoder's disposition,
+        // not an undecodable surrogate delivered to the upgraded decoder.
+        rusqlite::Connection::open(&path).unwrap().execute_batch(
+            "UPDATE records SET quarantine_code='malformed_record' WHERE purpose='document.place';
+             UPDATE documents SET folder='',place_order='';
+             UPDATE metadata SET format_generation=1;"
+        ).unwrap();
+        let waiting = Arc::new(Mutex::new(HashSet::from([3])));
+        let log = log_opening(encoded(&records), waiting.clone());
+        let session = start(directory.path(), log.clone()).await;
+        assert_eq!(session.handles.store.format_generation().unwrap(), 1);
+        assert_eq!(session.handles.store.documents().unwrap()[0].folder, "");
+        session.harness.shutdown().await.unwrap();
+        waiting.lock().unwrap().clear();
+        let session = start(directory.path(), log.clone()).await;
+        assert_eq!(
+            session.handles.store.documents().unwrap()[0].folder,
+            "Plans/été"
+        );
+        assert_eq!(session.handles.store.format_generation().unwrap(), 2);
+        assert_eq!(quarantine_code(&path, 3), None);
+        assert_eq!(session.handles.store.record_count().unwrap(), 3);
+        session.harness.shutdown().await.unwrap();
+        let session = start(directory.path(), log).await;
+        assert_eq!(
+            session.handles.store.documents().unwrap()[0].folder,
+            "Plans/été"
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    /// Bytes no build decodes: the canonical form an older build could not read, or a record
+    /// no build ever will.
+    const UNDECODABLE: &[u8] = b"not a domain record";
+
+    /// Leaves the store at `path` as the last build before format generations left it.
+    fn as_older_build(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE file_relocations; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=8;",
+            )
+            .unwrap();
+    }
+
+    /// Ingests record `seed`, sealed as the one byte `seed`, as the older build saw `canonical`.
+    fn ingest_seen_as(
+        store: &DocumentStore,
+        seed: u64,
+        record: &DomainRecord,
+        canonical: &[u8],
+    ) -> crate::store::IngestResult {
+        store
+            .ingest(
+                &hex(64, seed),
+                &hex(82, seed),
+                "bob",
+                record.kind(),
+                "c2ln",
+                canonical,
+                &[seed as u8],
+                None,
+            )
+            .unwrap()
+    }
+
+    fn ingest_as_seen(store: &DocumentStore, seed: u64, record: &DomainRecord) {
+        ingest_seen_as(store, seed, record, &record.encode());
+    }
+
+    /// A record log that opens the row sealed as byte `n` into `records[n - 1]`, as this build's
+    /// Core would. A seed in `waiting` has no history access yet.
+    fn log_opening(
+        records: Vec<(DomainRecord, Vec<u8>)>,
+        waiting: Arc<Mutex<HashSet<u64>>>,
+    ) -> ScriptedCapability {
+        ScriptedCapability::new().calls(move |method, payload| match method {
+            "open" => Ok(
+                json!({"results":payload["sealedRecords"].as_array().unwrap().iter().map(|sealed| {
+                let seed = URL_SAFE_NO_PAD.decode(sealed.as_str().unwrap()).unwrap()[0] as u64;
+                if waiting.lock().unwrap().contains(&seed) {
+                    return json!({"status":"waiting_for_history_access"});
+                }
+                let (record, canonical) = &records[seed as usize - 1];
+                json!({"status":"ready","recordId":hex(64,seed),"orderKey":hex(82,seed),
+                    "author":"bob","purpose":record.kind(),"signature":"c2ln",
+                    "canonical":URL_SAFE_NO_PAD.encode(canonical)})
+            }).collect::<Vec<_>>()}),
+            ),
+            _ => Err(error("unavailable", false)),
+        })
+    }
+
+    /// `records` as Core opens them today, each with its own canonical bytes.
+    fn encoded(records: &[DomainRecord]) -> Vec<(DomainRecord, Vec<u8>)> {
+        records
+            .iter()
+            .map(|record| (record.clone(), record.encode()))
+            .collect()
+    }
+
+    fn quarantine_code(path: &std::path::Path, seed: u64) -> Option<String> {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT quarantine_code FROM records WHERE record_id=?1",
+                [hex(64, seed)],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A concurrent peer's update that leaves front matter below the genesis paragraph, which
+    /// stays a schema violation under every build so far (ADR 0042).
+    fn front_matter_below_a_block() -> Vec<u8> {
+        let doc = loro::LoroDoc::new();
+        doc.import(&TEST_GENESIS).unwrap();
+        let before = doc.oplog_vv();
+        let Some(loro::ValueOrContainer::Container(loro::Container::List(children))) =
+            doc.get_map("doc").get("children")
+        else {
+            panic!("the genesis has a children list");
+        };
+        let node = children
+            .insert_container(children.len(), loro::LoroMap::new())
+            .unwrap();
+        node.insert("nodeName", "preserved_block").unwrap();
+        node.insert_container("attributes", loro::LoroMap::new())
+            .unwrap()
+            .insert("kind", "front_matter")
+            .unwrap();
+        let text = node
+            .insert_container("children", loro::LoroList::new())
+            .unwrap()
+            .insert_container(0, loro::LoroText::new())
+            .unwrap();
+        text.insert(0, "---\nt: 1\n---").unwrap();
+        doc.commit();
+        doc.export(loro::ExportMode::updates(&before)).unwrap()
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a Document an older build paused because it could not read a
+    // Preserved Block recovers at activation, with the later records ADR 0029 held back, whether
+    // the older build held them at replay or quarantined them at delivery.
+    #[tokio::test]
+    async fn upgrade_reimports_schema_violation_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let document = hex(64, 2);
+        let mut writer = Writer::new();
+        let edit = |id: u64, update: Vec<u8>| {
+            DomainRecord::identified_document_edit("bob", &document, &hex(32, id), &[1; 32], update)
+                .unwrap()
+        };
+        let table = "| a |\n|---|\n| 1 |\n";
+        let records = [
+            DomainRecord::collection_create("bob", "Plan").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap(),
+            edit(3, writer.write(table)),
+            edit(4, writer.write(&format!("{table}\nheld at replay\n"))),
+            edit(
+                5,
+                writer.write(&format!("{table}\nheld at replay\n\nheld at delivery\n")),
+            ),
+        ];
+        let store = DocumentStore::open(&path).unwrap();
+        for (index, record) in records[..4].iter().enumerate() {
+            ingest_as_seen(&store, index as u64 + 1, record);
+        }
+        store
+            .mark_import_failure(&document, &hex(64, 3), "schema_violation")
+            .unwrap();
+        ingest_as_seen(&store, 5, &records[4]);
+        assert_eq!(quarantine_code(&path, 5).as_deref(), Some("import_failure"));
+        drop(store);
+        as_older_build(&path);
+
+        let log = log_opening(encoded(&records), Arc::default());
+        let mut session = start(directory.path(), log).await;
+
+        let store = session.handles.store.clone();
+        assert!(!session.handles.qualified.load(Ordering::Acquire));
+        assert_eq!(store.import_failure(&document).unwrap(), None);
+        assert_eq!(store.format_generation().unwrap(), FORMAT_GENERATION);
+        assert_eq!(quarantine_code(&path, 5), None);
+        let opened = body_view(&mut session.harness, &document).await;
+        assert_eq!(opened["editable"], true);
+        assert_eq!(
+            opened["text"],
+            format!("{table}\nheld at replay\n\nheld at delivery\n")
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — records an older build could not decode project at activation
+    // from their retained rows, in ingestion order: a rename, a create that a waiting edit
+    // depends on, a Comment and an edit.
+    #[tokio::test]
+    async fn upgrade_reprojects_malformed_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let document = hex(64, 2);
+        let late = hex(64, 4);
+        let records = [
+            DomainRecord::collection_create("bob", "Plan").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Old title", genesis()).unwrap(),
+            DomainRecord::document_rename("bob", &document, "New title").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Late", genesis()).unwrap(),
+            DomainRecord::identified_document_edit(
+                "bob",
+                &late,
+                &hex(32, 5),
+                &[1; 32],
+                Writer::new().write("waited\n"),
+            )
+            .unwrap(),
+            DomainRecord::comment_add("bob", &document, None, None, "Seen now").unwrap(),
+            DomainRecord::identified_document_edit(
+                "bob",
+                &document,
+                &hex(32, 7),
+                &[1; 32],
+                Writer::new().write("unread edit\n"),
+            )
+            .unwrap(),
+        ];
+        let store = DocumentStore::open(&path).unwrap();
+        ingest_as_seen(&store, 1, &records[0]);
+        ingest_as_seen(&store, 2, &records[1]);
+        for seed in [3, 4, 6, 7] {
+            assert_eq!(
+                ingest_seen_as(&store, seed, &records[seed as usize - 1], UNDECODABLE),
+                crate::store::IngestResult::Quarantined("malformed_record".into())
+            );
+        }
+        ingest_as_seen(&store, 5, &records[4]);
+        assert_eq!(
+            quarantine_code(&path, 5).as_deref(),
+            Some("waiting_for_target")
+        );
+        drop(store);
+        as_older_build(&path);
+
+        let log = log_opening(encoded(&records), Arc::default());
+        let mut session = start(directory.path(), log).await;
+
+        for seed in 1..=7 {
+            assert_eq!(quarantine_code(&path, seed), None, "record {seed}");
+        }
+        let store = session.handles.store.clone();
+        assert_eq!(store.format_generation().unwrap(), FORMAT_GENERATION);
+        let snapshot = session
+            .harness
+            .request("documents.snapshot", json!({}))
+            .await
+            .unwrap();
+        let titles: Vec<&str> = snapshot["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|document| document["title"].as_str().unwrap())
+            .collect();
+        assert!(titles.contains(&"New title"), "{titles:?}");
+        assert!(titles.contains(&"Late"), "{titles:?}");
+        let comments = store.comments(&document).unwrap();
+        assert_eq!(comments[0].markdown.as_deref(), Some("Seen now"));
+        assert_eq!(
+            store.edit_identity(&hex(32, 7)).unwrap().unwrap().0,
+            hex(64, 7),
+            "a re-projected edit is indexed before its body opens"
+        );
+        let edited = body_view(&mut session.harness, &document).await;
+        assert_eq!(edited["text"], "unread edit\n");
+        let opened = body_view(&mut session.harness, &late).await;
+        assert_eq!(opened["editable"], true);
+        assert_eq!(opened["text"], "waited\n");
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — re-evaluation cures only what this build can read. A tree that
+    // is still invalid is marked again and shows its last good text, a record that still does not
+    // decode stays quarantined, and non-first front matter stays a violation (ADR 0042).
+    #[tokio::test]
+    async fn still_failing_record_stays_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let invalid = hex(64, 2);
+        let misplaced = hex(64, 6);
+        let edit = |document: &str, id: u64, update: Vec<u8>| {
+            DomainRecord::identified_document_edit("bob", document, &hex(32, id), &[1; 32], update)
+                .unwrap()
+        };
+        let records = [
+            DomainRecord::collection_create("bob", "Plan").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Invalid", genesis()).unwrap(),
+            edit(&invalid, 3, Writer::new().write("good\n")),
+            edit(&invalid, 4, schema_invalid_update()),
+            edit(&invalid, 5, Writer::new().write("held back\n")),
+            DomainRecord::document_create("bob", &hex(64, 1), "Misplaced", genesis()).unwrap(),
+            edit(&misplaced, 7, front_matter_below_a_block()),
+            DomainRecord::document_rename("bob", &invalid, "Never").unwrap(),
+        ];
+        let store = DocumentStore::open(&path).unwrap();
+        for (index, record) in records[..4].iter().enumerate() {
+            ingest_as_seen(&store, index as u64 + 1, record);
+        }
+        store
+            .mark_import_failure(&invalid, &hex(64, 4), "schema_violation")
+            .unwrap();
+        ingest_as_seen(&store, 5, &records[4]);
+        ingest_as_seen(&store, 6, &records[5]);
+        ingest_as_seen(&store, 7, &records[6]);
+        store
+            .mark_import_failure(&misplaced, &hex(64, 7), "schema_violation")
+            .unwrap();
+        ingest_seen_as(&store, 8, &records[7], UNDECODABLE);
+        drop(store);
+        as_older_build(&path);
+
+        let mut opened_by_core = encoded(&records);
+        opened_by_core[7].1 = UNDECODABLE.to_vec();
+        let log = log_opening(opened_by_core, Arc::default());
+        let mut session = start(directory.path(), log).await;
+
+        let store = session.handles.store.clone();
+        assert_eq!(
+            store.import_failure(&invalid).unwrap(),
+            Some((hex(64, 4), "schema_violation".into()))
+        );
+        assert_eq!(
+            store.import_failure(&misplaced).unwrap(),
+            Some((hex(64, 7), "schema_violation".into()))
+        );
+        assert_eq!(
+            quarantine_code(&path, 8).as_deref(),
+            Some("malformed_record")
+        );
+        assert_eq!(store.format_generation().unwrap(), FORMAT_GENERATION);
+        let opened = body_view(&mut session.harness, &invalid).await;
+        assert_eq!(opened["reason"], "import_failure");
+        assert_eq!(opened["editable"], false);
+        assert_eq!(opened["text"], "good\n");
+        let opened = body_view(&mut session.harness, &misplaced).await;
+        assert_eq!(opened["reason"], "import_failure");
+        assert_eq!(opened["editable"], false);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — after one re-evaluation, activation at the same generation
+    // leaves a marker and a quarantine as they are.
+    #[tokio::test]
+    async fn reevaluation_runs_once_per_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let document = hex(64, 2);
+        let records = [
+            DomainRecord::collection_create("bob", "Plan").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap(),
+            DomainRecord::document_rename("bob", &document, "New title").unwrap(),
+        ];
+        let store = DocumentStore::open(&path).unwrap();
+        ingest_as_seen(&store, 1, &records[0]);
+        ingest_as_seen(&store, 2, &records[1]);
+        drop(store);
+        as_older_build(&path);
+
+        let log = log_opening(encoded(&records), Arc::default());
+        let session = start(directory.path(), log.clone()).await;
+        assert_eq!(
+            session.handles.store.format_generation().unwrap(),
+            FORMAT_GENERATION
+        );
+        // Both would be cured by a second re-evaluation: the tree is valid, and the row decodes.
+        ingest_seen_as(&session.handles.store, 3, &records[2], UNDECODABLE);
+        session
+            .handles
+            .store
+            .mark_import_failure(&document, &hex(64, 2), "schema_violation")
+            .unwrap();
+        session.harness.shutdown().await.unwrap();
+
+        let mut session = start(directory.path(), log).await;
+        let store = session.handles.store.clone();
+        assert_eq!(
+            store.import_failure(&document).unwrap(),
+            Some((hex(64, 2), "schema_violation".into()))
+        );
+        assert_eq!(
+            quarantine_code(&path, 3).as_deref(),
+            Some("malformed_record")
+        );
+        assert_eq!(store.format_generation().unwrap(), FORMAT_GENERATION);
+        let opened = body_view(&mut session.harness, &document).await;
+        assert_eq!(opened["reason"], "import_failure");
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a quarantined record that this activation cannot open yet is
+    // not given up on: the generation stays behind, and a later activation projects it.
+    #[tokio::test]
+    async fn reevaluation_retries_a_record_waiting_for_history_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        let document = hex(64, 2);
+        let records = [
+            DomainRecord::collection_create("bob", "Plan").unwrap(),
+            DomainRecord::document_create("bob", &hex(64, 1), "Notes", genesis()).unwrap(),
+            DomainRecord::document_rename("bob", &document, "New title").unwrap(),
+        ];
+        let store = DocumentStore::open(&path).unwrap();
+        ingest_as_seen(&store, 1, &records[0]);
+        ingest_as_seen(&store, 2, &records[1]);
+        ingest_seen_as(&store, 3, &records[2], UNDECODABLE);
+        drop(store);
+        as_older_build(&path);
+
+        let waiting: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::from([3])));
+        let log = log_opening(encoded(&records), waiting.clone());
+        let session = start(directory.path(), log.clone()).await;
+        assert_eq!(session.handles.store.format_generation().unwrap(), 0);
+        assert_eq!(
+            quarantine_code(&path, 3).as_deref(),
+            Some("malformed_record")
+        );
+        session.harness.shutdown().await.unwrap();
+
+        waiting.lock().unwrap().clear();
+        let session = start(directory.path(), log).await;
+        assert_eq!(
+            session.handles.store.format_generation().unwrap(),
+            FORMAT_GENERATION
+        );
+        assert_eq!(quarantine_code(&path, 3), None);
+        session.harness.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -4664,7 +5541,10 @@ mod tests {
             ).unwrap();
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;").unwrap();
+        connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;").unwrap();
+        connection
+            .execute_batch("DROP TABLE file_relocations;")
+            .unwrap();
         drop(connection);
         let access = Arc::new(AtomicBool::new(false));
         let gained = access.clone();
@@ -4811,7 +5691,10 @@ mod tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;")
+            .unwrap();
+        connection
+            .execute_batch("DROP TABLE file_relocations;")
             .unwrap();
         drop(connection);
         let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
@@ -6533,7 +7416,12 @@ mod tests {
     }
 
     /// An edit record from another Installation's author, carrying `update`.
-    fn remote_edit(document: &str, author: &str, seed: u64, update: Vec<u8>) -> JsonValue {
+    pub(super) fn remote_edit(
+        document: &str,
+        author: &str,
+        seed: u64,
+        update: Vec<u8>,
+    ) -> JsonValue {
         record_frame(
             seed,
             author,
@@ -6549,7 +7437,7 @@ mod tests {
     }
 
     /// Delivers `frame` on the record log stream.
-    async fn deliver(session: &Session, frame: JsonValue) {
+    pub(super) async fn deliver(session: &Session, frame: JsonValue) {
         assert!(session.scripted.stream().send(frame).await);
     }
 
@@ -7406,7 +8294,7 @@ mod tests {
         assert_eq!(contract.contracts.len(), 1);
         let provided = &contract.contracts[0];
         assert_eq!(provided.identity, ports::CONTRACT);
-        assert_eq!((provided.major, provided.minor), (1, 3));
+        assert_eq!((provided.major, provided.minor), (1, 4));
         let names: Vec<_> = provided
             .ports
             .iter()
@@ -7443,6 +8331,7 @@ mod tests {
             "documents.unknown_collection",
             "documents.collection_archived",
             "documents.invalid_title",
+            "documents.invalid_folder",
             "documents.actor_unauthorized",
             "documents.principal_not_bound",
         ] {
@@ -8055,6 +8944,24 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), relisted)
             .await
             .expect("a rename invalidates the listing");
+        session
+            .harness
+            .request(
+                "documents.document.place",
+                json!({"documentId":document,"folder":"Plans"}),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.next_event().await.unwrap().unwrap();
+                if event["$teamarnessPortValue"] == json!({}) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("placement invalidates the listing independently of body changes");
         events.close().await;
         session.harness.shutdown().await.unwrap();
     }
@@ -8100,7 +9007,7 @@ mod tests {
     fn port_contract_minors_are_additive() {
         assert_additive(
             include_bytes!("../tests/fixtures/ports-1.2.json"),
-            include_bytes!("../../ports.json"),
+            include_bytes!("../tests/fixtures/ports-1.3.json"),
             (2, 3),
             4,
         );
@@ -8116,6 +9023,69 @@ mod tests {
             (0, 1),
             0,
         );
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12 — only listing folder and optional create folder change in 1.4.
+    #[test]
+    fn port_contract_14_only_adds_declared_folder_fields() {
+        use teamarness_package_contract::port_contract::{
+            check_additive_minor_documents, compile_port_contracts,
+        };
+        let old =
+            compile_port_contracts(include_bytes!("../tests/fixtures/ports-1.3.json")).unwrap();
+        let current = include_bytes!("../../ports.json");
+        let new = compile_port_contracts(current).unwrap();
+        assert_eq!(new.contracts[0].minor, 4);
+        assert_eq!(old.contracts[0].ports.len(), new.contracts[0].ports.len());
+        // The generic checker requires exact schemas. Remove exactly the declared 1.4
+        // additions, then prove every other shape and referenced definition stayed.
+        let mut normalized: JsonValue = serde_json::from_slice(current).unwrap();
+        assert_eq!(
+            normalized["$defs"]["folder"],
+            json!({"type":"string", "maxLength":512})
+        );
+        normalized["$defs"]
+            .as_object_mut()
+            .unwrap()
+            .remove("folder");
+        let doc = &mut normalized["$defs"]["document"];
+        assert_eq!(
+            doc["properties"]["folder"],
+            json!({"$ref":"#/$defs/folder"})
+        );
+        assert!(
+            doc["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("folder"))
+        );
+        doc["properties"].as_object_mut().unwrap().remove("folder");
+        doc["required"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|v| v != "folder");
+        let create = normalized["contracts"][0]["ports"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|p| p["name"] == "document.create")
+            .unwrap();
+        assert_eq!(
+            create["request"]["properties"]["folder"],
+            json!({"$ref":"#/$defs/folder"})
+        );
+        assert!(
+            !create["request"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("folder"))
+        );
+        create["request"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("folder");
+        let normalized = compile_port_contracts(&serde_json::to_vec(&normalized).unwrap()).unwrap();
+        check_additive_minor_documents(&old, &normalized, ports::CONTRACT).unwrap();
     }
 
     fn agent() -> JsonValue {
@@ -8395,6 +9365,198 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
+    // Verifies: TEAM.SYS.DOCS-R09, TEAM.SYS.DOCS-R12 — maximum folder paths fit bounded pages.
+    #[tokio::test]
+    async fn document_listing_with_maximum_folders_stays_within_payload_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (collection, _) = ported_document(&mut session).await;
+        let folder = "é".repeat(crate::domain::MAX_FOLDER_BYTES / 2);
+        for _ in 0..ports::MAX_PAGE {
+            port_as(&mut session.harness, "command", "document.create", agent(),
+                json!({"collectionId":collection,"title":"界".repeat(crate::domain::MAX_TITLE),"folder":folder})).await.unwrap();
+        }
+        let page = query(
+            &mut session.harness,
+            "document.list",
+            json!({"collectionId":collection,"limit":64}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page["documents"].as_array().unwrap().len(), ports::MAX_PAGE);
+        assert!(serde_json::to_vec(&page).unwrap().len() <= ports::PORT_PAYLOAD_BYTES);
+        let contract = teamarness_package_contract::port_contract::compile_port_contracts(
+            include_bytes!("../../ports.json"),
+        )
+        .unwrap();
+        contract
+            .validate(ports::CONTRACT, "document.list", "response", &page)
+            .unwrap();
+        let last = query(
+            &mut session.harness,
+            "document.list",
+            json!({"collectionId":collection,"after":page["next"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(last["documents"][0]["folder"], folder);
+        assert_eq!(last["documents"].as_array().unwrap().len(), 1);
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R12, TEAM.SYS.DOCS-R15 — caller paths share canonical placement.
+    #[tokio::test]
+    async fn foldered_create_and_placement_preserve_authorship_and_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (collection, original) = ported_document(&mut session).await;
+        let before = appends(&session);
+        for actor in [alice(), agent()] {
+            let created = port_as(
+                &mut session.harness,
+                "command",
+                "document.create",
+                actor.clone(),
+                json!({"collectionId":collection,"title":"Foldered","folder":"Plans/e\u{301}"}),
+            )
+            .await
+            .unwrap();
+            let calls = append_calls(&session);
+            let create = &calls[calls.len() - 2];
+            let place = &calls[calls.len() - 1];
+            assert_eq!(appended_record(create).kind(), "document.create");
+            assert_eq!(appended_record(place).kind(), "document.place");
+            assert_eq!(
+                appended_record(create).author(),
+                appended_record(place).author()
+            );
+            assert_eq!(
+                create.payload.get("principal"),
+                place.payload.get("principal")
+            );
+            assert_eq!(
+                appended_record(create).author(),
+                if actor["kind"] == "agent" {
+                    AGENT_KEY
+                } else {
+                    ALICE
+                }
+            );
+            let page = query(
+                &mut session.harness,
+                "document.list",
+                json!({"collectionId":collection}),
+            )
+            .await
+            .unwrap();
+            let doc = page["documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["id"] == created["documentId"])
+                .unwrap();
+            assert_eq!(doc["folder"], "Plans/é");
+            assert_eq!(doc["version"], created["version"]);
+            port_as(&mut session.harness, "command", "document.revise", actor,
+                json!({"documentId":created["documentId"],"baseVersion":created["version"],"markdown":"Body intact\n"})).await.unwrap();
+        }
+        assert_eq!(appends(&session), before + 6);
+        let created = session
+            .harness
+            .request(
+                "documents.document.create",
+                json!({"collectionId":collection,"title":"UI","folder":"A"}),
+            )
+            .await
+            .unwrap();
+        let id = created["id"].as_str().unwrap();
+        let mut identities = HashSet::new();
+        for folder in ["B", "A", "B", ""] {
+            session
+                .harness
+                .request(
+                    "documents.document.place",
+                    json!({"documentId":id,"folder":folder}),
+                )
+                .await
+                .unwrap();
+            let calls = append_calls(&session);
+            identities.insert(appended_record(calls.last().unwrap()).encode());
+            let snapshot = session
+                .harness
+                .request("documents.snapshot", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot["documents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|d| d["id"] == id)
+                    .unwrap()["folder"],
+                folder
+            );
+        }
+        assert_eq!(identities.len(), 4);
+        let before = appends(&session);
+        for folder in ["../bad", "a//b", "a\\b", "/root"] {
+            let request = json!({"collectionId":collection,"title":"Bad","folder":folder});
+            let refused = session
+                .harness
+                .request("documents.document.create", request.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code(), "documents.invalid_folder");
+            let refused = port_as(
+                &mut session.harness,
+                "command",
+                "document.create",
+                agent(),
+                request,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refused.code(), "documents.invalid_folder");
+            assert!(!refused.outcome_uncertain());
+            let refused = session
+                .harness
+                .request(
+                    "documents.document.place",
+                    json!({"documentId":original,"folder":folder}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code(), "documents.invalid_folder");
+        }
+        assert_eq!(appends(&session), before);
+        for ui in [false, true] {
+            let request = json!({"collectionId":collection,"title":"Root","folder":""});
+            if ui {
+                session
+                    .harness
+                    .request("documents.document.create", request)
+                    .await
+                    .unwrap();
+            } else {
+                port_as(
+                    &mut session.harness,
+                    "command",
+                    "document.create",
+                    alice(),
+                    request,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            appends(&session),
+            before + 2,
+            "empty folder appends only create"
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
     async fn create_as(
         harness: &mut Harness,
         actor: JsonValue,
@@ -8515,6 +9677,72 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
+    // Verifies: TEAM.SYS.DOCS-R11 — a Document created through the Ports keeps its table and front
+    // matter byte for byte, and revisions made against one version, by a Person and by an Agent,
+    // merge their cell edits into the one table.
+    #[tokio::test]
+    async fn create_then_markdown_keeps_preserved_blocks_and_cell_edits_merge_in_place() {
+        const FRONT_MATTER: &str = "---\ntitle: \"a | b\"\ntags: [x,   y]\n---\n";
+        const TABLE: &str = "|  a  | b |\n|:---|--:|\n| 1   | 2 |\n| \\| | `x` |\n";
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), scripted_log()).await;
+        let (collection, _) = ported_document(&mut session).await;
+        let created = create_as(&mut session.harness, alice(), &collection, "Plan")
+            .await
+            .unwrap();
+        let document = created["documentId"].as_str().unwrap().to_owned();
+        let source = format!("{FRONT_MATTER}\nProse.\n\n{TABLE}");
+        let first = revise(
+            &mut session.harness,
+            &document,
+            &created["version"],
+            &source,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["changed"], true);
+        assert_eq!(first["normalised"], false);
+        let read = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read["markdown"], source.as_str());
+        assert_eq!(read["version"], first["version"]);
+
+        // Two revisions from one version, each changing one cell of the same table.
+        let person = source.replace("| 1   |", "| 9   |");
+        revise(&mut session.harness, &document, &first["version"], &person)
+            .await
+            .unwrap();
+        let by_agent = source.replace("| 2 |", "| 8 |");
+        let merged = port_as(
+            &mut session.harness,
+            "command",
+            "document.revise",
+            agent(),
+            json!({"documentId":document,"baseVersion":first["version"],"markdown":by_agent}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged["changed"], true);
+        let read = query(
+            &mut session.harness,
+            "document.markdown",
+            json!({"documentId":document}),
+        )
+        .await
+        .unwrap();
+        // Both cells changed in the one table, with nothing else touched and nothing duplicated.
+        assert_eq!(
+            read["markdown"],
+            source.replace("| 1   | 2 |", "| 9   | 8 |").as_str()
+        );
+        session.harness.shutdown().await.unwrap();
+    }
+
     // Verifies: TEAM.SYS.DOCS-R12 — a create refused before its append, or by Core for an Agent it
     // does not sign for, is certain and creates nothing (ADR 0038).
     #[tokio::test]
@@ -8595,6 +9823,75 @@ mod tests {
         session.harness.shutdown().await.unwrap();
     }
 
+    // Verifies: TEAM.SYS.DOCS-R12, TEAM.SYS.DOCS-R15 — even a certain second-append refusal
+    // leaves a created Document, so neither caller can safely retry the whole command.
+    #[tokio::test]
+    async fn foldered_create_second_append_failure_is_uncertain_and_never_retried() {
+        for ui in [false, true] {
+            let next = Arc::new(std::sync::atomic::AtomicU64::new(100));
+            let scripted = ScriptedCapability::new().calls(move |method, payload| match method {
+                "open" => Ok(
+                    json!({"results":payload["sealedRecords"].as_array().unwrap().iter()
+                    .map(|_| json!({"status":"waiting_for_history_access"})).collect::<Vec<_>>()}),
+                ),
+                "append" if payload["purpose"] == "document.place" => {
+                    Err(error("principal_not_bound", false))
+                }
+                "append" => {
+                    let seed = next.fetch_add(1, Ordering::SeqCst);
+                    let author = if payload.get("principal").is_some() {
+                        AGENT_KEY
+                    } else {
+                        ALICE
+                    };
+                    Ok(
+                        json!({"recordId":hex(64,seed),"orderKey":hex(82,seed),"author":author,
+                        "signature":"c2ln","sealedRecord":"c2VhbGVk","durability":"committed"}),
+                    )
+                }
+                _ => Err(error("unavailable", false)),
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let mut session = start(directory.path(), scripted).await;
+            let (collection, _) = ported_document(&mut session).await;
+            let before = appends(&session);
+            let request = json!({"collectionId":collection,"title":"Partial","folder":"A"});
+            let cause = if ui {
+                session
+                    .harness
+                    .request("documents.document.create", request)
+                    .await
+                    .unwrap_err()
+            } else {
+                port_as(
+                    &mut session.harness,
+                    "command",
+                    "document.create",
+                    agent(),
+                    request,
+                )
+                .await
+                .unwrap_err()
+            };
+            assert!(cause.outcome_uncertain());
+            assert_eq!(appends(&session), before + 2);
+            let documents = session.handles.store.documents().unwrap();
+            let partial = documents
+                .iter()
+                .find(|d| d.title.as_deref() == Some("Partial"))
+                .unwrap();
+            assert_eq!(partial.folder, "");
+            assert_eq!(
+                session.handles.bodies.lock().unwrap()[&partial.id].text(),
+                ""
+            );
+            // Observe beyond the flusher retry interval: creates and placements are not staged.
+            tokio::time::sleep(FLUSH_RETRY * 2).await;
+            assert_eq!(appends(&session), before + 2);
+            session.harness.shutdown().await.unwrap();
+        }
+    }
+
     // Verifies: TEAM.SYS.DOCS-R12 — a create whose append may have committed is uncertain, so a
     // Consumer does not repeat it and duplicate the Document.
     #[tokio::test]
@@ -8673,6 +9970,7 @@ mod tests {
             format!("{} KiB Port value bound", ports::PORT_PAYLOAD_BYTES / 1024),
             format!("more than {} IDs", ports::MAX_VERSION_IDS),
             "baseVersion set to the returned version".into(),
+            "Write inline links".into(),
             "documents.collection_archived".into(),
             "documents.principal_not_bound".into(),
             "Host-derived actor".into(),
@@ -9384,5 +10682,110 @@ mod tests {
         }
         assert_eq!(seen, 9, "every change is reachable");
         session.harness.shutdown().await.unwrap();
+    }
+
+    /// A signed record whose stored text reads as nesting far beyond any limit, delivered on the
+    /// thread that delivers records. An abort here happens before the commit, so without the
+    /// bound the same record would abort the Package again on each redelivery.
+    #[test]
+    fn a_record_with_deeply_nested_text_is_applied_and_the_cursor_advances() {
+        use crate::markdown::{Block, Inline, Marks, PreservedKind};
+        use loro::{ExportMode, LoroDoc};
+
+        const DEPTH: usize = 20_000;
+        let deep = ">".repeat(DEPTH);
+        for blocks in [
+            vec![Block::Preserved {
+                kind: PreservedKind::Html,
+                source: deep.clone(),
+            }],
+            vec![Block::Paragraph(vec![Inline::Text(
+                format!("a\n{deep}"),
+                Marks {
+                    code: true,
+                    ..Marks::default()
+                },
+            )])],
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = DocumentStore::open(directory.path().join("documents.sqlite3")).unwrap();
+            let (events, _receiver) = broadcast::channel(256);
+            let hub = test_hub(store.clone(), events);
+            let (collection, document, edit_id) = (hex(64, 1), hex(64, 2), hex(64, 3));
+
+            let body = LoroDoc::new();
+            body.import(&genesis()).unwrap();
+            let before = body.oplog_vv();
+            body.set_peer_id(0xABCDEF).unwrap();
+            crate::markdown::write_tree(&body, &blocks).unwrap();
+            let update = body.export(ExportMode::updates(&before)).unwrap();
+            assert!(update.len() <= MAX_UPDATE, "a record can carry this update");
+
+            let records = [
+                (
+                    collection.clone(),
+                    DomainRecord::collection_create(ALICE, "Plan").unwrap(),
+                ),
+                (
+                    document.clone(),
+                    DomainRecord::document_create(ALICE, &collection, "Doc", genesis()).unwrap(),
+                ),
+                (
+                    edit_id.clone(),
+                    DomainRecord::identified_document_edit(
+                        ALICE,
+                        &document,
+                        &hex(32, 9),
+                        &[7; 32],
+                        update,
+                    )
+                    .unwrap(),
+                ),
+            ];
+
+            let runtime = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+            let results = runtime
+                .block_on(runtime.spawn_blocking({
+                    let hub = hub.clone();
+                    move || {
+                        // The last record is delivered twice, as after a restart.
+                        let last = records.len() - 1;
+                        let deliveries = (0..records.len()).chain([last]);
+                        let results: Vec<IngestResult> = deliveries
+                            .map(|index| {
+                                let (id, record) = &records[index];
+                                let seed = index as u64 + 1;
+                                let bytes = record.encode();
+                                hub.ingest_record(
+                                    id,
+                                    &hex(82, seed),
+                                    ALICE,
+                                    record.kind(),
+                                    "sig",
+                                    &bytes,
+                                    &bytes,
+                                    Some(&hex(50, seed)),
+                                    &|| {},
+                                )
+                                .unwrap()
+                                .result
+                            })
+                            .collect();
+                        results
+                    }
+                }))
+                .unwrap();
+            assert_eq!(results[2], IngestResult::Applied);
+            assert_eq!(results[3], IngestResult::Duplicate);
+            assert_eq!(store.cursor().unwrap(), Some(hex(50, 3)));
+            assert_eq!(store.import_failure(&document).unwrap(), None);
+            assert_eq!(
+                hub.with_body(&document, |body| body.text().to_owned())
+                    .matches('>')
+                    .count(),
+                DEPTH,
+                "no character is lost"
+            );
+        }
     }
 }

@@ -1,7 +1,7 @@
-# 0042 — Generic external access to Person-selected Package Ports
+# 0045 — Generic external access to Person-selected Package Ports
 
 **Status:** accepted (2026-11-16)
-**Supersedes:** ADR 0041 (Decision §5, initial read-only, stream, and Conversations restrictions; Consequences, external writes outside the initial delivery)
+**Supersedes:** ADR 0044 (Decision §5, initial read-only, stream, and Conversations restrictions; Consequences, external writes outside the initial delivery)
 **Refines:** ADR 0016 (external Provider-error projection), ADR 0026 (external live-delivery adapter)
 
 ## Context
@@ -108,7 +108,7 @@ This is architecture intent, not passing implementation or manual evidence. No m
 
 - `crates/teamarness-package-sdk/src/ports_v3.rs` exposes `command`, `query`, `live_query`, and `subscribe_event` with Person access and route preconditions. `capability.rs` supplies `recv_with_credit`, explicit close, and drop cleanup.
 - `crates/teamarness-package-host/src/{port_access,capability,broker,event_subscriptions}.rs` own Person authorization, dispatch, validation, and bounded subscription delivery. `errors.rs` fixes Provider-error details at 4,096 bytes and depth 8.
-- `context/02-system/05-packages/requirements.md`, especially R13–R14, requires truthful command uncertainty and bounded live-only event delivery. ADRs 0026 and 0041 place generic authority in the Host and external policy in the Package.
+- `context/02-system/05-packages/requirements.md`, especially R13–R14, requires truthful command uncertainty and bounded live-only event delivery. ADRs 0026 and 0044 place generic authority in the Host and external policy in the Package.
 - `packages/{backlog-package,documents-package,exhibits-package,conversations-package}/ports.json` describe the real Provider commands, queries, and events. Their runtime guides own workflow and reconciliation semantics.
 - Targeted inspection at Host `d0cc7c4cceb37bf64aa09342fb6c9abaf26644dc` and standalone gateway `eac9d8c0c34e2c6a1729fe54a460485bb6c8b592` found read-only/Conversations filters in the gateway, not a missing Host dispatch shape. Gateway config already records exact tool names and kind-sensitive fingerprints. Its HTTP code currently buffers complete JSON responses and uses a whole-response write deadline, so subscriptions require a separate body/write-lifetime path.
 - **Weaknesses:** gateway source belongs to a separate repository and is not reproduced here. No new tests, builds, runtime cost measurement, outside-agent workflow, or notification-harness integration ran during this design. Eight stream slots and heartbeat/write intervals are bounded design choices, not measured throughput guarantees. Existing upstream unhealthy-Provider stream debt in DELTA-018 is not resolved here.

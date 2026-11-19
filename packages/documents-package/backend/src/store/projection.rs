@@ -222,6 +222,19 @@ pub(crate) fn project_domain(
             clear(tx, record_id)?;
             Ok(ProjectionOutcome::applied())
         }
+        DomainRecord::DocumentPlace {
+            document, folder, ..
+        } => {
+            if !document_exists(tx, document)? {
+                return ProjectionOutcome::deferred(tx, record_id, domain);
+            }
+            tx.execute(
+                "UPDATE documents SET folder=?2,place_order=?3 WHERE document_id=?1 AND place_order<?3",
+                params![document, folder, order_key],
+            )?;
+            clear(tx, record_id)?;
+            Ok(ProjectionOutcome::applied())
+        }
         DomainRecord::DocumentArchive { document, .. }
         | DomainRecord::DocumentRestore { document, .. } => {
             if !document_exists(tx, document)? {

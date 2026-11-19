@@ -5,6 +5,7 @@ import "./styles.css";
 import type { PackageMountContext, PackageUnmount } from "@teamarness/package-ui-sdk";
 import type { Collection, Document, DocumentsContract, Snapshot } from "./contract.generated";
 import { DocumentsController } from "./controller";
+import { mountSettings } from "./settings";
 import { DocumentsView } from "./view";
 
 export type { DocumentsContract };
@@ -21,6 +22,12 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   } catch (error) {
     cleanupKit();
     throw error;
+  }
+  if (context.view === "settings") {
+    return mountSettings(context, client, () => {
+      cleanupStyles();
+      cleanupKit();
+    });
   }
   let disposed = false;
   let nameRetry: ReturnType<typeof setTimeout> | undefined;

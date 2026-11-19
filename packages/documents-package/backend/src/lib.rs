@@ -82,6 +82,57 @@ mod store_tests {
             .unwrap()
     }
 
+    // Verifies: TEAM.SYS.DOCS-R03, TEAM.SYS.DOCS-R15 — placement is independent and repeatable.
+    #[test]
+    fn document_placement_converges_and_survives_restart() {
+        let records = [
+            DomainRecord::collection_create(ALICE, "Plans").unwrap(),
+            DomainRecord::document_create(ALICE, &hex(64, 1), "Notes", genesis()).unwrap(),
+            DomainRecord::collection_create(ALICE, "Other").unwrap(),
+            DomainRecord::document_place(ALICE, &hex(64, 2), "A", [4; 16]).unwrap(),
+            DomainRecord::document_place(ALICE, &hex(64, 2), "B", [5; 16]).unwrap(),
+            DomainRecord::document_place(ALICE, &hex(64, 2), "A", [6; 16]).unwrap(),
+            DomainRecord::document_place(ALICE, &hex(64, 2), "B", [7; 16]).unwrap(),
+            DomainRecord::document_move(ALICE, &hex(64, 2), &hex(64, 3)).unwrap(),
+            DomainRecord::document_place(ALICE, &hex(64, 2), "", [9; 16]).unwrap(),
+        ];
+        for order in [
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
+            vec![8, 7, 6, 5, 4, 3, 2, 1, 0],
+            vec![3, 5, 6, 4, 8, 0, 2, 7, 1],
+        ] {
+            let f = fixture();
+            for index in order {
+                ingest(&f.store, index as u64 + 1, ALICE, &records[index]);
+            }
+            for (index, record) in records.iter().enumerate() {
+                assert_eq!(
+                    ingest(&f.store, index as u64 + 1, ALICE, record),
+                    IngestResult::Duplicate
+                );
+            }
+            let path = f._directory.path().join("documents.sqlite3");
+            drop(f.store);
+            let store = DocumentStore::open(&path).unwrap();
+            let docs = store.documents().unwrap();
+            assert_eq!(docs.len(), 1);
+            assert_eq!(docs[0].id, hex(64, 2));
+            assert_eq!(docs[0].collection_id, hex(64, 3));
+            assert_eq!(docs[0].folder, "");
+            assert_eq!(store.body_records(Some(&hex(64, 2))).unwrap().len(), 1);
+        }
+        let f = fixture();
+        for (index, record) in records.iter().enumerate() {
+            ingest(&f.store, index as u64 + 1, ALICE, record);
+            if index >= 3 {
+                assert_eq!(
+                    f.store.documents().unwrap()[0].folder,
+                    ["A", "B", "A", "B", "B", ""][index - 3]
+                );
+            }
+        }
+    }
+
     fn names(store: &DocumentStore) -> Vec<(String, Option<String>, bool)> {
         store
             .collections()
@@ -146,7 +197,10 @@ mod store_tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;")
+            .unwrap();
+        connection
+            .execute_batch("DROP TABLE file_relocations;")
             .unwrap();
         drop(connection);
         let store = DocumentStore::open(&path).unwrap();
@@ -351,7 +405,10 @@ mod store_tests {
                 ).unwrap();
             }
             let connection = rusqlite::Connection::open(&path).unwrap();
-            connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;").unwrap();
+            connection.execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;").unwrap();
+            connection
+                .execute_batch("DROP TABLE file_relocations;")
+                .unwrap();
             drop(connection);
             let store = DocumentStore::open(&path).unwrap();
             let mut rows = store.identity_candidates().unwrap();
@@ -410,7 +467,10 @@ mod store_tests {
         }
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; PRAGMA user_version=4;")
+            .execute_batch("DROP TABLE edit_identities; DROP TABLE document_identity_conflicts; DROP TABLE document_import_failures; DROP TABLE comment_history_state; DROP TABLE comment_history_changes; ALTER TABLE metadata DROP COLUMN format_generation; DROP TABLE refused_files; DROP TABLE mapped_files; DROP TABLE folder_mappings; ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order; PRAGMA user_version=4;")
+            .unwrap();
+        connection
+            .execute_batch("DROP TABLE file_relocations;")
             .unwrap();
         drop(connection);
         let store = DocumentStore::open(&path).unwrap();
@@ -1428,6 +1488,190 @@ mod store_tests {
             first,
             "reopening keeps the epoch"
         );
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a v8 database opens at format generation 0 with its data
+    // intact, so the first activation re-evaluates it, and reopening changes nothing.
+    #[test]
+    fn migration_0009_from_v8() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(concat!(
+                    include_str!("../migrations/0001_documents.sql"),
+                    include_str!("../migrations/0002_edit_targets.sql"),
+                    include_str!("../migrations/0003_comments.sql"),
+                    include_str!("../migrations/0004_comment_time.sql"),
+                    include_str!("../migrations/0005_edit_identity_index.sql"),
+                    include_str!("../migrations/0006_import_failure.sql"),
+                    include_str!("../migrations/0007_schema_violation.sql"),
+                    include_str!("../migrations/0008_comment_history.sql"),
+                ))
+                .unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO comment_history_state(singleton,epoch,revision) VALUES(1,'old',0);
+                     UPDATE metadata SET cursor='kept' WHERE singleton=1;",
+                )
+                .unwrap();
+            connection.pragma_update(None, "user_version", 8).unwrap();
+        }
+        let version = || -> i64 {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        for _ in 0..2 {
+            let store = DocumentStore::open(&path).unwrap();
+            assert_eq!(store.format_generation().unwrap(), 0);
+            assert_eq!(store.cursor().unwrap().as_deref(), Some("kept"));
+            assert_eq!(version(), 12, "it migrates on to the latest schema");
+        }
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a v9 database gains the empty folder sync tables with its
+    // data intact, and reopening changes nothing.
+    #[test]
+    fn migration_0010_from_v9() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(concat!(
+                    include_str!("../migrations/0001_documents.sql"),
+                    include_str!("../migrations/0002_edit_targets.sql"),
+                    include_str!("../migrations/0003_comments.sql"),
+                    include_str!("../migrations/0004_comment_time.sql"),
+                    include_str!("../migrations/0005_edit_identity_index.sql"),
+                    include_str!("../migrations/0006_import_failure.sql"),
+                    include_str!("../migrations/0007_schema_violation.sql"),
+                    include_str!("../migrations/0008_comment_history.sql"),
+                    include_str!("../migrations/0009_format_generation.sql"),
+                ))
+                .unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO comment_history_state(singleton,epoch,revision) VALUES(1,'old',0);
+                     UPDATE metadata SET cursor='kept',format_generation=3 WHERE singleton=1;",
+                )
+                .unwrap();
+            connection.pragma_update(None, "user_version", 9).unwrap();
+        }
+        let version = || -> i64 {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        for round in 0..2 {
+            let store = DocumentStore::open(&path).unwrap();
+            assert_eq!(version(), 12);
+            assert_eq!(store.cursor().unwrap().as_deref(), Some("kept"));
+            assert_eq!(store.format_generation().unwrap(), 3);
+            assert_eq!(store.comment_head().unwrap().0, "old");
+            if round == 0 {
+                assert!(store.folder_mappings().unwrap().is_empty());
+                store
+                    .set_folder_mapping(&store::mappings::FolderMapping {
+                        collection_id: hex(64, 1),
+                        root_path: "/notes".to_owned(),
+                        state: store::mappings::MappingState::Active,
+                        created_at: 1,
+                        recursive: false,
+                    })
+                    .unwrap();
+            } else {
+                assert_eq!(store.folder_mappings().unwrap().len(), 1, "reopen keeps it");
+            }
+            assert!(store.mapped_files(&hex(64, 1)).unwrap().is_empty());
+            assert!(store.refused_files(&hex(64, 1)).unwrap().is_empty());
+        }
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R15 — v10 data gains root placement and stays flat without losing bases.
+    #[test]
+    fn migration_0011_preserves_documents_and_flat_mapping_state() {
+        let f = fixture();
+        let collection = hex(64, 1);
+        let document = hex(64, 2);
+        let create = DomainRecord::document_create(ALICE, &collection, "Notes", genesis()).unwrap();
+        ingest(
+            &f.store,
+            1,
+            ALICE,
+            &DomainRecord::collection_create(ALICE, "Plans").unwrap(),
+        );
+        ingest(&f.store, 2, ALICE, &create);
+        f.store
+            .set_folder_mapping(&store::mappings::FolderMapping {
+                collection_id: collection.clone(),
+                root_path: "/notes".into(),
+                state: store::mappings::MappingState::Active,
+                created_at: 1,
+                recursive: false,
+            })
+            .unwrap();
+        let file = store::mappings::MappedFile {
+            document_id: document.clone(),
+            collection_id: collection.clone(),
+            rel_path: "Notes.md".into(),
+            name_key: "notes.md".into(),
+            base_version: Some("base".into()),
+            written_hash: Some([1; 32]),
+            pending_write_hash: Some([2; 32]),
+            pending_write_version: Some("pending".into()),
+        };
+        f.store.upsert_mapped_file(&file).unwrap();
+        let path = f._directory.path().join("documents.sqlite3");
+        drop(f.store);
+        rusqlite::Connection::open(&path).unwrap().execute_batch(
+            "ALTER TABLE documents DROP COLUMN folder; ALTER TABLE documents DROP COLUMN place_order;
+             ALTER TABLE folder_mappings DROP COLUMN recursive; DROP TABLE file_relocations; PRAGMA user_version=10;"
+        ).unwrap();
+        for _ in 0..2 {
+            let store = DocumentStore::open(&path).unwrap();
+            assert_eq!(store.documents().unwrap()[0].folder, "");
+            assert!(
+                !store
+                    .folder_mapping(&collection)
+                    .unwrap()
+                    .unwrap()
+                    .recursive
+            );
+            assert_eq!(store.mapped_files(&collection).unwrap(), vec![file.clone()]);
+            assert_eq!(
+                store.body_records(Some(&document)).unwrap()[0].sealed_record,
+                b"sealed"
+            );
+            assert_eq!(store.record_count().unwrap(), 2);
+        }
+    }
+
+    // Verifies: TEAM.SYS.DOCS-R05 — a build refuses a database from a newer schema and leaves it
+    // unchanged. A v9 build refuses a v10 database through this same check; only the version
+    // numbers differ, because no v9 build can run in this test.
+    #[test]
+    fn a_newer_schema_is_refused_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("documents.sqlite3");
+        DocumentStore::open(&path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", 13)
+            .unwrap();
+        assert!(matches!(
+            DocumentStore::open(&path),
+            Err(StoreError::UnsupportedSchema)
+        ));
+        let version: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 13);
     }
 
     // Verifies: TEAM.SYS.DOCS-R07 — a thread is its root and every nested reply in creation

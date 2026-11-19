@@ -52,12 +52,66 @@ export type Comments = {
 export type Document = {
   readonly "archived": boolean;
   readonly "collectionId": RecordId;
+  readonly "folder": Folder;
   readonly "id": RecordId;
   readonly "title": string;
 };
 
 export type DocumentRequest = {
   readonly "documentId": RecordId;
+};
+
+export type Folder = string;
+
+export type FolderMapping = {
+  readonly "counts": {
+    readonly "files": number;
+    readonly "refused": number;
+    readonly "subfolders": number;
+  };
+  readonly "gitRoot": string | null;
+  readonly "path": string;
+  readonly "pendingFolderChanges": number;
+  readonly "recursive": boolean;
+  readonly "refused": readonly MappingRefusal[];
+  readonly "state": "active" | "unavailable" | "paused";
+  readonly "subfolders": readonly string[];
+};
+
+export type MappingDraft = {
+  readonly "collectionId"?: RecordId;
+  readonly "name"?: string;
+  readonly "path"?: string;
+};
+
+export type MappingRefusal = {
+  readonly "detail"?: string;
+  readonly "name": string;
+  readonly "reason": "lossy" | "too_large" | "not_utf8" | "schema_violation" | "merge_refused" | "symlink" | "title_too_long" | "name_collision_unresolved" | "invalid_folder" | "unreadable";
+};
+
+export type MappingReport = {
+  readonly "blocked": boolean;
+  readonly "counts": {
+    readonly "files": number;
+    readonly "reformatted": number;
+    readonly "refused": number;
+    readonly "relocations": number;
+    readonly "subfolders": number;
+  };
+  readonly "files": readonly {
+    readonly "bytes": number;
+    readonly "name": string;
+  }[];
+  readonly "gitRoot": string | null;
+  readonly "reformatted": readonly string[];
+  readonly "refused": readonly MappingRefusal[];
+  readonly "relocations": readonly ({
+    readonly "documentId": RecordId;
+    readonly "from": string | null;
+    readonly "to": string;
+  })[];
+  readonly "subfolders": readonly string[];
 };
 
 export type Name = string;
@@ -165,6 +219,7 @@ export type DocumentsContract = {
     readonly "documents.document.archive": { readonly request: DocumentRequest; readonly response: Appended };
     readonly "documents.document.create": { readonly request: {
         readonly "collectionId": RecordId;
+        readonly "folder"?: Folder;
         readonly "title": Title;
       }; readonly response: Appended };
     readonly "documents.document.markdown": { readonly request: {
@@ -182,6 +237,10 @@ export type DocumentsContract = {
         readonly "documentId": RecordId;
       }; readonly response: Appended };
     readonly "documents.document.open": { readonly request: DocumentRequest; readonly response: BodyState };
+    readonly "documents.document.place": { readonly request: {
+        readonly "documentId": RecordId;
+        readonly "folder": Folder;
+      }; readonly response: Appended };
     readonly "documents.document.recover": { readonly request: {
         readonly "documentId": RecordId;
         readonly "requestIds": readonly RequestId[];
@@ -201,6 +260,44 @@ export type DocumentsContract = {
         readonly "update": string;
       }; readonly response: {
         readonly "requestId": RequestId;
+      } };
+    readonly "documents.mapping.clear": { readonly request: CollectionRequest; readonly response: {
+        readonly "cleared": boolean;
+        readonly "collectionId": RecordId;
+      } };
+    readonly "documents.mapping.draft.get": { readonly request: Record<string, never>; readonly response: MappingDraft };
+    readonly "documents.mapping.draft.set": { readonly request: MappingDraft; readonly response: Record<string, never> };
+    readonly "documents.mapping.enable-recursive": { readonly request: {
+        readonly "collectionId": RecordId;
+        readonly "confirmGit"?: boolean;
+        readonly "dryRun"?: boolean;
+      }; readonly response: {
+        readonly "changed": boolean;
+        readonly "collectionId": RecordId;
+        readonly "dryRun": boolean;
+        readonly "recursive": boolean;
+        readonly "report"?: MappingReport;
+      } };
+    readonly "documents.mapping.list": { readonly request: Record<string, never>; readonly response: {
+        readonly "collections": readonly ({
+          readonly "archived": boolean;
+          readonly "collectionId": RecordId;
+          readonly "mapping": FolderMapping | null;
+          readonly "name": string;
+        })[];
+      } };
+    readonly "documents.mapping.set": { readonly request: {
+        readonly "collectionId"?: RecordId;
+        readonly "confirmGit"?: boolean;
+        readonly "dryRun"?: boolean;
+        readonly "newCollectionName"?: Name;
+        readonly "path": string;
+      }; readonly response: {
+        readonly "collectionId": RecordId | null;
+        readonly "direction": "export" | "import" | "unchanged";
+        readonly "dryRun": boolean;
+        readonly "path": string;
+        readonly "report"?: MappingReport;
       } };
     readonly "documents.place.get": { readonly request: Record<string, never>; readonly response: Place };
     readonly "documents.place.set": { readonly request: Place; readonly response: Record<string, never> };

@@ -1,0 +1,3 @@
+ALTER TABLE documents ADD COLUMN folder TEXT NOT NULL DEFAULT '';
+ALTER TABLE documents ADD COLUMN place_order TEXT NOT NULL DEFAULT '';
+ALTER TABLE folder_mappings ADD COLUMN recursive INTEGER NOT NULL DEFAULT 0 CHECK(recursive IN (0,1));

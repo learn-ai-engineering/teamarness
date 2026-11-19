@@ -2,6 +2,8 @@ import type { Collection, Comment, Document } from "./contract.generated";
 import type { DocumentsController } from "./controller";
 import { DocumentEditor, hasBody } from "./editor/view";
 import { renderMarkdown } from "./markdown";
+import { documentFolders, folderAncestors } from "./folders";
+import type { DocumentFolder } from "./folders";
 
 const KIT = {
   primary: "teamarness-control teamarness-control--primary",
@@ -37,9 +39,11 @@ const ICON_PATHS = {
   reply: "M9 17 4 12l5-5 M4 12h10a6 6 0 0 1 6 6v1",
   resolve: "M4 12l5 5L20 6", reopen: "M4 11a8 8 0 1 1 2 6 M4 5v6h6",
   clock: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M12 7v5l3 2",
+  unlink: "M15 7h2a5 5 0 0 1 0 10h-2 M9 17H7A5 5 0 0 1 7 7h2 M12 3v2 M12 19v2",
 } as const;
 
-function icon(name: keyof typeof ICON_PATHS, label: string, onClick: () => void, tooltip = false): HTMLButtonElement {
+/** An icon button: `label` is its accessible name and native title; `tooltip` adds the styled hint. */
+export function icon(name: keyof typeof ICON_PATHS, label: string, onClick: () => void, tooltip = false): HTMLButtonElement {
   const control = button("", "documents-icon", onClick);
   control.setAttribute("aria-label", label);
   control.title = label;
@@ -110,6 +114,7 @@ function inlineForm(options: {
   className: string;
   onSubmit: (value: string) => Promise<boolean>;
   currentDraft?: () => number;
+  frameSafe?: boolean;
 }): { form: HTMLFormElement; input: HTMLInputElement; submit: HTMLButtonElement } {
   const form = document.createElement("form");
   form.className = `${options.className} ${KIT.field}`;
@@ -128,8 +133,9 @@ function inlineForm(options: {
   submit.className = KIT.primary;
   submit.textContent = options.submitLabel;
   form.append(input, submit);
-  form.addEventListener("submit", (event) => {
+  const send = (event: Event): void => {
     event.preventDefault();
+    if (submit.disabled) return;
     const value = input.value.trim();
     if (!value) return;
     if ([...value].length > options.maxLength) {
@@ -142,8 +148,62 @@ function inlineForm(options: {
     void options.onSubmit(value).then((ok) => {
       if (ok && revision === inputRevision && draft === options.currentDraft?.()) input.value = "";
     });
-  });
+  };
+  form.addEventListener("submit", send);
+  if (options.frameSafe) {
+    submit.type = "button";
+    submit.addEventListener("click", send);
+    form.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.isComposing && event.target instanceof HTMLInputElement) send(event);
+    });
+  }
   return { form, input, submit };
+}
+
+/** Ordinary buttons instead of native select popovers, which violate the frame policy in WebKit. */
+function folderChooser(label: string, changed: () => void) {
+  const element = document.createElement("div");
+  element.className = "folder-chooser";
+  const caption = document.createElement("label");
+  caption.textContent = label;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = KIT.input;
+  input.setAttribute("aria-label", label);
+  input.placeholder = "Collection root (empty)";
+  input.addEventListener("input", changed);
+  caption.append(input);
+  const choices = document.createElement("div");
+  choices.className = "folder-choices";
+  choices.hidden = true;
+  choices.setAttribute("role", "group");
+  choices.setAttribute("aria-label", "Existing folders");
+  const choose = button("Choose folder", KIT.secondary, () => {
+    choices.hidden = !choices.hidden;
+    choose.setAttribute("aria-expanded", String(!choices.hidden));
+  });
+  choose.setAttribute("aria-expanded", "false");
+  let previous = "";
+  const refresh = (documents: readonly Document[]) => {
+    const paths = [...new Set(documents.flatMap((d) => folderAncestors(d.folder)))].sort();
+    const key = JSON.stringify(paths);
+    if (key === previous) return;
+    previous = key;
+    const focused = (element.getRootNode() as ShadowRoot).activeElement;
+    const focusedPath = focused instanceof HTMLButtonElement && choices.contains(focused) ? focused.textContent : null;
+    choices.replaceChildren(...["", ...paths].map((path) => button(path || "Collection root", KIT.secondary, () => {
+      input.value = path;
+      changed();
+      choices.hidden = true;
+      choose.setAttribute("aria-expanded", "false");
+      input.focus();
+    })));
+    if (focusedPath !== null) {
+      ([...choices.querySelectorAll("button")].find((b) => b.textContent === focusedPath) ?? choose).focus();
+    }
+  };
+  element.append(caption, choose, choices);
+  return { element, input, refresh };
 }
 
 /**
@@ -158,6 +218,13 @@ export class DocumentsView {
   private readonly collectionList: HTMLUListElement;
   private readonly collectionForm: ReturnType<typeof inlineForm>;
   private readonly documentForm: ReturnType<typeof inlineForm>;
+  private readonly createFolder: ReturnType<typeof folderChooser>;
+  private readonly placementForm: HTMLFormElement;
+  private readonly placementFolder: ReturnType<typeof folderChooser>;
+  private readonly placementCurrent: HTMLElement;
+  private readonly placementSubmit: HTMLButtonElement;
+  private placementDocumentId: string | null = null;
+  private placementRevision = 0;
   private readonly archivedToggle: HTMLButtonElement;
   private readonly editorPane: HTMLElement;
   private readonly editorTitle: HTMLElement;
@@ -189,6 +256,8 @@ export class DocumentsView {
   private replyTo: string | null = null;
   private composerDocumentId: string | null = null;
   private readonly expanded = new Set<string>();
+  private readonly collapsedFolders = new Set<string>();
+  private revealedDocumentLocation: string | null = null;
   private selectedCollectionId: string | null = null;
   private leftOpen = true;
   private commentsOpen = true;
@@ -196,6 +265,7 @@ export class DocumentsView {
   private createGeneration = 0;
   private activeMenu: HTMLElement | null = null;
   private activeMenuButton: HTMLButtonElement | null = null;
+  private readonly menuOpeners = new Map<string, () => void>();
   private renameForm: ReturnType<typeof inlineForm> | null = null;
   private renameTarget: string | null = null;
   private readonly onOutsideClick = (event: Event): void => {
@@ -279,27 +349,60 @@ export class DocumentsView {
         return ok;
       },
     });
+    this.createFolder = folderChooser("New Document folder", () => { this.createGeneration++; });
     this.documentForm = inlineForm({
       label: "New Document title", placeholder: "New Document title", submitLabel: "Create",
-      maxLength: 256, className: "document-create", currentDraft: () => this.createGeneration,
+      maxLength: 256, className: "document-create", currentDraft: () => this.createGeneration, frameSafe: true,
       onSubmit: async (title) => {
         const target = this.createTarget;
         const generation = this.createGeneration;
         if (target === null || target === "collection"
           || target !== controller.state.selectedCollectionId) return false;
-        const ok = await controller.createDocument(title);
+        const ok = await controller.createDocument(title, this.createFolder.input.value);
         if (ok && generation === this.createGeneration && this.createTarget === target) {
+          this.createFolder.input.value = "";
           this.createTarget = null;
           this.render();
         }
         return ok;
       },
     });
+    this.documentForm.form.insertBefore(this.createFolder.element, this.documentForm.submit);
     this.collectionForm.input.addEventListener("input", () => { this.createGeneration++; });
     this.documentForm.input.addEventListener("input", () => { this.createGeneration++; });
     this.collectionForm.form.append(icon("x", "Cancel", () => { this.createGeneration++; this.createTarget = null; this.render(); }));
     this.documentForm.form.append(icon("x", "Cancel", () => { this.createGeneration++; this.createTarget = null; this.render(); }));
-    this.rail.append(railHeader, this.collectionList);
+    this.placementForm = document.createElement("form");
+    this.placementForm.className = "document-placement";
+    this.placementForm.setAttribute("aria-label", "Move Document to folder");
+    this.placementForm.hidden = true;
+    this.placementCurrent = document.createElement("p");
+    this.placementFolder = folderChooser("Destination folder", () => { this.placementRevision++; });
+    const place = (event: Event): void => {
+      event.preventDefault();
+      const documentId = this.placementDocumentId;
+      if (documentId === null || controller.state.busy) return;
+      const revision = this.placementRevision;
+      void controller.placeDocument(documentId, this.placementFolder.input.value).then((ok) => {
+        if (ok && revision === this.placementRevision) {
+          this.placementDocumentId = null;
+          this.render();
+        }
+      });
+    };
+    this.placementSubmit = button("Move", KIT.primary, () => {});
+    this.placementSubmit.addEventListener("click", place);
+    this.placementForm.addEventListener("submit", place);
+    this.placementForm.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.isComposing && event.target instanceof HTMLInputElement) place(event);
+    });
+    this.placementForm.append(this.placementCurrent, this.placementFolder.element, this.placementSubmit,
+      button("Cancel", KIT.secondary, () => {
+        this.placementRevision++;
+        this.placementDocumentId = null;
+        this.render();
+      }));
+    this.rail.append(railHeader, this.collectionList, this.placementForm);
     this.leftHandle = this.resizeHandle("left");
     this.rightHandle = this.resizeHandle("right");
 
@@ -647,8 +750,24 @@ export class DocumentsView {
       if (this.createTarget !== null) this.createGeneration++;
       this.createTarget = null;
       this.documentForm.input.value = "";
+      this.createFolder.input.value = "";
+    }
+    this.createFolder.refresh(this.controller.visibleDocuments);
+    const placing = snapshot.documents.find((d) => d.id === this.placementDocumentId);
+    this.placementForm.hidden = placing === undefined;
+    this.placementSubmit.disabled = busy;
+    if (placing) {
+      this.placementCurrent.textContent = `${placing.title} — Current folder: ${placing.folder || "Collection root"}`;
+      this.placementFolder.refresh(snapshot.documents.filter((d) => d.collectionId === placing.collectionId && (showArchived || !d.archived)));
     }
     this.documentForm.submit.disabled = busy || this.controller.selectedCollection === null;
+    const open = this.controller.openDocument;
+    const location = open ? JSON.stringify([open.id, open.collectionId, open.folder]) : null;
+    if (open && location !== this.revealedDocumentLocation) {
+      this.expanded.add(open.collectionId);
+      for (const path of folderAncestors(open.folder)) this.collapsedFolders.delete(`${open.collectionId}:${path}`);
+    }
+    this.revealedDocumentLocation = location;
     this.renderCollections();
     this.renderEditor();
     this.renderRails();
@@ -779,14 +898,22 @@ export class DocumentsView {
   }
 
   private menu(row: HTMLElement, trigger: HTMLButtonElement, actions: HTMLElement): void {
-    trigger.setAttribute("aria-expanded", "false");
-    trigger.addEventListener("click", () => {
-      if (this.activeMenuButton === trigger) { this.dismissMenu(); return; }
+    const key = trigger.dataset.treeFocus!;
+    actions.querySelectorAll<HTMLButtonElement>("button").forEach((control, index) => {
+      control.dataset.treeFocus ??= `${key}:${index}`;
+    });
+    const open = () => {
       this.dismissMenu();
       row.append(actions);
       this.activeMenu = actions;
       this.activeMenuButton = trigger;
       trigger.setAttribute("aria-expanded", "true");
+    };
+    this.menuOpeners.set(key, open);
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.addEventListener("click", () => {
+      if (this.activeMenuButton === trigger) { this.dismissMenu(); return; }
+      open();
       (actions.querySelector("button") as HTMLButtonElement | null)?.focus();
     });
   }
@@ -825,7 +952,9 @@ export class DocumentsView {
       ?? this.activeMenuButton?.dataset.treeFocus : undefined;
     const selection = inTree && focused instanceof HTMLInputElement
       ? { start: focused.selectionStart, end: focused.selectionEnd } : null;
+    const menuKey = this.activeMenuButton?.dataset.treeFocus;
     this.dismissMenu();
+    this.menuOpeners.clear();
     const selected = this.controller.state.selectedCollectionId;
     const rows = this.controller.visibleCollections.map((collection) => {
       const item = document.createElement("li");
@@ -878,7 +1007,7 @@ export class DocumentsView {
         list.setAttribute("aria-label", `Documents in ${collection.name}`);
         const documents = this.controller.state.snapshot.documents.filter((d) =>
           d.collectionId === collection.id && (this.controller.state.showArchived || !d.archived));
-        list.append(...documents.map((d) => this.documentRow(d, collection)));
+        this.appendFolderContents(list, documentFolders(documents), collection);
         if (!documents.length) {
           const empty = document.createElement("li");
           empty.className = "documents-empty";
@@ -895,6 +1024,7 @@ export class DocumentsView {
       return item;
     });
     this.collectionList.replaceChildren(...rows);
+    if (menuKey) this.menuOpeners.get(menuKey)?.();
     if (this.createTarget === "collection") {
       const create = document.createElement("li");
       create.append(this.collectionForm.form);
@@ -910,6 +1040,33 @@ export class DocumentsView {
         focused.setSelectionRange(selection.start, selection.end);
       }
     }
+  }
+
+  private appendFolderContents(list: HTMLUListElement, folder: DocumentFolder, collection: Collection): void {
+    for (const child of folder.children) {
+      const item = document.createElement("li");
+      item.className = "folder-group";
+      const key = `${collection.id}:${child.path}`;
+      const expanded = !this.collapsedFolders.has(key);
+      const disclosure = button(child.name, "folder-button", () => {
+        if (expanded) this.collapsedFolders.add(key);
+        else this.collapsedFolders.delete(key);
+        this.render();
+      });
+      disclosure.setAttribute("aria-label", `Folder ${child.path}`);
+      disclosure.setAttribute("aria-expanded", String(expanded));
+      disclosure.dataset.treeFocus = `folder:${key}`;
+      item.append(disclosure);
+      if (expanded) {
+        const nested = document.createElement("ul");
+        nested.className = "folder-documents";
+        nested.setAttribute("aria-label", `Documents in folder ${child.path}`);
+        this.appendFolderContents(nested, child, collection);
+        item.append(nested);
+      }
+      list.append(item);
+    }
+    list.append(...folder.documents.map((d) => this.documentRow(d, collection)));
   }
 
   private documentRow(document_: Document, collection: Collection): HTMLLIElement {
@@ -933,7 +1090,18 @@ export class DocumentsView {
     actions.className = "document-actions action-menu";
     actions.setAttribute("role", "group");
     actions.setAttribute("aria-label", `Actions for ${document_.title}`);
-    actions.append(
+    const currentFolder = document.createElement("p");
+    currentFolder.className = "document-current-folder";
+    currentFolder.textContent = `Current folder: ${document_.folder || "Collection root"}`;
+    actions.append(currentFolder,
+      button("Move to folder", KIT.secondary, () => {
+        this.dismissMenu();
+        this.placementRevision++;
+        this.placementDocumentId = document_.id;
+        this.placementFolder.input.value = document_.folder;
+        this.render();
+        this.placementFolder.input.focus();
+      }),
       button("Rename", KIT.secondary, () => this.startRename("document", document_.id, document_.title)),
       button(document_.archived ? "Restore" : "Archive", KIT.secondary, () => {
         this.dismissMenu();
@@ -942,23 +1110,19 @@ export class DocumentsView {
     );
     const destinations = this.controller.state.snapshot.collections.filter((c) => !c.archived && c.id !== collection.id);
     if (destinations.length > 0) {
-      const move = document.createElement("select");
-      move.className = `${KIT.input} document-move`;
-      move.setAttribute("aria-label", `Move ${document_.title} to`);
-      const placeholder = document.createElement("option");
-      placeholder.value = "";
-      placeholder.textContent = "Move to…";
-      move.append(placeholder);
+      const move = document.createElement("fieldset");
+      move.className = "document-move";
+      const heading = document.createElement("legend");
+      heading.textContent = "Move to Collection";
+      move.append(heading);
       for (const destination of destinations) {
-        const option = document.createElement("option");
-        option.value = destination.id;
-        option.textContent = destination.name;
-        move.append(option);
+        const control = button(destination.name, KIT.secondary, () => {
+          this.dismissMenu();
+          void this.controller.moveDocument(document_.id, destination.id);
+        });
+        control.dataset.treeFocus = `document:move:${document_.id}:${destination.id}`;
+        move.append(control);
       }
-      move.addEventListener("change", () => {
-        if (move.value) { this.dismissMenu(); void this.controller.moveDocument(document_.id, move.value); }
-      });
-      move.disabled = this.controller.state.busy;
       actions.append(move);
     }
     for (const control of actions.querySelectorAll("button")) control.disabled = this.controller.state.busy;

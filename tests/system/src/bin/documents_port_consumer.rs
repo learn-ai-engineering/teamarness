@@ -2,6 +2,8 @@
 //! Test-only SDK consumer of Documents Port Contract 1.x: no UI operation and no product
 //! registration. It relays numbered steps the system test writes into its Package Data
 //! Directory (`step-<n>.json`) to the Host broker, and answers each in `answer-<n>.json`.
+//! Requests pass unchanged, including 1.4 folder input; the Provider owns normalization.
+//! Actor identity comes from the Host binding, never from this relay.
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;

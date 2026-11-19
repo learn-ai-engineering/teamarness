@@ -1,5 +1,17 @@
 import { Schema } from "prosemirror-model";
 
+/** The kinds of a `preserved_block`, with the label its frame shows. */
+export const PRESERVED_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  table: "Table · preserved Markdown",
+  front_matter: "Front matter · preserved Markdown",
+  html: "HTML · preserved Markdown",
+});
+
+/** The label of a frame. An unknown kind never reaches the editor: the Backend refuses the tree. */
+export function preservedLabel(kind: unknown): string {
+  return PRESERVED_LABELS[String(kind)] ?? PRESERVED_LABELS.html!;
+}
+
 /**
  * The one body schema that the UI and the Backend share.
  *
@@ -33,6 +45,22 @@ export const schema = new Schema({
       attrs: { params: { default: "" } },
       parseDOM: [{ tag: "pre", preserveWhitespace: "full" }],
       toDOM: () => ["pre", ["code", 0]],
+    },
+    // Source the Backend keeps verbatim. It has no `parseDOM`: the schema never turns Markdown or
+    // HTML into one (R11). Only a clipboard frame comes back as one (`preserved.ts`): a copy inside
+    // the editor, or a frame of a known kind from outside it, which reads the same.
+    // `isolating` keeps a neighbouring block from joining its text.
+    preserved_block: {
+      content: "text*",
+      group: "block",
+      code: true,
+      marks: "",
+      atom: true,
+      isolating: true,
+      selectable: true,
+      draggable: true,
+      attrs: { kind: { default: "html" } },
+      toDOM: (node) => ["figure", { class: "preserved-block", "data-kind": String(node.attrs.kind) }, ["figcaption", preservedLabel(node.attrs.kind)], ["pre", 0]],
     },
     ordered_list: {
       content: "list_item+",

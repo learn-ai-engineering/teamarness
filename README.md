@@ -267,6 +267,18 @@ The runtime refuses a data directory that still holds retired version-1 protecti
 
 The Documents record format changed incompatibly when Document bodies became structured trees (ADR 0032): a `document.create` record now carries a body genesis, and plain-text body records are no longer read. A development data directory that holds Documents from before that change must be reset in the same way. There is no migration, because no released build wrote those records.
 
+## Documents folder mappings and upgrades
+
+Documents Collections support nested folder paths and local two-way Markdown mappings. New mappings include eligible nested lowercase `.md` files after preview and confirmation. Existing mappings stay flat until you select **Enable subfolders** in Documents **Configuration**, review the incremental report, and confirm. Imports are shared with the Workspace. Each Installation consents independently; another Member cannot enable your ignored subfolders. Unmapping leaves files on disk.
+
+Forward migrations 0011 and 0012 preserve Document bodies and file associations but prevent older builds from opening the upgraded local database. Older peers on their own databases still exchange ordinary body edits. They ignore folder placement until upgrade; format generation 2 recovers retained placement without redelivery. This is distinct from the historical incompatible body-format change described above and requires no data reset.
+
+A file move preserves identity only with an unambiguous unchanged-hash match. Moving and editing together, or moving a file across mapped roots, does not guarantee identity. Use **Move to Collection** in the app for an identity-preserving Collection move. Hidden paths, temporary files, and extensions other than lowercase `.md` are excluded; unsafe or unrepresentable folder paths are refused rather than renamed silently.
+
+A missing or unreadable root archives nothing. Deleting the only populated subtree also marks the mapping unavailable and archives nothing. Deleting a safely scanned subtree archives its Documents when eligible files remain elsewhere; restore recreates files and parents. Repeating archive after restore as the same author remains an accepted limitation. Filesystem race limits and other retained debt are documented in [DELTA-023](context/.delta/DELTA-023-preserved-blocks-accepted-tech-debt.md).
+
+Local macOS automation covers recursive sync and the folder controls. Don observed subfolders, filesystem edits across app instances, renames and archives working, and accepted the folders-first alphabetical UI after creating new Documents and folders. The final UI-only change passed all 162 Documents UI tests; Don approved scoped testing and manual acceptance instead of another full validation round. Directory replacement by a regular file and case-only directory moves on case-sensitive storage remain accepted limitations. Broader manual, platform and storage checks are deferred in [DELTA-023 group 12](context/.delta/DELTA-023-preserved-blocks-accepted-tech-debt.md#12-slice-c-accepted-limitations-and-follow-up-checks). See [Document folders](context/.decisions/0043-document-folders.md) for contracts and evidence. This local acceptance is not release qualification.
+
 ## Publish a stable release
 
 A stable release starts when a `vX.Y.Z` tag is pushed. The tag must match the desktop version in the tagged commit, and that commit must be on `main`. Do not sign the commit or the tag. The release workflow signs the update artifacts with the key in the `release` environment.

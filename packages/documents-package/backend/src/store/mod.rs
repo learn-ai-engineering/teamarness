@@ -1,3 +1,4 @@
+pub(crate) mod mappings;
 pub(crate) mod migration;
 pub(crate) mod projection;
 
@@ -6,10 +7,13 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::domain::{DomainRecord, quarantine};
 use projection::WAITING;
+
+/// The quarantine code of a record this build could not decode.
+const MALFORMED: &str = "malformed_record";
 
 pub(crate) type ImportClassifier<'a> =
     dyn Fn(&str, &str, &str, Option<&str>, usize, &[u8]) -> Option<&'static str> + 'a;
@@ -21,6 +25,8 @@ pub enum StoreError {
     Lock,
     UnsupportedSchema,
     UncertainOutcome,
+    /// A write broke a uniqueness rule or named a parent that does not exist.
+    Conflict,
 }
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -61,6 +67,7 @@ pub struct DocumentView {
     /// The Order Key of the create record, which orders the listing.
     pub order_key: String,
     pub collection_id: String,
+    pub folder: String,
     pub archived: bool,
     pub title: Option<String>,
 }
@@ -122,6 +129,18 @@ pub enum IngestResult {
     Quarantined(String),
     IdentityConflict(String),
     ImportFailure(String),
+}
+
+/// What one re-evaluation after a format upgrade did, as counts only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reevaluation {
+    /// Documents released from a `schema_violation` marker. The body open that follows imports
+    /// them again and marks any that still fail.
+    pub reimported: usize,
+    /// `malformed_record` rows that decoded and projected.
+    pub reprojected: usize,
+    /// `malformed_record` rows that did not.
+    pub still_failed: usize,
 }
 
 /// What one ingest committed, plus every body update it made applicable: the record's own
@@ -304,6 +323,120 @@ impl DocumentStore {
             params![document, record_id, category],
         ).map_err(rerr)?;
         Ok(())
+    }
+
+    /// The format generation this Installation last ran under; 0 before any re-evaluation.
+    pub fn format_generation(&self) -> Result<u32, StoreError> {
+        let inner = lock(&self.inner)?;
+        inner
+            .conn
+            .query_row(
+                "SELECT format_generation FROM metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(rerr)
+    }
+
+    /// The rows an older build could not decode, to open before [`Self::reevaluate_after_upgrade`].
+    pub fn malformed_records(&self) -> Result<Vec<StoredRecord>, StoreError> {
+        self.records_where(&format!("quarantine_code='{MALFORMED}'"))
+    }
+
+    /// Re-evaluates, once per generation, what a build older than `current` paused or quarantined.
+    ///
+    /// Run before any body opens, so the ordinary open reimports each released Document from its
+    /// retained rows and marks it again if it still fails. Everything here commits together.
+    ///
+    /// - A `schema_violation` marker is cleared, and the Document's later records that ADR 0029
+    ///   quarantined as `import_failure` are released with it. Other failure categories stay.
+    /// - A `malformed_record` row found in `opened`, by record ID, projects from those canonical
+    ///   bytes in ingestion order. A row absent from `opened`, or that still does not decode,
+    ///   keeps its code. Rehydration then remembers projected names and retries waiting records.
+    ///
+    /// `undecided` means a row cannot be opened yet and could still project, so the generation
+    /// stays behind and the next activation tries again; repeating this is harmless.
+    pub(crate) fn reevaluate_after_upgrade(
+        &self,
+        current: u32,
+        opened: &HashMap<String, Vec<u8>>,
+        undecided: bool,
+    ) -> Result<Reevaluation, StoreError> {
+        let _ingest = self
+            .ingest_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = lock(&self.inner)?;
+        let transaction = inner
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(rerr)?;
+        let stored: u32 = transaction
+            .query_row(
+                "SELECT format_generation FROM metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(rerr)?;
+        if stored >= current {
+            return Ok(Reevaluation::default());
+        }
+        transaction
+            .execute(
+                "UPDATE records SET quarantine_code=NULL WHERE quarantine_code='import_failure' AND target IN (SELECT document_id FROM document_import_failures WHERE category='schema_violation')",
+                [],
+            )
+            .map_err(rerr)?;
+        let reimported = transaction
+            .execute(
+                "DELETE FROM document_import_failures WHERE category='schema_violation'",
+                [],
+            )
+            .map_err(rerr)?;
+        let rows: Vec<(String, String, String)> = {
+            let mut statement = transaction
+                .prepare(&format!(
+                    "SELECT record_id,order_key,author FROM records WHERE quarantine_code='{MALFORMED}' ORDER BY ingestion_ordinal"
+                ))
+                .map_err(rerr)?;
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .map_err(rerr)?
+                .collect::<Result<_, _>>()
+                .map_err(rerr)?
+        };
+        let (mut reprojected, mut still_failed) = (0, 0);
+        for (record_id, order_key, author) in rows {
+            let decoded = opened
+                .get(&record_id)
+                .and_then(|canonical| DomainRecord::decode(canonical).ok());
+            let Some(domain) = decoded else {
+                still_failed += 1;
+                continue;
+            };
+            let outcome =
+                projection::project_domain(&transaction, &record_id, &order_key, &author, &domain)
+                    .map_err(rerr)?;
+            if matches!(outcome.result, IngestResult::Quarantined(_)) {
+                still_failed += 1;
+            } else {
+                reprojected += 1;
+            }
+        }
+        if !undecided {
+            transaction
+                .execute(
+                    "UPDATE metadata SET format_generation=?1 WHERE singleton=1",
+                    [current],
+                )
+                .map_err(rerr)?;
+        }
+        transaction.commit().map_err(rerr)?;
+        Ok(Reevaluation {
+            reimported,
+            reprojected,
+            still_failed,
+        })
     }
 
     pub fn conflicted_documents(&self) -> Result<Vec<String>, StoreError> {
@@ -655,9 +788,9 @@ impl DocumentStore {
                 outcome
             }
             Err(_) => {
-                quarantine(&transaction, record_id, "malformed_record").map_err(rerr)?;
+                quarantine(&transaction, record_id, MALFORMED).map_err(rerr)?;
                 projection::ProjectionOutcome {
-                    result: IngestResult::Quarantined("malformed_record".into()),
+                    result: IngestResult::Quarantined(MALFORMED.into()),
                     ..projection::ProjectionOutcome::applied()
                 }
             }
@@ -928,7 +1061,7 @@ impl DocumentStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Ok(domain) = DomainRecord::decode(canonical) else {
             return Ok(Ingested {
-                result: IngestResult::Quarantined("malformed_record".into()),
+                result: IngestResult::Quarantined(MALFORMED.into()),
                 edits: Vec::new(),
             });
         };
@@ -1233,7 +1366,7 @@ impl DocumentStore {
         let inner = lock(&self.inner)?;
         let mut statement = inner
             .conn
-            .prepare("SELECT document_id,creator,collection_id,archived,create_order FROM documents ORDER BY create_order,document_id")
+            .prepare("SELECT document_id,creator,collection_id,archived,create_order,folder FROM documents ORDER BY create_order,document_id")
             .map_err(rerr)?;
         let rows = statement
             .query_map([], |row| {
@@ -1243,17 +1376,19 @@ impl DocumentStore {
                     row.get::<_, String>(2)?,
                     row.get::<_, bool>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })
             .map_err(rerr)?;
         rows.map(|row| {
             row.map(
-                |(id, creator, collection_id, archived, order_key)| DocumentView {
+                |(id, creator, collection_id, archived, order_key, folder)| DocumentView {
                     title: inner.texts.get(&id).map(|(_, text)| text.clone()),
                     id,
                     creator,
                     order_key,
                     collection_id,
+                    folder,
                     archived,
                 },
             )
