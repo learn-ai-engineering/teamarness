@@ -131,7 +131,7 @@ previous mount fields or requiring older UIs to adopt it. The Shell SHALL offer 
 main mount with its own declared settings destination available. It SHALL carry no target
 selector and SHALL add no Backend operation, Tauri command or Semantic Capability. A settings
 mount and an unavailable context SHALL omit it. The intent SHALL not return a promise that
-outlives destruction of its own frame (ADRs 0015, 0037, 0043).
+outlives destruction of its own frame (ADRs 0015, 0037, 0046).
 
 
 **Onboarding qualification (not installed acceptance):** The explicit paired runner
