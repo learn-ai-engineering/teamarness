@@ -41,6 +41,10 @@ fn valid_package() -> TempDir {
 }
 
 fn write_manifest(temp: &TempDir, patch: serde_json::Value) {
+    write_manifest_for_target(temp, patch, "aarch64-apple-darwin");
+}
+
+fn write_manifest_for_target(temp: &TempDir, patch: serde_json::Value, target: &str) {
     let backend = fs::read(temp.path().join("backend/package")).unwrap();
     let entrypoint = fs::read(temp.path().join("ui/index.js")).unwrap();
     let asset = fs::read(temp.path().join("ui/icon.svg")).unwrap();
@@ -52,7 +56,7 @@ fn write_manifest(temp: &TempDir, patch: serde_json::Value) {
         "presentation": { "displayName": "Reference" },
         "protocol": { "major": 1, "minMinor": 0, "maxMinor": 0 },
         "backends": [{
-            "target": "aarch64-apple-darwin",
+            "target": target,
             "path": "backend/package",
             "size": backend.len(),
             "sha256": digest(&backend)
@@ -546,9 +550,10 @@ async fn authoring_catalog_is_static_complete_and_absent_from_ui_snapshot() {
     document["contracts"][0]["ports"][0]["request"] = serde_json::json!({"$ref":"#/$defs/message"});
     let bytes = serde_json::to_vec(&document).unwrap();
     fs::write(temp.path().join("ports.json"), &bytes).unwrap();
-    write_manifest(
+    write_manifest_for_target(
         &temp,
         serde_json::json!({"portContract":{"path":"ports.json","sha256":digest(&bytes)},"consumedPorts":[{"identity":"dev.example.conversations","major":1,"minMinor":0,"maxMinor":1,"required":false,"ports":[{"name":"conversation.list","kind":"query"}]}]}),
+        teamarness_package_host::NATIVE_BACKEND_TARGET,
     );
     fs::rename(temp.path(), application.join("one")).unwrap();
     let index = application.join("application-packages.v1.json");
@@ -636,7 +641,7 @@ async fn open_catalog(
     fs::create_dir(&application).unwrap();
     fs::create_dir(&private).unwrap();
     let temp = valid_package();
-    write_manifest(&temp, patch);
+    write_manifest_for_target(&temp, patch, teamarness_package_host::NATIVE_BACKEND_TARGET);
     fs::rename(temp.path(), application.join("one")).unwrap();
     let index = application.join("application-packages.v1.json");
     fs::write(

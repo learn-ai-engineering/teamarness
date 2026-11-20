@@ -1,3 +1,5 @@
+mod build_profile;
+
 const COMMANDS: &[&str] = &[
     "installation_details",
     "list_workspaces",
@@ -43,8 +45,10 @@ fn production_release_inputs() {
     const ENDPOINT: &str =
         "https://github.com/learn-ai-engineering/teamarness/releases/latest/download/latest.json";
     println!("cargo:rerun-if-env-changed=TAURI_CONFIG");
-    let production = std::env::var_os("CARGO_FEATURE_PRODUCTION_RELEASE").is_some()
-        && std::env::var("DEBUG").as_deref() == Ok("false");
+    let production = build_profile::production_release(
+        std::env::var_os("CARGO_FEATURE_PRODUCTION_RELEASE").is_some(),
+        std::env::var("PROFILE").ok().as_deref(),
+    );
     println!("cargo:rustc-env=TEAMARNESS_PRODUCTION_RELEASE={production}");
     if !production {
         return;
