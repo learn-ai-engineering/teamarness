@@ -31,9 +31,9 @@ test("manual fixture preparation builds current native bytes, shares the tested 
     const paths = current.stdout.split("\n").map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(row => row?.reason === "compiler-artifact" && row.executable).map(row => row.executable);
     assert.ok(paths.length >= 6, "source-current integration fixtures reported");
     const before = await Promise.all(paths.map(async path => hash(await readFile(path))));
-    // Cargo test injects package metadata into its child environment. A nested build must
-    // not feed that metadata back into ring's rerun-if-env-changed inputs.
-    const prepared = spawnSync(process.execPath, ["scripts/prepare-headless-fixture.mjs", directory], { encoding: "utf8", env: { ...process.env, CARGO_MANIFEST_DIR: join(process.cwd(), "tests/system"), CARGO_PKG_NAME: "teamarness-system-tests", CARGO_PKG_VERSION_MAJOR: "0", CARGO_PKG_VERSION_MINOR: "1", CARGO_PKG_VERSION_PATCH: "0", CARGO_PKG_VERSION_PRE: "" } });
+    // Conflicting ambient rustup selection and injected Cargo-test metadata must not
+    // select a different compiler or replace any live Cargo-owned fixture.
+    const prepared = spawnSync(process.execPath, ["scripts/prepare-headless-fixture.mjs", directory], { encoding: "utf8", env: { ...process.env, RUSTUP_TOOLCHAIN: "stable", RUSTC: "rustc", CARGO_MANIFEST_DIR: join(process.cwd(), "tests/system"), CARGO_PKG_NAME: "teamarness-system-tests", CARGO_PKG_VERSION_MAJOR: "0", CARGO_PKG_VERSION_MINOR: "1", CARGO_PKG_VERSION_PATCH: "0", CARGO_PKG_VERSION_PRE: "" } });
     assert.equal(prepared.status, 0, prepared.stderr);
     const manifest = JSON.parse(await readFile(join(directory, "teamarness.package.json"), "utf8"));
     assert.deepEqual(await Promise.all(paths.map(async path => hash(await readFile(path)))), before, "manual preparation must not replace integration-test executables with a different Cargo feature graph or inherited Cargo-test metadata");

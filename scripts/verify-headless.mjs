@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { repositoryRoot } from "./bundled-packages.mjs";
+import { cargoFixtureEnvironment } from "./cargo-fixture.mjs";
 
 export const targets = {
   headless_mesh: ["sync_only_two_headless_and_desktop_backends_cover_two_workspaces_offline_restart_and_late_join"],
@@ -32,7 +33,7 @@ export function shellBlocks(markdown) { return [...markdown.matchAll(/```sh\n([\
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 function run(command, args, { printOutput = true } = {}) {
   console.log(`> ${command} ${args.join(" ")}`);
-  const result = spawnSync(command, args, { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 128 * 1024 * 1024, env: { ...process.env, NO_COLOR: "1" } });
+  const result = spawnSync(command, args, { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 128 * 1024 * 1024, env: { ...cargoFixtureEnvironment(), NO_COLOR: "1" } });
   if (printOutput || result.status !== 0) process.stdout.write(result.stdout ?? "");
   process.stderr.write(result.stderr ?? "");
   console.log(`command exit: ${result.status ?? "not-started"}`);

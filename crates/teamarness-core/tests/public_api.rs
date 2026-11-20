@@ -1,12 +1,48 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use teamarness_core::{CoreRuntime, CoreRuntimeConfig, PublicIdentity};
 
+#[path = "../../../tests/support/cargo_fixture.rs"]
+mod cargo_fixture;
+
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+// Cargo must prune unrelated workspace roots from a copied lock before --locked
+// checking the isolated consumer. Only the consumer itself may be newly resolved.
+fn locked_package_headers(lock: &str) -> Vec<&str> {
+    lock.split("\n[[package]]\n")
+        .skip(1)
+        .map(|package| package.split("\ndependencies = [").next().unwrap().trim())
+        .collect()
+}
+
+fn assert_locked_closure(repository_lock: &str, fixture_lock: &str, consumer: &str) {
+    let locked = locked_package_headers(repository_lock);
+    let consumer = format!("name = {consumer:?}\nversion = \"0.0.0\"");
+    for package in locked_package_headers(fixture_lock) {
+        assert!(
+            package == consumer || locked.contains(&package),
+            "isolated fixture selected a dependency outside the repository lock:\n{package}"
+        );
+    }
+}
+
+#[test]
+fn isolated_lock_refuses_dependency_version_or_checksum_drift() {
+    let locked = "version = 4\n\n[[package]]\nname = \"zerocopy-derive\"\nversion = \"0.8.57\"\nsource = \"registry+proof\"\nchecksum = \"locked\"\n";
+    assert_locked_closure(locked, locked, "consumer");
+    for drift in [
+        locked.replace("0.8.57", "0.8.63"),
+        locked.replace("locked", "changed"),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| assert_locked_closure(locked, &drift, "consumer")).is_err()
+        );
+    }
+}
 
 fn temporary_directory() -> PathBuf {
     let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
@@ -31,11 +67,33 @@ fn compile_fails(fixture: &Path, expected_marker: &str, shared_target: &Path) {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO"))
+    let repository = core_directory.join("../..");
+    let repository_lock = fs::read_to_string(repository.join("Cargo.lock")).unwrap();
+    let consumer = format!("teamarness-core-ui-{fixture_name}");
+    fs::write(
+        crate_directory.join("Cargo.lock"),
+        format!("{repository_lock}\n[[package]]\nname = {consumer:?}\nversion = \"0.0.0\"\ndependencies = [\"teamarness-core\"]\n"),
+    )
+    .unwrap();
+    let pruned = cargo_fixture::command(&repository)
+        .args(["update", "--offline", "--workspace", "--manifest-path"])
+        .arg(crate_directory.join("Cargo.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        pruned.status.success(),
+        "{}",
+        cargo_fixture::diagnostics(&pruned)
+    );
+    let fixture_lock = fs::read_to_string(crate_directory.join("Cargo.lock")).unwrap();
+    assert_locked_closure(&repository_lock, &fixture_lock, &consumer);
+
+    let output = cargo_fixture::command(&repository)
         .args([
             "check",
             "--quiet",
             "--offline",
+            "--locked",
             "--manifest-path",
             crate_directory
                 .join("Cargo.toml")
@@ -46,6 +104,10 @@ fn compile_fails(fixture: &Path, expected_marker: &str, shared_target: &Path) {
         ])
         .output()
         .unwrap();
+    assert_eq!(
+        fixture_lock,
+        fs::read_to_string(crate_directory.join("Cargo.lock")).unwrap()
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
@@ -58,6 +120,7 @@ fn compile_fails(fixture: &Path, expected_marker: &str, shared_target: &Path) {
         fixture.display()
     );
 
+    eprintln!("public boundary refusal executed: {fixture_name} ({expected_marker})");
     fs::remove_dir_all(crate_directory).unwrap();
 }
 

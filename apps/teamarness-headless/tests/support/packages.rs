@@ -4,6 +4,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+#[path = "../../../../tests/support/cargo_fixture.rs"]
+mod cargo_fixture;
+
 pub const PERSONAL: &str = "org.unfamiliar.headless-proof";
 pub const TEAM: &str = "org.unfamiliar.team-proof";
 
@@ -19,8 +22,7 @@ pub fn executable() -> &'static Path {
     EXECUTABLE.get_or_init(|| {
         // Cargo rebuilds this source-owned test bin before returning its machine-readable path.
         // Never select an existing target/debug artifact merely because it happens to exist.
-        let output = std::process::Command::new(env!("CARGO"))
-            .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        let output = cargo_fixture::command(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
             .args([
                 "build",
                 "-p",
@@ -35,7 +37,7 @@ pub fn executable() -> &'static Path {
         assert!(
             output.status.success(),
             "{}",
-            String::from_utf8_lossy(&output.stderr)
+            cargo_fixture::diagnostics(&output)
         );
         String::from_utf8(output.stdout)
             .unwrap()

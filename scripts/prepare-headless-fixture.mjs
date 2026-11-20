@@ -7,17 +7,15 @@ import { repositoryRoot } from "./bundled-packages.mjs";
 import { nativeBackendTarget } from "./package-directory.mjs";
 import { fileURLToPath } from "node:url";
 import { qualificationCommands } from "./verify-headless.mjs";
+import { cargoFixtureEnvironment } from "./cargo-fixture.mjs";
 
 export async function prepareFixture(directory) {
   // A new explicit directory only. Never overwrite an existing Package or profile.
   await mkdir(directory, { mode: 0o700 });
   const [command, args] = qualificationCommands()[0];
-  const env = { ...process.env };
-  // Cargo test injects its own Package metadata. ring tracks these variables as
-  // build inputs; passing them into nested Cargo recompiles/replaces live fixtures.
-  for (const key of Object.keys(env)) if (key === "CARGO_MANIFEST_DIR" || key.startsWith("CARGO_PKG_")) delete env[key];
+  const env = cargoFixtureEnvironment();
   const build = spawnSync(command, args, { cwd: repositoryRoot, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
-  if (build.error || build.status !== 0) throw new Error(`source fixture build failed: ${build.stderr ?? build.error}`);
+  if (build.error || build.status !== 0) throw new Error(`source fixture build failed (${build.status ?? build.error}):\nstdout:\n${build.stdout ?? ""}\nstderr:\n${build.stderr ?? ""}`);
   const binary = build.stdout.split("\n").map(line => { try { return JSON.parse(line); } catch { return null; } }).find(row => row?.target?.name === "headless-personal-fixture" && row.executable)?.executable;
   if (!binary) throw new Error("Cargo did not report the source-current fixture");
   return writeFixture(directory, await readFile(binary));
