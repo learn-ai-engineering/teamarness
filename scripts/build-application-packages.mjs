@@ -11,7 +11,7 @@ import {
   serializeJson,
 } from "./bundled-packages.mjs";
 import { buildPackage } from "./build-package.mjs";
-import { adhocSignBackend, compareDeclaredPackageBytes, copyPackageDirectory } from "./package-directory.mjs";
+import { adhocSignBackend, compareDeclaredPackageBytes, copyPackageDirectory, nativeBackendTarget, requireNativeBackendTarget, validateBackendTarget } from "./package-directory.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 export const repositoryRoot = resolve(dirname(scriptPath), "..");
@@ -22,9 +22,16 @@ export async function buildApplicationPackages({
   skipUiBuild = false,
   backendPaths = {},
   release = false,
+  target = nativeBackendTarget(),
+  outputRoot: selectedOutputRoot,
 } = {}) {
+  validateBackendTarget(target);
+  if (!skipBuilds) requireNativeBackendTarget(target);
+  if (!selectedOutputRoot && target !== "aarch64-apple-darwin") {
+    throw new Error("Non-desktop Package assembly requires an explicit outputRoot");
+  }
   const packages = await readBundledPackages(root);
-  const outputRoot = join(root, STAGING_ROOT);
+  const outputRoot = selectedOutputRoot ? resolve(selectedOutputRoot) : join(root, STAGING_ROOT);
   await rm(outputRoot, { recursive: true, force: true });
   await mkdir(outputRoot, { recursive: true, mode: 0o700 });
   const directories = [];
@@ -38,12 +45,15 @@ export async function buildApplicationPackages({
       outputDirectory: join(outputRoot, identity),
       skipBuilds,
       skipUiBuild,
-      backendSigner: release ? adhocSignBackend : undefined,
+      target,
+      backendSigner: release && target === "aarch64-apple-darwin" ? adhocSignBackend : undefined,
     }));
   }
-  const indexPath = join(root, APPLICATION_INDEX_PATH);
+  const indexPath = selectedOutputRoot ? join(outputRoot, "application-packages.v1.json") : join(root, APPLICATION_INDEX_PATH);
   const index = serializeJson(applicationIndexDocument(packages));
   await replaceFile(indexPath, index);
+
+  if (selectedOutputRoot) return { indexPath, directories };
 
   const debugRoot = join(root, "target/debug/packages");
   await rm(debugRoot, { recursive: true, force: true });

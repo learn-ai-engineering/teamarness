@@ -33,7 +33,7 @@ test("application builder stages every bundled Package and writes one complete i
     const backendPaths = {};
     for (const entry of bundled) backendPaths[entry.identity] = await packageFixture(root, entry);
 
-    const result = await buildApplicationPackages({ repositoryRoot: root, skipBuilds: true, skipUiBuild: true, backendPaths });
+    const result = await buildApplicationPackages({ repositoryRoot: root, target: "aarch64-apple-darwin", skipBuilds: true, skipUiBuild: true, backendPaths });
 
     assert.equal(
       await readFile(result.indexPath, "utf8"),
@@ -47,4 +47,28 @@ test("application builder stages every bundled Package and writes one complete i
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("explicit resource roots isolate target output and Linux release never codesigns", async () => {
+  const root = await mkdtemp(join(tmpdir(), "teamarness-application-native-"));
+  try {
+    const bundled = await readBundledPackages(repositoryRoot);
+    await mkdir(join(root, "packages"), { recursive: true });
+    await copyFile(join(repositoryRoot, BUNDLED_PACKAGES_PATH), join(root, BUNDLED_PACKAGES_PATH));
+    await writeFile(join(root, "packages/application-packages.v1.json"), "source index preserved");
+    const backendPaths = {};
+    for (const entry of bundled) backendPaths[entry.identity] = await packageFixture(root, entry);
+    const desktop = await buildApplicationPackages({ repositoryRoot: root, target: "aarch64-apple-darwin", skipBuilds: true, skipUiBuild: true, backendPaths });
+    const original = await readFile(join(desktop.directories[0], "teamarness.package.json"));
+    const outputRoot = join(root, "headless/linux/packages");
+    const result = await buildApplicationPackages({ repositoryRoot: root, outputRoot, target: "x86_64-unknown-linux-gnu",
+      skipBuilds: true, skipUiBuild: true, backendPaths, release: true });
+    assert.equal(result.indexPath, join(outputRoot, "application-packages.v1.json"));
+    assert.equal(result.directories[0], join(outputRoot, bundled[0].identity));
+    assert.equal(JSON.parse(await readFile(join(result.directories[0], "teamarness.package.json"))).backends[0].target, "x86_64-unknown-linux-gnu");
+    assert.deepEqual(await readFile(join(desktop.directories[0], "teamarness.package.json")), original);
+    assert.deepEqual(await readFile(join(root, "target/debug/packages", bundled[0].identity, "teamarness.package.json")), original);
+    await assert.rejects(buildApplicationPackages({ repositoryRoot: root, outputRoot, target: "unsupported", skipBuilds: true }), /Unsupported Backend target/);
+    assert.equal(JSON.parse(await readFile(result.indexPath)).packages.length, bundled.length);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

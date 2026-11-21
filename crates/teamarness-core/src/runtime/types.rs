@@ -18,6 +18,7 @@ use crate::error::{IdentityError, ValueParseError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreRuntimeConfig {
     private_data_directory: PathBuf,
+    pub(super) exclusive_application_ownership: bool,
     /// Tests bound a session far below production so a bound is reached in a
     /// few records instead of a few thousand.
     #[cfg(test)]
@@ -30,9 +31,18 @@ impl CoreRuntimeConfig {
     pub fn new(private_data_directory: impl Into<PathBuf>) -> Self {
         Self {
             private_data_directory: private_data_directory.into(),
+            exclusive_application_ownership: false,
             #[cfg(test)]
             session_limits: crate::synchronization::limits::SessionLimits::CURRENT,
         }
+    }
+
+    /// Requires sole application ownership before storage recovery or networking.
+    /// Library callers remain nonexclusive unless they explicitly opt in.
+    #[must_use]
+    pub fn with_exclusive_application_ownership(mut self) -> Self {
+        self.exclusive_application_ownership = true;
+        self
     }
 
     /// Returns the private data directory owned by the runtime.

@@ -271,7 +271,7 @@ pub struct PackageHostConfig {
 }
 
 impl PackageHostConfig {
-    /// Creates a configuration for the supported Apple silicon target.
+    /// Creates a configuration for this compiled Host target.
     #[must_use]
     pub fn new(
         application_root: impl Into<PathBuf>,
@@ -284,7 +284,7 @@ impl PackageHostConfig {
             application_index: application_index.into(),
             private_data_directory: private_data_directory.into(),
             installation_public_identity,
-            target: "aarch64-apple-darwin".to_owned(),
+            target: crate::NATIVE_BACKEND_TARGET.to_owned(),
             capability_call_timeout: protocol::ProtocolLimits::CURRENT.capability_call,
         }
     }

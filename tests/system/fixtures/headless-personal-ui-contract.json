@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "settings": {"type":"object","properties":{"value":{"type":"string","maxLength":262132}},"required":["value"],"additionalProperties":false},
+    "unused": {"type":"string","description":"complete definitions retained"}
+  },
+  "requests": {
+    "proof.settings.get": {"request":{"type":"object","additionalProperties":false},"response":{"$ref":"#/$defs/settings"}},
+    "proof.settings.set": {"request":{"$ref":"#/$defs/settings"},"response":{"$ref":"#/$defs/settings"}},
+    "proof.status": {"request":{"type":"object","additionalProperties":false},"response":{"type":"object"}},
+    "proof.secret": {"request":{"type":"object","additionalProperties":false},"response":{"type":"object","required":["secret"],"additionalProperties":false,"properties":{"secret":{"type":["string","null"],"maxLength":64}}}},
+    "proof.error": {"request":{"type":"object","additionalProperties":false},"response":{"type":"object"}},
+    "proof.invalid": {"request":{"type":"object","additionalProperties":false},"response":{"type":"object","properties":{"value":{"type":"string","maxLength":262132}},"required":["value"],"additionalProperties":false}},
+    "proof.mutate": {"request":{"type":"object","additionalProperties":false,"required":["delayMs"],"properties":{"delayMs":{"type":"integer","minimum":0,"maximum":5000}}},"response":{"type":"object"}},
+    "proof.binding.current": {"request":{"type":"object","additionalProperties":false},"response":{"type":"object"}},
+    "proof.binding.clear": {"request":{"type":"object","additionalProperties":false},"response":{"type":"object"}},
+    "proof.binding.set": {"request":{"type":"object","additionalProperties":false,"required":["principalId"],"properties":{"principalId":{"type":"string","pattern":"^[a-f0-9]{64}$"}}},"response":{"type":"object"}}
+  },
+  "subscriptions": {"proof.watch":{"request":{"type":"object","additionalProperties":false},"event":{"$ref":"#/$defs/settings"}}}
+}

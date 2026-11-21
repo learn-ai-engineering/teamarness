@@ -57,3 +57,33 @@ test("staging records every declared byte and copies a byte-identical local Pack
   await writeFile(join(local, "ui/index.js"), "changed");
   await assert.rejects(compareDeclaredPackageBytes(output, local), /byte mismatch/);
 });
+
+test("staging selects exactly one target and hashes signed final bytes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "teamarness-package-target-"));
+  const manifestPath = join(root, "source.json");
+  const backendPath = join(root, "backend-input");
+  const ui = join(root, "ui.js");
+  const contract = join(root, "contract.json");
+  await writeFile(backendPath, "unsigned");
+  await writeFile(ui, "export {};");
+  await writeFile(contract, "{}");
+  await writeFile(manifestPath, JSON.stringify({ backends: [
+    { target: "x86_64-unknown-linux-gnu", path: "backend/linux", size: 0, sha256: "0".repeat(64) },
+    { target: "aarch64-apple-darwin", path: "backend/mac", size: 0, sha256: "0".repeat(64) },
+  ], ui: { entrypoint: { path: "ui/index.js" }, assets: [], contract: { path: "ui/contract.json" } } }));
+  const outputDirectory = join(root, "out");
+  const options = { manifestPath, backendPath, contractPath: contract, uiEntrypointPath: ui, outputDirectory };
+  const result = await stagePackageDirectory({ ...options, target: "aarch64-apple-darwin",
+    backendSigner: async (path) => { assert.equal(path.split("/").at(-1), "mac"); await writeFile(path, "signed"); } });
+  assert.equal(result.backends.length, 1);
+  assert.equal(result.backends[0].path, "backend/mac");
+  assert.equal(await readFile(join(outputDirectory, "backend/mac"), "utf8"), "signed");
+  await verifyPackageDirectory(outputDirectory);
+  assert.equal(await readFile(backendPath, "utf8"), "unsigned");
+  await assert.rejects(stagePackageDirectory({ ...options, target: "x86_64-unknown-linux-gnu", backendSigner: () => assert.fail("Linux must not sign") }), /only supported for macOS/);
+  const duplicate = JSON.parse(await readFile(manifestPath));
+  duplicate.backends.push(duplicate.backends[0]);
+  await writeFile(manifestPath, JSON.stringify(duplicate));
+  await assert.rejects(stagePackageDirectory({ ...options, target: "x86_64-unknown-linux-gnu" }), /Duplicate Backend target/);
+
+});

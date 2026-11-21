@@ -11,5 +11,6 @@ mod membership_replication;
 mod order_keys;
 mod record_delivery;
 mod recovery;
+mod shutdown_work;
 mod sync_authorization;
 mod sync_bounds;

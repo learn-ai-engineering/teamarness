@@ -120,6 +120,8 @@ fn watch_root(
 struct Catalog {
     /// Mapped Collection → (root path, recursive).
     mappings: HashMap<String, (String, bool)>,
+    /// Archive Order Keys keep a completed archive/restore cycle observable between reads.
+    state_orders: HashMap<String, String>,
     /// Collection → archived.
     collections: HashMap<String, bool>,
     /// Document → (Collection, title, archived, folder).
@@ -163,6 +165,9 @@ impl Catalog {
             .collect();
         Ok(Self {
             mappings,
+            state_orders: store
+                .folder_sync_state_orders()
+                .map_err(|_| storage_failed())?,
             collections,
             documents,
         })
@@ -175,6 +180,7 @@ impl Catalog {
         for (collection, root) in &next.mappings {
             if self.mappings.get(collection) != Some(root)
                 || self.collections.get(collection) != next.collections.get(collection)
+                || self.state_orders.get(collection) != next.state_orders.get(collection)
             {
                 folders.insert(collection.clone());
             }
@@ -182,7 +188,10 @@ impl Catalog {
         let documents = next
             .documents
             .iter()
-            .filter(|(id, now)| self.documents.get(*id) != Some(*now))
+            .filter(|(id, now)| {
+                self.documents.get(*id) != Some(*now)
+                    || self.state_orders.get(*id) != next.state_orders.get(*id)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         (folders, documents)
@@ -502,6 +511,118 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
+    // Verifies: TEAM.SYS.DOCS-R14, TEAM.SYS.DOCS-R15.
+    #[tokio::test]
+    async fn restore_after_folder_pass_recreates_parents_when_catalog_changes_coalesce() {
+        let data = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        std::fs::create_dir_all(root.join("Nested/deep")).unwrap();
+        std::fs::write(root.join("Nested/deep/Note.md"), "Nested.\n").unwrap();
+        std::fs::write(root.join("Sentinel.md"), "Keep.\n").unwrap();
+        let mut session =
+            crate::backend::tests::start_without_folder_sync(data.path(), remembering_log()).await;
+        qualify_empty_history(&session).await;
+        let collection = request(
+            &mut session,
+            "documents.collection.create",
+            json!({"name":"Plans"}),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .handles
+            .store
+            .set_folder_mapping(&crate::store::mappings::FolderMapping {
+                collection_id: collection.clone(),
+                root_path: root.to_str().unwrap().to_owned(),
+                state: crate::store::mappings::MappingState::Active,
+                created_at: 1,
+                recursive: true,
+            })
+            .unwrap();
+        let sync = FolderSync::new(
+            &session.handles.log,
+            &session.handles.hub,
+            &session.handles.changes,
+            crate::backend::tests::ALICE.to_owned(),
+            CancellationToken::new(),
+        );
+        sync.reconcile_folder(&collection).await.unwrap();
+        let document = session
+            .handles
+            .store
+            .documents()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.title.as_deref() == Some("Note"))
+            .unwrap()
+            .id;
+        let mut worker = Loop {
+            sync,
+            store: session.handles.store.clone(),
+            cancellation: CancellationToken::new(),
+            slot: Arc::new(Mutex::new(None)),
+            watches: HashMap::new(),
+            catalog: Catalog::read(&session.handles.store).unwrap(),
+        };
+        assert!(
+            worker
+                .pass(Pending {
+                    catalog: true,
+                    ..Pending::default()
+                })
+                .await
+                .is_none()
+        );
+        std::fs::remove_dir_all(root.join("Nested")).unwrap();
+        // This is the actual folder pass that archives the missing subtree. The catalog was
+        // read before reconciliation; a restore may arrive before the next catalog read.
+        assert!(
+            worker
+                .pass(Pending {
+                    folders: HashSet::from([collection]),
+                    ..Pending::default()
+                })
+                .await
+                .is_none()
+        );
+        assert!(
+            session
+                .handles
+                .store
+                .documents()
+                .unwrap()
+                .iter()
+                .find(|d| d.id == document)
+                .unwrap()
+                .archived
+        );
+        request(
+            &mut session,
+            "documents.document.restore",
+            json!({"documentId":document}),
+        )
+        .await;
+        assert!(
+            worker
+                .pass(Pending {
+                    catalog: true,
+                    ..Pending::default()
+                })
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Nested/deep/Note.md")).unwrap(),
+            "Nested.\n"
+        );
+        drop(worker);
+        session.harness.shutdown().await.unwrap();
+    }
+
     fn titled(session: &Session, title: &str) -> bool {
         session
             .handles
@@ -737,6 +858,7 @@ mod tests {
     #[test]
     fn catalog_changes_name_what_folder_sync_must_act_on() {
         let before = Catalog {
+            state_orders: HashMap::new(),
             mappings: HashMap::from([("c".into(), ("/a".into(), false))]),
             collections: HashMap::from([("c".into(), false), ("d".into(), false)]),
             documents: HashMap::from([
@@ -751,6 +873,7 @@ mod tests {
             ]),
         };
         let same = Catalog {
+            state_orders: before.state_orders.clone(),
             mappings: before.mappings.clone(),
             collections: before.collections.clone(),
             documents: before.documents.clone(),
@@ -759,6 +882,7 @@ mod tests {
         assert!(folders.is_empty() && documents.is_empty());
 
         let after = Catalog {
+            state_orders: HashMap::new(),
             mappings: HashMap::from([
                 ("c".into(), ("/a".into(), true)),
                 ("d".into(), ("/b".into(), false)),

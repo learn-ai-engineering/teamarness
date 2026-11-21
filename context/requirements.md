@@ -24,7 +24,7 @@ Revoking a member SHALL end their current membership interval. Every committed m
 
 ## TEAM-R06 — Package Model
 
-All product-domain capability SHALL live in Packages. Host-level Workspace controls SHALL remain in the Shell. A Package SHALL own its domain model, records, schemas, projections, policy, UI, and Package-specific membership.
+All product-domain capability SHALL live in Packages. Host-level Workspace controls SHALL remain in the application interfaces, not Packages (ADR 0047). A Package SHALL own its domain model, records, schemas, projections, policy, UI, and Package-specific membership.
 
 Detailed by: `TEAM.SYS-R01`, `TEAM.SYS.PKG-R01`–`R11`, `TEAM.SYS.PKG-R18`.
 

@@ -421,13 +421,14 @@ async fn protection_offer(
     workspace: WorkspaceId,
     package: &str,
     peer: PublicIdentity,
+    work: &Arc<super::peer_sessions::SessionWork>,
 ) -> Option<ProtectionBundle> {
     if grant.content_key_id.is_none() || remote_key.is_some() {
         return None;
     }
     let scope = package.to_owned();
     note_rejection(
-        crate::blocking::receiver_call(receiver, move |receiver| {
+        work.receiver_call(receiver, move |receiver| {
             receiver.protection_bundle_for(workspace, &scope, peer)
         })
         .await,
@@ -444,6 +445,7 @@ async fn import_offered_bundle(
     workspace: WorkspaceId,
     package: &str,
     peer: PublicIdentity,
+    work: &Arc<super::peer_sessions::SessionWork>,
 ) -> Result<(), LogSessionError> {
     let Some(offered) = offered else {
         return Ok(());
@@ -451,7 +453,7 @@ async fn import_offered_bundle(
     let bundle = offered.validated().map_err(LogSessionError::Protocol)?;
     let scope = package.to_owned();
     note_rejection(
-        crate::blocking::receiver_call(receiver, move |receiver| {
+        work.receiver_call(receiver, move |receiver| {
             receiver.import_protection_bundle(peer, workspace, &scope, bundle)
         })
         .await,
@@ -467,22 +469,24 @@ async fn note_membership_mismatch(
     grant: &SessionGrant,
     workspace: WorkspaceId,
     peer: PublicIdentity,
+    work: &Arc<super::peer_sessions::SessionWork>,
 ) {
     if remote_version == grant.membership_version {
         return;
     }
-    let _ = crate::blocking::receiver_call(receiver, move |receiver| {
-        receiver.note_membership_mismatch(workspace, peer);
-    })
-    .await;
+    let _ = work
+        .receiver_call(receiver, move |receiver| {
+            receiver.note_membership_mismatch(workspace, peer);
+        })
+        .await;
 }
 
 /// Loads what this side will offer and runs the exchange.
 #[allow(clippy::too_many_arguments)]
 async fn exchange_and_acknowledge(
     connection: &Connection,
-    reader: &mut FrameReader,
-    sink: &mut (impl futures_util::Sink<LogSyncWire, Error = FrameError> + Unpin + Send),
+    reader: FrameReader,
+    sink: impl futures_util::Sink<LogSyncWire, Error = FrameError> + Unpin + Send + 'static,
     receiver: &Arc<dyn SyncReceiver>,
     health: &Arc<crate::synchronization::SyncHealthRegistry>,
     context: ExchangeContext,
@@ -493,12 +497,14 @@ async fn exchange_and_acknowledge(
     let scope = context.package.clone();
     // The author list and heights are read once; the operations themselves are
     // read lazily, in pages, only for what fits this session's send budget.
-    let seed = crate::blocking::receiver_call(receiver, move |receiver| {
-        receiver.session_seed(peer, workspace, &scope)
-    })
-    .await
-    .map_err(|_| LogSessionError::Transport("runtime state is unavailable".to_owned()))?
-    .map_err(LogSessionError::Refused)?;
+    let seed = context
+        .work
+        .receiver_call(receiver, move |receiver| {
+            receiver.session_seed(peer, workspace, &scope)
+        })
+        .await
+        .map_err(|_| LogSessionError::Transport("runtime state is unavailable".to_owned()))?
+        .map_err(LogSessionError::Refused)?;
     let log_id =
         crate::synchronization::operation_store::log_id(scope_digest(&context.package, workspace));
     let mut logs = std::collections::BTreeMap::new();
@@ -514,13 +520,14 @@ async fn exchange_and_acknowledge(
             workspace,
             package: context.package.clone(),
             log_id,
+            work: Arc::clone(&context.work),
         },
         seed,
         limits,
     );
     let role = context.role;
     let scope = scope_digest(&context.package, workspace);
-    let outcomes = run_exchange(
+    let (outcomes, _sink, _reader) = run_exchange(
         reader,
         sink,
         view.clone(),
@@ -558,18 +565,20 @@ pub(crate) async fn outbound_log_session(
     package: String,
     peer: PublicIdentity,
     limits: SessionLimits,
+    work: Arc<super::peer_sessions::SessionWork>,
 ) -> Result<ExchangeReport, LogSessionError> {
     let mut cancellation = sessions.subscribe(peer);
     let scope = package.clone();
-    let grant = crate::blocking::receiver_call(&receiver, move |receiver| {
-        receiver.authorize_session(peer, workspace, &scope)
-    })
-    .await
-    .map_err(|_| LogSessionError::Transport("runtime state is unavailable".to_owned()))?
-    .map_err(|_| LogSessionError::LocalNotAuthorized)?;
+    let grant = work
+        .receiver_call(&receiver, move |receiver| {
+            receiver.authorize_session(peer, workspace, &scope)
+        })
+        .await
+        .map_err(|_| LogSessionError::Transport("runtime state is unavailable".to_owned()))?
+        .map_err(|_| LogSessionError::LocalNotAuthorized)?;
     tokio::select! {
         result = outbound_session_body(
-            endpoint, address, &receiver, &health, grant, workspace, &package, peer, limits,
+            endpoint, address, &receiver, &health, grant, workspace, &package, peer, limits, work,
         ) => result,
         () = peer_sessions::cancelled(&mut cancellation) => Err(LogSessionError::Cancelled),
     }
@@ -586,6 +595,7 @@ async fn outbound_session_body(
     package: &str,
     peer: PublicIdentity,
     limits: SessionLimits,
+    work: Arc<super::peer_sessions::SessionWork>,
 ) -> Result<ExchangeReport, LogSessionError> {
     // A peer that has gone away must be discovered well inside the session
     // budget, so the dial has its own, shorter deadline.
@@ -640,9 +650,12 @@ async fn outbound_session_body(
         connection.close(CLOSE_KEY_MISMATCH.into(), b"key mismatch");
         return Err(LogSessionError::Refused(Refusal::KeyMismatch));
     }
-    import_offered_bundle(receiver, welcome_bundle, workspace, package, peer).await?;
-    note_membership_mismatch(receiver, remote_version, &grant, workspace, peer).await;
-    let offer = protection_offer(receiver, &grant, remote_key, workspace, package, peer).await;
+    import_offered_bundle(receiver, welcome_bundle, workspace, package, peer, &work).await?;
+    note_membership_mismatch(receiver, remote_version, &grant, workspace, peer, &work).await;
+    let offer = protection_offer(
+        receiver, &grant, remote_key, workspace, package, peer, &work,
+    )
+    .await;
     sink.send(LogSyncWire::Ready {
         protection: offer.map(ProtectionBundleWire::from_bundle),
     })
@@ -651,8 +664,8 @@ async fn outbound_session_body(
     reader.set_phase(FramePhase::Session);
     let result = exchange_and_acknowledge(
         &connection,
-        &mut reader,
-        &mut sink,
+        reader,
+        sink,
         receiver,
         health,
         ExchangeContext {
@@ -660,6 +673,7 @@ async fn outbound_session_body(
             workspace,
             package: package.to_owned(),
             role: Role::Initiator,
+            work,
         },
         limits,
     )
@@ -800,6 +814,21 @@ impl LogSyncHandler {
         self.active.load(Ordering::Acquire)
     }
 
+    /// Holds real admission capacity without a silent connection's Hello expiry.
+    #[cfg(test)]
+    pub(crate) fn hold_slot_for_test(
+        &self,
+        peer: PublicIdentity,
+    ) -> Arc<super::peer_sessions::SessionWork> {
+        self.services
+            .sessions
+            .begin_work(
+                self.take_slot(peer)
+                    .expect("test responder slot is available"),
+            )
+            .expect("test responder is accepting work")
+    }
+
     /// How many inbound sessions this peer has ever been given a slot for.
     #[cfg(test)]
     pub(crate) fn accepted_from_for_test(&self, peer: PublicIdentity) -> usize {
@@ -852,10 +881,11 @@ async fn run_log_session(
     services: SyncServices,
     peer: PublicIdentity,
     limits: SessionLimits,
+    work: Arc<super::peer_sessions::SessionWork>,
 ) -> Result<(), LogSessionError> {
     let mut cancellation = services.sessions.subscribe(peer);
     tokio::select! {
-        result = run_log_session_body(&connection, &services, peer, limits) => result,
+        result = run_log_session_body(&connection, &services, peer, limits, work) => result,
         () = peer_sessions::cancelled(&mut cancellation) => Err(LogSessionError::Cancelled),
     }
 }
@@ -865,6 +895,7 @@ async fn run_log_session_body(
     services: &SyncServices,
     peer: PublicIdentity,
     limits: SessionLimits,
+    work: Arc<super::peer_sessions::SessionWork>,
 ) -> Result<(), LogSessionError> {
     let receiver = &services.receiver;
     let (send, receive) = connection
@@ -901,11 +932,12 @@ async fn run_log_session_body(
         _ => return Err(LogSessionError::Protocol("missing hello".to_owned())),
     };
     let scope = package.clone();
-    let authorized = crate::blocking::receiver_call(receiver, move |receiver| {
-        receiver.authorize_session(peer, workspace, &scope)
-    })
-    .await
-    .unwrap_or(Err(Refusal::Unavailable));
+    let authorized = work
+        .receiver_call(receiver, move |receiver| {
+            receiver.authorize_session(peer, workspace, &scope)
+        })
+        .await
+        .unwrap_or(Err(Refusal::Unavailable));
     let grant = match authorized {
         Ok(grant) => grant,
         Err(refusal) => return Err(refuse(&mut sink, connection, refusal).await),
@@ -917,7 +949,10 @@ async fn run_log_session_body(
     {
         return Err(refuse(&mut sink, connection, Refusal::KeyMismatch).await);
     }
-    let bundle = protection_offer(receiver, &grant, remote_key, workspace, &package, peer).await;
+    let bundle = protection_offer(
+        receiver, &grant, remote_key, workspace, &package, peer, &work,
+    )
+    .await;
     sink.send(LogSyncWire::Welcome {
         membership_version: grant.membership_version,
         content_key_id: grant.content_key_id,
@@ -925,14 +960,14 @@ async fn run_log_session_body(
     })
     .await
     .map_err(|error| transport_error(connection, &error))?;
-    note_membership_mismatch(receiver, remote_version, &grant, workspace, peer).await;
+    note_membership_mismatch(receiver, remote_version, &grant, workspace, peer, &work).await;
     match reader
         .next_wire()
         .await
         .map_err(|error| transport_error(connection, &error))?
     {
         LogSyncWire::Ready { protection } => {
-            import_offered_bundle(receiver, protection, workspace, &package, peer).await?;
+            import_offered_bundle(receiver, protection, workspace, &package, peer, &work).await?;
         }
         LogSyncWire::Refused { reason } => {
             return Err(LogSessionError::Refused(
@@ -945,8 +980,8 @@ async fn run_log_session_body(
     let scope = scope_digest(&package, workspace);
     let report = exchange_and_acknowledge(
         connection,
-        &mut reader,
-        &mut sink,
+        reader,
+        sink,
         receiver,
         &services.health,
         ExchangeContext {
@@ -954,6 +989,7 @@ async fn run_log_session_body(
             workspace,
             package,
             role: Role::Responder,
+            work,
         },
         limits,
     )
@@ -1004,9 +1040,19 @@ impl ProtocolHandler for LogSyncHandler {
                 return Ok(());
             }
         };
+        let Some(work) = self.services.sessions.begin_work(slot) else {
+            connection.close(CLOSE_UNAVAILABLE.into(), b"package sync unavailable");
+            return Ok(());
+        };
         let result = timeout(
             self.limits.session_timeout,
-            run_log_session(connection.clone(), self.services.clone(), peer, self.limits),
+            run_log_session(
+                connection.clone(),
+                self.services.clone(),
+                peer,
+                self.limits,
+                work,
+            ),
         )
         .await;
         match result {
@@ -1020,7 +1066,6 @@ impl ProtocolHandler for LogSyncHandler {
                 connection.close(CLOSE_INVALID.into(), b"log sync invalid or timed out");
             }
         }
-        drop(slot);
         Ok(())
     }
 

@@ -2,7 +2,7 @@
 
 Prefix: `TEAM.DEL`
 
-Delivery covers the desktop application bundle, bundled Packages, repository checks and protected stable release/update tooling (ADR 0040). Local automated qualification is separate from hosted publication and installed-update evidence. Developer ID signing, notarization, other targets and one-hour adoption remain deferred.
+Delivery covers explicit native application builds (ADR 0047), complete bundled Packages, repository checks, and protected desktop stable release/update tooling (ADR 0040). Local automated qualification is separate from hosted publication, service operation, and installed-update evidence. Developer ID signing, notarization, other native targets, public headless publication, and one-hour adoption remain deferred.
 
 ## TEAM.DEL-R01 — Desktop Bundle
 
@@ -23,6 +23,14 @@ Stable releases SHALL use canonical `vMAJOR.MINOR.PATCH` tags agreeing with all 
 ## TEAM.DEL-R05 — Qualified Immutable Releases
 
 Only a complete qualified draft containing the DMG, updater archive, signature and `latest.json` SHALL become public. All draft bytes SHALL be read back and qualified, including official signed-version verification and every bundled Package. Publication SHALL be serialized, strictly increase the greatest published stable version, and be the final mutation with stable/latest explicitly selected. Same-source draft reruns MAY replace draft assets; wrong-source and published overwrites SHALL fail. A matching published rerun SHALL make no mutations. CI provenance/digest records SHALL NOT be public assets.
+
+## TEAM.DEL-R07 — Explicit Native Application Distributions
+
+Application builds SHALL require explicit application and target selectors, accepting only desktop `aarch64-apple-darwin` or headless `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`. A non-native or unsupported selection SHALL fail before expensive work or output deletion. A selected build SHALL NOT build the other application, cross-compile, or default to build-all. The existing desktop compatibility and release paths SHALL remain independent.
+
+Headless output SHALL be isolated by application and target, contain its executable and complete Team Package Directories from the bundled list, and run independently of cwd using the canonical executable parent for default resources. Final native Backend declarations, digests, sizes, and permissions SHALL match shipped bytes; Mac signing SHALL precede hashing and Linux SHALL NOT invoke codesign. Neither Agent nor External Gateway source, artifact, or registration SHALL be required.
+
+Operator instructions SHALL provide a manually installed, restrictive Linux user-service example, with a 150-second service stop budget above the application's 120-second shutdown budget and mixed cgroup cleanup. Documentation SHALL distinguish native Linux syntax/runtime/service observations from Mac automation and SHALL NOT infer logout/reboot persistence from a static unit check.
 
 ## TEAM.DEL-R06 — Operations and Qualification
 

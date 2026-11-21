@@ -535,7 +535,7 @@ fn consumer(root: &Path, identity: &str, major: u16, declared: bool) {
     fs::write(root.join("ui/index.js"), script).unwrap();
     fs::write(root.join("ui-contract.json"), &contract).unwrap();
     let mut manifest = json!({"schemaVersion":1,"identity":identity,"version":"1.0.0","presentation":{"displayName":"Compatibility control"},"protocol":{"major":1,"minMinor":0,"maxMinor":0},
-        "backends":[{"target":"aarch64-apple-darwin","path":"backend/consumer","size":binary.len(),"sha256":digest(&binary)}],
+        "backends":[{"target":teamarness_package_host::NATIVE_BACKEND_TARGET,"path":"backend/consumer","size":binary.len(),"sha256":digest(&binary)}],
         "ui":{"entrypoint":{"path":"ui/index.js","size":script.len(),"sha256":digest(script)},"assets":[],"contract":{"path":"ui-contract.json","sha256":digest(&contract)}},
         "capabilities":[{"identity":"teamarness.package-ports","major":major,"minMinor":0,"maxMinor":0}]});
     if declared {

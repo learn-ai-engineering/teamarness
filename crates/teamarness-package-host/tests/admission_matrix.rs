@@ -131,7 +131,7 @@ fn write_package(root: &Path, identity: &str, version: &str) {
         "version": version,
         "presentation": {"displayName": identity},
         "protocol": {"major": 1, "minMinor": 0, "maxMinor": 0},
-        "backends": [{"target":"aarch64-apple-darwin","path":"backend/package","size":backend.len(),"sha256":digest(&backend)}],
+        "backends": [{"target":teamarness_package_host::NATIVE_BACKEND_TARGET,"path":"backend/package","size":backend.len(),"sha256":digest(&backend)}],
         "ui": {
             "entrypoint":{"path":"ui/index.js","size":entrypoint.len(),"sha256":digest(&entrypoint)},
             "assets":[],

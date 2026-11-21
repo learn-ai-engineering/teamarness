@@ -5,6 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+/// Backend target of the compiled Host; applications cannot override it.
+pub const NATIVE_BACKEND_TARGET: &str = env!("TEAMARNESS_HOST_TARGET");
+
 mod admission;
 mod authority;
 #[cfg(feature = "test-hooks")]
@@ -67,6 +70,7 @@ pub use crate::values::{
     PackageValue, PendingRegistrationChange, RegistrationRequest, RegistrationStatus, UiMountId,
     UiRequestId, UiResourceToken, UiSubscriptionId, ValueParseError, WorkspaceId,
 };
+pub use teamarness_package_contract::ui_contract::MAX_UI_PAYLOAD_BYTES;
 
 use crate::errors::host_error;
 

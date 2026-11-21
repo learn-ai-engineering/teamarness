@@ -52,6 +52,7 @@ fn stage_consumer(application: &Path) {
     let mut manifest: Value =
         serde_json::from_slice(&fs::read(source.join("teamarness.package.json")).unwrap()).unwrap();
     let backend = fs::read(env!("CARGO_BIN_EXE_exhibits-port-consumer-under-test")).unwrap();
+    manifest["backends"][0]["target"] = json!(teamarness_package_host::NATIVE_BACKEND_TARGET);
     write_executable(
         &root.join(manifest["backends"][0]["path"].as_str().unwrap()),
         &backend,

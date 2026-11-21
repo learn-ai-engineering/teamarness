@@ -4,6 +4,26 @@ import { chmod, copyFile, cp, lstat, mkdir, mkdtemp, readFile, rm, stat, writeFi
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
+export function nativeBackendTarget() {
+  const result = spawnSync("rustc", ["-vV"], { encoding: "utf8", shell: false });
+  const target = result.status === 0 && /^host: (.+)$/m.exec(result.stdout)?.[1];
+  if (!target) throw new Error("rustc did not report its native host target");
+  return validateBackendTarget(target);
+}
+
+export function validateBackendTarget(target) {
+  if (!["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"].includes(target)) {
+    throw new Error(`Unsupported Backend target: ${target}`);
+  }
+  return target;
+}
+
+export function requireNativeBackendTarget(target) {
+  validateBackendTarget(target);
+  const native = nativeBackendTarget();
+  if (target !== native) throw new Error(`Backend target ${target} is not native (${native})`);
+}
+
 export async function adhocSignBackend(path) {
   if (process.platform !== "darwin" || process.arch !== "arm64") throw new Error("Release Backend signing requires native Apple Silicon macOS");
   const result = spawnSync("codesign", ["--force", "-s", "-", "--options", "runtime", path], { encoding: "utf8", shell: false });
@@ -20,8 +40,21 @@ export async function stagePackageDirectory({
   outputDirectory,
   version,
   backendSigner,
+  target = nativeBackendTarget(),
 }) {
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  validateBackendTarget(target);
+  if (new Set(manifest.backends.map(({ target }) => target)).size !== manifest.backends.length) {
+    throw new Error("Duplicate Backend target in source manifest");
+  }
+  const template = manifest.backends.find((backend) => backend.target === target)
+    ?? (manifest.backends.length === 1 ? manifest.backends[0] : undefined);
+  if (!template) throw new Error(`No unambiguous Backend template for ${target}`);
+  const suffix = `-${template.target}`;
+  const path = template.path.endsWith(suffix)
+    ? `${template.path.slice(0, -suffix.length)}-${target}` : template.path;
+  manifest.backends = [{ ...template, target, path }];
+  if (backendSigner && target !== "aarch64-apple-darwin") throw new Error("Backend signing is only supported for macOS");
   let backend;
   if (backendSigner) {
     const temporary = await mkdtemp(join(tmpdir(), "teamarness-backend-sign-"));

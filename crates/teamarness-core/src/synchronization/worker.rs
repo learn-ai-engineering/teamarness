@@ -1731,26 +1731,41 @@ mod tests {
                 "empty session retains demand"
             );
         }
-        let loaded = worker.loads_for_test();
+        until("the initial session completion is published", || {
+            worker
+                .snapshot_for_test()
+                .iter()
+                .all(|peer| !peer.in_flight)
+        })
+        .await;
+        let (acquired, acquired_rx) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let held = Arc::clone(&fixture.state);
+        let holding = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            let _ = acquired.send(());
+            let _ = released.recv();
+        });
+        acquired_rx.await.unwrap();
+        let loaded = settled_load_baseline(&worker.loads, &worker.completed_loads).await;
         tokio::time::advance(SchedulerLimits::CURRENT.record_idle + Duration::from_millis(1)).await;
-        until("the first idle reload completes", || {
+        assert_eq!(
+            demand_calls(),
+            1,
+            "idle work cannot finish while its state load is held"
+        );
+        drop(release);
+        holding.join().unwrap();
+        // Advancing paused time and yielding do not complete a blocking SQLite
+        // load. Observe its completion and dispatch, not a yield-count guess.
+        until("the idle reload completes", || {
             worker.loads_for_test() > loaded
         })
         .await;
-        tokio::time::advance(SchedulerLimits::CURRENT.record_idle + Duration::from_millis(1)).await;
-        // The first record-idle tick may precede the session's last attempt;
-        // subsequent ticks must reoffer the consumed demand.
-        for _ in 0..3 {
-            if demand_calls() >= 2 {
-                break;
-            }
-            tokio::time::advance(SchedulerLimits::CURRENT.record_idle + Duration::from_millis(1))
-                .await;
-            for _ in 0..200 {
-                tokio::task::yield_now().await;
-            }
-        }
-        assert!(demand_calls() >= 2, "idle reconciliation reoffers demand");
+        until("idle reconciliation reoffers demand", || {
+            demand_calls() >= 2
+        })
+        .await;
         worker.shutdown().await;
         drop(worker);
         fixture.finish();

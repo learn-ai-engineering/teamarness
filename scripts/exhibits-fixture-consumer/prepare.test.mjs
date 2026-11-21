@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
+import { nativeBackendTarget } from "../package-directory.mjs";
+
 import {
   EXHIBITS_FIXTURE_CONSUMER_DISPLAY_NAME,
   EXHIBITS_FIXTURE_CONSUMER_IDENTITY,
@@ -32,6 +34,7 @@ test("prepares a local consumer Package whose manifest sizes and digests match i
     assert.equal(prepared.displayName, EXHIBITS_FIXTURE_CONSUMER_DISPLAY_NAME);
     const manifest = JSON.parse(await readFile(join(prepared.packageDirectory, "teamarness.package.json"), "utf8"));
     assert.equal(manifest.identity, EXHIBITS_FIXTURE_CONSUMER_IDENTITY);
+    assert.equal(manifest.backends[0].target, nativeBackendTarget());
     assert.ok(manifest.capabilities.some(({ identity }) => identity === "teamarness.content-views"));
     for (const declared of [manifest.backends[0], manifest.ui.entrypoint]) {
       const bytes = await readFile(join(prepared.packageDirectory, declared.path));

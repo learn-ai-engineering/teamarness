@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/teamarness-desktop/src-tauri",
+    "apps/teamarness-headless",
     "crates/teamarness-core",
     "crates/teamarness-package-contract",
     "crates/teamarness-package-host",
@@ -67,3 +68,15 @@ unicode-general-category = "=1.1.0"
 unicode-normalization = "=0.1.25"
 caseless = "=0.2.2"
 notify = { version = "=8.2.1", default-features = false, features = ["macos_fsevent"] }
+
+# LogSync authenticates up to 2,048 operations per bounded session. Keep the
+# curve arithmetic optimized in debug builds too; unoptimized verification on
+# native x86_64 alone exhausts the unchanged session deadline.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+# Admission repeatedly authenticates large Backend artifacts. Optimize the
+# measured workspace SHA implementation in debug builds, without removing any
+# integrity check or extending operator observation deadlines.
+[profile.dev.package."sha2@0.11.0"]
+opt-level = 3

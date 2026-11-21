@@ -22,6 +22,7 @@ pub(crate) struct ViewContext {
     pub(crate) workspace: WorkspaceId,
     pub(crate) package: String,
     pub(crate) log_id: [u8; 32],
+    pub(crate) work: Arc<super::peer_sessions::SessionWork>,
 }
 
 /// What this session has already committed to send, per author.
@@ -165,19 +166,22 @@ impl SqliteLogView {
         limit: usize,
     ) -> Result<Option<Vec<(u32, usize)>>, LogViewError> {
         let context = Arc::clone(&self.context);
-        let sizes = crate::blocking::receiver_call(&self.receiver, move |receiver| {
-            receiver.range_sizes(
-                context.peer,
-                context.workspace,
-                &context.package,
-                author,
-                after,
-                until,
-                limit,
-            )
-        })
-        .await
-        .map_err(|_| LogViewError("runtime state is unavailable".to_owned()))?;
+        let sizes = self
+            .context
+            .work
+            .receiver_call(&self.receiver, move |receiver| {
+                receiver.range_sizes(
+                    context.peer,
+                    context.workspace,
+                    &context.package,
+                    author,
+                    after,
+                    until,
+                    limit,
+                )
+            })
+            .await
+            .map_err(|_| LogViewError("runtime state is unavailable".to_owned()))?;
         match sizes {
             Ok(sizes) => Ok(Some(sizes)),
             Err(rejection) => {
@@ -200,19 +204,22 @@ impl SqliteLogView {
         loop {
             let context = Arc::clone(&self.context);
             let rows = self.limits.view_page_rows;
-            let page = crate::blocking::receiver_call(&self.receiver, move |receiver| {
-                receiver.load_range_page(
-                    context.peer,
-                    context.workspace,
-                    &context.package,
-                    author,
-                    next,
-                    until,
-                    rows,
-                )
-            })
-            .await
-            .map_err(|_| LogViewError("runtime state is unavailable".to_owned()))?;
+            let page = self
+                .context
+                .work
+                .receiver_call(&self.receiver, move |receiver| {
+                    receiver.load_range_page(
+                        context.peer,
+                        context.workspace,
+                        &context.package,
+                        author,
+                        next,
+                        until,
+                        rows,
+                    )
+                })
+                .await
+                .map_err(|_| LogViewError("runtime state is unavailable".to_owned()))?;
             let page = page.map_err(|error| match error {
                 RangeLoadError::ScopeCorrupt => LogViewError("scope corrupt".to_owned()),
                 RangeLoadError::Unavailable => LogViewError("served log is unavailable".to_owned()),
@@ -361,6 +368,7 @@ mod tests {
             workspace: WorkspaceId::from_bytes([4; 16]),
             package: "teamarness.test".to_owned(),
             log_id: LOG,
+            work: super::super::PeerSessions::new().begin_work(()).unwrap(),
         }
     }
 

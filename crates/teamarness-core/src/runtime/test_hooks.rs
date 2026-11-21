@@ -61,6 +61,7 @@ pub(super) async fn probe_package_sync_as_key_for_test(
         package.to_owned(),
         responder.public_identity,
         responder.session_limits,
+        responder.sync_services.sessions.begin_work(()).unwrap(),
     )
     .await;
     match result {
@@ -395,6 +396,8 @@ impl RuntimeState {
             principal_sync_init_faults: 0,
             next_subscriber_id: 0,
             poisoned: false,
+            application_ownership: None,
+            shutdown_complete: false,
         }
     }
 
@@ -981,6 +984,7 @@ impl CoreRuntime {
                 package_identity.to_owned(),
                 peer,
                 self.session_limits,
+                self.sync_services.sessions.begin_work(()).unwrap(),
             ),
         )
         .await;
@@ -1036,6 +1040,7 @@ impl CoreRuntime {
             package_identity.to_owned(),
             peer,
             self.session_limits,
+            self.sync_services.sessions.begin_work(()).unwrap(),
         )
         .await
     }
@@ -1071,6 +1076,15 @@ impl CoreRuntime {
             }
             _ => None,
         }
+    }
+
+    /// Owns a responder slot through a test's dispatch, without Hello expiry.
+    #[cfg(test)]
+    pub(crate) fn hold_package_sync_slot_for_test(
+        &self,
+        peer: PublicIdentity,
+    ) -> Arc<crate::synchronization::peer_sessions::SessionWork> {
+        self.log_sync.hold_slot_for_test(peer)
     }
 
     /// Opens a package synchronization stream and then waits, holding the
@@ -1214,6 +1228,30 @@ impl CoreRuntime {
     #[doc(hidden)]
     pub async fn open_loopback_for_tests(config: CoreRuntimeConfig) -> Result<Self, CoreError> {
         Self::open_inner(config, Box::new(SystemClock), Some(true)).await
+    }
+
+    /// Produces an authentic, already-expired unused invitation for public onboarding tests.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn expired_workspace_invitation_for_tests(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<crate::WorkspaceInvitation, crate::OnboardingError> {
+        let now = self.clock.now_unix_ms();
+        let (token, genesis) = self
+            .issue_invitation_with_genesis_at(
+                workspace,
+                now.saturating_sub(120_000),
+                now.saturating_sub(60_000),
+            )
+            .map_err(map_invitation_onboarding_error)?;
+        let verified = token.verified().map_err(map_invitation_onboarding_error)?;
+        crate::WorkspaceInvitation::from_parts(
+            &verified,
+            genesis,
+            self.transport.endpoint_address(),
+        )
+        .map_err(|_| crate::OnboardingError::InvalidInput)
     }
 
     /// Teaches this loopback Installation how to reach `peer`.

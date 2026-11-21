@@ -35,6 +35,10 @@ pub enum StorageError {
     /// The private data path is not a private Teamarness directory: it is a
     /// symbolic link, belongs to another user, or holds unrelated files.
     InvalidDataDirectory,
+    /// Another application already owns this private directory.
+    ApplicationAlreadyOwned,
+    /// The stable application lock is not an owner-only, single-link regular file.
+    InvalidApplicationLock,
     /// A filesystem operation failed.
     Io,
     /// Restrictive filesystem permissions could not be applied.
@@ -63,6 +67,8 @@ impl fmt::Display for StorageError {
             Self::InvalidDataDirectory => {
                 "the private data path is not a private Teamarness directory"
             }
+            Self::ApplicationAlreadyOwned => "another application owns this data directory",
+            Self::InvalidApplicationLock => "the application lock is unsafe",
             Self::Io => "private storage filesystem operation failed",
             Self::Permission => "private storage permissions could not be restricted",
             Self::Database => "core database operation failed",

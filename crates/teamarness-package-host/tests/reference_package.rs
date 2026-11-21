@@ -286,7 +286,7 @@ fn write_package(root: &Path, identity: &str, version: &str, backend_source: &Pa
     fs::create_dir_all(root.join("backend")).unwrap();
     fs::create_dir_all(root.join("ui")).unwrap();
     let backend = fs::read(backend_source).unwrap();
-    let backend_path = root.join("backend/teamarness-reference-package-aarch64-apple-darwin");
+    let backend_path = root.join("backend/teamarness-reference-package");
     fs::write(&backend_path, &backend).unwrap();
     fs::set_permissions(&backend_path, fs::Permissions::from_mode(0o700)).unwrap();
     let ui = b"export function mount() { return async () => {}; }";
@@ -303,7 +303,7 @@ fn write_package(root: &Path, identity: &str, version: &str, backend_source: &Pa
         "version":version,
         "presentation":{"displayName":"Reference Package"},
         "protocol":{"major":1,"minMinor":0,"maxMinor":0},
-        "backends":[{"target":"aarch64-apple-darwin","path":"backend/teamarness-reference-package-aarch64-apple-darwin","size":backend.len(),"sha256":digest(&backend)}],
+        "backends":[{"target":teamarness_package_host::NATIVE_BACKEND_TARGET,"path":"backend/teamarness-reference-package","size":backend.len(),"sha256":digest(&backend)}],
         "ui":{"entrypoint":{"path":"ui/index.js","size":ui.len(),"sha256":digest(ui)},"assets":[],"contract":{"path":"ui/contract.json","sha256":digest(&contract)}},
         "capabilities":[
             {"identity":"teamarness.workspace-context","major":1,"minMinor":0,"maxMinor":0},

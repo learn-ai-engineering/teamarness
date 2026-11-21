@@ -161,15 +161,15 @@ impl Network {
     pub(crate) async fn run_outbound<T, E, Fut>(
         &self,
         overloaded: E,
-        session: impl FnOnce(Endpoint) -> Fut,
+        session: impl FnOnce(Endpoint, tokio::sync::OwnedSemaphorePermit) -> Fut,
     ) -> Result<T, E>
     where
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        let Ok(_permit) = self.outbound.clone().try_acquire_owned() else {
+        let Ok(permit) = self.outbound.clone().try_acquire_owned() else {
             return Err(overloaded);
         };
-        session(self.endpoint.clone()).await
+        session(self.endpoint.clone(), permit).await
     }
 
     /// Runs one outbound session within the second peer budget, which the Core
@@ -381,7 +381,7 @@ mod tests {
         }
         assert_eq!(
             network
-                .run_outbound("overloaded", |_| async { Ok::<(), _>(()) })
+                .run_outbound("overloaded", |_, _permit| async { Ok::<(), _>(()) })
                 .await,
             Err("overloaded")
         );

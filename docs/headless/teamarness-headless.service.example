@@ -1,0 +1,17 @@
+[Unit]
+Description=Teamarness headless Installation
+
+[Service]
+Type=simple
+# Copy the complete distribution to this directory, not just the executable.
+ExecStart=%h/.local/lib/teamarness-headless/teamarness-headless serve --data-dir %h/.local/share/teamarness-headless
+WorkingDirectory=%h
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+# Application drains and shuts down Host/Core within 120 seconds from SIGTERM.
+TimeoutStopSec=150s
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

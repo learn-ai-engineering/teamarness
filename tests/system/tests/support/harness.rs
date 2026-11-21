@@ -59,7 +59,7 @@ impl PackageStage {
             identity: PACKAGE_ID,
             display_name: "Conversations",
             backend: backend_executable(),
-            backend_file: "backend/teamarness-conversations-package-aarch64-apple-darwin",
+            backend_file: "backend/teamarness-conversations-package",
             source: "packages/conversations-package",
             record_log_minor: 1,
         }
@@ -72,7 +72,7 @@ impl PackageStage {
             identity: "dev.teamarness.documents",
             display_name: "Documents",
             backend: PathBuf::from(env!("CARGO_BIN_EXE_documents-backend-under-test")),
-            backend_file: "backend/teamarness-documents-package-aarch64-apple-darwin",
+            backend_file: "backend/teamarness-documents-package",
             source: "packages/documents-package",
             record_log_minor: 1,
         }
@@ -614,7 +614,7 @@ pub fn stage_package_with(root: &Path, stage: &PackageStage) -> PathBuf {
             "version":"1.0.0",
             "presentation":{"displayName":stage.display_name},
             "protocol":{"major":1,"minMinor":0,"maxMinor":0},
-            "backends":[{"target":"aarch64-apple-darwin","path":backend_file,"size":backend.len(),"sha256":digest(&backend)}],
+            "backends":[{"target":teamarness_package_host::NATIVE_BACKEND_TARGET,"path":backend_file,"size":backend.len(),"sha256":digest(&backend)}],
             "ui":{
                 "entrypoint":{"path":"ui/index.js","size":ui.len(),"sha256":digest(ui)},
                 "assets":[{"path":"ui/style.css","mediaType":"text/css","size":css.len(),"sha256":digest(css)}],
@@ -665,6 +665,12 @@ pub fn stage_backlog(root: &Path) -> PathBuf {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(source.join("teamarness.package.json")).unwrap()).unwrap();
     let backend = fs::read(env!("CARGO_BIN_EXE_backlog-backend-under-test")).unwrap();
+    manifest["backends"][0]["target"] =
+        serde_json::json!(teamarness_package_host::NATIVE_BACKEND_TARGET);
+    manifest["backends"][0]["path"] = serde_json::json!(format!(
+        "backend/teamarness-backlog-package-{}",
+        teamarness_package_host::NATIVE_BACKEND_TARGET
+    ));
     let backend_path = package.join(manifest["backends"][0]["path"].as_str().unwrap());
     fs::create_dir_all(backend_path.parent().unwrap()).unwrap();
     fs::write(&backend_path, &backend).unwrap();
@@ -712,6 +718,11 @@ pub fn stage_exhibits(application: &Path) {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(source.join("teamarness.package.json")).unwrap()).unwrap();
     let backend = fs::read(env!("CARGO_BIN_EXE_exhibits-backend-under-test")).unwrap();
+    manifest["backends"][0]["target"] = json!(teamarness_package_host::NATIVE_BACKEND_TARGET);
+    manifest["backends"][0]["path"] = json!(format!(
+        "backend/teamarness-exhibits-package-{}",
+        teamarness_package_host::NATIVE_BACKEND_TARGET
+    ));
     let backend_path = root.join(manifest["backends"][0]["path"].as_str().unwrap());
     fs::create_dir_all(backend_path.parent().unwrap()).unwrap();
     fs::write(&backend_path, &backend).unwrap();
@@ -792,7 +803,7 @@ pub fn write_qualification_provider(root: &Path) -> (String, String) {
     fs::write(root.join("ports.json"), &ports).unwrap();
     let manifest = serde_json::json!({"schemaVersion":1,"identity":QUALIFICATION,"version":"1.0.0",
         "presentation":{"displayName":"Qualification"},"protocol":{"major":1,"minMinor":0,"maxMinor":0},
-        "backends":[{"target":"aarch64-apple-darwin","path":"backend/provider","size":binary.len(),"sha256":digest(&binary)}],
+        "backends":[{"target":teamarness_package_host::NATIVE_BACKEND_TARGET,"path":"backend/provider","size":binary.len(),"sha256":digest(&binary)}],
         "ui":{"entrypoint":{"path":"ui/index.js","size":ui.len(),"sha256":digest(ui)},"assets":[],"contract":{"path":"ui-contract.json","sha256":digest(&ui_contract)}},
         "portContract":{"path":"ports.json","sha256":digest(&ports)},"capabilities":[]});
     fs::write(

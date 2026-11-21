@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { BUNDLED_PACKAGES_PATH, readBundledPackages, repositoryRoot } from "./bundled-packages.mjs";
+import { nativeBackendTarget } from "./package-directory.mjs";
 import { buildPackage, cargoTargetDirectory, resolveBundledPackage } from "./build-package.mjs";
 
 const bundledPackages = await readBundledPackages(repositoryRoot);
@@ -104,6 +105,7 @@ test("builder declares signed Backend bytes without mutating Cargo output", asyn
     const output = await buildPackage({
       repositoryRoot: root, sourceDirectory: entry.sourceDirectory, backendPath: backend,
       skipBuilds: true, skipUiBuild: true,
+      target: "aarch64-apple-darwin",
       backendSigner: async (path) => { await writeFile(path, Buffer.concat([original, Buffer.from("signed")])); },
     });
     const manifest = JSON.parse(await readFile(join(output, "teamarness.package.json"), "utf8"));
@@ -185,4 +187,46 @@ test("Backend lookup follows a custom CARGO_TARGET_DIR", async () => {
   } finally {
     await rm(targetDirectory, { recursive: true, force: true });
   }
+});
+
+test("builder writes only the selected native Backend target without editing its source template", async () => {
+  await withRoot("teamarness-package-native-", async (root) => {
+    const [entry] = bundledPackages;
+    const { manifest: source, backend } = await packageFixture(root, entry);
+    const output = await buildPackage({ repositoryRoot: root, sourceDirectory: entry.sourceDirectory,
+      backendPath: backend, skipBuilds: true, skipUiBuild: true, target: "x86_64-unknown-linux-gnu" });
+    const staged = JSON.parse(await readFile(join(output, "teamarness.package.json")));
+    assert.equal(staged.backends.length, 1);
+    assert.equal(staged.backends[0].target, "x86_64-unknown-linux-gnu");
+    assert.equal(staged.backends[0].path, `backend/${entry.cargoPackage}-x86_64-unknown-linux-gnu`);
+    assert.deepEqual(await readFile(join(output, staged.backends[0].path)), await readFile(backend));
+    assert.deepEqual(JSON.parse(await readFile(join(root, entry.sourceDirectory, "teamarness.package.json"))), source);
+  });
+});
+
+test("unsupported target and missing Backend refuse before replacing existing output", async () => {
+  await withRoot("teamarness-package-refuse-", async (root) => {
+    const [entry] = bundledPackages;
+    const { backend } = await packageFixture(root, entry);
+    const outputDirectory = join(root, "preserved");
+    await mkdir(outputDirectory);
+    await writeFile(join(outputDirectory, "sentinel"), "preserved");
+    const options = { repositoryRoot: root, sourceDirectory: entry.sourceDirectory, backendPath: backend,
+      skipBuilds: true, skipUiBuild: true, outputDirectory };
+    await assert.rejects(buildPackage({ ...options, target: "wasm32-unknown-unknown" }), /Unsupported Backend target/);
+    await assert.rejects(buildPackage({ ...options, backendPath: join(root, "missing") }), /Backend was not built/);
+    assert.equal(await readFile(join(outputDirectory, "sentinel"), "utf8"), "preserved");
+  });
+});
+
+
+test("non-native build refuses before touching source or existing output", async () => {
+  await withRoot("teamarness-package-nonnative-", async (root) => {
+    const outputDirectory = join(root, "preserved");
+    await mkdir(outputDirectory);
+    await writeFile(join(outputDirectory, "sentinel"), "preserved");
+    const target = nativeBackendTarget() === "aarch64-apple-darwin" ? "x86_64-unknown-linux-gnu" : "aarch64-apple-darwin";
+    await assert.rejects(buildPackage({ repositoryRoot: root, sourceDirectory: "missing", outputDirectory, target }), /not native/);
+    assert.equal(await readFile(join(outputDirectory, "sentinel"), "utf8"), "preserved");
+  });
 });

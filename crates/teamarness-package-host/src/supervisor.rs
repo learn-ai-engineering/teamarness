@@ -587,7 +587,12 @@ async fn observed_start_time(pid: u32) -> Option<String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+async fn observed_start_time(pid: u32) -> Option<String> {
+    linux_identity::start_time(pid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 async fn observed_start_time(_pid: u32) -> Option<String> {
     Some("unsupported-target".into())
 }
@@ -662,7 +667,12 @@ fn inspect_lease(lease: &ProcessLease) -> LeaseEvidence {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn inspect_lease(lease: &ProcessLease) -> LeaseEvidence {
+    linux_identity::inspect(lease)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn inspect_lease(lease: &ProcessLease) -> LeaseEvidence {
     if Path::new(&format!("/proc/{}", lease.pid)).exists() {
         LeaseEvidence::Ambiguous
@@ -670,3 +680,6 @@ fn inspect_lease(lease: &ProcessLease) -> LeaseEvidence {
         LeaseEvidence::Gone
     }
 }
+
+#[cfg(target_os = "linux")]
+mod linux_identity;

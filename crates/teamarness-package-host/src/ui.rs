@@ -96,6 +96,14 @@ impl CompiledUiContract {
         self.validate(payload, |value| self.0.validate_event(operation, value))
     }
 
+    pub(crate) fn operations(&self) -> Vec<(&str, &str)> {
+        self.0.operations()
+    }
+
+    pub(crate) fn operation_schema(&self, operation: &str) -> Option<serde_json::Value> {
+        self.0.operation_schema(operation)
+    }
+
     fn validate(
         &self,
         payload: &PackageValue,

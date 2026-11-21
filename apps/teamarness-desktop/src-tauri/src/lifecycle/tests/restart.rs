@@ -98,5 +98,110 @@ async fn timed_out_ordinary_restart_joins_late_cleanup_without_restarting() {
     lifecycle.finished().await;
     assert!(!adapter.order.lock().unwrap().contains(&"restart"));
     assert_eq!(adapter.installs.load(Ordering::SeqCst), 0);
+    assert_eq!(adapter.retirements.load(Ordering::SeqCst), 0);
     assert!(lifecycle.admit().is_err());
+}
+
+/// Verifies: TEAM.SYS.ID-R07, TEAM.SYS.SHELL-R07
+#[tokio::test]
+async fn replacement_acquires_only_after_drain_successful_cleanup_and_explicit_retirement() {
+    use teamarness_core::{CoreRuntime, CoreRuntimeConfig};
+    struct Owned {
+        runtime: Arc<CoreRuntime>,
+        directory: PathBuf,
+        errors: ShutdownErrors,
+        replaced: AtomicUsize,
+    }
+    impl TerminalAdapter for Owned {
+        fn stop_updates(&self) {}
+        fn cleanup(&self) -> BoxFuture<'_, ShutdownErrors> {
+            Box::pin(async {
+                self.runtime.shutdown().await.unwrap();
+                self.errors.clone()
+            })
+        }
+        fn install(&self, pending: Install) -> Result<(), InstallFailure> {
+            pending()
+        }
+        fn retire_ownership(&self) -> Result<(), ()> {
+            self.runtime.retire_application_ownership().map_err(|_| ())
+        }
+        fn restart(&self) {
+            // Tauri starts the replacement while the old Arc still exists.
+            let directory = self.directory.clone();
+            // The synchronous adapter cannot block this executor: inspect the
+            // real kernel lock, then the parent opens Core below.
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(directory.join("application.lock"))
+                .unwrap();
+            lock.try_lock().expect("replacement owns the retired lock");
+            self.replaced.fetch_add(1, Ordering::SeqCst);
+        }
+        fn exit(&self) {}
+    }
+    for update in [false, true] {
+        for errors in [
+            ShutdownErrors::default(),
+            ShutdownErrors {
+                host: true,
+                ..Default::default()
+            },
+            ShutdownErrors {
+                core: true,
+                ..Default::default()
+            },
+            ShutdownErrors {
+                uncertain: true,
+                ..Default::default()
+            },
+        ] {
+            let fail = errors.failed();
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("private");
+            let config = CoreRuntimeConfig::new(&directory).with_exclusive_application_ownership();
+            let runtime = Arc::new(
+                CoreRuntime::open_loopback_for_tests(config.clone())
+                    .await
+                    .unwrap(),
+            );
+            let adapter = Arc::new(Owned {
+                runtime,
+                directory,
+                errors,
+                replaced: AtomicUsize::new(0),
+            });
+            let lifecycle = Lifecycle::new();
+            let admitted = lifecycle.admit().unwrap();
+            if update {
+                lifecycle
+                    .apply("1", || Ok(candidate()), adapter.clone())
+                    .unwrap();
+            } else {
+                lifecycle.restart(adapter.clone()).unwrap();
+            }
+            assert!(lifecycle.admit().is_err());
+            assert!(
+                CoreRuntime::open_loopback_for_tests(config.clone())
+                    .await
+                    .is_err()
+            );
+            drop(admitted);
+            lifecycle.finished().await;
+            assert_eq!(adapter.replaced.load(Ordering::SeqCst), usize::from(!fail));
+            let replacement = CoreRuntime::open_loopback_for_tests(config).await;
+            if fail {
+                assert!(replacement.is_err());
+            } else {
+                let replacement = replacement.unwrap();
+                assert_eq!(
+                    replacement.public_identity(),
+                    adapter.runtime.public_identity()
+                );
+                assert!(adapter.runtime.set_display_name("retired").is_err());
+                replacement.shutdown().await.unwrap();
+            }
+        }
+    }
 }

@@ -192,9 +192,23 @@ The bundled Packages are listed once in `packages/bundled-packages.json`. After 
 
 The Core Runtime public API is `teamarness_core::CoreRuntime`. Identity secrets, raw key bytes, SQLite handles, Iroh transport handles, canonical membership bytes, and private membership adapters remain private. The Tauri bridge carries only owned Installation, Workspace, membership, Principal, invitation, and stable-error DTOs. Agent keys and invitation material do not cross the bridge as Agent-management responses.
 
+## Explicit application builds
+
+Select one native application and target. Both selectors are required; unsupported or non-native combinations fail before building or removing output:
+
+```sh
+npm run build:app -- --app desktop --target aarch64-apple-darwin
+npm run build:app -- --app headless --target aarch64-apple-darwin
+npm run build:app -- --app headless --target x86_64-unknown-linux-gnu
+```
+
+Run only the command matching your intended application and native host. There is no cross-compilation or build-all fallback. `npm run build` remains the desktop-oriented compatibility path. A selected headless build never builds the desktop frontend or Tauri; it produces `target/teamarness-applications/headless/<target>/` with its executable and complete Team Package resources. Keep that directory together. Neither Agent nor External Gateway is required.
+
+See [Run a headless Teamarness Installation](docs/headless/README.md) for relocation, foreground startup, private onboarding and Package requests, artifact smoke, and the manually installed Linux user service. Mac headless uses foreground operation, not launchd. The [canonical verification runbook](docs/headless/verification.md) covers source-current sync-only loopback automation, final Mac M, native Ubuntu N, and human M1–M5. Native Ubuntu and actual production mesh/service/logout/reboot/desktop observations remain pending; Mac automation is not Linux evidence. Independent [Agent](docs/headless/follow-ups/agent.md) and [gateway](docs/headless/follow-ups/external-gateway.md) briefs distinguish generic Host evidence from unrun product compatibility.
+
 ## Current-platform bundles
 
-Build ordinary local macOS application and disk-image bundles (production updates Disabled) with:
+The selected desktop build delegates to the existing ordinary local macOS application and disk-image command (production updates Disabled), which also remains directly available:
 
 ```sh
 npm run tauri build -- --bundles app,dmg
