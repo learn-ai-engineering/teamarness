@@ -2332,22 +2332,16 @@ async fn forged_scope_record_is_rejected_without_ending_the_session() {
             },
         )
         .await;
-    // Deterministically distinguish pre-Hello Busy from a record-handling refusal.
+    // Own the real admission guards through dispatch. Silent connections are
+    // unsuitable here: their unchanged Hello deadline can expire after a count
+    // observation but before the injected session actually reaches the peer.
     let first = cluster
-        .node("m")
-        .hold_package_sync_before_hello_for_test(cluster.address("b"))
-        .await;
+        .node("b")
+        .hold_package_sync_slot_for_test(cluster.identity("m"));
     let second = cluster
-        .node("m")
-        .hold_package_sync_before_hello_for_test(cluster.address("b"))
-        .await;
-    cluster
-        .wait_until(
-            "test owns both raw injection responder slots",
-            DEFAULT_DEADLINE,
-            |c| c.node("b").inbound_package_sessions_for_test() == 2,
-        )
-        .await;
+        .node("b")
+        .hold_package_sync_slot_for_test(cluster.identity("m"));
+    assert_eq!(cluster.node("b").inbound_package_sessions_for_test(), 2);
     let refused = cluster
         .node("m")
         .deliver_operations_for_test(

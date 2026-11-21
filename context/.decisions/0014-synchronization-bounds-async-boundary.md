@@ -15,6 +15,8 @@ Synchronous SQLite and cryptographic work ran on Tokio worker threads while hold
 
 Async code enters Core state only through a blocking-thread boundary. The runtime keeps one synchronous state lock and a synchronous command API. Work done while holding the lock is bounded: one local append, one page of at most 32 subscription records, one page of at most 256 log rows, or one batch of at most 16 remote operations. No lock guard is held across an await.
 
+LogSync also authenticates decoded headers inside its protocol future. Core polls that owned future on a blocking thread with its original transport and session deadline. Caller cancellation requests cooperative worker cancellation; the current synchronous poll may finish first. Original global and per-peer admission capacity remains held by all surviving protocol and storage work. Core refuses successful shutdown and ownership retirement while that work remains; it does not extend cleanup deadlines. The frame reader is aborted when its owner is dropped.
+
 Package capability calls run their Core work on blocking threads, limited to eight concurrent calls across all Packages, so the ten-second call deadline takes effect. `overloaded` and `deadline_exceeded` are retryable. An `append` that times out after starting reports an uncertain outcome; it is content-idempotent.
 
 ### Bounded synchronization sessions

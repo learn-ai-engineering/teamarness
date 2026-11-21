@@ -21,6 +21,7 @@ use crate::invitation::{InvitationClaim, InvitationToken};
 /// The runtime owns its SQLite connection and installation secret. Neither
 /// those values nor private test dependencies can be obtained by callers.
 pub struct CoreRuntime {
+    peer_sessions: Arc<crate::synchronization::PeerSessions>,
     public_identity: PublicIdentity,
     state: Arc<Mutex<RuntimeState>>,
     clock: Arc<dyn Clock>,
@@ -325,6 +326,7 @@ impl CoreRuntime {
             crate::synchronization::scheduler::production_jitter,
         );
         Ok(Self {
+            peer_sessions,
             public_identity,
             state,
             clock,
@@ -358,11 +360,19 @@ impl CoreRuntime {
         // Stop the scheduler and await every session before Router/Endpoint
         // shutdown. This ordering prevents SQLite callbacks from racing the
         // shared network teardown.
+        let drain_deadline = tokio::time::Instant::now()
+            + crate::synchronization::limits::SchedulerLimits::CURRENT.shutdown_grace;
+        self.peer_sessions.close_work();
         self.sync_worker.shutdown().await;
         self.transport
             .shutdown()
             .await
             .map_err(|_| crate::ShutdownError::Transport)?;
+        // Cancelled blocking work retains its session lease until its final
+        // callback exits. Uncertain cleanup must not permit ownership handoff.
+        if !self.peer_sessions.drain_until(drain_deadline).await {
+            return Err(crate::ShutdownError::Transport);
+        }
         self.state
             .lock()
             .map_err(fault!(crate::ShutdownError::Transport))?

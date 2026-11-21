@@ -62,6 +62,7 @@ pub(crate) struct ExchangeContext {
     pub(crate) workspace: WorkspaceId,
     pub(crate) package: String,
     pub(crate) role: Role,
+    pub(crate) work: Arc<super::peer_sessions::SessionWork>,
 }
 
 type Logs = std::collections::BTreeMap<p2panda_core::VerifyingKey, Vec<[u8; 32]>>;
@@ -75,15 +76,15 @@ type Logs = std::collections::BTreeMap<p2panda_core::VerifyingKey, Vec<[u8; 32]>
 /// subscription can say how far behind it is while a session runs.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_exchange<S, W>(
-    reader: &mut FrameReader,
-    sink: &mut W,
+    reader: FrameReader,
+    sink: W,
     store: S,
     logs: Logs,
     receiver: Arc<dyn SyncReceiver>,
     context: ExchangeContext,
     limits: SessionLimits,
     health: Option<HealthReporter>,
-) -> Result<OutcomeCounts, LogSessionError>
+) -> Result<(OutcomeCounts, W, FrameReader), LogSessionError>
 where
     S: p2panda_store::logs::LogStore<
             Operation<()>,
@@ -94,21 +95,24 @@ where
         > + Clone
         + Send
         + 'static,
-    W: futures_util::Sink<LogSyncWire, Error = FrameError> + Unpin + Send,
+    W: futures_util::Sink<LogSyncWire, Error = FrameError> + Unpin + Send + 'static,
 {
     let failure = reader.failure_handle();
     let (events, mut event_rx) =
         tokio::sync::broadcast::channel::<LogSyncEvent<()>>(limits.event_capacity());
-    let protocol = LogSync::new(store, logs, events);
-    let mut protocol_sink = sink.with(|message| {
+    // The worker can drop its sender before its JoinHandle becomes ready.
+    // Keep event delivery open until this owner observes protocol completion.
+    let protocol = LogSync::new(store, logs, events.clone());
+    let protocol_sink = sink.with(|message| {
         futures_util::future::ready(Ok::<_, FrameError>(LogSyncWire::Message(message)))
     });
-    let mut messages = reader.messages(limits);
+    let messages = reader.messages(limits);
     let mut running = Box::pin(super::p2panda_adapter::run_finite(
         protocol,
-        &mut protocol_sink,
-        &mut messages,
+        protocol_sink,
+        messages,
         limits.session_timeout,
+        Arc::clone(&context.work),
     ));
 
     let mut outcomes = OutcomeCounts::default();
@@ -117,7 +121,10 @@ where
     loop {
         tokio::select! {
             result = &mut running => {
-                let failed = result.err().map(|error| session_error(&error, failure.take()));
+                let (transport, failed) = match result {
+                    Ok(transport) => (Some(transport), None),
+                    Err(error) => (None, Some(session_error(&error, failure.take()))),
+                };
                 // Whatever LogSync emitted before it stopped is applied either
                 // way: a peer that exceeded a bound is disconnected, and the
                 // operations it already delivered are kept.
@@ -145,7 +152,10 @@ where
                 }
                 return match failed {
                     Some(error) => Err(error),
-                    None => Ok(outcomes),
+                    None => {
+                        let (sink, messages) = transport.expect("successful protocol returns its transport");
+                        Ok((outcomes, sink.into_inner(), messages.into_reader()))
+                    },
                 };
             }
             event = event_rx.recv() => match event {
@@ -228,11 +238,13 @@ async fn apply_batch(
     let package = context.package.clone();
     // Applying operations is SQLite and signature work: it crosses to a
     // blocking thread, so the session never holds the asynchronous executor.
-    let applied = crate::blocking::receiver_call(receiver, move |receiver| {
-        receiver.receive_operations(peer, workspace, &package, batch)
-    })
-    .await
-    .map_err(|_| LogSessionError::Transport("runtime state is unavailable".to_owned()))?;
+    let applied = context
+        .work
+        .receiver_call(receiver, move |receiver| {
+            receiver.receive_operations(peer, workspace, &package, batch)
+        })
+        .await
+        .map_err(|_| LogSessionError::Transport("runtime state is unavailable".to_owned()))?;
     let results = applied.map_err(|error| match error {
         FatalSyncError::PeerRevoked => {
             LogSessionError::Protocol("peer was revoked mid-session".to_owned())
@@ -308,6 +320,7 @@ mod tests {
             workspace: WorkspaceId::from_bytes([4; 16]),
             package: "teamarness.test".to_owned(),
             role,
+            work: super::super::PeerSessions::new().begin_work(()).unwrap(),
         }
     }
 
@@ -353,12 +366,12 @@ mod tests {
             let receiver: Arc<dyn SyncReceiver> = Arc::clone(&initiator_receiver) as _;
             let logs = logs.clone();
             async move {
-                let mut reader = FrameReader::spawn(left_read, limits);
+                let reader = FrameReader::spawn(left_read, limits);
                 reader.set_phase(super::super::frames::FramePhase::Session);
-                let mut sink = super::super::frames::frame_sink(left_write, limits);
+                let sink = super::super::frames::frame_sink(left_write, limits);
                 run_exchange(
-                    &mut reader,
-                    &mut sink,
+                    reader,
+                    sink,
                     initiator,
                     logs,
                     receiver,
@@ -372,12 +385,12 @@ mod tests {
         let two = {
             let receiver: Arc<dyn SyncReceiver> = Arc::clone(&responder_receiver) as _;
             async move {
-                let mut reader = FrameReader::spawn(right_read, limits);
+                let reader = FrameReader::spawn(right_read, limits);
                 reader.set_phase(super::super::frames::FramePhase::Session);
-                let mut sink = super::super::frames::frame_sink(right_write, limits);
+                let sink = super::super::frames::frame_sink(right_write, limits);
                 run_exchange(
-                    &mut reader,
-                    &mut sink,
+                    reader,
+                    sink,
                     responder,
                     logs,
                     receiver,
@@ -394,8 +407,8 @@ mod tests {
         )
         .await
         .expect("both halves of the exchange finish");
-        first.expect("the initiator half completes");
-        second.expect("the responder half completes");
+        drop(first.expect("the initiator half completes"));
+        drop(second.expect("the responder half completes"));
         (initiator_receiver, responder_receiver)
     }
 
@@ -467,12 +480,12 @@ mod tests {
             let receiver: Arc<dyn SyncReceiver> = Arc::clone(&receiving) as _;
             let logs = logs.clone();
             async move {
-                let mut reader = FrameReader::spawn(left_read, limits);
+                let reader = FrameReader::spawn(left_read, limits);
                 reader.set_phase(super::super::frames::FramePhase::Session);
-                let mut sink = super::super::frames::frame_sink(left_write, limits);
+                let sink = super::super::frames::frame_sink(left_write, limits);
                 run_exchange(
-                    &mut reader,
-                    &mut sink,
+                    reader,
+                    sink,
                     MemoryLogStore::from_operations(Vec::new()),
                     logs,
                     receiver,
@@ -486,12 +499,12 @@ mod tests {
         let two = {
             let receiver: Arc<dyn SyncReceiver> = Arc::clone(&serving) as _;
             async move {
-                let mut reader = FrameReader::spawn(right_read, limits);
+                let reader = FrameReader::spawn(right_read, limits);
                 reader.set_phase(super::super::frames::FramePhase::Session);
-                let mut sink = super::super::frames::frame_sink(right_write, limits);
+                let sink = super::super::frames::frame_sink(right_write, limits);
                 run_exchange(
-                    &mut reader,
-                    &mut sink,
+                    reader,
+                    sink,
                     MemoryLogStore::from_operations(served),
                     logs,
                     receiver,
@@ -508,8 +521,8 @@ mod tests {
         )
         .await
         .expect("both halves finish");
-        let outcomes = first.expect("the receiving half completes");
-        second.expect("the serving half completes");
+        let (outcomes, _, _) = first.expect("the receiving half completes");
+        drop(second.expect("the serving half completes"));
 
         let from_rejected = receiving
             .seen()

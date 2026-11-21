@@ -182,6 +182,7 @@ fn record(
 
 /// A bounded reader over one package synchronization stream.
 pub(crate) struct FrameReader {
+    task: tokio::task::JoinHandle<()>,
     inbound: tokio::sync::mpsc::UnboundedReceiver<Result<LogSyncWire, FrameError>>,
     phase: Arc<AtomicU8>,
     /// The failure that stopped the reader, if any. The session reads it after
@@ -210,7 +211,7 @@ impl FrameReader {
         // The queue is unbounded in type only: what the task may forward is
         // bounded by the receive budget it enforces before forwarding.
         let (outbound, inbound) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut budget = ReceiveBudget::new(&limits);
             loop {
                 let mut header = [0_u8; 4];
@@ -266,6 +267,7 @@ impl FrameReader {
             }
         });
         Self {
+            task,
             inbound,
             phase,
             failure,
@@ -296,7 +298,7 @@ impl FrameReader {
 
     /// Adapts the reader for the LogSync protocol, which speaks only
     /// [`LogSyncMessage`]s. A handshake frame here is a protocol error.
-    pub(crate) fn messages(&mut self, limits: SessionLimits) -> FrameMessages<'_> {
+    pub(crate) fn messages(self, limits: SessionLimits) -> FrameMessages {
         let failure = Arc::clone(&self.failure);
         FrameMessages {
             reader: self,
@@ -313,13 +315,25 @@ impl FrameReader {
     }
 }
 
-pub(crate) struct FrameMessages<'a> {
-    reader: &'a mut FrameReader,
+impl Drop for FrameReader {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub(crate) struct FrameMessages {
+    reader: FrameReader,
     limits: SessionLimits,
     failure: Arc<std::sync::Mutex<Option<FrameError>>>,
 }
 
-impl Stream for FrameMessages<'_> {
+impl FrameMessages {
+    pub(crate) fn into_reader(self) -> FrameReader {
+        self.reader
+    }
+}
+
+impl Stream for FrameMessages {
     type Item = Result<LogSyncMessage<[u8; 32]>, FrameError>;
 
     fn poll_next(
@@ -434,6 +448,49 @@ mod tests {
         writer.write_all(&bytes).await.unwrap();
     }
 
+    /// Verifies: TEAM.SYS.TRANS-R07
+    #[tokio::test]
+    async fn dropping_reader_stops_an_owned_pending_transport_read() {
+        struct PendingRead {
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+            ended: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+        impl AsyncRead for PendingRead {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if let Some(started) = self.get_mut().started.take() {
+                    let _ = started.send(());
+                }
+                std::task::Poll::Pending
+            }
+        }
+        impl Drop for PendingRead {
+            fn drop(&mut self) {
+                if let Some(ended) = self.ended.take() {
+                    let _ = ended.send(());
+                }
+            }
+        }
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (ended, end) = tokio::sync::oneshot::channel();
+        let reader = FrameReader::spawn(
+            PendingRead {
+                started: Some(started),
+                ended: Some(ended),
+            },
+            small(),
+        );
+        start.await.unwrap();
+        drop(reader);
+        tokio::time::timeout(std::time::Duration::from_secs(5), end)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn oversized_frame_is_rejected_before_allocation() {
         let (mut peer, local) = tokio::io::duplex(64 * 1024);
@@ -536,7 +593,7 @@ mod tests {
     async fn presync_announcing_more_than_the_budget_fails_early() {
         let (mut peer, local) = tokio::io::duplex(256 * 1024);
         let limits = small();
-        let mut reader = FrameReader::spawn(local, limits);
+        let reader = FrameReader::spawn(local, limits);
         reader.set_phase(FramePhase::Session);
         write_frame(
             &mut peer,
@@ -557,7 +614,7 @@ mod tests {
     async fn handshake_frame_inside_a_session_is_a_protocol_error() {
         let (mut peer, local) = tokio::io::duplex(64 * 1024);
         let limits = small();
-        let mut reader = FrameReader::spawn(local, limits);
+        let reader = FrameReader::spawn(local, limits);
         reader.set_phase(FramePhase::Session);
         write_frame(&mut peer, &LogSyncWire::Refused { reason: 1 }).await;
         let mut messages = reader.messages(limits);

@@ -61,6 +61,7 @@ pub(super) async fn probe_package_sync_as_key_for_test(
         package.to_owned(),
         responder.public_identity,
         responder.session_limits,
+        responder.sync_services.sessions.begin_work(()).unwrap(),
     )
     .await;
     match result {
@@ -983,6 +984,7 @@ impl CoreRuntime {
                 package_identity.to_owned(),
                 peer,
                 self.session_limits,
+                self.sync_services.sessions.begin_work(()).unwrap(),
             ),
         )
         .await;
@@ -1038,6 +1040,7 @@ impl CoreRuntime {
             package_identity.to_owned(),
             peer,
             self.session_limits,
+            self.sync_services.sessions.begin_work(()).unwrap(),
         )
         .await
     }
@@ -1073,6 +1076,15 @@ impl CoreRuntime {
             }
             _ => None,
         }
+    }
+
+    /// Owns a responder slot through a test's dispatch, without Hello expiry.
+    #[cfg(test)]
+    pub(crate) fn hold_package_sync_slot_for_test(
+        &self,
+        peer: PublicIdentity,
+    ) -> Arc<crate::synchronization::peer_sessions::SessionWork> {
+        self.log_sync.hold_slot_for_test(peer)
     }
 
     /// Opens a package synchronization stream and then waits, holding the

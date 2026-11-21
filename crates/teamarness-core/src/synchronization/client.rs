@@ -51,10 +51,13 @@ pub(crate) async fn send_log_sync(
         limits.session_timeout,
         network.run_outbound(
             LogSessionError::Refused(Refusal::Unavailable),
-            move |endpoint| async move {
+            move |endpoint, permit| async move {
+                let work = sessions
+                    .begin_outbound_work(peer, permit)
+                    .ok_or(LogSessionError::PeerBusy)?;
                 crate::synchronization::network_handler::outbound_log_session(
                     &endpoint, address, receiver, sessions, health, workspace, package, peer,
-                    limits,
+                    limits, work,
                 )
                 .await
             },
