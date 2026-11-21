@@ -2,6 +2,8 @@
 
 Use the headless application as a continuously available peer without a graphical session. It uses the same Core Runtime and Package Host as desktop. Agent and External Gateway source, artifacts, and registrations are not required. They remain independent Personal Packages; their native product compatibility is not established by this application build.
 
+To set up a Linux machine with the Agent and External Gateway, follow [Install headless Teamarness on a Linux machine](install-linux.md). Findings from the first Linux deploy are in [Linux deploy findings](follow-ups/linux-deploy-findings.md).
+
 Use the [canonical verification runbook](verification.md) for source-current loopback tests, final Mac M, native Ubuntu N, and Don's M1–M5 observations. Independent Package work starts from the [Agent](follow-ups/agent.md) or [External Gateway](follow-ups/external-gateway.md) handoff. Generic fixture evidence is not actual product compatibility.
 
 ## Build one native application
