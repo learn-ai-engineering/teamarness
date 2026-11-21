@@ -2,7 +2,7 @@
 
 Use the headless application as a continuously available peer without a graphical session. It uses the same Core Runtime and Package Host as desktop. Agent and External Gateway source, artifacts, and registrations are not required. They remain independent Personal Packages; their native product compatibility is not established by this application build.
 
-To set up a Linux machine with the Agent and External Gateway, follow [Install headless Teamarness on a Linux machine](install-linux.md). Findings from the first Linux deploy are in [Linux deploy findings](follow-ups/linux-deploy-findings.md).
+To set up a Linux machine, follow [Install headless Teamarness on Linux](install-linux.md). Findings from the first Linux deploy are in [Linux deploy findings](follow-ups/linux-deploy-findings.md).
 
 Use the [canonical verification runbook](verification.md) for source-current loopback tests, final Mac M, native Ubuntu N, and Don's M1–M5 observations. Independent Package work starts from the [Agent](follow-ups/agent.md) or [External Gateway](follow-ups/external-gateway.md) handoff. Generic fixture evidence is not actual product compatibility.
 
@@ -40,7 +40,7 @@ Run the final artifact smoke from the checkout. Set `TARGET` to your native sele
 node scripts/smoke-headless.mjs "target/teamarness-applications/headless/$TARGET"
 ```
 
-The smoke copies the final distribution outside the checkout, removes GUI environment variables, tests offline help/version, starts disposable storage, checks admitted Team Packages, and verifies SIGTERM, SIGINT, and persistent identity. It does not join a Workspace or prove domain synchronization. Linux native build, smoke, systemd syntax, and actual Ubuntu service/logout/reboot observations remain pending native qualification; Mac checks cannot qualify Linux.
+The smoke copies the final distribution outside the checkout, removes GUI environment variables, tests offline help/version, starts disposable storage, checks admitted Team Packages, and verifies SIGTERM, SIGINT, and persistent identity. It does not join a Workspace or prove domain synchronization. The copy goes to the system temporary directory. If `/tmp` is a small `tmpfs` or has a user quota, the copy can fail with error `-122` (`EDQUOT`). In that case, set `TMPDIR` to a private directory on a larger disk. Linux native build, smoke, systemd syntax, and actual Ubuntu service/logout/reboot observations remain pending native qualification; Mac checks cannot qualify Linux.
 
 ## Install and start in the foreground
 

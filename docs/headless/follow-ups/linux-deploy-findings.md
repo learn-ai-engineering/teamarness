@@ -17,10 +17,10 @@ This page records friction from the first real Linux deploy: Host 72cb5f2, Agent
 
 | Finding | Suggested follow-up |
 |---|---|
-| No prebuilt Linux artifacts exist. Each target needs a build machine with toolchains. | Build Linux releases on factory1 or factory2 as self-hosted GitHub Actions runners. Check fork-PR risk for public repositories first. |
-| The Agent and Gateway have no release archives. | Add Package release archives, so that an install becomes "download, copy, reload". |
-| Operator requests need a manual contract-digest lookup. | `install-linux.md` uses a shell helper for now. Consider an operator option that resolves the current digest. |
-| A group-writable `~/.local/lib` blocked the Gateway's `tmx` install (`output_unsafe`). | Documented in `install-linux.md`. The Gateway's onboarding guide must state the rule for directories above the Package directory. |
+| No prebuilt Linux artifacts exist. Each target needs a build machine with toolchains. A distribution built on Ubuntu 26.04 needs that glibc version or newer. | Build Linux releases on factory1 or factory2 as self-hosted GitHub Actions runners. Check fork-PR risk for public repositories first. |
+| The Agent and Gateway have no release archives. | Add Package release archives, so that an install becomes "download, copy, reload". Build releases against an older glibc baseline. |
+| Operator requests need a manual contract-digest lookup. | The Host install guide defines a `tm_req` shell helper for now. Consider an operator option that resolves the current digest. |
+| A group-writable `~/.local/lib` blocked the Gateway's `tmx` install (`output_unsafe`). | The Host install guide sets safe permissions on `~`, `~/.local`, and `~/.local/lib`. The Gateway's headless guide states the rule for directories above the Package directory. |
 | A small user-quota `/tmp` failed the smoke test copy with `EDQUOT`. | Documented (`TMPDIR`). The smoke script could report the cause. |
 | A desktop Invitation was truncated to 256 characters during a clipboard transfer. The join refused it as `invalid_input`. | The cause is unknown. The desktop copy path writes the full value. Consider a clearer "truncated invitation" error. |
 
@@ -42,4 +42,14 @@ This page records friction from the first real Linux deploy: Host 72cb5f2, Agent
 | `tmx schema` output is large (about 34 KB for four contracts). | Consider a summary mode. |
 | The guide does not say what to pass on the first Exhibit draft. | Guide text in Exhibits. |
 | `#general` has the same all-zero ID in every Workspace. A wrong `--workspace` value writes silently to the wrong Workspace. | Tell agents to select Workspaces by ID. |
-| Tool selection is per Workspace. | Documented in `install-linux.md`. |
+| Tool selection is per Workspace. | Documented in the Gateway's headless guide. |
+
+## Planned install experience
+
+Don accepted this direction on 2026-11-21. It is not implemented yet.
+
+- **Answers-file setup.** `setup --print-template` writes a commented answers file. The person fills it in, then `setup --answers <file>` applies it. The setup can run again safely and reports what it did. There is no wizard. Secrets come from a separate private file that setup deletes on success, or from stdin.
+- **Same shape for Packages.** Each Package ships its own per-Workspace setup with the same answers-file shape. Packages share no code.
+- **Package docs stand alone.** Each Package documents its own headless build, install, and setup, and links to the Host guide as a prerequisite. The Host guide names no Packages.
+- **Testable setup.** Run the setup unattended on factory1 or factory2 with fixture answers.
+- **Single install folder.** Consider one parent folder, for example `~/.local/lib/teamarness/`, that the setup creates with safe permissions and checks up front.
