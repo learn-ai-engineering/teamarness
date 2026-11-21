@@ -54,6 +54,12 @@ To join a Workspace during setup, select **Copy Workspace Invitation** in the de
 pbpaste | ssh my-linux-box 'umask 077; cat > ~/teamarness-invite.txt'
 ```
 
+If you create the file on the Linux machine instead, for example in an editor, make it private before you run setup:
+
+```sh
+chmod 600 ~/teamarness-invite.txt
+```
+
 In `host.toml`, set `invitation_file = "~/teamarness-invite.txt"` under `[join]`. Setup checks that the Invitation is complete before it changes anything, and it deletes the file after a successful join.
 
 ## 4. Run setup
@@ -87,13 +93,14 @@ source ~/.config/teamarness-headless/helpers.sh
 
 `tm` runs the operator CLI against this Installation. `tm_req WORKSPACE PACKAGE OPERATION` sends one Package request, with the JSON request on stdin.
 
-## Join another Workspace
+## Check the Installation
 
-Save a new Invitation to the `invitation_file` path, then run setup again. Setup reports `unchanged` for everything else.
-
-## Update the Host
-
-Get the new distribution, set `distribution_dir` to it, and run setup again. Setup stops the service, replaces the installed files, and starts the service again. The Installation identity, memberships, and Package data in `data_dir` stay.
+| Check | Command |
+|---|---|
+| Service state | `systemctl --user status teamarness-headless` |
+| Logs | `journalctl --user -u teamarness-headless -b` |
+| Workspaces | `tm workspace list` |
+| Package instances | `tm status` |
 
 ## If setup stops
 
@@ -120,11 +127,10 @@ Setup runs these steps in order. Each step changes something only when the curre
 
 The [operator guide](README.md) documents the equivalent manual commands.
 
-## Check the Installation
+## Join another Workspace
 
-| Check | Command |
-|---|---|
-| Service state | `systemctl --user status teamarness-headless` |
-| Logs | `journalctl --user -u teamarness-headless -b` |
-| Workspaces | `tm workspace list` |
-| Package instances | `tm status` |
+Save a new Invitation as a private file at the `invitation_file` path, as in [step 3](#3-add-a-workspace-invitation-optional), then run setup again. Setup reports `unchanged` for everything else.
+
+## Update the Host
+
+Get the new distribution, set `distribution_dir` to it, and run setup again. Setup stops the service, replaces the installed files, and starts the service again. The Installation identity, memberships, and Package data in `data_dir` stay.
