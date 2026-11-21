@@ -1,0 +1,504 @@
+#!/usr/bin/env -S python3 -I
+"""Install and configure a headless Teamarness Installation from an answers file.
+
+Usage:
+  teamarness-headless-setup --print-template [<path>]
+  teamarness-headless-setup --answers <file>
+  teamarness-headless-setup --help
+
+Every step reads the current state first and changes only what differs, so a
+rerun with the same answers reports `unchanged` for each item. A failed read or
+an uncertain change stops the run; nothing is retried automatically.
+
+Exit codes: 0 success, 1 operational failure or uncertain outcome, 2 invalid
+answers or invocation.
+"""
+
+import getpass
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+if sys.version_info < (3, 11):
+    print("stopped: preflight requires Python 3.11 or later", file=sys.stderr)
+    sys.exit(2)
+
+import tomllib  # noqa: E402
+
+TEMPLATE = """\
+# Teamarness headless Host setup answers.
+# Fill in the required values, then run:
+#   teamarness-headless-setup --answers <this file>
+# Rerunning with the same answers changes nothing.
+
+# Required. The headless distribution directory for this machine. It contains
+# exactly `teamarness-headless` and `packages/`. Setup copies it into install_dir.
+# To update the Host later, point this at a newer distribution and rerun setup.
+distribution_dir = ""
+
+# Required. The name this Installation shows in Workspaces.
+installation_name = ""
+
+# Where the Host is installed and where it keeps its private data.
+# Keep data_dir between updates: it holds the identity and memberships.
+install_dir = "~/.local/lib/teamarness-headless"
+data_dir = "~/.local/share/teamarness-headless"
+
+# Run the Installation as a systemd user service, and keep it running at boot
+# and after logout (lingering).
+service = true
+linger = true
+
+# Shell helpers (`tm`, `tm_req`) for operator commands. Load them with:
+#   source <helpers_file>
+helpers_file = "~/.config/teamarness-headless/helpers.sh"
+
+[join]
+# Optional. A private file (mode 0600) that holds one Workspace Invitation copied
+# from the desktop app. Setup deletes the file after a successful join. To join
+# another Workspace later, save a new Invitation here and rerun setup.
+invitation_file = ""
+# The Person name in the Workspace. Empty means installation_name.
+person_name = ""
+"""
+
+KEYS = {
+    "distribution_dir": str,
+    "installation_name": str,
+    "install_dir": str,
+    "data_dir": str,
+    "service": bool,
+    "linger": bool,
+    "helpers_file": str,
+    "join": dict,
+}
+JOIN_KEYS = {"invitation_file": str, "person_name": str}
+DEFAULTS = {
+    "install_dir": "~/.local/lib/teamarness-headless",
+    "data_dir": "~/.local/share/teamarness-headless",
+    "service": True,
+    "linger": True,
+    "helpers_file": "~/.config/teamarness-headless/helpers.sh",
+    "join": {},
+}
+UNIT_NAME = "teamarness-headless.service"
+INVITATION_PREFIX = "teamarness-workspace-v1."
+READY_SECONDS = 60
+
+
+class Stop(Exception):
+    """Ends the run with a `stopped:` line and an exit code."""
+
+    def __init__(self, message, code=1):
+        super().__init__(message)
+        self.code = code
+
+
+class Report:
+    def __init__(self):
+        self.counts = {"changed": 0, "unchanged": 0}
+
+    def item(self, state, text):
+        self.counts[state] += 1
+        print(f"{state}: {text}", flush=True)
+
+
+def invalid(message):
+    return Stop(f"answers {message}", 2)
+
+
+def load_answers(path):
+    try:
+        with open(path, "rb") as handle:
+            raw = tomllib.load(handle)
+    except OSError as error:
+        raise invalid(f"file cannot be read: {error.strerror}")
+    except tomllib.TOMLDecodeError as error:
+        raise invalid(f"file is not valid TOML: {error}")
+    for key, value in raw.items():
+        if key not in KEYS:
+            raise invalid(f"has unknown key `{key}`")
+        if not isinstance(value, KEYS[key]):
+            raise invalid(f"key `{key}` must be {KEYS[key].__name__}")
+    for key, value in raw.get("join", {}).items():
+        if key not in JOIN_KEYS:
+            raise invalid(f"has unknown key `join.{key}`")
+        if not isinstance(value, JOIN_KEYS[key]):
+            raise invalid(f"key `join.{key}` must be str")
+    answers = {**DEFAULTS, **raw}
+    for key in ("distribution_dir", "installation_name"):
+        if not answers.get(key, "").strip():
+            raise invalid(f"key `{key}` is required")
+    for key in ("distribution_dir", "install_dir", "data_dir", "helpers_file"):
+        value = os.path.expanduser(answers[key])
+        if not os.path.isabs(value):
+            raise invalid(f"key `{key}` must be an absolute path or start with ~")
+        if any(character.isspace() for character in value):
+            raise invalid(f"key `{key}` must not contain whitespace")
+        answers[key] = os.path.normpath(value)
+    join = answers["join"]
+    invitation = join.get("invitation_file", "")
+    join["invitation_file"] = os.path.normpath(os.path.expanduser(invitation)) if invitation else ""
+    join["person_name"] = join.get("person_name") or answers["installation_name"]
+    if answers["linger"] and not answers["service"]:
+        raise invalid("key `linger` requires `service = true`")
+    return answers
+
+
+def preflight(answers):
+    if os.geteuid() == 0:
+        raise Stop("preflight run setup as the unprivileged service account, not root", 2)
+    needed = ["rsync"] + (["systemctl", "loginctl"] if answers["service"] else [])
+    missing = [tool for tool in needed if shutil.which(tool) is None]
+    if missing:
+        raise Stop(f"preflight missing required tools: {', '.join(missing)}", 2)
+    distribution = answers["distribution_dir"]
+    try:
+        entries = sorted(os.listdir(distribution))
+    except OSError:
+        raise invalid(f"distribution_dir `{distribution}` cannot be read")
+    if entries != ["packages", "teamarness-headless"]:
+        raise invalid(f"distribution_dir `{distribution}` must contain exactly teamarness-headless and packages/")
+    result = subprocess.run([os.path.join(distribution, "teamarness-headless"), "--version"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Stop(f"preflight distribution executable did not run (exit {result.returncode}); check that it matches this machine")
+    return result.stdout.strip()
+
+
+def secure_ancestors(report, paths):
+    """Create missing directories privately and remove group/other write from owned ancestors."""
+    home = os.path.realpath(os.path.expanduser("~"))
+    uid = os.geteuid()
+    checked = set()
+    for target in paths:
+        # Resolve system symlinks (for example /var on macOS); Packages check resolved paths too.
+        target = os.path.realpath(target)
+        current = "/"
+        for part in target.strip("/").split("/"):
+            current = os.path.join(current, part)
+            if current in checked:
+                continue
+            checked.add(current)
+            try:
+                info = os.lstat(current)
+            except FileNotFoundError:
+                os.mkdir(current, 0o700)
+                report.item("changed", f"directory {current} created (0700)")
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                raise Stop(f"permissions {current} is a symlink; use a real directory path")
+            if not stat.S_ISDIR(info.st_mode):
+                raise Stop(f"permissions {current} is not a directory")
+            writable = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            if not writable:
+                continue
+            inside_home = current == home or current.startswith(home + os.sep)
+            if info.st_uid == uid and inside_home:
+                os.chmod(current, stat.S_IMODE(info.st_mode) & ~(stat.S_IWGRP | stat.S_IWOTH))
+                report.item("changed", f"permissions {current} no longer group/other-writable")
+            elif not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX):
+                raise Stop(f"permissions {current} is group/other-writable and not yours to fix; ask an administrator")
+
+
+def rsync_changes(source, destination):
+    result = subprocess.run(["rsync", "-a", "--delete", "--checksum", "--dry-run", "--itemize-changes",
+                             f"{source}/", f"{destination}/"], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Stop(f"install rsync comparison failed (exit {result.returncode})")
+    return [line for line in result.stdout.splitlines() if line and not line.startswith(".")]
+
+
+def systemctl(*args, check=True):
+    result = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()[-1:] or [""]
+        raise Stop(f"service `systemctl --user {' '.join(args)}` failed: {detail[0]}")
+    return result
+
+
+def service_active():
+    return systemctl("is-active", UNIT_NAME, check=False).stdout.strip() == "active"
+
+
+def install(report, answers):
+    source, destination = answers["distribution_dir"], answers["install_dir"]
+    if not os.listdir(destination):
+        changes = ["new"]
+    else:
+        changes = rsync_changes(source, destination)
+    if not changes:
+        report.item("unchanged", f"install {destination}")
+        return False
+    was_active = answers["service"] and service_active()
+    if was_active:
+        systemctl("stop", UNIT_NAME)
+    result = subprocess.run(["rsync", "-a", "--delete", f"{source}/", f"{destination}/"], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Stop(f"install copy into {destination} failed (exit {result.returncode}); rerun setup")
+    if was_active:
+        systemctl("start", UNIT_NAME)
+    report.item("changed", f"install {destination} ({'updated' if changes != ['new'] else 'installed'})")
+    return True
+
+
+def unit_path_text(path):
+    """Write paths under the home directory with systemd's %h, matching the documented example unit."""
+    home = os.path.expanduser("~")
+    return "%h" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+def render_unit(answers):
+    executable = unit_path_text(os.path.join(answers["install_dir"], "teamarness-headless"))
+    return f"""[Unit]
+Description=Teamarness headless Installation
+
+[Service]
+Type=simple
+# Copy the complete distribution to this directory, not just the executable.
+ExecStart={executable} serve --data-dir {unit_path_text(answers['data_dir'])}
+WorkingDirectory=%h
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+# Application drains and shuts down Host/Core within 120 seconds from SIGTERM.
+TimeoutStopSec=150s
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def write_private(path, content):
+    temporary = f"{path}.setup-tmp"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(content)
+    os.replace(temporary, path)
+
+
+def read_text(path):
+    try:
+        with open(path) as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+
+
+def service(report, answers, installed_changed):
+    unit_path = os.path.expanduser(f"~/.config/systemd/user/{UNIT_NAME}")
+    content = render_unit(answers)
+    unit_changed = read_text(unit_path) != content
+    if unit_changed:
+        write_private(unit_path, content)
+        systemctl("daemon-reload")
+        report.item("changed", f"unit {unit_path}")
+    else:
+        report.item("unchanged", f"unit {unit_path}")
+    enabled = systemctl("is-enabled", UNIT_NAME, check=False).stdout.strip() == "enabled"
+    active = service_active()
+    if not enabled or not active:
+        systemctl("enable", "--now", UNIT_NAME)
+        report.item("changed", "service enabled and started")
+    elif unit_changed:
+        systemctl("restart", UNIT_NAME)
+        report.item("changed", "service restarted for the new unit")
+    else:
+        report.item("unchanged", "service enabled and running" + (" (updated install already restarted)" if installed_changed else ""))
+
+
+def linger(report):
+    user = getpass.getuser()
+    result = subprocess.run(["loginctl", "show-user", user, "-p", "Linger", "--value"], capture_output=True, text=True)
+    if result.returncode == 0 and result.stdout.strip() == "yes":
+        report.item("unchanged", "linger")
+        return
+    enabled = subprocess.run(["loginctl", "enable-linger", user], capture_output=True, text=True)
+    if enabled.returncode != 0:
+        raise Stop("linger could not be enabled; your administrator's policy may block it (loginctl enable-linger)")
+    report.item("changed", "linger enabled (starts at boot, survives logout)")
+
+
+class Host:
+    def __init__(self, answers):
+        self.app = os.path.join(answers["install_dir"], "teamarness-headless")
+        self.data = answers["data_dir"]
+
+    def run(self, *args):
+        result = subprocess.run([self.app, "--data-dir", self.data, *args], capture_output=True, text=True)
+        try:
+            body = json.loads(result.stdout) if result.stdout.strip() else None
+        except json.JSONDecodeError:
+            body = None
+        return result.returncode, body
+
+    def read(self, step, *args):
+        code, body = self.run(*args)
+        if code != 0:
+            detail = body.get("code") if isinstance(body, dict) else f"exit {code}"
+            raise Stop(f"{step} `{' '.join(args)}` failed ({detail})")
+        return body
+
+
+def wait_ready(report, host):
+    deadline = time.monotonic() + READY_SECONDS
+    while True:
+        code, body = host.run("status")
+        if code == 0 and isinstance(body, dict) and body.get("readiness") == "ready":
+            report.item("unchanged", "readiness ready")
+            return
+        if time.monotonic() >= deadline:
+            raise Stop(f"readiness not ready after {READY_SECONDS}s; inspect with: journalctl --user -u {UNIT_NAME} -b")
+        time.sleep(1)
+
+
+def name(report, host, answers):
+    identity = host.read("name", "identity", "show")
+    wanted = answers["installation_name"]
+    if identity.get("displayName") == wanted:
+        report.item("unchanged", f"installation name {wanted}")
+        return
+    code, body = host.run("identity", "set-name", "--name", wanted)
+    if code != 0:
+        raise Stop(f"name outcome unknown — inspect with: {host.app} --data-dir {host.data} identity show, then rerun setup")
+    report.item("changed", f"installation name {wanted}")
+
+
+def check_invitation(path):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise invalid(f"join.invitation_file `{path}` must be a regular file, not a symlink")
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise invalid(f"join.invitation_file `{path}` must be yours with mode 0600 (chmod 600 {path})")
+    with open(path, "rb") as handle:
+        text = handle.read().decode("ascii", "replace").strip()
+    try:
+        assert text.startswith(INVITATION_PREFIX)
+        payload = bytes.fromhex(text[len(INVITATION_PREFIX):])
+        token_length = int.from_bytes(payload[1:3], "big")
+        offset = 3 + token_length + 32
+        ticket_length = int.from_bytes(payload[offset:offset + 2], "big")
+        assert len(payload) >= offset + 2 and len(payload) == offset + 2 + ticket_length
+    except (AssertionError, ValueError):
+        raise invalid(f"join.invitation_file holds an incomplete Invitation ({len(text)} characters); copy it again from the desktop app")
+    return text
+
+
+def join(report, host, answers):
+    path = answers["join"]["invitation_file"]
+    if not path:
+        return
+    workspaces = host.read("join", "workspace", "list")
+    if check_invitation(path) is None:
+        if workspaces:
+            report.item("unchanged", f"join (invitation file consumed; {len(workspaces)} Workspace(s) joined)")
+            return
+        raise invalid(f"join.invitation_file `{path}` does not exist and no Workspace is joined")
+    code, body = host.run("workspace", "join", "--person-name", answers["join"]["person_name"], "--invitation-file", path)
+    if code == 0 and isinstance(body, dict) and body.get("membershipCommitted"):
+        os.remove(path)
+        workspace = body.get("workspace", {})
+        report.item("changed", f"joined Workspace {workspace.get('name')} ({workspace.get('id')}); invitation file deleted")
+        return
+    uncertain = not isinstance(body, dict) or body.get("outcomeUncertain", True)
+    if uncertain:
+        raise Stop(f"join outcome unknown — inspect with: {host.app} --data-dir {host.data} workspace list, then rerun setup")
+    raise Stop(f"join refused, nothing changed ({body.get('code')}); the invitation file was kept")
+
+
+def helpers(report, answers):
+    path = answers["helpers_file"]
+    content = f"""# Teamarness headless operator helpers. Load with: source {path}
+APP="{os.path.join(answers['install_dir'], 'teamarness-headless')}"
+DATA="{answers['data_dir']}"
+tm() {{ "$APP" --data-dir "$DATA" "$@"; }}
+# tm_req WORKSPACE PACKAGE OPERATION  (reads the JSON request on stdin)
+tm_req() {{
+  local digest
+  digest=$(tm package operations --workspace "$1" --package "$2" |
+    python3 -I -c 'import json,sys; print(json.load(sys.stdin)["contractDigest"])') || return
+  tm package request --workspace "$1" --package "$2" --operation "$3" --contract-digest "$digest" --input -
+}}
+"""
+    if read_text(path) == content:
+        report.item("unchanged", f"helpers {path}")
+    else:
+        write_private(path, content)
+        report.item("changed", f"helpers {path}")
+
+
+def apply(answers_path):
+    answers = load_answers(answers_path)
+    os.umask(0o077)
+    report = Report()
+    version = preflight(answers)
+    if answers["join"]["invitation_file"]:
+        check_invitation(answers["join"]["invitation_file"])  # refuse a bad Invitation before any change
+    print(f"setup: {version} → {answers['install_dir']}", flush=True)
+    directories = [answers["install_dir"], answers["data_dir"], os.path.dirname(answers["helpers_file"])]
+    if answers["service"]:
+        directories.append(os.path.expanduser("~/.config/systemd/user"))
+    secure_ancestors(report, directories)
+    installed_changed = install(report, answers)
+    host = Host(answers)
+    if answers["service"]:
+        service(report, answers, installed_changed)
+        if answers["linger"]:
+            linger(report)
+        wait_ready(report, host)
+    else:
+        print("note: service = false; start the Installation with: "
+              f"{host.app} serve --data-dir {host.data}", flush=True)
+        wait_ready(report, host)
+    name(report, host, answers)
+    join(report, host, answers)
+    helpers(report, answers)
+    workspaces = host.read("summary", "workspace", "list")
+    for workspace in workspaces:
+        print(f"workspace: {workspace.get('name')} {workspace.get('id')}", flush=True)
+    print(f"next: source {answers['helpers_file']}, then set up each Package with its own setup", flush=True)
+    return report
+
+
+def print_template(path):
+    if path is None:
+        sys.stdout.write(TEMPLATE)
+        return
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise Stop(f"template {path} already exists; choose another path", 2)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(TEMPLATE)
+    print(f"template written to {path}")
+
+
+def main(argv):
+    try:
+        if argv in (["--help"], ["-h"]):
+            print(__doc__.strip())
+            return 0
+        if argv[:1] == ["--print-template"] and len(argv) <= 2:
+            print_template(argv[1] if len(argv) == 2 else None)
+            return 0
+        if argv[:1] == ["--answers"] and len(argv) == 2:
+            report = apply(argv[1])
+            print(f"summary: {report.counts['changed']} changed, {report.counts['unchanged']} unchanged", flush=True)
+            return 0
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    except Stop as stop:
+        print(f"stopped: {stop}", flush=True)
+        return stop.code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

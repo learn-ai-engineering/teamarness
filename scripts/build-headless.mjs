@@ -32,6 +32,10 @@ export async function buildHeadless({ root = repositoryRoot, target } = {}) {
     const verified = await verifyHeadlessDistribution({ directory: staging, target, packages });
     await rm(output, { recursive: true, force: true });
     await rename(staging, output);
+    // The answers-file setup ships beside the distribution; the verified distribution root stays unchanged.
+    const setup = join(output, "..", "teamarness-headless-setup");
+    await copyFile(join(root, "scripts/headless/teamarness-headless-setup"), setup);
+    await chmod(setup, 0o755);
     console.log(`Headless distribution: ${output}\n${JSON.stringify(verified)}`);
     return { directory: output, ...verified };
   } finally { await rm(staging, { recursive: true, force: true }); }

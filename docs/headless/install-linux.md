@@ -5,115 +5,120 @@ Use this guide to set up a headless Teamarness Installation on a Linux machine. 
 > [!NOTE]
 > This guide is verified on Ubuntu 26.04 x86_64 with systemd 259. Other Linux distributions that meet the requirements below are expected to work, but they are not tested yet.
 
-Setup has two tiers:
+Setup uses an answers file:
 
-- **Machine tier, once per machine:** install the Host, start the service, and name the Installation.
-- **Workspace tier, once per Workspace:** join the Workspace.
+1. Print a template.
+2. Fill in the template.
+3. Run setup with the answers file.
+
+Setup reads the current state before each step, so you can safely run it again. It also adds Workspaces and applies Host updates.
 
 To add Personal Packages, such as an Agent, follow each Package's own headless guide after you finish this guide.
 
 ## Requirements
 
 - Linux on x86_64 with GNU libc (glibc). musl-based distributions are not supported.
-- systemd with user services and lingering, to run the Installation as a service. Without systemd, you can still run `serve` in the foreground.
-- One unprivileged account that runs the Installation and any local agent tools. Do not run the Installation as root.
-- The headless distribution for `x86_64-unknown-linux-gnu`. This is a directory that contains `teamarness-headless` and `packages/`.
+- systemd with user services and lingering.
+- Python 3.11 or later, and rsync.
+- One unprivileged account that runs the Installation and any local agent tools. Do not run setup or the Installation as root.
 - The Teamarness desktop app on another machine, to create Workspace Invitations.
 
+## 1. Get the distribution
+
+You need two things side by side:
+
+- The headless distribution directory for `x86_64-unknown-linux-gnu`. It contains `teamarness-headless` and `packages/`.
+- The `teamarness-headless-setup` script.
+
 > [!NOTE]
-> No release archives exist yet. Until they do, build the distribution yourself on a Linux x86_64 machine. See [Build one native application](README.md#build-one-native-application). Update this guide when release archives are available.
+> No release archives exist yet. Until they do, build both on a Linux x86_64 machine. See [Build one native application](README.md#build-one-native-application). The build writes `target/teamarness-applications/headless/x86_64-unknown-linux-gnu/` and `target/teamarness-applications/headless/teamarness-headless-setup`. Copy both to the machine, for example with `rsync -a`. Update this guide when release archives are available.
 
-## Machine tier
-
-### 1. Install the Host
-
-Create private directories:
+## 2. Create the answers file
 
 ```sh
-umask 077
-mkdir -p ~/.local/lib ~/.config/systemd/user
-chmod go-w ~ ~/.local ~/.local/lib
+./teamarness-headless-setup --print-template host.toml
 ```
 
-Trusted native code runs from these directories. Some Packages refuse to run when a directory above their installed files is group- or other-writable. Distributions with a default `umask` of `002` often create such directories, so `chmod go-w` removes that access.
+Open `host.toml` and set the two required values:
 
-Copy the complete distribution into place. Do not use symlinks, and do not edit files after the copy. In this example, `DIST` is the distribution directory:
+- `distribution_dir`: the absolute path of the distribution directory.
+- `installation_name`: the name this Installation shows in Workspaces.
+
+The other values have working defaults. The template explains each one.
+
+## 3. Add a Workspace Invitation (optional)
+
+To join a Workspace during setup, select **Copy Workspace Invitation** in the desktop app. Do not paste the Invitation anywhere else. Send it straight to the Linux machine as a private file. From a Mac:
 
 ```sh
-rsync -a --delete "$DIST"/ ~/.local/lib/teamarness-headless/
-~/.local/lib/teamarness-headless/teamarness-headless --version
+pbpaste | ssh my-linux-box 'umask 077; cat > ~/teamarness-invite.txt'
 ```
 
-### 2. Start the service
+In `host.toml`, set `invitation_file = "~/teamarness-invite.txt"` under `[join]`. Setup checks that the Invitation is complete before it changes anything, and it deletes the file after a successful join.
 
-Copy the [example user unit](teamarness-headless.service.example) to `~/.config/systemd/user/teamarness-headless.service`. Then enable it and lingering:
+## 4. Run setup
 
 ```sh
-systemd-analyze --user verify ~/.config/systemd/user/teamarness-headless.service
-systemctl --user daemon-reload
-systemctl --user enable --now teamarness-headless.service
-loginctl enable-linger "$USER"
+./teamarness-headless-setup --answers host.toml
 ```
 
-Lingering starts the service at boot and keeps it running after you log out. Your administrator's policy can restrict lingering.
+Setup prints one line for each item: `changed`, `unchanged`, or `stopped`. It ends with the joined Workspaces and a summary:
 
-### 3. Define the shell helpers
+```text
+changed: install /home/you/.local/lib/teamarness-headless (installed)
+changed: unit /home/you/.config/systemd/user/teamarness-headless.service
+changed: service enabled and started
+changed: linger enabled (starts at boot, survives logout)
+unchanged: readiness ready
+changed: installation name my-linux-box
+changed: joined Workspace team (aad43be122caa818738f763c373ba820); invitation file deleted
+changed: helpers /home/you/.config/teamarness-headless/helpers.sh
+workspace: team aad43be122caa818738f763c373ba820
+summary: 7 changed, 1 unchanged
+```
 
-Paste these helpers into each shell that you use for operator commands. `tm` runs the operator CLI against this Installation. `tm_req` sends one Package request and looks up the current contract digest for you. Package guides use both helpers.
+Keep `host.toml`. It holds no secrets.
+
+Load the operator helpers in each shell that you use for operator commands and Package guides:
 
 ```sh
-APP="$HOME/.local/lib/teamarness-headless/teamarness-headless"
-DATA="$HOME/.local/share/teamarness-headless"
-tm() { "$APP" --data-dir "$DATA" "$@"; }
-# tm_req WORKSPACE PACKAGE OPERATION  (reads the JSON request on stdin)
-tm_req() {
-  local digest
-  digest=$(tm package operations --workspace "$1" --package "$2" |
-    python3 -I -c 'import json,sys; print(json.load(sys.stdin)["contractDigest"])') || return
-  tm package request --workspace "$1" --package "$2" --operation "$3" --contract-digest "$digest" --input -
-}
+source ~/.config/teamarness-headless/helpers.sh
 ```
 
-### 4. Name the Installation
+`tm` runs the operator CLI against this Installation. `tm_req WORKSPACE PACKAGE OPERATION` sends one Package request, with the JSON request on stdin.
 
-```sh
-tm identity set-name --name my-linux-box
-tm status
-```
+## Join another Workspace
 
-Check that `readiness` is `ready`.
-
-## Workspace tier
-
-Repeat this step for each Workspace.
-
-### 5. Join the Workspace
-
-In the desktop app, select **Copy Workspace Invitation**. Do not paste the Invitation anywhere else. Send it straight to the Linux machine as a private file. From a Mac:
-
-```sh
-pbpaste | ssh my-linux-box 'umask 077; cat > ~/teamarness-invite.txt; wc -c < ~/teamarness-invite.txt'
-```
-
-A complete Invitation is about 800 characters. If the count is 256 or lower, the Invitation was truncated. Copy it again.
-
-On the Linux machine:
-
-```sh
-tm workspace join --person-name my-linux-box --invitation-file ~/teamarness-invite.txt
-rm ~/teamarness-invite.txt
-tm workspace list
-```
-
-The Installation joins as a Workspace Person. Use the Workspace ID from `workspace list` in later commands and Package guides. Always select Workspaces by ID, not by name.
+Save a new Invitation to the `invitation_file` path, then run setup again. Setup reports `unchanged` for everything else.
 
 ## Update the Host
 
-1. Stop the service: `systemctl --user stop teamarness-headless`.
-2. Replace the distribution: `rsync -a --delete "$DIST"/ ~/.local/lib/teamarness-headless/`.
-3. Start the service: `systemctl --user start teamarness-headless`.
+Get the new distribution, set `distribution_dir` to it, and run setup again. Setup stops the service, replaces the installed files, and starts the service again. The Installation identity, memberships, and Package data in `data_dir` stay.
 
-Do not change or delete files in `~/.local/share/teamarness-headless`. That directory holds the Installation identity, memberships, and Package data.
+## If setup stops
+
+| Output | Meaning and action |
+|---|---|
+| `stopped: answers …` (exit 2) | An answers value is invalid. Fix it and run setup again. |
+| `stopped: permissions …` | A directory above the install location is group- or other-writable and is not yours. Ask an administrator. Setup fixes directories that you own. |
+| `stopped: … outcome unknown — inspect with: …` (exit 1) | A change might have happened. Run the inspect command that setup prints, then run setup again. Setup never retries by itself. |
+| `stopped: readiness not ready …` | The service did not become ready. Read the logs with `journalctl --user -u teamarness-headless -b`. |
+
+## What setup does
+
+Setup runs these steps in order. Each step changes something only when the current state differs:
+
+1. Checks Python, rsync, systemd, the account, and the distribution.
+2. Creates missing directories with mode 0700. Removes group and other write access from directories you own above the install, data, and configuration locations. Trusted native code runs from there, and some Packages refuse group-writable ancestors.
+3. Copies the distribution to `install_dir`. If the installed copy differs, it applies the copy as an update.
+4. Writes the [user unit](teamarness-headless.service.example), then enables and starts the service.
+5. Enables lingering, so the service starts at boot and keeps running after logout.
+6. Waits until the Installation reports `ready`.
+7. Sets the Installation name.
+8. Joins the Workspace from `invitation_file`, then deletes the file.
+9. Writes the operator helpers.
+
+The [operator guide](README.md) documents the equivalent manual commands.
 
 ## Check the Installation
 
@@ -123,5 +128,3 @@ Do not change or delete files in `~/.local/share/teamarness-headless`. That dire
 | Logs | `journalctl --user -u teamarness-headless -b` |
 | Workspaces | `tm workspace list` |
 | Package instances | `tm status` |
-
-If a command reports `outcomeUncertain: true`, inspect the state before you do anything else. Do not repeat the command automatically. For details, see [Handle errors without replay](README.md#handle-errors-without-replay).

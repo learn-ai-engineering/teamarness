@@ -40,6 +40,8 @@ test("headless assembly isolates cleanup, builds only selected resources, and ve
     const packages = await readBundledPackages();
     await mkdir(join(root, "packages"));
     await copyFile(join(repositoryRoot, "packages/bundled-packages.json"), join(root, "packages/bundled-packages.json"));
+    await mkdir(join(root, "scripts/headless"), { recursive: true });
+    await copyFile(join(repositoryRoot, "scripts/headless/teamarness-headless-setup"), join(root, "scripts/headless/teamarness-headless-setup"));
     const sourceManifests = new Map();
     for (const { sourceDirectory, manifest } of packages) {
       const source = join(root, sourceDirectory);
@@ -64,6 +66,9 @@ test("headless assembly isolates cleanup, builds only selected resources, and ve
     assert.equal(result.status, 0, result.stderr);
     const verified = await verifyHeadlessDistribution({ directory: output, target: linux, packages });
     assert.deepEqual(verified.identities, packages.map(({ identity }) => identity));
+    const shippedSetup = join(output, "..", "teamarness-headless-setup");
+    assert.deepEqual(await readFile(shippedSetup), await readFile(join(repositoryRoot, "scripts/headless/teamarness-headless-setup")));
+    assert.equal((await stat(shippedSetup)).mode & 0o777, 0o755);
     for (const path of sentinels.slice(0, -1)) assert.equal(await readFile(path, "utf8"), "preserve");
     await assert.rejects(readFile(sentinels.at(-1)), /ENOENT/);
     for (const [source, bytes] of sourceManifests) assert.deepEqual(await readFile(join(source, "teamarness.package.json")), bytes);
