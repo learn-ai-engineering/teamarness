@@ -28,6 +28,35 @@ pub const GENERAL: &str = "00000000000000000000000000000000";
 pub const TEAM: [&str; 3] = [DOCUMENTS, BACKLOG, CONVERSATIONS];
 pub const DEADLINE: Duration = Duration::from_secs(60);
 
+pub fn fixture_root() -> tempfile::TempDir {
+    let root = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    assert_eq!(root.path().parent(), Some(std::env::temp_dir().as_path()));
+    assert_eq!(
+        fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let canonical = root.path().canonicalize().unwrap();
+    let socket_bytes = canonical
+        .join("a/control.sock")
+        .as_os_str()
+        .as_encoded_bytes()
+        .len();
+    let limit = if cfg!(target_os = "macos") { 104 } else { 108 };
+    assert!(
+        socket_bytes < limit,
+        "configured temporary root must fit the real Unix socket limit"
+    );
+    eprintln!(
+        "Headless fixture temporary root={} canonical={} socketBytes={socket_bytes}",
+        std::env::temp_dir().display(),
+        canonical.display()
+    );
+    root
+}
+
 pub fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()

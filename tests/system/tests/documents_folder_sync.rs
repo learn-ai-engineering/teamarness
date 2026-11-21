@@ -147,7 +147,15 @@ impl Installation {
     }
 
     /// Opens an editor session, as the UI does, and returns its doc, peer and subscription.
-    async fn session(&self, document: &str) -> (loro::LoroDoc, u64, UiSubscriptionId) {
+    async fn session(
+        &self,
+        document: &str,
+    ) -> (
+        loro::LoroDoc,
+        u64,
+        UiSubscriptionId,
+        teamarness_package_host::PackageHostSubscription,
+    ) {
         let subscription = UiSubscriptionId::new(format!(
             "folder-sync-session-{}",
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -189,7 +197,9 @@ impl Installation {
         let doc = loro::LoroDoc::new();
         doc.import(&snapshot).unwrap();
         let peer: u64 = begin["sessionPeer"].as_str().unwrap().parse().unwrap();
-        (doc, peer, subscription)
+        // Keep the claimed receiver alive until CloseUiSubscription. Dropping it here
+        // makes the next session event a host EventLagged fault of the entire mount.
+        (doc, peer, subscription, events)
     }
 
     async fn close(&self, subscription: UiSubscriptionId) {
@@ -207,7 +217,7 @@ impl Installation {
     /// A Person editing in the Documents UI: one session update that merges the revised
     /// Markdown as the session's peer, sent through `documents.document.update`.
     async fn edit_in_app(&self, document: &str, revise: impl Fn(&str) -> String) {
-        let (doc, peer, subscription) = self.session(document).await;
+        let (doc, peer, subscription, events) = self.session(document).await;
         let current = export(&doc).unwrap();
         let merged = merge(&doc, &doc.oplog_frontiers(), &revise(&current), peer).unwrap();
         let request_id = format!(
@@ -225,13 +235,15 @@ impl Installation {
             .await;
         assert_eq!(answer["requestId"], request_id);
         self.close(subscription).await;
+        drop(events);
     }
 
     /// How many peers have written the Document's body here. Every file import and every
     /// editor session writes as a fresh peer, so this counts the body records written.
     async fn writers(&self, document: &str) -> usize {
-        let (doc, _, subscription) = self.session(document).await;
+        let (doc, _, subscription, events) = self.session(document).await;
         self.close(subscription).await;
+        drop(events);
         doc.oplog_vv().len()
     }
 

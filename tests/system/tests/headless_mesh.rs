@@ -10,7 +10,7 @@ use teamarness_package_host::{PackageHostCommand, ReconcileWorkspaces};
 async fn sync_only_two_headless_and_desktop_backends_cover_two_workspaces_offline_restart_and_late_join()
  {
     no_external_configuration();
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = fixture_root();
     let application = stage(root.path());
     let desktop = Desktop::open(&application, &root.path().join("desktop")).await;
     let workspaces = [

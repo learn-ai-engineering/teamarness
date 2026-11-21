@@ -23,6 +23,23 @@ pub enum MappingState {
     Paused,
 }
 
+impl DocumentStore {
+    /// Retain archive transitions even when a watcher coalesces archive and restore into one read.
+    pub(crate) fn folder_sync_state_orders(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        let inner = lock(&self.inner)?;
+        let mut statement = inner.conn.prepare(
+            "SELECT collection_id,state_order FROM collections UNION ALL SELECT document_id,state_order FROM documents",
+        ).map_err(rerr)?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(rerr)?
+            .collect::<Result<_, _>>()
+            .map_err(rerr)
+    }
+}
+
 impl MappingState {
     #[must_use]
     pub const fn as_str(self) -> &'static str {

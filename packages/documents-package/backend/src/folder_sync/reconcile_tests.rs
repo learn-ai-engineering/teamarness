@@ -2353,62 +2353,79 @@ async fn unavailable_relocation_source(kind: &str, direct: bool) {
 #[cfg(unix)]
 #[tokio::test]
 async fn recursive_case_renamed_unavailable_subtree_preserves_identity_across_restart() {
-    let fixture = Fixture::new().await;
-    fixture.recursive();
-    fs::create_dir(fixture.root.join("Plans")).unwrap();
-    fixture.write("Plans/Note.md", "Original.\n");
-    fixture.write("Sentinel.md", "Sentinel.\n");
-    fixture.folder().await;
-    let document = fixture.titled("Note").id;
-    let sentinel = fixture.titled("Sentinel").id;
-    let before = fixture.state(&document).unwrap();
-    // Two steps expose the new spelling on case-insensitive filesystems too.
-    fs::rename(fixture.root.join("Plans"), fixture.root.join("RenameStage")).unwrap();
-    fs::rename(fixture.root.join("RenameStage"), fixture.root.join("plans")).unwrap();
-    assert!(fixture.files().contains(&"plans".to_owned()));
-    let permissions = RestorePermissions::deny(&fixture.root.join("plans"));
-    assert_eq!(
-        fs::read_dir(fixture.root.join("plans")).unwrap_err().kind(),
-        std::io::ErrorKind::PermissionDenied,
-        "subtree witness requires actual denial, not privileged noncoverage"
-    );
-    eprintln!("established case-renamed subtree PermissionDenied before restart");
-    let fixture = fixture.restart().await;
-    // Restore access before the reopened temporary tree is dropped, including on panic.
-    let permissions = permissions;
-    assert_eq!(
-        fs::read_dir(fixture.root.join("plans")).unwrap_err().kind(),
-        std::io::ErrorKind::PermissionDenied,
-    );
-    fixture.write("Sentinel.md", "Sentinel progressed.\n");
-    let outcome = fixture.folder().await;
-    assert_eq!(
-        outcome.archived, 0,
-        "unavailable equivalent spelling is not deletion"
-    );
-    assert_eq!(fixture.state(&document).unwrap(), before);
-    assert!(!fixture.titled("Note").archived);
-    assert_eq!(fixture.text(&sentinel), "Sentinel progressed.\n");
-    assert_eq!(fixture.documents().len(), 2);
-    assert!(
-        fixture
-            .refusals()
-            .iter()
-            .any(|refusal| refusal.rel_path == "plans")
-    );
-    drop(permissions);
-    fixture.folder().await;
-    let after = fixture.state(&document).unwrap();
-    assert_eq!(after.rel_path, "plans/Note.md");
-    assert_eq!(after.base_version, before.base_version);
-    assert_eq!(after.written_hash, before.written_hash);
-    assert_eq!(fixture.titled("Note").id, document);
-    assert_eq!(fixture.titled("Note").folder, "plans");
-    assert!(!fixture.titled("Note").archived);
-    assert_eq!(fixture.documents().len(), 2);
-    assert_eq!(fixture.read("plans/Note.md"), "Original.\n");
-    fixture.settled().await;
-    fixture.shutdown().await;
+    // The stationary witness independently covers permission denial and restart without
+    // assuming identity can be inferred through an unreadable, differently named directory.
+    for target in ["plans", "Plans"] {
+        let fixture = Fixture::new().await;
+        fixture.recursive();
+        fs::create_dir(fixture.root.join("Plans")).unwrap();
+        fixture.write("Plans/Note.md", "Original.\n");
+        fixture.write("Sentinel.md", "Sentinel.\n");
+        fixture.folder().await;
+        let document = fixture.titled("Note").id;
+        let sentinel = fixture.titled("Sentinel").id;
+        let before = fixture.state(&document).unwrap();
+        // Two steps expose the new spelling on case-insensitive filesystems too.
+        fs::rename(fixture.root.join("Plans"), fixture.root.join("RenameStage")).unwrap();
+        fs::rename(fixture.root.join("RenameStage"), fixture.root.join(target)).unwrap();
+        assert!(fixture.files().contains(&target.to_owned()));
+        let case_sensitive = !fixture.root.join("Plans/Note.md").exists();
+        let permissions = RestorePermissions::deny(&fixture.root.join(target));
+        assert_eq!(
+            fs::read_dir(fixture.root.join(target)).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "subtree witness requires actual denial, not privileged noncoverage"
+        );
+        eprintln!("established case-renamed subtree PermissionDenied before restart");
+        let fixture = fixture.restart().await;
+        // Restore access before the reopened temporary tree is dropped, including on panic.
+        let permissions = permissions;
+        assert_eq!(
+            fs::read_dir(fixture.root.join(target)).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+        );
+        fixture.write("Sentinel.md", "Sentinel progressed.\n");
+        let outcome = fixture.folder().await;
+        assert_eq!(
+            outcome.archived, 0,
+            "unavailable equivalent spelling is not deletion"
+        );
+        assert_eq!(fixture.state(&document).unwrap(), before);
+        assert!(!fixture.titled("Note").archived);
+        assert_eq!(fixture.text(&sentinel), "Sentinel progressed.\n");
+        assert_eq!(fixture.documents().len(), 2);
+        assert!(
+            fixture
+                .refusals()
+                .iter()
+                .any(|refusal| refusal.rel_path == target)
+        );
+        drop(permissions);
+        let outcome = fixture.folder().await;
+        if target == "plans" && case_sensitive {
+            // ADR 0043 / accepted CR-302: case-only parent movement remains refused.
+            assert_eq!(outcome.archived, 0);
+            assert!(outcome.refused > 0);
+            assert_eq!(fixture.state(&document).unwrap(), before);
+            assert_eq!(fixture.titled("Note").folder, "Plans");
+            assert_eq!(fixture.read(&format!("{target}/Note.md")), "Original.\n");
+            assert!(!fixture.titled("Note").archived);
+            assert_eq!(fixture.documents().len(), 2);
+            fixture.shutdown().await;
+            continue;
+        }
+        let after = fixture.state(&document).unwrap();
+        assert_eq!(after.rel_path, format!("{target}/Note.md"));
+        assert_eq!(after.base_version, before.base_version);
+        assert_eq!(after.written_hash, before.written_hash);
+        assert_eq!(fixture.titled("Note").id, document);
+        assert_eq!(fixture.titled("Note").folder, target);
+        assert!(!fixture.titled("Note").archived);
+        assert_eq!(fixture.documents().len(), 2);
+        assert_eq!(fixture.read(&format!("{target}/Note.md")), "Original.\n");
+        fixture.settled().await;
+        fixture.shutdown().await;
+    }
 }
 
 // Verifies: TEAM.SYS.DOCS-R14.
@@ -2416,70 +2433,109 @@ async fn recursive_case_renamed_unavailable_subtree_preserves_identity_across_re
 #[tokio::test]
 async fn recursive_case_only_relocation_recovery_validates_same_entry() {
     use std::os::unix::fs::MetadataExt;
-    let fixture = Fixture::new().await;
-    fixture.recursive();
-    fs::create_dir(fixture.root.join("Plans")).unwrap();
-    fixture.write("Plans/Note.md", "Original.\n");
-    fixture.folder().await;
-    let document = fixture.titled("Note").id;
-    let before = fixture.state(&document).unwrap();
-    fs::rename(fixture.root.join("Plans"), fixture.root.join("RenameStage")).unwrap();
-    fs::rename(fixture.root.join("RenameStage"), fixture.root.join("plans")).unwrap();
-    fs::rename(
-        fixture.root.join("plans/Note.md"),
-        fixture.root.join("plans/note.md"),
-    )
-    .unwrap();
-    match fs::symlink_metadata(fixture.root.join("Plans/Note.md")) {
-        Ok(source) => {
-            let target = fs::symlink_metadata(fixture.root.join("plans/note.md")).unwrap();
-            assert!(source.is_file() && target.is_file());
-            assert_eq!((source.dev(), source.ino()), (target.dev(), target.ino()));
-            eprintln!("established case-only same-entry recovery witness");
-        }
-        Err(cause) => {
-            assert_eq!(cause.kind(), std::io::ErrorKind::NotFound);
-            eprintln!("case-sensitive storage: safe-absence recovery, not a same-entry witness");
-        }
-    }
-    fixture.sync.crash_at(Crash::PlacementAppended);
-    assert_eq!(
-        fixture
-            .sync
-            .reconcile_folder(&fixture.collection)
-            .await
-            .unwrap_err()
-            .code(),
-        "documents.test_crash"
-    );
-    let intent = fixture
-        .session
-        .handles
-        .store
-        .file_relocation(&document)
-        .unwrap()
+    for target in ["plans", "Moved"] {
+        let fixture = Fixture::new().await;
+        fixture.recursive();
+        fs::create_dir(fixture.root.join("Plans")).unwrap();
+        fixture.write("Plans/Note.md", "Original.\n");
+        fixture.folder().await;
+        let document = fixture.titled("Note").id;
+        let before = fixture.state(&document).unwrap();
+        fs::rename(fixture.root.join("Plans"), fixture.root.join("RenameStage")).unwrap();
+        fs::rename(fixture.root.join("RenameStage"), fixture.root.join(target)).unwrap();
+        fs::rename(
+            fixture.root.join(format!("{target}/Note.md")),
+            fixture.root.join(format!("{target}/note.md")),
+        )
         .unwrap();
-    assert!(intent.local_move);
-    assert_eq!(intent.source_path, "Plans/Note.md");
-    assert_eq!(intent.destination_path, "plans/note.md");
-    assert_eq!(fixture.titled("Note").folder, "plans");
-    let fixture = fixture.restart().await;
-    fixture.reconcile(&document).await;
-    let after = fixture.state(&document).unwrap();
-    assert_eq!(after.rel_path, "plans/note.md");
-    assert_eq!(after.base_version, before.base_version);
-    assert_eq!(after.written_hash, before.written_hash);
-    assert!(
-        fixture
+        match fs::symlink_metadata(fixture.root.join("Plans/Note.md")) {
+            Ok(source) => {
+                let target =
+                    fs::symlink_metadata(fixture.root.join(format!("{target}/note.md"))).unwrap();
+                assert!(source.is_file() && target.is_file());
+                assert_eq!((source.dev(), source.ino()), (target.dev(), target.ino()));
+                eprintln!("established case-only same-entry recovery witness");
+            }
+            Err(cause) => {
+                assert_eq!(cause.kind(), std::io::ErrorKind::NotFound);
+                eprintln!(
+                    "case-sensitive storage: safe-absence recovery, not a same-entry witness"
+                );
+            }
+        }
+        if target == "plans" && !fixture.root.join("Plans/Note.md").exists() {
+            let outcome = fixture.folder().await;
+            assert_eq!(outcome.archived, 0);
+            assert!(outcome.refused > 0);
+            assert_eq!(fixture.state(&document).unwrap(), before);
+            assert_eq!(fixture.titled("Note").folder, "Plans");
+            assert_eq!(fixture.read("plans/note.md"), "Original.\n");
+            assert_eq!(fixture.documents().len(), 1);
+            let intent = fixture
+                .session
+                .handles
+                .store
+                .file_relocation(&document)
+                .unwrap()
+                .unwrap();
+            assert_eq!(intent.source_path, "Plans/Note.md");
+            assert_eq!(intent.destination_path, "plans/note.md");
+            let fixture = fixture.restart().await;
+            fixture.reconcile(&document).await;
+            assert_eq!(fixture.state(&document).unwrap(), before);
+            assert_eq!(
+                fixture
+                    .session
+                    .handles
+                    .store
+                    .file_relocation(&document)
+                    .unwrap(),
+                Some(intent)
+            );
+            assert_eq!(fixture.read("plans/note.md"), "Original.\n");
+            assert_eq!(fixture.documents().len(), 1);
+            fixture.shutdown().await;
+            continue;
+        }
+        fixture.sync.crash_at(Crash::PlacementAppended);
+        assert_eq!(
+            fixture
+                .sync
+                .reconcile_folder(&fixture.collection)
+                .await
+                .unwrap_err()
+                .code(),
+            "documents.test_crash"
+        );
+        let intent = fixture
             .session
             .handles
             .store
             .file_relocation(&document)
             .unwrap()
-            .is_none()
-    );
-    assert_eq!(fixture.titled("note").id, document);
-    assert_eq!(fixture.documents().len(), 1);
-    fixture.settled().await;
-    fixture.shutdown().await;
+            .unwrap();
+        assert!(intent.local_move);
+        assert_eq!(intent.source_path, "Plans/Note.md");
+        assert_eq!(intent.destination_path, format!("{target}/note.md"));
+        assert_eq!(fixture.titled("Note").folder, target);
+        let fixture = fixture.restart().await;
+        fixture.reconcile(&document).await;
+        let after = fixture.state(&document).unwrap();
+        assert_eq!(after.rel_path, format!("{target}/note.md"));
+        assert_eq!(after.base_version, before.base_version);
+        assert_eq!(after.written_hash, before.written_hash);
+        assert!(
+            fixture
+                .session
+                .handles
+                .store
+                .file_relocation(&document)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fixture.titled("note").id, document);
+        assert_eq!(fixture.documents().len(), 1);
+        fixture.settled().await;
+        fixture.shutdown().await;
+    }
 }

@@ -815,7 +815,6 @@ pub(super) async fn changed(
     tokio::spawn(async move {
         loop {
             let mut documents = BTreeSet::new();
-            let mut listing_changed = false;
             let mut relist = false;
             tokio::select! {
                 () = sender.closed() => return,
@@ -823,7 +822,6 @@ pub(super) async fn changed(
                     if result.is_err() {
                         return;
                     }
-                    listing_changed = true;
                 }
                 event = bodies.recv() => match event {
                     Ok(event) => note_document(&event, &mut documents),
@@ -838,7 +836,10 @@ pub(super) async fn changed(
                     Err(_) => break,
                 }
             }
-            if listing_changed || metadata.has_changed().unwrap_or(false) {
+            // Body publication precedes the metadata wake inside the store's commit lock.
+            // Read the committed listing on either wake so a create cannot first masquerade
+            // as a body-only change when the metadata sender has not run yet.
+            {
                 metadata.borrow_and_update();
                 let state = context.state().clone();
                 let Ok(next) = context.blocking(move |_| listing_fingerprint(&state)).await else {

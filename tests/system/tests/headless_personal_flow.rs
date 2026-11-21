@@ -14,7 +14,7 @@ use teamarness_package_host::{PackageHostCommand, ReconcileWorkspaces};
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn canonical_runbook_fixture_settings_lifecycle_and_retention() {
     no_external_configuration();
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = fixture_root();
     let application = stage(root.path());
     let desktop = Desktop::open(&application, &root.path().join("desktop")).await;
     let ws = desktop.core.create_workspace("Runbook").unwrap().id();
@@ -174,7 +174,7 @@ fn route(row: &Value, action: &str, port: &str, request: Value) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn independent_personal_install_remove_preserves_team_generations_and_document_bodies() {
     no_external_configuration();
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = fixture_root();
     let application = stage(root.path());
     let desktop = Desktop::open(&application, &root.path().join("desktop")).await;
     let workspaces = [
