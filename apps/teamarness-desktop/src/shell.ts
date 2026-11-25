@@ -11,7 +11,7 @@ import {
   type PackageNavigationPresentation,
   type ShellPresentation,
 } from "./presentation";
-import type { StatusMessageTimers } from "./status-message";
+import { renderStatusMessage, type StatusMessageTimers } from "./status-message";
 import type { InstallationThemeController, ThemePreference } from "./theme";
 import { THEME_OPTIONS } from "./theme-icons";
 import { renderShell, type ShellModel } from "./view";
@@ -65,6 +65,8 @@ type WorkspaceActions = Readonly<{
   copyInvitation(workspaceId: string): Promise<void>;
   refreshMembership(workspaceId: string): Promise<void>;
   retry(): Promise<void>;
+  dismissError(): void;
+  dismissMembershipRefreshWarning(): void;
 }>;
 
 type ShellOptions = Readonly<{
@@ -88,6 +90,8 @@ export class Shell {
   private workspacePresentation: ShellPresentation | null = null;
   private packageSnapshot: PackageHostSnapshot | null = null;
   private packageSnapshotFailed = false;
+  /** The Person closed the snapshot failure notification; the next failure shows it again. */
+  private packageSnapshotFailureDismissed = false;
   /** The last failed Recover or Dispose, for Retry and for a later successful refresh. */
   private packageLifecycleFeedback: PackageLifecycleFeedback | null = null;
   /** The message that result put in the Workspace page's message area. */
@@ -198,7 +202,7 @@ export class Shell {
   }
 
   public updatePackageSnapshotFailure(): void {
-    this.packageSnapshotFailed = true;
+    { this.packageSnapshotFailed = true; this.packageSnapshotFailureDismissed = false; }
     this.renderPackageConsumers();
   }
 
@@ -413,7 +417,7 @@ export class Shell {
     this.shellFrame.contextualNavigation.innerHTML = `<header class="workspace-context"><div><p>Workspace</p><h1>${escape(activePresentation.name)}</h1></div>
       <button type="button" class="workspace-settings-link" data-screen="workspace-settings" aria-label="Workspace settings" title="Workspace settings"${settingsCurrent}>${SETTINGS_ICON}</button></header>
       <nav class="contextual-navigation__body" aria-label="Active Workspace">
-      ${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}
+      ${renderPackageSnapshotFailure(this.packageSnapshotFailed && !this.packageSnapshotFailureDismissed, this.packageSnapshot !== null)}
       <section class="package-group" aria-labelledby="team-packages-heading"><h2 id="team-packages-heading">Team Packages</h2><ul>${team || "<li>None available</li>"}</ul></section>
       <section class="package-group" aria-labelledby="private-packages-heading"><h2 id="private-packages-heading">Personal Packages</h2><ul>${privatePackages || "<li>None available</li>"}</ul></section></nav>`;
 
@@ -448,7 +452,7 @@ export class Shell {
     if (!this.workspacePresentation || this.selectedRoute.kind === "package-instance") return;
     if (this.selectedRoute.kind === "package-page") {
       this.shellFrame.shellScreen.innerHTML = renderShell(this.workspacePresentation, this.selectedRoute, {
-        packagePage: `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packagePage.render(this.packageSnapshot, this.selectedRoute.tab ?? "about")}${this.configurationUnavailable ? '<p role="alert">Configuration is unavailable. The Package must be active and declare a settings view. Try reopening it after refreshing.</p>' : ""}`,
+        packagePage: `${renderPackageSnapshotFailure(this.packageSnapshotFailed && !this.packageSnapshotFailureDismissed, this.packageSnapshot !== null)}${this.packagePage.render(this.packageSnapshot, this.selectedRoute.tab ?? "about")}${this.configurationUnavailable ? '<p role="alert">Configuration is unavailable. The Package must be active and declare a settings view. Try reopening it after refreshing.</p>' : ""}`,
       });
       this.bindSelectedScreen();
       const pageOpened = this.packagePage.takeFocusRequest();
@@ -464,7 +468,7 @@ export class Shell {
       return;
     }
     const packageSettings = this.selectedRoute.kind === "workspace-settings"
-      ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packageManagement.renderMessage(this.packageSnapshot)}${this.packageManagement.renderPanel(this.packageSnapshot)}${renderPackageInstanceSettings(
+      ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed && !this.packageSnapshotFailureDismissed, this.packageSnapshot !== null)}${this.packageManagement.renderMessage(this.packageSnapshot)}${this.packageManagement.renderPanel(this.packageSnapshot)}${renderPackageInstanceSettings(
         this.packagePresentation,
         this.packageActionTargets,
         this.options.packageVisibility,
@@ -566,7 +570,7 @@ export class Shell {
       this.packageSnapshot = result.snapshot;
       this.packageSnapshotFailed = false;
     }
-    if (result.failure === "refresh" || result.failure === "operation-and-refresh") this.packageSnapshotFailed = true;
+    if (result.failure === "refresh" || result.failure === "operation-and-refresh") { this.packageSnapshotFailed = true; this.packageSnapshotFailureDismissed = false; }
     if (result.failure === "operation" || result.failure === "operation-and-refresh") {
       throw new Error("Package lifecycle operation failed");
     }
@@ -631,6 +635,12 @@ export class Shell {
     this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("#retry")?.addEventListener("click", () => {
       void this.options.workspaceActions.retry();
     });
+    this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("[data-workspace-error-dismiss]")?.addEventListener("click", () => {
+      this.options.workspaceActions.dismissError();
+    });
+    this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("[data-membership-refresh-dismiss]")?.addEventListener("click", () => {
+      this.options.workspaceActions.dismissMembershipRefreshWarning();
+    });
     this.bindPackageSnapshotRetry(this.shellFrame.shellScreen);
     this.bindPackageManagement();
     this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-package-action]").forEach((button) => {
@@ -684,6 +694,10 @@ export class Shell {
     region.querySelector<HTMLButtonElement>("[data-package-snapshot-retry]")?.addEventListener("click", () => {
       void this.retryPackageSnapshot();
     });
+    region.querySelector<HTMLButtonElement>("[data-package-snapshot-dismiss]")?.addEventListener("click", () => {
+      this.packageSnapshotFailureDismissed = true;
+      this.renderPackageConsumers();
+    });
   }
 
   private async retryPackageSnapshot(): Promise<void> {
@@ -711,7 +725,7 @@ export class Shell {
       this.packageSnapshotFailed = false;
     }
     if (result.failure === "refresh" || result.failure === "operation-and-refresh") {
-      this.packageSnapshotFailed = true;
+      { this.packageSnapshotFailed = true; this.packageSnapshotFailureDismissed = false; }
     }
     this.showPackageLifecycleFeedback({ action, instance, name, failure: result.failure });
     this.renderPackageConsumers();
@@ -882,7 +896,7 @@ function renderPackageSnapshotFailure(failed: boolean, hasSnapshot: boolean): st
   const message = hasSnapshot
     ? "Package information may be out of date. Showing the latest available Package information."
     : "Package information is unavailable.";
-  return `<div class="package-snapshot-failure" role="alert"><p>${message}</p><button type="button" data-package-snapshot-retry>Retry Package information</button></div>`;
+  return renderStatusMessage({ message, failed: true }, "data-package-snapshot-dismiss", '<button type="button" data-package-snapshot-retry>Retry Package information</button>');
 }
 
 // Only Package Instances that need recovery get lifecycle controls; healthy rows stay quiet.

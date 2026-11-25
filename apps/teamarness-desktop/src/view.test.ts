@@ -464,6 +464,53 @@ describe("Shell Workspace screens", () => {
     expect(html).not.toContain("timeout");
   });
 
+  // Verifies: TEAM.SYS.SHELL-R08
+  it("hides a Workspace notice after five seconds but keeps an error until it is closed", async () => {
+    const scheduled: Array<{ callback: () => void; ms: number; cleared: boolean }> = [];
+    const timers = {
+      setTimeout: (callback: () => void, ms: number) => { const entry = { callback, ms, cleared: false }; scheduled.push(entry); return entry; },
+      clearTimeout: (handle: unknown) => { (handle as { cleared: boolean }).cleared = true; },
+    };
+    const failure = fixture.errors.find(({ code }) => code === "timeout") as BridgeError;
+    let fail = false;
+    const controller = new ShellController(fakeBridge({
+      renameWorkspacePrincipal: async () => { if (fail) throw failure; },
+    }), () => undefined, undefined, timers);
+    await controller.load();
+    await controller.rename(workspace.id, "Don");
+    expect(controller.snapshot().notice).toBe("Name updated");
+    const live = scheduled.filter(({ cleared }) => !cleared);
+    expect(live.map(({ ms }) => ms)).toEqual([5_000]);
+    live[0]?.callback();
+    expect(controller.snapshot().notice).toBeNull();
+
+    fail = true;
+    await controller.rename(workspace.id, "Don");
+    expect(controller.snapshot().error).toBe("timeout");
+    expect(scheduled.filter(({ cleared }) => !cleared).every(({ callback }) => { callback(); return true; })).toBe(true);
+    expect(controller.snapshot().error).toBe("timeout");
+    const html = await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id });
+    expect(html).toContain('role="alert"');
+    expect(html).toContain("data-workspace-error-dismiss");
+    expect(html.indexOf("data-workspace-error-dismiss")).toBeGreaterThan(html.indexOf('id="workspace-page-heading"'));
+    controller.dismissError();
+    expect(controller.snapshot().error).toBeNull();
+  });
+
+  it("closes the roster refresh warning without retrying it", async () => {
+    let fail = false;
+    const controller = new ShellController(fakeBridge({
+      addWorkspaceAgent: async () => undefined,
+      currentMembership: async () => { if (fail) throw { code: "timeout", retryable: true }; return fixture.membership as Membership; },
+    }), () => undefined);
+    await controller.load();
+    fail = true;
+    await controller.addAgent(workspace.id, "Helper");
+    expect(await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id })).toContain("data-membership-refresh-dismiss");
+    controller.dismissMembershipRefreshWarning();
+    expect(controller.snapshot().membershipRefreshUnavailable).toBeNull();
+  });
+
   it("keeps membership refresh failures observable", async () => {
     const failure = fixture.errors.find(({ code }) => code === "timeout") as BridgeError;
     let shouldFail = false;

@@ -40,6 +40,8 @@ export type RegistrationFeedback = Readonly<{
   message: string;
   failed: boolean;
   restart: boolean;
+  /** Stays until dismissed, because it carries the only Restart control. */
+  persistent?: boolean;
   /** A `lifecycle` Recover or Dispose that failed and can run again from the message. */
   retry?: "recover" | "dispose";
 }>;
@@ -227,7 +229,7 @@ export class PackageManagementController {
         ? `<button type="button" data-package-failure-action="${feedback.retry}">Retry ${feedback.retry === "recover" ? "Recover Backend" : "Dispose"}</button>`
         : "";
     return renderStatusMessageSlot(
-      { message: `${feedback.name}: ${feedback.message}`, failed: feedback.failed },
+      { message: `${feedback.name}: ${feedback.message}`, failed: feedback.failed, persistent: feedback.persistent === true },
       MESSAGE_DISMISS,
       restart,
     );
@@ -404,7 +406,8 @@ export class PackageManagementController {
     let feedback: RegistrationFeedback;
     try {
       const change = await operation();
-      feedback = { source: "registration", identity, name, message: success(change), failed: false, restart: change.restartRequired };
+      // A change that needs a restart carries the only Restart control, so it stays (DELTA-018 SF-304).
+      feedback = { source: "registration", identity, name, message: success(change), failed: false, restart: change.restartRequired, persistent: change.restartRequired };
     } catch (error: unknown) {
       feedback = { source: "registration", identity, name, message: refusalMessage(error), failed: true, restart: false };
     }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { renderStatusMessageSlot, STATUS_MESSAGE_HIDE_MS, StatusMessageSlot, type StatusMessageTimers } from "./status-message";
+import { renderStatusMessage, renderStatusMessageSlot, STATUS_MESSAGE_HIDE_MS, StatusMessageSlot, type StatusMessageTimers } from "./status-message";
 
 /** A clock the test advances by hand. */
 function manualTimers(): StatusMessageTimers & { advance(ms: number): void; pending(): number } {
@@ -77,5 +77,19 @@ describe("status message slot", () => {
     const error = renderStatusMessageSlot({ message: "Refused.", failed: true }, "data-dismiss");
     expect(error).toContain('role="alert" aria-live="assertive"><p>Refused.</p>');
     expect(error).toContain('data-dismiss aria-label="Dismiss message"');
+  });
+
+  // Verifies: TEAM.SYS.SHELL-R08
+  it("keeps a persistent success until it is replaced and gives it the same close control as an error", () => {
+    const timers = manualTimers();
+    const slot = new StatusMessageSlot(() => undefined, timers);
+    slot.set({ message: "Applies after restart.", failed: false, persistent: true });
+    expect(timers.pending()).toBe(0);
+    timers.advance(STATUS_MESSAGE_HIDE_MS * 4);
+    expect(slot.current()?.message).toBe("Applies after restart.");
+    const persistent = renderStatusMessageSlot({ message: "Applies after restart.", failed: false, persistent: true }, "data-dismiss");
+    expect(persistent).toContain('role="status" aria-live="polite"');
+    expect(persistent).toContain('class="status-message-dismiss" data-dismiss aria-label="Dismiss message" title="Dismiss message"><span aria-hidden="true">×</span></button>');
+    expect(renderStatusMessage({ message: "Refused.", failed: true }, "data-x")).toMatch(/^<div class="status-message status-message--error" role="alert"[^>]*><p>Refused\.<\/p><button type="button" class="status-message-dismiss" data-x /);
   });
 });

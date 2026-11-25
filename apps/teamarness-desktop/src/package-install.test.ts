@@ -547,6 +547,19 @@ describe("the Packages section message area", () => {
     expect(test.renders()).toBe(renders + 1);
   });
 
+  // Verifies: TEAM.SYS.SHELL-R08
+  it("keeps a success that carries the only Restart control until it is dismissed (SF-304)", async () => {
+    const test = harness({ reload: async () => ({ revision: 6, restartRequired: true }) });
+    await test.controller.registrationAction("reload", refused.expectedIdentity, snapshot([refused]));
+    test.timers.advance(STATUS_MESSAGE_HIDE_MS * 10);
+    const message = test.controller.renderMessage(snapshot([refused]));
+    expect(message).toContain("data-package-change-restart");
+    expect(message).toContain('role="status"');
+    expect(message).toContain('data-package-message-dismiss aria-label="Dismiss message"');
+    test.controller.dismissMessage();
+    expect(test.controller.renderMessage(snapshot([refused]))).not.toContain("data-package-change-restart");
+  });
+
   it("keeps an error until it is dismissed, or until the next action replaces it", async () => {
     let fail = true;
     const test = harness({

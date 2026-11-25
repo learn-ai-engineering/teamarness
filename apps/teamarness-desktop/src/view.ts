@@ -2,6 +2,13 @@ import type { TeamarnessBridge } from "./bridge";
 import { isBridgeError } from "./contracts";
 import type { Installation, Membership, PrincipalsSnapshot, ShellErrorCode, Workspace } from "./contracts";
 import { buildShellPresentation, type ShellPresentation } from "./presentation";
+import {
+  browserStatusMessageTimers,
+  renderStatusMessage,
+  renderStatusMessageSlot,
+  STATUS_MESSAGE_HIDE_MS,
+  type StatusMessageTimers,
+} from "./status-message";
 import type { ShellRoute } from "./shell";
 
 export type ShellModel = Readonly<{
@@ -51,11 +58,13 @@ export class ShellController {
   private readonly principalRetryDelays = new Map<string, number>();
   private nextWatch = 0;
   private disposed = false;
+  private noticeTimer: unknown = null;
 
   public constructor(
     private readonly bridge: TeamarnessBridge,
     private readonly update: (model: ShellModel) => void,
     private readonly copy: (value: Promise<string>) => Promise<void> = writeClipboardTextWhenReady,
+    private readonly timers: StatusMessageTimers = browserStatusMessageTimers,
   ) {}
 
   public snapshot(): ShellModel { return this.model; }
@@ -65,6 +74,17 @@ export class ShellController {
     this.watched.clear();
     for (const retry of this.principalRetries.values()) clearTimeout(retry);
     this.principalRetries.clear();
+    this.cancelNoticeTimer();
+  }
+
+  /** Closes the error notification; the failed action can still be retried from its control. */
+  public dismissError(): void {
+    this.set({ error: null });
+  }
+
+  /** Closes the warning that the roster could not be refreshed after an Agent change. */
+  public dismissMembershipRefreshWarning(): void {
+    this.set({ membershipRefreshUnavailable: null });
   }
 
   public selectWorkspace(workspaceId: string): void {
@@ -270,7 +290,24 @@ export class ShellController {
 
   private set(change: Partial<ShellModel>): void {
     this.model = { ...this.model, ...change };
+    if ("notice" in change) this.scheduleNoticeHide(change.notice ?? null);
     this.update(this.model);
+  }
+
+  /** A notice hides itself after the shared delay unless a later change replaced it (`TEAM.SYS.SHELL-R08`). */
+  private scheduleNoticeHide(notice: string | null): void {
+    this.cancelNoticeTimer();
+    if (notice === null || this.disposed) return;
+    this.noticeTimer = this.timers.setTimeout(() => {
+      this.noticeTimer = null;
+      if (this.model.notice === notice) this.set({ notice: null });
+    }, STATUS_MESSAGE_HIDE_MS);
+  }
+
+  private cancelNoticeTimer(): void {
+    if (this.noticeTimer === null) return;
+    this.timers.clearTimeout(this.noticeTimer);
+    this.noticeTimer = null;
   }
 }
 
@@ -301,15 +338,27 @@ export function renderShell(
   route: ShellRoute,
   input: ShellRendererInput = {},
 ): string {
-  const statusMessage = presentation.loading ? "Working…" : presentation.notice ?? "";
-  const status = `<p class="shell-status" role="status" aria-live="polite">${escape(statusMessage)}</p>`;
-  const error = `<div class="shell-alert" role="alert">${presentation.error
-    ? `<p class="error">${escape(presentation.error.message)}</p>${presentation.error.canRetry ? '<button id="retry" type="button">Retry</button>' : ""}`
-    : ""}</div>`;
-  const refreshWarning = presentation.membershipRefreshUnavailable && routeWorkspaceId(route) === presentation.membershipRefreshUnavailable
-    ? '<div class="shell-alert" role="alert"><p>Agent change succeeded, but members could not be refreshed. Check the roster before another change.</p><button id="retry-membership-refresh" type="button">Refresh members</button></div>'
+  // One notification area at the top of the screen, in the space it always keeps (`TEAM.SYS.SHELL-R08`).
+  const error = presentation.error
+    ? renderStatusMessage(
+      { message: presentation.error.message, failed: true },
+      "data-workspace-error-dismiss",
+      presentation.error.canRetry ? '<button id="retry" type="button">Retry</button>' : "",
+    )
     : "";
-  const feedback = `${status}${error}${refreshWarning}`;
+  const refreshWarning = presentation.membershipRefreshUnavailable && routeWorkspaceId(route) === presentation.membershipRefreshUnavailable
+    ? renderStatusMessage(
+      { message: "Agent change succeeded, but members could not be refreshed. Check the roster before another change.", failed: true },
+      "data-membership-refresh-dismiss",
+      '<button id="retry-membership-refresh" type="button">Refresh members</button>',
+    )
+    : "";
+  const status = presentation.loading
+    ? { message: "Working…", failed: false }
+    : presentation.notice === null ? null : { message: presentation.notice, failed: false };
+  const feedback = error || refreshWarning
+    ? `<div class="status-message-slot">${error}${refreshWarning}</div>`
+    : renderStatusMessageSlot(status, "");
 
   if (route.kind === "workspace-chooser") {
     const choices = presentation.workspaceChoices.map(({ name }, index) =>
@@ -318,7 +367,7 @@ export function renderShell(
     const workspaceListSection = workspaceList
       ? `<section class="screen-section" aria-labelledby="workspace-list-heading"><h2 id="workspace-list-heading">Your Workspaces</h2><ul class="workspace-list">${workspaceList}</ul></section>`
       : "";
-    return `${feedback}<section class="shell-screen" aria-labelledby="chooser-heading"><header class="screen-heading"><p class="eyebrow">Workspaces</p><h1 id="chooser-heading">Create or join a Workspace</h1><p>Create a new Workspace, or join one with a Workspace Invitation.</p></header>
+    return `<section class="shell-screen" aria-labelledby="chooser-heading"><header class="screen-heading"><p class="eyebrow">Workspaces</p><h1 id="chooser-heading">Create or join a Workspace</h1><p>Create a new Workspace, or join one with a Workspace Invitation.</p></header>${feedback}
       ${workspaceListSection}
       <section class="screen-section"><h2>Create a Workspace</h2><form id="create-workspace"><label for="workspace-name">Workspace name</label>
       <input id="workspace-name" required maxlength="64" autocapitalize="off" autocorrect="off" spellcheck="false" writingsuggestions="false"><label for="create-person-name">Your name in this Workspace</label><input id="create-person-name" required maxlength="256" autocomplete="name"><button ${presentation.loading ? "disabled" : ""}>Create</button></form></section>
@@ -327,7 +376,8 @@ export function renderShell(
   }
 
   if (route.kind === "package-page") {
-    return `${feedback}${input.packagePage ?? '<section class="shell-screen"><p class="empty-state">Package information is loading.</p></section>'}`;
+    // The Package page keeps its own message space; a Workspace result shows above it only when present.
+    return `${status === null && !error && !refreshWarning ? "" : feedback}${input.packagePage ?? '<section class="shell-screen"><p class="empty-state">Package information is loading.</p></section>'}`;
   }
 
   const workspace = presentation.workspace;
@@ -339,7 +389,7 @@ export function renderShell(
     : '<li class="empty-state">Membership is loading.</li>');
   const disabled = presentation.loading ? " disabled" : "";
   const memberCount = workspace.memberCount === 1 ? "1 Member." : `${workspace.memberCount} Members.`;
-  return `${feedback}<section class="shell-screen workspace-page" aria-labelledby="workspace-page-heading"><header class="package-page-header workspace-page-header"><p class="package-page-kind">Workspace</p><h1 id="workspace-page-heading" class="package-page-title">${escape(workspace.name)}</h1><p class="package-page-subtitle">${memberCount}</p></header>
+  return `<section class="shell-screen workspace-page" aria-labelledby="workspace-page-heading"><header class="package-page-header workspace-page-header"><p class="package-page-kind">Workspace</p><h1 id="workspace-page-heading" class="package-page-title">${escape(workspace.name)}</h1><p class="package-page-subtitle">${memberCount}</p></header>${feedback}
     ${settingsGroup("your-name", "Your name", "The name other Members see for you in this Workspace.", `<form id="rename-person"><label for="rename-person-name">Name in this Workspace</label><div class="inline-field"><input id="rename-person-name" required maxlength="256" autocomplete="name" value="${escape(workspace.ownPersonName)}"><button${disabled}>Save name</button></div></form>`)}
     ${settingsGroup("members", "Members", "People and Agents in this Workspace. You are the Steward of each Agent you add.", `<ol class="members">${members}</ol><form id="add-agent"><label for="agent-name">Add an Agent</label><div class="inline-field"><input id="agent-name" required maxlength="256" autocomplete="off" placeholder="Agent name"><button${disabled}>Add agent</button></div></form><div><button type="button" id="refresh-membership" class="secondary"${disabled}>Refresh members</button></div>`)}
     ${settingsGroup("invitations", "Workspace Invitations", "Each Workspace Invitation admits one Person, once.", `<div><button type="button" id="copy-invitation"${disabled}>Copy Workspace Invitation</button></div><p class="sensitive">Workspace Invitations are sensitive bearer admission material. Share them privately.</p>`)}

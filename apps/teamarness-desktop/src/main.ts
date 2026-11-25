@@ -55,6 +55,8 @@ const shell = new Shell(frame, {
     copyInvitation: async (workspaceId) => { await controller.copyInvitation(workspaceId); },
     refreshMembership: async (workspaceId) => { await controller.refreshMembership(workspaceId); },
     retry: async () => { await controller.load(); },
+    dismissError: () => { controller.dismissError(); },
+    dismissMembershipRefreshWarning: () => { controller.dismissMembershipRefreshWarning(); },
   },
 });
 

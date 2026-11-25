@@ -196,9 +196,13 @@ class ThemeRailRegion extends Region {
 class RetryRegion extends Region {
   public readonly retry = new TestControl();
   public readonly refresh = new TestControl();
+  public readonly dismissError = new TestControl();
+  public readonly dismissRefresh = new TestControl();
 
   public querySelector(selector: string): TestControl | null {
     if (selector === "#retry-membership-refresh" && this.innerHTML.includes('id="retry-membership-refresh"')) return this.refresh;
+    if (selector === "[data-workspace-error-dismiss]" && this.innerHTML.includes("data-workspace-error-dismiss")) return this.dismissError;
+    if (selector === "[data-membership-refresh-dismiss]" && this.innerHTML.includes("data-membership-refresh-dismiss")) return this.dismissRefresh;
     return selector === "#retry" && this.innerHTML.includes('id="retry"') ? this.retry : null;
   }
 
@@ -313,6 +317,8 @@ function harness(
       copyInvitation: async () => undefined,
       refreshMembership: async (id) => { calls.push(`refresh:${id}`); },
       retry: async () => { calls.push("retry"); },
+      dismissError: () => { calls.push("dismiss-error"); },
+      dismissMembershipRefreshWarning: () => { calls.push("dismiss-refresh-warning"); },
     },
     onRouteChange: (route) => { routes.push(route); },
     mountApplicationUpdates,
@@ -669,6 +675,18 @@ describe("persistent Shell frame", () => {
     expect(test.calls).toContain("retry");
   });
 
+  // Verifies: TEAM.SYS.SHELL-R08
+  it("binds each Workspace notification's close control to its own dismissal", async () => {
+    const screen = new RetryRegion();
+    const test = harness(screen as unknown as HTMLElement);
+    await test.shell.updateWorkspace({ ...model(), error: "timeout", membershipRefreshUnavailable: workspace.id });
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+    screen.dismissError.click();
+    screen.dismissRefresh.click();
+    expect(test.calls).toEqual(expect.arrayContaining(["dismiss-error", "dismiss-refresh-warning"]));
+    expect(test.calls).not.toContain("retry");
+  });
+
   it("keeps protocol data out of normal text, attributes, and accessible labels on every Workspace screen", async () => {
     const test = harness();
     await test.shell.updateWorkspace(model());
@@ -994,6 +1012,8 @@ it.each(["create", "join"] as const)("reconciles a completed %s while rejected R
       copyInvitation: (id) => controller.copyInvitation(id),
       refreshMembership: (id) => controller.refreshMembership(id),
       retry: () => controller.load(),
+      dismissError: () => { controller.dismissError(); },
+      dismissMembershipRefreshWarning: () => { controller.dismissMembershipRefreshWarning(); },
     },
   });
   const ready: ApplicationUpdateSnapshot = {
