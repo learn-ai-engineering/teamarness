@@ -51,19 +51,32 @@ export function createFakeBacklog(seed: { epics?: FakeEpic[]; tickets?: Partial<
     tickets.set(ticket.ticketId, ticket);
   }
 
+  /** A Ticket's reference as the Backend derives it: its shortest unique ID prefix, at least 4. */
+  const refOf = (ticketId: string): string => {
+    let shared = 0;
+    for (const other of tickets.keys()) {
+      if (other === ticketId) continue;
+      let common = 0;
+      while (common < other.length && other[common] === ticketId[common]) common++;
+      shared = Math.max(shared, common);
+    }
+    return ticketId.slice(0, Math.min(ticketId.length, Math.max(4, shared + 1)));
+  };
+
   const snapshot = (): Snapshot => ({
     availability: "current",
     warnings: [],
     epics: [...epics.values()].sort((a, b) => a.epicId.localeCompare(b.epicId)).map((epic): Epic => ({ ...epic })),
     tickets: [...tickets.values()].sort((a, b) => a.ticketId.localeCompare(b.ticketId)).map((ticket): TicketSummary => ({
-      ticketId: ticket.ticketId, epicId: ticket.epicId, title: ticket.title, status: ticket.status,
+      ticketId: ticket.ticketId, ref: refOf(ticket.ticketId), epicId: ticket.epicId, title: ticket.title, status: ticket.status,
       priority: ticket.priority, assignee: ticket.assignee, archived: ticket.archived,
       version: ticket.version, createdOrder: ticket.createdOrder,
     })),
   });
 
   const full = (ticket: FakeTicket): Ticket => ({
-    ticketId: ticket.ticketId, epicId: ticket.epicId, title: ticket.title, body: ticket.body, status: ticket.status,
+    ticketId: ticket.ticketId, ref: refOf(ticket.ticketId), epicId: ticket.epicId, title: ticket.title, body: ticket.body,
+    status: ticket.status,
     priority: ticket.priority, assignee: ticket.assignee, archived: ticket.archived, version: ticket.version,
     creator: ticket.creator, createdAt: ticket.createdAt, lastEditor: ticket.lastEditor, lastAt: ticket.lastAt,
   });

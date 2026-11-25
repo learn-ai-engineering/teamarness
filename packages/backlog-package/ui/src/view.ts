@@ -1,6 +1,6 @@
-import type { Epic, Priority, Status, TicketSummary } from "./contract.generated";
-import { MAX_TITLE, PRIORITIES, PRIORITY_LABEL, STATUSES, STATUS_LABEL } from "./controller";
-import type { BacklogController, ControllerState } from "./controller";
+import type { Epic, Priority, TicketSummary } from "./contract.generated";
+import { MAX_TITLE, MIN_NAV_WIDTH, PRIORITIES, PRIORITY_LABEL, STATUSES, STATUS_LABEL } from "./controller";
+import type { BacklogController, ControllerState, StatusFilter } from "./controller";
 import { TicketDetailView } from "./detail";
 import { Listbox } from "./listbox";
 
@@ -35,7 +35,14 @@ const ICON_PATHS = {
   eye: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z",
   eyeOff: "M3 3l18 18 M10.5 5.2A11 11 0 0 1 12 5c6.5 0 10 7 10 7a16 16 0 0 1-3.1 4.1 M6.1 6.1C3.4 8 2 12 2 12s3.5 7 10 7c1.5 0 2.9-.4 4.1-1",
   chevron: "M9 6l6 6-6 6",
+  expandAll: "M7 6l5 5 5-5 M7 13l5 5 5-5",
+  collapseAll: "M7 11l5-5 5 5 M7 18l5-5 5 5",
 } as const;
+
+/** How far one arrow key press moves the rail's edge, in CSS pixels. */
+const NAV_WIDTH_STEP = 16;
+/** Room the Ticket pane keeps beside the widest rail, in CSS pixels. */
+const DETAIL_MIN_WIDTH = 320;
 
 function icon(name: keyof typeof ICON_PATHS, label: string, onClick: () => void, tooltip = false): HTMLButtonElement {
   const control = button("", "backlog-icon", onClick);
@@ -133,7 +140,13 @@ export class BacklogView {
   private readonly ticketForm: ReturnType<typeof inlineForm>;
   private readonly archivedToggle: HTMLButtonElement;
   private readonly priorityFilter: Listbox<FilterValue<Priority>>;
-  private readonly statusFilter: Listbox<FilterValue<Status>>;
+  private readonly statusFilter: Listbox<FilterValue<StatusFilter>>;
+  private readonly expandAllToggle: HTMLButtonElement;
+  private readonly rail: HTMLElement;
+  private readonly resizer: HTMLElement;
+  private readonly shell: HTMLElement;
+  /** The rail width a drag in progress has reached; it is remembered when the drag ends. */
+  private dragWidth: number | null = null;
   private readonly clearPriority: HTMLButtonElement;
   private readonly clearStatus: HTMLButtonElement;
   private readonly detail: TicketDetailView;
@@ -185,8 +198,10 @@ export class BacklogView {
 
     const shell = document.createElement("div");
     shell.className = "backlog-shell";
+    this.shell = shell;
 
     const rail = document.createElement("aside");
+    this.rail = rail;
     rail.className = "epic-rail";
     rail.setAttribute("aria-label", "Epics and Tickets");
     const railHeader = document.createElement("div");
@@ -203,7 +218,9 @@ export class BacklogView {
       this.epicForm.input.focus();
     });
     addEpic.classList.add("epic-add");
-    railHeader.append(railHeading, this.archivedToggle, addEpic);
+    this.expandAllToggle = icon("expandAll", "Expand all Epics", () => controller.toggleAllEpics(), true);
+    this.expandAllToggle.classList.add("expand-all-toggle");
+    railHeader.append(railHeading, this.expandAllToggle, this.archivedToggle, addEpic);
 
     // --- filters (built once) ---
     const filters = document.createElement("div");
@@ -215,11 +232,12 @@ export class BacklogView {
       options: [{ value: "all", label: "All priorities" }, ...PRIORITIES.map((value) => ({ value, label: PRIORITY_LABEL[value] }))],
       onChange: (value) => controller.setPriorityFilter(value === "all" ? null : value),
     });
-    this.statusFilter = new Listbox<FilterValue<Status>>({
+    this.statusFilter = new Listbox<FilterValue<StatusFilter>>({
       label: "Status filter",
       className: "status-filter",
-      value: "all",
-      options: [{ value: "all", label: "All statuses" }, ...STATUSES.map((value) => ({ value, label: STATUS_LABEL[value] }))],
+      value: "not_done",
+      options: [{ value: "not_done", label: "Not done" }, { value: "all", label: "All statuses" },
+        ...STATUSES.map((value) => ({ value, label: STATUS_LABEL[value] }))],
       onChange: (value) => controller.setStatusFilter(value === "all" ? null : value),
     });
     this.clearPriority = icon("x", "Clear priority filter", () => {
@@ -275,7 +293,18 @@ export class BacklogView {
     const cancelCreate = () => { this.createGeneration++; this.createTarget = null; this.refresh(); };
     this.epicForm.form.append(icon("x", "Cancel", cancelCreate));
     this.ticketForm.form.append(icon("x", "Cancel", cancelCreate));
-    rail.append(railHeader, filters, this.epicList);
+    this.resizer = document.createElement("div");
+    this.resizer.className = "epic-rail-resizer";
+    this.resizer.tabIndex = 0;
+    this.resizer.setAttribute("role", "separator");
+    this.resizer.setAttribute("aria-orientation", "vertical");
+    this.resizer.setAttribute("aria-label", "Resize Epics panel");
+    this.resizer.setAttribute("aria-valuemin", String(MIN_NAV_WIDTH));
+    this.resizer.title = "Drag to resize. Double-click to reset.";
+    this.resizer.addEventListener("pointerdown", (event) => this.startResize(event));
+    this.resizer.addEventListener("dblclick", () => controller.setNavWidth(null));
+    this.resizer.addEventListener("keydown", (event) => this.resizeByKey(event));
+    rail.append(railHeader, filters, this.epicList, this.resizer);
 
     // --- detail pane ---
     const detail = document.createElement("section");
@@ -306,6 +335,11 @@ export class BacklogView {
     this.error.textContent = error ?? "";
     this.priorityFilter.setValue(filters.priority ?? "all");
     this.statusFilter.setValue(filters.status ?? "all");
+    const allExpanded = this.controller.allEpicsExpanded;
+    updateIcon(this.expandAllToggle, allExpanded ? "collapseAll" : "expandAll",
+      allExpanded ? "Collapse all Epics" : "Expand all Epics");
+    this.expandAllToggle.disabled = this.controller.visibleEpics.length === 0;
+    this.applyNavWidth(this.dragWidth ?? this.controller.state.navWidth);
     this.clearPriority.hidden = filters.priority === null;
     this.clearStatus.hidden = filters.status === null;
     this.epicForm.submit.disabled = busy;
@@ -317,16 +351,80 @@ export class BacklogView {
     }
     this.ticketForm.submit.disabled = busy;
     if (this.treeChanged(this.controller.state)) this.renderTree(loaded);
+    this.markSelected(this.controller.state.selectedTicketId);
     this.detail.render();
   }
 
   /** Whether the tree's inputs changed since it was last built. View-local changes clear the memo. */
   private treeChanged(state: ControllerState): boolean {
+    // Selection is patched in place by `markSelected`, so choosing a Ticket keeps the tree,
+    // its scroll position and its focus as they are.
     const inputs = [state.snapshot, state.loaded, state.showArchived, state.filters, state.expandedEpicIds,
-      state.selectedTicketId, state.busy];
+      state.busy];
     const same = inputs.length === this.treeInputs.length && inputs.every((value, index) => value === this.treeInputs[index]);
     this.treeInputs = inputs;
     return !same;
+  }
+
+  /** Marks the selected Ticket's row as current, and no other. */
+  private markSelected(ticketId: string | null): void {
+    for (const select of this.epicList.querySelectorAll<HTMLButtonElement>(".ticket-title")) {
+      const row = select.closest<HTMLElement>(".ticket-row");
+      if (row?.dataset.ticketId === ticketId) select.setAttribute("aria-current", "true");
+      else select.removeAttribute("aria-current");
+    }
+  }
+
+  /** The widest the rail may be now: the shell less the Ticket pane's room, never below the minimum. */
+  private maxNavWidth(): number {
+    return Math.max(MIN_NAV_WIDTH, this.shell.getBoundingClientRect().width - DETAIL_MIN_WIDTH);
+  }
+
+  /** Sets the rail's width, or returns it to the stylesheet's default for `null`. */
+  private applyNavWidth(width: number | null): void {
+    if (width === null) this.rail.style.removeProperty("--epic-rail-width");
+    else this.rail.style.setProperty("--epic-rail-width", `${width}px`);
+    const shown = Math.round(width ?? this.rail.getBoundingClientRect().width);
+    this.resizer.setAttribute("aria-valuenow", String(shown));
+  }
+
+  /** Follows the pointer while the rail's edge is dragged, then remembers the width. */
+  private startResize(event: PointerEvent): void {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = this.rail.getBoundingClientRect().width;
+    const handle = this.resizer;
+    handle.setPointerCapture(event.pointerId);
+    handle.classList.add("is-dragging");
+    const move = (moved: PointerEvent): void => {
+      this.dragWidth = Math.min(this.maxNavWidth(), Math.max(MIN_NAV_WIDTH, startWidth + moved.clientX - startX));
+      this.applyNavWidth(this.dragWidth);
+    };
+    const end = (): void => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", end);
+      handle.removeEventListener("pointercancel", end);
+      handle.classList.remove("is-dragging");
+      const width = this.dragWidth;
+      this.dragWidth = null;
+      if (width !== null) this.controller.setNavWidth(width);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+  }
+
+  /** Arrow keys move the rail's edge; Home returns it to the default width. */
+  private resizeByKey(event: KeyboardEvent): void {
+    const current = this.controller.state.navWidth ?? this.rail.getBoundingClientRect().width;
+    let width: number | null;
+    if (event.key === "ArrowRight") width = Math.min(this.maxNavWidth(), current + NAV_WIDTH_STEP);
+    else if (event.key === "ArrowLeft") width = Math.max(MIN_NAV_WIDTH, current - NAV_WIDTH_STEP);
+    else if (event.key === "Home") width = null;
+    else return;
+    event.preventDefault();
+    this.controller.setNavWidth(width);
   }
 
   /** Re-renders after a change only the view knows about (an inline form opened or closed). */
@@ -402,6 +500,8 @@ export class BacklogView {
     const selection = inTree && focused instanceof HTMLInputElement
       ? { start: focused.selectionStart, end: focused.selectionEnd } : null;
     this.dismissMenu();
+    // Rebuilding must not move the tree: keep where it was scrolled to.
+    const { scrollTop } = this.epicList;
     const epics = this.controller.visibleEpics;
     const rows = epics.map((epic) => this.epicRow(epic));
     this.epicList.replaceChildren(...rows);
@@ -420,12 +520,13 @@ export class BacklogView {
       const next = focused instanceof HTMLElement && this.epicList.contains(focused) ? focused
         : [...this.epicList.querySelectorAll<HTMLElement>("[data-tree-focus]")]
           .find((control) => control.dataset.treeFocus === focusKey);
-      next?.focus();
+      next?.focus({ preventScroll: true });
       if (next === focused && selection && focused instanceof HTMLInputElement
         && selection.start !== null && selection.end !== null) {
         focused.setSelectionRange(selection.start, selection.end);
       }
     }
+    this.epicList.scrollTop = scrollTop;
   }
 
   private epicRow(epic: Epic): HTMLLIElement {
@@ -502,13 +603,16 @@ export class BacklogView {
     row.dataset.ticketId = ticket.ticketId;
     if (ticket.archived) row.classList.add("is-archived");
     const select = button("", "ticket-title", () => this.controller.selectTicket(ticket.ticketId));
+    const reference = document.createElement("span");
+    reference.className = "ticket-ref";
+    reference.textContent = `#${ticket.ref}`;
     const label = document.createElement("span");
     label.className = "ticket-title-text";
     label.textContent = ticket.title + (ticket.archived ? " (archived)" : "");
     const meta = document.createElement("span");
     meta.className = `ticket-meta priority-${ticket.priority}`;
     meta.textContent = `${PRIORITY_LABEL[ticket.priority]} · ${STATUS_LABEL[ticket.status]}`;
-    select.append(label, meta);
+    select.append(reference, label, meta);
     select.dataset.treeFocus = `ticket:select:${ticket.ticketId}`;
     if (selectedTicketId === ticket.ticketId) select.setAttribute("aria-current", "true");
     const trigger = icon("more", `Actions for ${ticket.title}`, () => {});

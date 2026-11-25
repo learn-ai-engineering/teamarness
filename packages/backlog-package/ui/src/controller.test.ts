@@ -10,7 +10,7 @@ function epic(n: number, title: string, archived = false): Epic {
 
 function ticket(n: number, fields: Partial<TicketSummary>): TicketSummary {
   return {
-    ticketId: recordId(n), epicId: recordId(1), title: `T${n}`, status: "not_ready", priority: "medium",
+    ticketId: recordId(n), ref: recordId(n), epicId: recordId(1), title: `T${n}`, status: "not_ready", priority: "medium",
     assignee: null, archived: false, version: order(n), createdOrder: order(n), ...fields,
   };
 }
@@ -67,6 +67,7 @@ const seed = () => ({
 describe("BacklogController", () => {
   it("hides archived Epics and Tickets until show archived is on", () => {
     const { controller } = setup(seed());
+    controller.setStatusFilter(null);
     expect(controller.visibleEpics.map((e) => e.title)).toEqual(["Alpha", "beta"]);
     expect(controller.visibleTickets(A).map((t) => t.title)).toEqual(["A high ready", "A high done", "A low ready"]);
     controller.toggleArchived();
@@ -85,8 +86,47 @@ describe("BacklogController", () => {
     expect(controller.state.expandedEpicIds.has(recordId(99))).toBe(false);
   });
 
+  it("shows only open work until a status filter is chosen, and Cancelled counts as done", () => {
+    const { backlog, controller } = setup(seed());
+    expect(controller.state.filters).toEqual({ priority: null, status: "not_done" });
+    expect(controller.visibleTickets(A).map((t) => t.title)).toEqual(["A high ready", "A low ready"]);
+    const ready = controller.visibleTickets(A)[1]!;
+    backlog.tickets.get(ready.ticketId)!.status = "cancelled";
+    controller.applySnapshot(backlog.snapshot());
+    expect(controller.visibleTickets(A).map((t) => t.title)).toEqual(["A high ready"]);
+    controller.setStatusFilter("cancelled");
+    expect(controller.visibleTickets(A).map((t) => t.title)).toEqual(["A low ready"]);
+    controller.setStatusFilter(null);
+    expect(controller.visibleTickets(A).map((t) => t.title)).toEqual(["A high ready", "A high done", "A low ready"]);
+  });
+
+  it("expands every Epic, or collapses them all once every one is expanded", () => {
+    const { controller } = setup(seed());
+    expect(controller.allEpicsExpanded).toBe(true);
+    controller.toggleAllEpics();
+    expect([...controller.state.expandedEpicIds]).toEqual([]);
+    controller.toggleEpic(A);
+    expect(controller.allEpicsExpanded).toBe(false);
+    controller.toggleAllEpics();
+    expect([...controller.state.expandedEpicIds].sort()).toEqual([A, B].sort());
+    expect(controller.allEpicsExpanded).toBe(true);
+  });
+
+  it("remembers the rail width within its bounds, and forgets it on reset", () => {
+    const { controller } = setup(seed());
+    expect(controller.state.navWidth).toBeNull();
+    expect(controller.rememberedState().state.navWidth).toBeUndefined();
+    controller.setNavWidth(480.4);
+    expect(controller.rememberedState().state.navWidth).toBe(480);
+    controller.setNavWidth(100);
+    expect(controller.state.navWidth).toBe(320);
+    controller.setNavWidth(null);
+    expect(controller.rememberedState().state.navWidth).toBeUndefined();
+  });
+
   it("combines filters, keeps every Epic and clears each filter on its own", () => {
     const { controller } = setup(seed());
+    controller.setStatusFilter(null);
     controller.setPriorityFilter("high");
     expect(controller.visibleEpics.map((e) => e.title)).toEqual(["Alpha", "beta"]);
     expect(controller.visibleTickets(A).map((t) => t.title)).toEqual(["A high ready", "A high done"]);

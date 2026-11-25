@@ -61,6 +61,7 @@ export class TicketDetailView {
   private readonly placeholder: HTMLElement;
   private readonly content: HTMLElement;
   private readonly heading: HTMLHeadingElement;
+  private readonly reference: HTMLElement;
   private readonly titleInput: HTMLInputElement;
   private readonly titleSlot: HTMLElement;
   private readonly editButton: HTMLButtonElement;
@@ -89,6 +90,9 @@ export class TicketDetailView {
 
     const header = element("div", "ticket-detail-header");
     this.heading = element("h2", "ticket-detail-title");
+    // The Ticket's reference, selected whole on click so it is easy to copy (ADR 0048).
+    this.reference = element("span", "ticket-detail-ref");
+    this.reference.title = "Ticket reference";
     this.titleInput = element("input", `${KIT.input} ticket-title-input`);
     this.titleInput.type = "text";
     this.titleInput.required = true;
@@ -98,11 +102,13 @@ export class TicketDetailView {
     this.titleInput.addEventListener("input", () => controller.editDraft({ title: this.titleInput.value }));
     this.titleSlot = element("div", "ticket-title-slot");
     this.titleSlot.append(this.heading);
+    const titleGroup = element("div", "ticket-title-group");
+    titleGroup.append(this.reference, this.titleSlot);
     this.editButton = button("Edit", `${KIT.secondary} ticket-edit`, () => {
       controller.startEdit();
       this.bodyInput.focus();
     });
-    header.append(this.titleSlot, this.editButton);
+    header.append(titleGroup, this.editButton);
     this.archivedNote = element("p", "ticket-archived-note", "This Ticket is archived.");
 
     this.status = new Listbox<Status>({
@@ -174,6 +180,8 @@ export class TicketDetailView {
     const editing = edit !== null;
 
     this.heading.textContent = ticket?.title ?? summary?.title ?? "";
+    const reference = ticket?.ref ?? summary?.ref;
+    this.reference.textContent = reference === undefined ? "" : `#${reference}`;
     show(this.titleSlot, editing ? this.titleInput : this.heading);
     if (editing && this.titleInput.value !== edit.draft.title) this.titleInput.value = edit.draft.title;
     this.titleInput.readOnly = busy;

@@ -43,7 +43,8 @@
         "not_ready",
         "ready",
         "in_progress",
-        "done"
+        "done",
+        "cancelled"
       ]
     },
     "priority": {
@@ -53,6 +54,10 @@
         "medium",
         "low"
       ]
+    },
+    "ref": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{4,64}$"
     },
     "availability": {
       "type": "string",
@@ -94,6 +99,7 @@
       "additionalProperties": false,
       "required": [
         "ticketId",
+        "ref",
         "epicId",
         "title",
         "status",
@@ -106,6 +112,9 @@
       "properties": {
         "ticketId": {
           "$ref": "#/$defs/recordId"
+        },
+        "ref": {
+          "$ref": "#/$defs/ref"
         },
         "epicId": {
           "$ref": "#/$defs/recordId"
@@ -147,6 +156,7 @@
       "additionalProperties": false,
       "required": [
         "ticketId",
+        "ref",
         "epicId",
         "title",
         "body",
@@ -163,6 +173,9 @@
       "properties": {
         "ticketId": {
           "$ref": "#/$defs/recordId"
+        },
+        "ref": {
+          "$ref": "#/$defs/ref"
         },
         "epicId": {
           "$ref": "#/$defs/recordId"
@@ -463,6 +476,9 @@
                   "$ref": "#/$defs/status"
                 },
                 {
+                  "const": "not_done"
+                },
+                {
                   "type": "null"
                 }
               ]
@@ -488,6 +504,11 @@
           "additionalProperties": {
             "$ref": "#/$defs/draft"
           }
+        },
+        "navWidth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
         }
       }
     },

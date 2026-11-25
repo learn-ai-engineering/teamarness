@@ -52,6 +52,8 @@ export type Priority = "high" | "medium" | "low";
 
 export type RecordId = string;
 
+export type Ref = string;
+
 export type RememberedState = {
   readonly "drafts": {
     readonly [key: string]: Draft;
@@ -60,8 +62,9 @@ export type RememberedState = {
   readonly "expandedEpicIds": readonly RecordId[];
   readonly "filters": {
     readonly "priority": Priority | null;
-    readonly "status": Status | null;
+    readonly "status": Status | "not_done" | null;
   };
+  readonly "navWidth"?: number;
   readonly "selectedTicketId"?: RecordId;
   readonly "showArchived": boolean;
 };
@@ -75,7 +78,7 @@ export type Snapshot = {
   readonly "warnings": readonly string[];
 };
 
-export type Status = "not_ready" | "ready" | "in_progress" | "done";
+export type Status = "not_ready" | "ready" | "in_progress" | "done" | "cancelled";
 
 export type Ticket = {
   readonly "archived": boolean;
@@ -87,6 +90,7 @@ export type Ticket = {
   readonly "lastAt": Time;
   readonly "lastEditor": Identity;
   readonly "priority": Priority;
+  readonly "ref": Ref;
   readonly "status": Status;
   readonly "ticketId": RecordId;
   readonly "title": string;
@@ -108,6 +112,7 @@ export type TicketSummary = {
   readonly "createdOrder": Version;
   readonly "epicId": RecordId;
   readonly "priority": Priority;
+  readonly "ref": Ref;
   readonly "status": Status;
   readonly "ticketId": RecordId;
   readonly "title": string;
