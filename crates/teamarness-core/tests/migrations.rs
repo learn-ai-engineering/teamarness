@@ -15,6 +15,81 @@ fn private_data_directory(test_name: &str) -> PathBuf {
     ))
 }
 
+/// Returns a current database to its pre-0020 shape, so a test can rewind `user_version` and
+/// replay earlier migrations that rebuild tables 0020's triggers refer to.
+fn undo_local_workspace_lifecycle(connection: &Connection) {
+    let restore = [
+        (
+            "workspaces_no_update",
+            "BEFORE UPDATE ON workspaces",
+            "ready workspace trust anchors are immutable",
+        ),
+        (
+            "workspaces_no_delete",
+            "BEFORE DELETE ON workspaces",
+            "ready workspace trust anchors are immutable",
+        ),
+        (
+            "membership_operations_no_delete",
+            "BEFORE DELETE ON membership_operations",
+            "canonical membership operations are append-only",
+        ),
+        (
+            "membership_dependencies_no_delete",
+            "BEFORE DELETE ON membership_dependencies",
+            "canonical membership dependencies are append-only",
+        ),
+        (
+            "membership_transitions_no_delete",
+            "BEFORE DELETE ON membership_transitions",
+            "membership transitions are append-only",
+        ),
+        (
+            "used_invitation_nonces_no_delete",
+            "BEFORE DELETE ON used_invitation_nonces",
+            "spent invitation bindings are append-only",
+        ),
+        (
+            "immutable_operations_no_delete",
+            "BEFORE DELETE ON immutable_operations",
+            "immutable operations are append-only",
+        ),
+        (
+            "immutable_operation_dependencies_no_delete",
+            "BEFORE DELETE ON immutable_operation_dependencies",
+            "operation dependencies are append-only",
+        ),
+        (
+            "immutable_records_no_delete",
+            "BEFORE DELETE ON immutable_records",
+            "immutable records are append-only",
+        ),
+        (
+            "record_delivery_no_delete",
+            "BEFORE DELETE ON record_delivery",
+            "delivery rows are append-only",
+        ),
+        (
+            "p2panda_operations_no_delete",
+            "BEFORE DELETE ON p2panda_operations",
+            "p2panda operations are append-only",
+        ),
+        (
+            "protection_control_operations_no_delete",
+            "BEFORE DELETE ON protection_control_operations",
+            "protection controls are append-only",
+        ),
+    ];
+    let mut batch = String::new();
+    for (name, event, message) in restore {
+        batch.push_str(&format!(
+            "DROP TRIGGER {name}; CREATE TRIGGER {name} {event} BEGIN SELECT RAISE(ABORT, '{message}'); END;"
+        ));
+    }
+    batch.push_str("DROP TABLE workspace_deletions;");
+    connection.execute_batch(&batch).unwrap();
+}
+
 #[tokio::test]
 async fn migration_0001_reserves_nullable_human_identity_subjects() {
     let directory = private_data_directory("migration-human-identity");
@@ -83,6 +158,7 @@ async fn migration_0016_upgrades_v15_membership_actions_and_preserves_guards() {
     // Build an empty version-15 membership table with its old action CHECK.
     // It has no Workspace rows, so the structural downgrade loses no data.
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    undo_local_workspace_lifecycle(&connection);
     connection
         .pragma_update(None, "foreign_keys", "OFF")
         .unwrap();
@@ -125,7 +201,7 @@ async fn migration_0016_upgrades_v15_membership_actions_and_preserves_guards() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 19);
+    assert_eq!(version, 20);
     let violations: i64 = connection
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
             row.get(0)
@@ -352,7 +428,7 @@ async fn migration_0007_adds_authenticated_p2panda_operation_projection() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 19);
+    assert_eq!(version, 20);
     for column in [
         "scope_id",
         "log_id",
@@ -427,7 +503,7 @@ async fn ordered_migration_is_idempotent_on_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 19);
+    assert_eq!(version, 20);
     assert_eq!(installation_count, 1);
 
     drop(connection);
@@ -567,6 +643,7 @@ async fn membership_wake_row_is_seeded_for_existing_workspaces() {
     // restored only so the forward migrations have the table and the column
     // they drop; neither shape is the subject of this test.
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    undo_local_workspace_lifecycle(&connection);
     connection
         .execute_batch(
             "DROP TABLE deferred_principal_names;
@@ -663,6 +740,7 @@ async fn migration_0013_adds_bounded_key_demand_and_upgrades_v12() {
     drop(runtime);
 
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
+    undo_local_workspace_lifecycle(&connection);
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .unwrap();
@@ -764,7 +842,7 @@ async fn migration_0013_adds_bounded_key_demand_and_upgrades_v12() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 19);
+    assert_eq!(version, 20);
     connection
         .execute(
             insert,
@@ -802,7 +880,7 @@ async fn migration_0017_replaces_names_with_principals_from_v16() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        19
+        20
     );
     assert_eq!(
         connection
@@ -847,7 +925,7 @@ async fn migration_0018_opens_v17_and_is_idempotent() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 19);
+    assert_eq!(version, 20);
     let columns: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('deferred_principal_names')",
@@ -924,7 +1002,7 @@ async fn migration_0019_rekeys_agent_bindings_by_package_and_preserves_rows() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 19);
+    assert_eq!(version, 20);
     let primary_key: Vec<String> = connection
         .prepare(
             "SELECT name FROM pragma_table_info('agent_package_bindings') WHERE pk > 0 ORDER BY pk",
@@ -965,7 +1043,7 @@ async fn migration_0019_rejects_future_schema_versions() {
     runtime.shutdown().await.unwrap();
     drop(runtime);
     let connection = Connection::open(directory.join("core.sqlite3")).unwrap();
-    connection.pragma_update(None, "user_version", 20).unwrap();
+    connection.pragma_update(None, "user_version", 21).unwrap();
     drop(connection);
     assert!(matches!(
         CoreRuntime::open_loopback_for_tests(config).await,
@@ -1016,7 +1094,7 @@ async fn migration_0012_removes_duplicate_content_key_copy() {
             .iter()
             .any(|column| column == "creator_public_identity")
     );
-    assert_eq!(version, 19);
+    assert_eq!(version, 20);
 
     drop(connection);
     fs::remove_dir_all(directory).unwrap();

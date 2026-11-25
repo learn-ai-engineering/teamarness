@@ -295,6 +295,7 @@ pub fn run() {
             commands::rename_workspace_principal,
             commands::add_workspace_agent,
             commands::remove_workspace_agent,
+            commands::rename_workspace,
             package_commands::package_catalog_snapshot,
             package_commands::package_subscribe_host_state,
             package_commands::package_open_mount,
@@ -420,7 +421,7 @@ mod tests {
                     .as_str()
                     .is_some_and(|name| name.starts_with("allow-")))
                 .count(),
-            37
+            38
         );
     }
 

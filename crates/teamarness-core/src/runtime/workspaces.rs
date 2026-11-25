@@ -41,6 +41,24 @@ impl CoreRuntime {
         }
     }
 
+    /// Renames a Workspace on this Installation only; other Members keep their own name for it
+    /// (ADR 0048). Names follow [`Self::create_workspace`]'s rules.
+    pub fn rename_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        name: &str,
+    ) -> Result<WorkspaceSummary, WorkspaceError> {
+        let mut state = self.lock_workspace_state()?;
+        let result = crate::workspace::rename(&mut state.connection, workspace_id, name);
+        if matches!(
+            result,
+            Err(WorkspaceError::Storage(StorageError::UncertainOutcome))
+        ) {
+            state.poisoned = true;
+        }
+        result
+    }
+
     /// Lists workspaces known to this installation.
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceSummary>, WorkspaceError> {
         let state = self.lock_workspace_state()?;

@@ -212,6 +212,46 @@ fn create_with_initial_name(
     Ok(summary(&request))
 }
 
+/// Renames a Workspace on this Installation only (ADR 0048).
+///
+/// The name is unsigned local metadata, so nothing is sent to other Members. A Workspace this
+/// Installation created keeps its creation request in step, because readiness verification
+/// compares the two.
+pub(crate) fn rename(
+    connection: &mut Connection,
+    workspace_id: WorkspaceId,
+    name: &str,
+) -> Result<WorkspaceSummary, WorkspaceError> {
+    validate_name(name)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(fault!(WorkspaceError::Storage(StorageError::Database)))?;
+    let changed = transaction
+        .execute(
+            "UPDATE workspaces SET name = ?2 WHERE workspace_id = ?1",
+            params![workspace_id.as_bytes().as_slice(), name],
+        )
+        .map_err(fault!(WorkspaceError::Storage(StorageError::Database)))?;
+    if changed != 1 {
+        return Err(WorkspaceError::UnknownWorkspace);
+    }
+    transaction
+        .execute(
+            "UPDATE workspace_creation_requests SET name = ?2 WHERE workspace_id = ?1",
+            params![workspace_id.as_bytes().as_slice(), name],
+        )
+        .map_err(fault!(WorkspaceError::Storage(StorageError::Database)))?;
+    let renamed = load_workspace(&transaction, workspace_id)
+        .map_err(workspace_from_storage)?
+        .ok_or(WorkspaceError::UnknownWorkspace)?;
+    transaction
+        .commit()
+        .map_err(fault!(WorkspaceError::Storage(
+            StorageError::UncertainOutcome
+        )))?;
+    Ok(summary(&renamed))
+}
+
 pub(crate) fn list(connection: &Connection) -> Result<Vec<WorkspaceSummary>, WorkspaceError> {
     verify_ready(connection).map_err(workspace_from_storage)?;
     let mut statement = connection

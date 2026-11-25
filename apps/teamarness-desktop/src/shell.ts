@@ -59,6 +59,7 @@ type WorkspaceActions = Readonly<{
   createWorkspace(name: string, personName: string): Promise<void>;
   joinWorkspace(invitation: string, personName: string): Promise<void>;
   rename(workspaceId: string, name: string): Promise<void>;
+  renameWorkspace(workspaceId: string, name: string): Promise<void>;
   addAgent(workspaceId: string, name: string): Promise<void>;
   removeAgent(workspaceId: string, agentId: string): Promise<void>;
   renameAgent(workspaceId: string, agentId: string, name: string): Promise<void>;
@@ -599,6 +600,11 @@ export class Shell {
     });
     const workspaceId = routeWorkspaceId(this.selectedRoute);
     if (workspaceId) {
+      this.shellFrame.shellScreen.querySelector<HTMLFormElement>("#rename-workspace")?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const name = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#rename-workspace-name");
+        if (name) void this.options.workspaceActions.renameWorkspace(workspaceId, name.value);
+      });
       this.shellFrame.shellScreen.querySelector<HTMLFormElement>("#rename-person")?.addEventListener("submit", (event) => {
         event.preventDefault();
         const name = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#rename-person-name");

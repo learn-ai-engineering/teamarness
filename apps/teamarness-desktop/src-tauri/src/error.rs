@@ -98,6 +98,7 @@ impl From<WorkspaceError> for BridgeError {
         match value {
             WorkspaceError::InvalidName => Self::invalid_input(),
             WorkspaceError::Conflict => Self::new(BridgeErrorCode::LocalConflict, false),
+            WorkspaceError::UnknownWorkspace => Self::invalid_input(),
             WorkspaceError::CorruptTrustAnchor => {
                 Self::new(BridgeErrorCode::InvalidBootstrap, false)
             }

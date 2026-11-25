@@ -14,6 +14,8 @@ export interface TeamarnessBridge {
   createWorkspace(name: string, personName: string): Promise<WorkspaceState>;
   createWorkspaceInvitation(workspaceId: string): Promise<Invitation>;
   joinWorkspace(invitation: string, personName: string): Promise<WorkspaceState>;
+  /** Renames a Workspace on this Installation only (ADR 0048). */
+  renameWorkspace(workspaceId: string, name: string): Promise<Workspace>;
   renameWorkspacePrincipal(workspaceId: string, principalId: string, name: string): Promise<void>;
   addWorkspaceAgent(workspaceId: string, name: string): Promise<void>;
   removeWorkspaceAgent(workspaceId: string, agentId: string): Promise<void>;
@@ -29,6 +31,7 @@ export const bridge: TeamarnessBridge = Object.freeze({
   createWorkspaceInvitation: (workspaceId: string) =>
     invoke<Invitation>("create_workspace_invitation", { workspaceId }),
   joinWorkspace: (invitation: string, personName: string) => invoke<WorkspaceState>("join_workspace", { invitation, personName }),
+  renameWorkspace: (workspaceId: string, name: string) => invoke<Workspace>("rename_workspace", { workspaceId, name }),
   renameWorkspacePrincipal: (workspaceId: string, principalId: string, name: string) => invoke<void>("rename_workspace_principal", { workspaceId, principalId, name }),
   addWorkspaceAgent: (workspaceId: string, name: string) => invoke<void>("add_workspace_agent", { workspaceId, name }),
   removeWorkspaceAgent: (workspaceId: string, agentId: string) => invoke<void>("remove_workspace_agent", { workspaceId, agentId }),

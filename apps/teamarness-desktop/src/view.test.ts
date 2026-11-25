@@ -19,6 +19,7 @@ function fakeBridge(overrides: Partial<TeamarnessBridge> = {}): TeamarnessBridge
     createWorkspace: async () => state,
     createWorkspaceInvitation: async () => invitation,
     joinWorkspace: async () => state,
+    renameWorkspace: async (workspaceId, name) => ({ ...workspace, id: workspaceId, name }),
     currentMembership: async () => membership,
     renameWorkspacePrincipal: async () => undefined,
     addWorkspaceAgent: async () => undefined,
@@ -509,6 +510,22 @@ describe("Shell Workspace screens", () => {
     expect(await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id })).toContain("data-membership-refresh-dismiss");
     controller.dismissMembershipRefreshWarning();
     expect(controller.snapshot().membershipRefreshUnavailable).toBeNull();
+  });
+
+  // Verifies: TEAM.SYS.SHELL-R04
+  it("renames the Workspace on this Installation and shows the new name", async () => {
+    const calls: string[] = [];
+    const controller = new ShellController(fakeBridge({
+      renameWorkspace: async (workspaceId, name) => { calls.push(`${workspaceId}:${name}`); return { ...workspace, name }; },
+    }), () => undefined);
+    await controller.load();
+    await controller.renameWorkspace(workspace.id, "Scratch <space>");
+    expect(calls).toEqual([`${workspace.id}:Scratch <space>`]);
+    expect(controller.snapshot()).toMatchObject({ notice: "Workspace renamed", error: null });
+    const html = await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id });
+    expect(html).toContain('<h1 id="workspace-page-heading" class="package-page-title">Scratch &lt;space&gt;</h1>');
+    expect(html).toContain('id="rename-workspace-name" required maxlength="64" autocomplete="off" value="Scratch &lt;space&gt;"');
+    expect(html).toContain("Other Members keep their own name for it.");
   });
 
   it("keeps membership refresh failures observable", async () => {

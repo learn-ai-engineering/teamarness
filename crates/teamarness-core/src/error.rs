@@ -133,6 +133,8 @@ pub enum WorkspaceError {
     InvalidName,
     /// A workspace identity or genesis conflicts with durable state.
     Conflict,
+    /// No Workspace with this identity is stored on this Installation.
+    UnknownWorkspace,
     /// A ready workspace trust anchor or pending request is corrupt.
     CorruptTrustAnchor,
     /// Durable storage failed while processing the workspace.
@@ -144,6 +146,7 @@ impl fmt::Display for WorkspaceError {
         match self {
             Self::InvalidName => formatter.write_str("invalid workspace name"),
             Self::Conflict => formatter.write_str("workspace identity or genesis conflicts"),
+            Self::UnknownWorkspace => formatter.write_str("unknown workspace"),
             Self::CorruptTrustAnchor => formatter.write_str("workspace trust anchor is corrupt"),
             Self::Storage(error) => error.fmt(formatter),
         }

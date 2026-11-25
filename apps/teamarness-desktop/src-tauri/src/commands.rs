@@ -12,7 +12,7 @@ use crate::dto::{
 };
 use crate::error::BridgeError;
 
-pub const COMMAND_NAMES: [&str; 11] = [
+pub const COMMAND_NAMES: [&str; 12] = [
     "installation_details",
     "list_workspaces",
     "create_workspace",
@@ -24,6 +24,7 @@ pub const COMMAND_NAMES: [&str; 11] = [
     "rename_workspace_principal",
     "add_workspace_agent",
     "remove_workspace_agent",
+    "rename_workspace",
 ];
 
 async fn blocking<T, F>(state: &DesktopState, operation: F) -> Result<T, BridgeError>
@@ -72,6 +73,31 @@ pub async fn list_workspaces(
                 runtime
                     .list_workspaces()
                     .map(|values| values.into_iter().map(WorkspaceDto::from).collect())
+                    .map_err(BridgeError::from)
+            })
+            .await
+        })
+        .await?
+}
+
+/// Renames a Workspace on this Installation only (ADR 0048). Running Package Instances see the
+/// new name from their next start.
+#[tauri::command]
+pub async fn rename_workspace(
+    workspace_id: String,
+    name: String,
+    state: State<'_, DesktopState>,
+) -> Result<WorkspaceDto, BridgeError> {
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let workspace =
+                WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
+            blocking(&state, move |runtime| {
+                runtime
+                    .rename_workspace(workspace, &name)
+                    .map(WorkspaceDto::from)
                     .map_err(BridgeError::from)
             })
             .await
@@ -571,6 +597,7 @@ mod tests {
                 "rename_workspace_principal",
                 "add_workspace_agent",
                 "remove_workspace_agent",
+                "rename_workspace",
             ]
         );
         let registry = COMMAND_NAMES.join(" ");

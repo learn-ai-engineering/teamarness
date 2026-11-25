@@ -164,6 +164,17 @@ export class ShellController {
     });
   }
 
+  /** Renames the Workspace on this Installation only; other Members keep their own name for it. */
+  public async renameWorkspace(workspaceId: string, name: string): Promise<void> {
+    await this.perform(async () => {
+      const renamed = await this.bridge.renameWorkspace(workspaceId, name);
+      this.set({
+        workspaces: this.model.workspaces.map((workspace) => workspace.id === renamed.id ? renamed : workspace),
+        notice: "Workspace renamed",
+      });
+    });
+  }
+
   public async rename(workspaceId: string, name: string): Promise<void> {
     await this.perform(async () => {
       const self = this.model.memberships[workspaceId]?.members.find(({ identity, kind }) => kind === "person" && identity === this.model.installation?.identity);
@@ -390,6 +401,7 @@ export function renderShell(
   const disabled = presentation.loading ? " disabled" : "";
   const memberCount = workspace.memberCount === 1 ? "1 Member." : `${workspace.memberCount} Members.`;
   return `<section class="shell-screen workspace-page" aria-labelledby="workspace-page-heading"><header class="package-page-header workspace-page-header"><p class="package-page-kind">Workspace</p><h1 id="workspace-page-heading" class="package-page-title">${escape(workspace.name)}</h1><p class="package-page-subtitle">${memberCount}</p></header>${feedback}
+    ${settingsGroup("workspace-name", "Workspace name", "The name this Workspace has on this Installation. Other Members keep their own name for it.", `<form id="rename-workspace"><label for="rename-workspace-name">Workspace name</label><div class="inline-field"><input id="rename-workspace-name" required maxlength="64" autocomplete="off" value="${escape(workspace.name)}"><button${disabled}>Rename</button></div></form>`)}
     ${settingsGroup("your-name", "Your name", "The name other Members see for you in this Workspace.", `<form id="rename-person"><label for="rename-person-name">Name in this Workspace</label><div class="inline-field"><input id="rename-person-name" required maxlength="256" autocomplete="name" value="${escape(workspace.ownPersonName)}"><button${disabled}>Save name</button></div></form>`)}
     ${settingsGroup("members", "Members", "People and Agents in this Workspace. You are the Steward of each Agent you add.", `<ol class="members">${members}</ol><form id="add-agent"><label for="agent-name">Add an Agent</label><div class="inline-field"><input id="agent-name" required maxlength="256" autocomplete="off" placeholder="Agent name"><button${disabled}>Add agent</button></div></form><div><button type="button" id="refresh-membership" class="secondary"${disabled}>Refresh members</button></div>`)}
     ${settingsGroup("invitations", "Workspace Invitations", "Each Workspace Invitation admits one Person, once.", `<div><button type="button" id="copy-invitation"${disabled}>Copy Workspace Invitation</button></div><p class="sensitive">Workspace Invitations are sensitive bearer admission material. Share them privately.</p>`)}
