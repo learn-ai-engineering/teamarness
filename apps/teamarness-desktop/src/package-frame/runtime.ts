@@ -4,6 +4,7 @@ import {
   type PackageUiModule,
   type PackageUnmount,
 } from "@teamarness/package-ui-sdk";
+import type { SettingsLayout, VisibleRegion } from "./frame-layout";
 import { createPortPackageClient } from "./port-client";
 import {
   CONNECT_KIND,
@@ -37,6 +38,12 @@ export type FrameEnvironment = Readonly<{
   runtimeUrl: string;
   importModule(url: string): Promise<unknown>;
   createStyleSheet(): CSSStyleSheet;
+  /** Sizes a settings view to its content; absent where the frame has no layout (tests). */
+  startSettingsLayout?(input: Readonly<{
+    host: FrameHostElement;
+    root: ShadowRoot;
+    reportHeight(height: number): void;
+  }>): SettingsLayout;
 }>;
 
 type PortLike = Readonly<{
@@ -93,6 +100,8 @@ function startBridge(env: FrameEnvironment, port: PortLike): void {
   let mountStarted = false;
   let unmountStarted = false;
   let packageUnmount: PackageUnmount = () => undefined;
+  let layout: SettingsLayout | null = null;
+  let region: VisibleRegion | null = null;
   const reported = new Set<FrameFaultSource>();
 
   const postFault = (source: FrameFaultSource): void => {
@@ -119,6 +128,14 @@ function startBridge(env: FrameEnvironment, port: PortLike): void {
       const host = env.document.getElementById(PACKAGE_HOST_ELEMENT_ID);
       if (host === null) throw new Error("The Package frame document has no host element");
       root = host.attachShadow({ mode: "open" });
+      if (message.view === "settings" && env.startSettingsLayout) {
+        layout = env.startSettingsLayout({
+          host,
+          root,
+          reportHeight: (height) => { if (!unmountStarted) port.postMessage({ kind: "content_height", height }); },
+        });
+        if (region !== null) layout.setVisibleRegion(region);
+      }
       const loaded = await env.importModule(resolveEntrypointUrl(env.runtimeUrl, message.entrypoint));
       if (typeof (loaded as PackageUiModule | null)?.mount !== "function") {
         throw new Error("Package UI module has no mount function");
@@ -155,6 +172,8 @@ function startBridge(env: FrameEnvironment, port: PortLike): void {
   const runUnmount = async (): Promise<void> => {
     if (unmountStarted) return;
     unmountStarted = true;
+    layout?.stop();
+    layout = null;
     let ok = true;
     try {
       await packageUnmount();
@@ -177,6 +196,10 @@ function startBridge(env: FrameEnvironment, port: PortLike): void {
         return;
       case "theme":
         applyTheme(message.theme);
+        return;
+      case "visible_region":
+        region = Object.freeze({ top: message.top, height: message.height });
+        layout?.setVisibleRegion(region);
         return;
       case "unmount":
         void runUnmount();

@@ -35,6 +35,8 @@ export type PackagePortHostOptions = Readonly<{
   transport: PackageHostTransport;
   onFault(source: PackageUiFaultSource): void;
   onOpenSettings?: () => Promise<void>;
+  /** A settings view's reported content height, in CSS pixels. */
+  onContentHeight?: (height: number) => void;
 }>;
 
 export type PackageMountMessage = Readonly<{
@@ -75,6 +77,7 @@ export class PackagePortHost {
   private settingsPending = false;
   private settingsTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly onOpenSettings: (() => Promise<void>) | undefined;
+  private readonly onContentHeight: ((height: number) => void) | undefined;
   private nextRequest = 0;
   private nextSubscription = 0;
 
@@ -104,6 +107,7 @@ export class PackagePortHost {
     this.transport = options.transport;
     this.onFault = options.onFault;
     this.onOpenSettings = options.onOpenSettings;
+    this.onContentHeight = options.onContentHeight;
     this.ready = new Promise<void>((resolve) => { this.resolveReady = resolve; });
     this.mounted = new Promise<void>((resolve, reject) => {
       this.settleMounted = (error) => { if (error === undefined) resolve(); else reject(error); };
@@ -134,6 +138,11 @@ export class PackagePortHost {
 
   public sendTheme(theme: ThemeSnapshot): void {
     this.post({ kind: "theme", theme });
+  }
+
+  /** Tells a settings view which part of its frame is on screen. */
+  public sendVisibleRegion(region: Readonly<{ top: number; height: number }>): void {
+    this.post({ kind: "visible_region", top: region.top, height: region.height });
   }
 
   public requestUnmount(): Promise<boolean> {
@@ -219,6 +228,9 @@ export class PackagePortHost {
         return;
       case "open_settings":
         this.queueSettings();
+        return;
+      case "content_height":
+        if (!this.unmounting && !this.faulted) this.onContentHeight?.(message.height);
         return;
       case "request":
         this.startRequest(message.id, message.operation, message.payload);

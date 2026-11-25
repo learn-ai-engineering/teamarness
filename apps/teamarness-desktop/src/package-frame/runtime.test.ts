@@ -34,6 +34,7 @@ function harness(options: Readonly<{
   module?: PackageUiModule | null;
   host?: boolean;
   contexts?: PackageMountContext[];
+  startSettingsLayout?: FrameEnvironment["startSettingsLayout"];
 }> = {}): Harness {
   const parent = { name: "parent" };
   const posted: Record<string, unknown>[] = [];
@@ -88,6 +89,7 @@ function harness(options: Readonly<{
       sheets.push(sheet);
       return sheet as unknown as CSSStyleSheet;
     },
+    ...(options.startSettingsLayout ? { startSettingsLayout: options.startSettingsLayout } : {}),
   };
 
   runPackageFrame(env);
@@ -333,4 +335,39 @@ it("offers only a target-free void settings intent and retires it before unmount
   await settle();
   context?.navigation?.openSettings();
   expect(test.posted.filter((message) => message.kind === "open_settings")).toEqual([{ kind: "open_settings" }]);
+});
+
+it("sizes only a settings view, forwards its visible region and stops before unmount acknowledgement", async () => {
+  const regions: unknown[] = [];
+  let report: ((height: number) => void) | undefined;
+  let starts = 0;
+  let stopped = false;
+  const test = harness({
+    startSettingsLayout: (input) => {
+      starts += 1;
+      report = input.reportHeight;
+      return { setVisibleRegion: (region) => { regions.push(region); }, stop: () => { stopped = true; } };
+    },
+  });
+  test.connect();
+  test.toFrame({ kind: "visible_region", top: 0, height: 500 });
+  test.toFrame({ ...mountMessage() as object, view: "settings" });
+  await settle();
+  expect(starts).toBe(1);
+  expect(regions).toEqual([{ top: 0, height: 500 }]);
+  report?.(1234);
+  expect(test.posted).toContainEqual({ kind: "content_height", height: 1234 });
+  test.toFrame({ kind: "visible_region", top: 120, height: 480 });
+  expect(regions.at(-1)).toEqual({ top: 120, height: 480 });
+  test.toFrame({ kind: "unmount" });
+  await settle();
+  expect(stopped).toBe(true);
+  report?.(99);
+  expect(test.posted.filter((message) => message.kind === "content_height")).toEqual([{ kind: "content_height", height: 1234 }]);
+
+  const main = harness({ startSettingsLayout: () => { starts += 1; return { setVisibleRegion: () => undefined, stop: () => undefined }; } });
+  main.connect();
+  main.toFrame(mountMessage());
+  await settle();
+  expect(starts).toBe(1);
 });

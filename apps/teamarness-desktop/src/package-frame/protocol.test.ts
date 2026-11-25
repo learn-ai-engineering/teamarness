@@ -13,6 +13,7 @@ import {
   parseShellMessage,
   type BridgeErrorEnvelope,
   type ThemeSnapshot,
+  MAX_FRAME_EXTENT_PX,
 } from "./protocol";
 
 function themeSnapshot(overrides: Record<string, string> = {}): ThemeSnapshot {
@@ -238,10 +239,23 @@ describe("Package UI bridge protocol", () => {
 });
 
 // Verifies: TEAM.SYS.SHELL-R05, TEAM.SYS.PKG-R19.
-it("accepts only the exact target-free settings intent on private bridge 4", () => {
-  expect(FRAME_BRIDGE_PROTOCOL).toBe(4);
+it("accepts only the exact target-free settings intent on the private bridge", () => {
+  expect(FRAME_BRIDGE_PROTOCOL).toBe(5);
   expect(parseFrameMessage({ kind: "open_settings" })).toEqual({ kind: "open_settings" });
   for (const key of ["url", "route", "target", "workspaceId", "packageIdentity", "mount", "id"]) {
     expect(parseFrameMessage({ kind: "open_settings", [key]: "foreign" })).toBeNull();
+  }
+});
+
+it("accepts only bounded whole-pixel settings sizing messages on private bridge 5", () => {
+  expect(parseFrameMessage({ kind: "content_height", height: 0 })).toEqual({ kind: "content_height", height: 0 });
+  expect(parseFrameMessage({ kind: "content_height", height: MAX_FRAME_EXTENT_PX })).toEqual({ kind: "content_height", height: MAX_FRAME_EXTENT_PX });
+  for (const height of [-1, 1.5, MAX_FRAME_EXTENT_PX + 1, Number.NaN, "10", null]) {
+    expect(parseFrameMessage({ kind: "content_height", height })).toBeNull();
+  }
+  expect(parseFrameMessage({ kind: "content_height", height: 10, mount: "m" })).toBeNull();
+  expect(parseShellMessage({ kind: "visible_region", top: 40, height: 600 })).toEqual({ kind: "visible_region", top: 40, height: 600 });
+  for (const region of [{ top: -1, height: 1 }, { top: 0, height: 0.5 }, { top: 0 }, { top: 0, height: 1, extra: 1 }]) {
+    expect(parseShellMessage({ kind: "visible_region", ...region })).toBeNull();
   }
 });

@@ -8,10 +8,13 @@ import {
 } from "@teamarness/package-ui-sdk";
 
 /**
- * The private Package UI bridge protocol. Both halves ship in one Shell build. Version 4 adds
- * target-free own-settings intents and mount availability; version 3 added `view`.
+ * The private Package UI bridge protocol. Both halves ship in one Shell build. Version 5 adds
+ * settings-view sizing (`content_height`, `visible_region`); version 4 added target-free
+ * own-settings intents and mount availability; version 3 added `view`.
  */
-export const FRAME_BRIDGE_PROTOCOL = 4;
+export const FRAME_BRIDGE_PROTOCOL = 5;
+/** The largest frame extent, in CSS pixels, either side reports for settings-view sizing. */
+export const MAX_FRAME_EXTENT_PX = 1_000_000;
 export const CONNECT_KIND = "teamarness.bridge.connect";
 
 /** Matches the Package Host bound `MAX_UI_PAYLOAD_BYTES`. */
@@ -99,6 +102,7 @@ export type FrameToShellMessage =
   | Readonly<{ kind: "hello"; protocol: number }>
   | Readonly<{ kind: "mounted" }>
   | Readonly<{ kind: "open_settings" }>
+  | Readonly<{ kind: "content_height"; height: number }>
   | Readonly<{ kind: "request"; id: number; operation: string; payload: unknown }>
   | Readonly<{ kind: "cancel"; id: number }>
   | Readonly<{ kind: "subscribe"; id: number; operation: string; payload: unknown }>
@@ -119,6 +123,7 @@ export type ShellToFrameMessage =
     theme: ThemeSnapshot;
   }>
   | Readonly<{ kind: "theme"; theme: ThemeSnapshot }>
+  | Readonly<{ kind: "visible_region"; top: number; height: number }>
   | Readonly<{ kind: "response"; id: number; ok: true; value: PackageValue }>
   | Readonly<{ kind: "response"; id: number; ok: false; error: BridgeErrorEnvelope }>
   | Readonly<{ kind: "subscribed"; id: number }>
@@ -132,6 +137,11 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null) return false;
   const prototype = Object.getPrototypeOf(value) as unknown;
   return prototype === Object.prototype || prototype === null;
+}
+
+/** A whole number of CSS pixels within the shared sizing bound. */
+function isFrameExtent(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= MAX_FRAME_EXTENT_PX;
 }
 
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -268,6 +278,9 @@ export function parseFrameMessage(data: unknown): FrameToShellMessage | null {
     case "open_settings":
       if (!hasExactKeys(data, ["kind"])) return null;
       return Object.freeze({ kind: "open_settings" });
+    case "content_height":
+      if (!hasExactKeys(data, ["kind", "height"]) || !isFrameExtent(data.height)) return null;
+      return Object.freeze({ kind: "content_height", height: data.height });
     case "mounted":
       if (!hasExactKeys(data, ["kind"])) return null;
       return Object.freeze({ kind: "mounted" });
@@ -350,6 +363,9 @@ export function parseShellMessage(data: unknown): ShellToFrameMessage | null {
         theme,
       });
     }
+    case "visible_region":
+      if (!hasExactKeys(data, ["kind", "top", "height"]) || !isFrameExtent(data.top) || !isFrameExtent(data.height)) return null;
+      return Object.freeze({ kind: "visible_region", top: data.top, height: data.height });
     case "theme": {
       if (!hasExactKeys(data, ["kind", "theme"])) return null;
       const theme = parseThemeSnapshot(data.theme);
