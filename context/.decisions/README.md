@@ -56,6 +56,7 @@ This index is the one place that lists every decision's status, its supersession
 | [0046](0046-package-owned-managed-cli.md) | Package-owned managed CLI and client credential custody | accepted (2026-11-17; renumbered at integration) | – | – | In the ADR | Refines 0007 and 0045; one native artifact, owned CLI copy, private client credentials, and recoverable setup. Current qualification and remaining gates are recorded in the roadmap. |
 
 | [0047](0047-native-applications-and-local-operator.md) | Shared native applications and local operator authority | accepted (2026-11-18) | 0036 (part: Shell-only registration authority) | – | In the ADR | Shared Core/Host, exclusive ownership and terminal handoff, native Package targets, private operator authority; staged implementation and native qualification remain explicit. |
+| [0048](0048-backlog-ticket-references-and-cancelled-status.md) | Backlog Tickets have derived short references and a Cancelled status | accepted (2026-11-26) | – | – | In the ADR | Refines 0039 (status value) and 0042 (re-evaluation pattern, for Backlog records); shortest-unique-prefix references, `ticket.get` by `ref`, Port Contract 1.1, Not done default filter |
 
 ### Parallel-branch numbering reconciliation
 
