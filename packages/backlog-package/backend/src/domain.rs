@@ -9,6 +9,9 @@
 use std::fmt;
 
 const MAGIC: &[u8] = b"TBLOG\x01";
+/// The codec generation: 2 adds `Status::Cancelled` (ADR 0048). A store last re-evaluated by an
+/// older generation re-decodes its `malformed_record` quarantine once.
+pub(crate) const CODEC_GENERATION: u8 = 2;
 /// A title holds 1 to 256 Unicode scalar values.
 pub(crate) const MAX_TITLE: usize = 256;
 /// A body holds at most 64 KiB of UTF-8 Markdown.
@@ -24,10 +27,19 @@ pub enum Status {
     Ready,
     InProgress,
     Done,
+    /// Closed and will not be done (ADR 0048). Code 5: a build before ADR 0048 quarantines a
+    /// record carrying it until it updates and re-evaluates.
+    Cancelled,
 }
 
 impl Status {
-    pub const ALL: [Self; 4] = [Self::NotReady, Self::Ready, Self::InProgress, Self::Done];
+    pub const ALL: [Self; 5] = [
+        Self::NotReady,
+        Self::Ready,
+        Self::InProgress,
+        Self::Done,
+        Self::Cancelled,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -35,6 +47,7 @@ impl Status {
             Self::Ready => "ready",
             Self::InProgress => "in_progress",
             Self::Done => "done",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -56,6 +69,7 @@ impl Status {
             Self::Ready => 2,
             Self::InProgress => 3,
             Self::Done => 4,
+            Self::Cancelled => 5,
         }
     }
 
@@ -1042,7 +1056,7 @@ mod tests {
                 .unwrap()
                 .encode();
         let status_at = bad_status.len() - 2;
-        bad_status[status_at] = 5;
+        bad_status[status_at] = 6;
         assert_eq!(
             DomainRecord::decode(&bad_status).unwrap_err(),
             DomainError::Invalid(Field::Status)

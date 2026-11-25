@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::domain::{DomainRecord, Priority, Status};
+use crate::refs;
 use projection::{EpicState, Outcome, Projection, TicketState, Touched, WAITING};
 
 #[derive(Debug)]
@@ -67,6 +68,8 @@ pub struct EpicView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketView {
     pub id: String,
+    /// The shortest unique prefix of `id`, at least four characters (ADR 0048).
+    pub reference: String,
     pub epic_id: String,
     /// `None` until the record that set it has been opened.
     pub title: Option<String>,
@@ -126,6 +129,9 @@ struct StoreInner {
     conn: Connection,
     projection: Projection,
 }
+
+/// The quarantine code of a record this codec could not decode.
+const MALFORMED: &str = "malformed_record";
 
 fn rerr(_error: rusqlite::Error) -> StoreError {
     StoreError::Storage
@@ -221,9 +227,15 @@ impl BacklogStore {
     pub fn tickets(&self) -> Result<Vec<TicketView>, StoreError> {
         let inner = self.lock()?;
         let projection = &inner.projection;
+        let ids: Vec<&String> = projection.tickets().map(|(id, _)| id).collect();
         Ok(projection
             .tickets()
-            .map(|(id, ticket)| ticket_view(projection, id, ticket))
+            .enumerate()
+            .map(|(index, (id, ticket))| {
+                let previous = index.checked_sub(1).map(|at| ids[at].as_str());
+                let next = ids.get(index + 1).map(|other| other.as_str());
+                ticket_view(projection, id, ticket, refs::reference(previous, id, next))
+            })
             .collect())
     }
 
@@ -235,9 +247,27 @@ impl BacklogStore {
     pub fn ticket(&self, id: &str) -> Result<Option<TicketView>, StoreError> {
         let inner = self.lock()?;
         let projection = &inner.projection;
-        Ok(projection
-            .ticket(id)
-            .map(|ticket| ticket_view(projection, id, ticket)))
+        Ok(projection.ticket(id).map(|ticket| {
+            let (previous, next) = projection.ticket_neighbours(id);
+            ticket_view(projection, id, ticket, refs::reference(previous, id, next))
+        }))
+    }
+
+    /// The IDs of every known Ticket, archived or not, whose ID starts with `prefix`, at most
+    /// `limit` of them, and whether more exist.
+    ///
+    /// # Errors
+    ///
+    /// The store lock is poisoned.
+    pub fn tickets_with_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<(Vec<String>, bool), StoreError> {
+        let inner = self.lock()?;
+        let mut matches = inner.projection.tickets_with_prefix(prefix);
+        let found: Vec<String> = matches.by_ref().take(limit).cloned().collect();
+        Ok((found, matches.next().is_some()))
     }
 
     /// Clears the delivery cursor, after the host reported it invalid; the next session
@@ -334,6 +364,114 @@ impl BacklogStore {
         result.map(|()| true)
     }
 
+    /// The codec generation that last re-evaluated this store's `malformed_record` quarantine.
+    ///
+    /// # Errors
+    ///
+    /// Storage failure.
+    pub fn codec_generation(&self) -> Result<u8, StoreError> {
+        self.lock()?
+            .conn
+            .query_row(
+                "SELECT codec_generation FROM metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(rerr)
+    }
+
+    /// Records that `generation` has re-evaluated the `malformed_record` quarantine.
+    ///
+    /// # Errors
+    ///
+    /// Storage failure.
+    pub fn set_codec_generation(&self, generation: u8) -> Result<(), StoreError> {
+        self.lock()?
+            .conn
+            .execute(
+                "UPDATE metadata SET codec_generation=?1 WHERE singleton=1",
+                [generation],
+            )
+            .map(|_| ())
+            .map_err(rerr)
+    }
+
+    /// Every record quarantined as `malformed_record`, in ingestion order: those an older
+    /// codec could not decode, which a newer one may (ADR 0048).
+    ///
+    /// # Errors
+    ///
+    /// Storage failure.
+    pub fn malformed_rows(&self) -> Result<Vec<SealedRow>, StoreError> {
+        let inner = self.lock()?;
+        let mut statement = inner
+            .conn
+            .prepare(
+                "SELECT record_id,order_key,author,purpose,signature,sealed_record FROM records WHERE quarantine_code=?1 ORDER BY ingestion_ordinal",
+            )
+            .map_err(rerr)?;
+        let rows = statement
+            .query_map([MALFORMED], |row| {
+                Ok(SealedRow {
+                    record_id: row.get(0)?,
+                    order_key: row.get(1)?,
+                    author: row.get(2)?,
+                    purpose: row.get(3)?,
+                    signature: row.get(4)?,
+                    sealed: row.get(5)?,
+                })
+            })
+            .map_err(rerr)?;
+        rows.collect::<Result<_, _>>().map_err(rerr)
+    }
+
+    /// Decodes a `malformed_record` again and, when it now decodes, projects it as if it had
+    /// just been delivered: applied, waiting, or quarantined for another reason. A record that
+    /// still does not decode stays quarantined.
+    ///
+    /// # Errors
+    ///
+    /// Storage failure; nothing was committed and the in-memory projection is reloaded.
+    pub fn reevaluate(
+        &self,
+        row: &SealedRow,
+        canonical: &[u8],
+    ) -> Result<IngestResult, StoreError> {
+        let Ok(record) = DomainRecord::decode(canonical) else {
+            return Ok(IngestResult::Quarantined(MALFORMED.into()));
+        };
+        let mut guard = self.lock()?;
+        let inner = &mut *guard;
+        let result = (|| {
+            let tx = inner.conn.transaction().map_err(rerr)?;
+            let result = if record.kind() == row.purpose {
+                tx.execute(
+                    "UPDATE records SET quarantine_code=NULL WHERE record_id=?1",
+                    [&row.record_id],
+                )
+                .map_err(rerr)?;
+                let outcome =
+                    inner
+                        .projection
+                        .apply(&row.record_id, &row.order_key, &row.author, &record);
+                commit_outcome(&tx, &inner.projection, &row.record_id, outcome)?
+            } else {
+                quarantine(&tx, &row.record_id, "purpose_mismatch")?
+            };
+            tx.commit().map_err(|_| StoreError::UncertainOutcome)?;
+            Ok(result)
+        })();
+        if result.is_err() {
+            let texts = inner.projection.texts().clone();
+            let mut reloaded = Projection::default();
+            if load(&inner.conn, &mut reloaded).is_ok() {
+                *reloaded.texts_mut() = texts;
+                inner.projection = reloaded;
+            }
+        }
+        result
+    }
+
     /// Record ids waiting for a target, with that target, from SQLite.
     ///
     /// # Errors
@@ -352,9 +490,15 @@ impl BacklogStore {
     }
 }
 
-fn ticket_view(projection: &Projection, id: &str, ticket: &TicketState) -> TicketView {
+fn ticket_view(
+    projection: &Projection,
+    id: &str,
+    ticket: &TicketState,
+    reference: String,
+) -> TicketView {
     TicketView {
         id: id.to_owned(),
+        reference,
         epic_id: ticket.epic.clone(),
         title: projection.texts().title(id).map(str::to_owned),
         body: projection.texts().body(id).map(str::to_owned),
@@ -426,7 +570,7 @@ fn ingest_in(
     )
     .map_err(rerr)?;
     let result = match DomainRecord::decode(incoming.canonical) {
-        Err(_) => quarantine(&tx, incoming.record_id, "malformed_record")?,
+        Err(_) => quarantine(&tx, incoming.record_id, MALFORMED)?,
         Ok(record) if record.kind() != incoming.purpose => {
             quarantine(&tx, incoming.record_id, "purpose_mismatch")?
         }
@@ -937,9 +1081,9 @@ mod tests {
             [
                 "records",
                 "epics",
-                "tickets",
                 "waiting_for_target",
-                "metadata"
+                "metadata",
+                "tickets"
             ]
         );
         for table in &tables {
@@ -1129,12 +1273,155 @@ mod tests {
         waiting.await.unwrap();
     }
 
+    // Verifies: TEAM.SYS.BACKLOG-R05, TEAM.SYS.BACKLOG-R12 — a record an older codec
+    // quarantined as malformed is projected once the codec decodes it; one that still does not
+    // decode stays quarantined (ADR 0048).
+    #[test]
+    fn reevaluation_projects_records_an_older_codec_could_not_decode() {
+        let fixture = fixture();
+        create_epic_and_ticket(&fixture.store);
+        let cancel = DomainRecord::ticket_update(
+            ALICE,
+            30,
+            &id(2),
+            TicketChanges {
+                status: Some(Status::Cancelled),
+                ..TicketChanges::default()
+            },
+        )
+        .unwrap()
+        .encode();
+        // What a build without `cancelled` stored: the same record, which it could not decode.
+        let mut unknown = cancel.clone();
+        let status_at = unknown.len() - 1;
+        unknown[status_at] = 0xee;
+        let store = &fixture.store;
+        for (seed, canonical) in [(3, &unknown), (4, &unknown)] {
+            let record_id = id(seed);
+            let order_key = order(seed);
+            let result = store
+                .ingest(Incoming {
+                    record_id: &record_id,
+                    order_key: &order_key,
+                    author: ALICE,
+                    purpose: "ticket.update",
+                    signature: "sig",
+                    canonical,
+                    sealed: b"sealed",
+                    cursor: None,
+                })
+                .unwrap();
+            assert_eq!(result, IngestResult::Quarantined(MALFORMED.into()));
+        }
+        assert!(store.has_projection_warnings().unwrap());
+        assert_eq!(store.codec_generation().unwrap(), 1);
+        let rows = store.malformed_rows().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.record_id.clone())
+                .collect::<Vec<_>>(),
+            [id(3), id(4)]
+        );
+        assert_eq!(
+            store.reevaluate(&rows[0], &cancel).unwrap(),
+            IngestResult::Applied
+        );
+        assert_eq!(
+            store.reevaluate(&rows[1], &unknown).unwrap(),
+            IngestResult::Quarantined(MALFORMED.into())
+        );
+        let ticket = store.ticket(&id(2)).unwrap().unwrap();
+        assert_eq!(ticket.status, Status::Cancelled);
+        assert_eq!(ticket.version, order(3));
+        assert_eq!(
+            store
+                .malformed_rows()
+                .unwrap()
+                .iter()
+                .map(|row| row.record_id.clone())
+                .collect::<Vec<_>>(),
+            [id(4)]
+        );
+        store.set_codec_generation(2).unwrap();
+        drop(fixture.store);
+        let reopened = BacklogStore::open(&fixture.path).unwrap();
+        assert_eq!(
+            reopened.ticket(&id(2)).unwrap().unwrap().status,
+            Status::Cancelled
+        );
+        assert_eq!(reopened.codec_generation().unwrap(), 2);
+    }
+
+    // Verifies: TEAM.SYS.BACKLOG-R05 — a schema-1 store migrates with its Tickets intact and
+    // then accepts `cancelled`.
+    #[test]
+    fn a_schema_1_store_migrates_and_accepts_cancelled() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("backlog.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0001_backlog.sql"))
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        drop(conn);
+        let store = BacklogStore::open(&path).unwrap();
+        assert_eq!(store.codec_generation().unwrap(), 1);
+        create_epic_and_ticket(&store);
+        let cancel = DomainRecord::ticket_update(
+            ALICE,
+            30,
+            &id(2),
+            TicketChanges {
+                status: Some(Status::Cancelled),
+                ..TicketChanges::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ingest(&store, 3, ALICE, &cancel), IngestResult::Applied);
+        drop(store);
+        let reopened = BacklogStore::open(&path).unwrap();
+        let ticket = reopened.ticket(&id(2)).unwrap().unwrap();
+        assert_eq!(ticket.status, Status::Cancelled);
+        assert_eq!(ticket.priority, Priority::High);
+    }
+
+    // Verifies: TEAM.SYS.BACKLOG-R11 — references lengthen only as far as a shared prefix needs,
+    // and archived Tickets count.
+    #[test]
+    fn references_are_shortest_unique_prefixes_over_every_ticket() {
+        let fixture = fixture();
+        create_epic_and_ticket(&fixture.store);
+        let store = &fixture.store;
+        // id(2) is 63 zeros then "2", so its only neighbour shares 63 characters.
+        assert_eq!(store.ticket(&id(2)).unwrap().unwrap().reference, "0000");
+        let create = |title: &str| {
+            DomainRecord::ticket_create(ALICE, 40, &id(1), title, "", Status::Ready, Priority::Low)
+                .unwrap()
+        };
+        ingest(store, 5, ALICE, &create("Second"));
+        let views = store.tickets().unwrap();
+        let refs: Vec<&str> = views.iter().map(|view| view.reference.as_str()).collect();
+        assert_eq!(refs, [id(2).as_str(), id(5).as_str()]);
+        assert_eq!(store.ticket(&id(5)).unwrap().unwrap().reference, id(5));
+        assert_eq!(
+            store.tickets_with_prefix("0000", 1).unwrap(),
+            (vec![id(2)], true)
+        );
+        assert_eq!(
+            store.tickets_with_prefix(&id(5), 16).unwrap(),
+            (vec![id(5)], false)
+        );
+        assert_eq!(
+            store.tickets_with_prefix("ffff", 16).unwrap(),
+            (vec![], false)
+        );
+    }
+
     #[test]
     fn a_newer_schema_is_refused() {
         let fixture = fixture();
         drop(fixture.store);
         let conn = Connection::open(&fixture.path).unwrap();
-        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
         drop(conn);
         assert!(matches!(
             BacklogStore::open(&fixture.path),

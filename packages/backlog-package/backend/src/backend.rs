@@ -25,8 +25,8 @@ use teamarness_package_sdk::{
 use tokio::sync::watch;
 
 use crate::domain::{
-    DEFAULT_PRIORITY, DEFAULT_STATUS, DomainError, DomainRecord, Field, Priority, Status,
-    TicketChanges,
+    CODEC_GENERATION, DEFAULT_PRIORITY, DEFAULT_STATUS, DomainError, DomainRecord, Field, Priority,
+    Status, TicketChanges,
 };
 use crate::store::{
     BacklogStore, Incoming, IngestResult, SealedRow, StoreError, TicketLocks, TicketView,
@@ -192,6 +192,7 @@ impl BacklogActive {
             .map(|ticket| {
                 json!({
                     "ticketId": ticket.id,
+                    "ref": ticket.reference,
                     "epicId": ticket.epic_id,
                     "title": ticket.title.unwrap_or_else(|| UNTITLED.into()),
                     "status": ticket.status.as_str(),
@@ -228,6 +229,7 @@ fn notify(changes: &watch::Sender<u64>) {
 pub(crate) fn ticket_value(ticket: &TicketView) -> JsonValue {
     json!({
         "ticketId": ticket.id,
+        "ref": ticket.reference,
         "epicId": ticket.epic_id,
         "title": ticket.title.clone().unwrap_or_else(|| UNTITLED.into()),
         "body": ticket.body.clone().unwrap_or_default(),
@@ -406,6 +408,7 @@ pub fn router() -> Router<BacklogActive> {
             let principals = Principals::from_initialization(&initialization, capabilities)
                 .map_err(|cause| capability_error("principals", cause))?;
             rehydrate(&store, &log, &cancellation).await?;
+            reevaluate(&store, &log, &cancellation).await?;
             let sync = Arc::new(Mutex::new(SyncReport::catching_up()));
             let (changes, _) = watch::channel(0);
             let session = start_session(&store, &log, &sync, &changes);
@@ -720,8 +723,9 @@ pub fn router() -> Router<BacklogActive> {
     )
     .port_request(
         ports::CONTRACT, "ticket.get", "query",
-        |context: Context<BacklogActive>, _actor: PortActor, request: TicketRequest| async move {
-            let ticket = read_ticket(&context, &request.ticket_id).await?;
+        |context: Context<BacklogActive>, _actor: PortActor, request: ports::GetRequest| async move {
+            let ticket_id = ports::resolve(&context, request).await?;
+            let ticket = read_ticket(&context, &ticket_id).await?;
             Ok(ticket_value(&ticket))
         },
     )
@@ -1048,6 +1052,65 @@ async fn rehydrate(
                 writer.reapply(row, canonical).map_err(storage_failed)?;
             }
             Ok(())
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+/// Once per codec generation, opens every record an older codec quarantined as malformed and
+/// projects those the current codec decodes (ADR 0048). The generation is recorded only when
+/// every such record could be opened, so one that cannot yet be opened is tried again on the
+/// next activation.
+async fn reevaluate(
+    store: &BacklogStore,
+    log: &RecordLog,
+    cancellation: &CancellationToken,
+) -> Result<(), BackendError> {
+    let reader = store.clone();
+    let rows = teamarness_package_sdk::blocking(cancellation, move |_| {
+        if reader.codec_generation().map_err(storage_failed)? >= CODEC_GENERATION {
+            return Ok(Vec::new());
+        }
+        reader.malformed_rows().map_err(storage_failed)
+    })
+    .await?;
+    let mut every_opened = true;
+    for batch in open_batches(&rows) {
+        let sealed: Vec<Vec<u8>> = batch.iter().map(|row| row.sealed.clone()).collect();
+        let results = log
+            .open(&sealed)
+            .await
+            .map_err(|cause| capability_error("open-records", cause))?;
+        let mut opened = Vec::new();
+        for (row, result) in batch.iter().zip(results) {
+            match result {
+                OpenResult::Ready(record)
+                    if record.record_id.as_str() == row.record_id
+                        && record.order_key.as_str() == row.order_key
+                        && record.author == row.author
+                        && record.purpose == row.purpose =>
+                {
+                    opened.push((row.clone(), record.canonical));
+                }
+                _ => every_opened = false,
+            }
+        }
+        let writer = store.clone();
+        teamarness_package_sdk::blocking(cancellation, move |_| {
+            for (row, canonical) in &opened {
+                writer.reevaluate(row, canonical).map_err(storage_failed)?;
+            }
+            Ok(())
+        })
+        .await?;
+    }
+    if every_opened {
+        let writer = store.clone();
+        teamarness_package_sdk::blocking(cancellation, move |_| {
+            writer
+                .set_codec_generation(CODEC_GENERATION)
+                .map_err(storage_failed)
         })
         .await?;
     }
@@ -1451,7 +1514,8 @@ mod tests {
         assert_eq!(
             full,
             json!({
-                "ticketId": ticket_id, "epicId": epic_id, "title": "Write the plan", "body": "",
+                "ticketId": ticket_id, "ref": &ticket_id[..4], "epicId": epic_id,
+                "title": "Write the plan", "body": "",
                 "status": "not_ready", "priority": "medium", "assignee": null,
                 "archived": false, "version": version, "creator": ALICE,
                 "createdAt": full["createdAt"], "lastEditor": ALICE, "lastAt": full["createdAt"],
@@ -1998,6 +2062,7 @@ mod tests {
     fn a_stale_refusal_that_would_not_fit_omits_the_body() {
         let mut ticket = TicketView {
             id: hex(64, 1),
+            reference: hex(64, 1)[..4].to_owned(),
             epic_id: hex(64, 2),
             title: Some("Plan".into()),
             body: Some("short".into()),
