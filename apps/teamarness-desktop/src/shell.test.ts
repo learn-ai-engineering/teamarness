@@ -611,7 +611,7 @@ describe("persistent Shell frame", () => {
     nav.settings.click();
     await vi.waitFor(() => expect(nav.innerHTML).toMatch(/class="workspace-settings-link"[^>]*aria-current="page"/), { timeout: 5_000 });
     expect(test.shell.route()).toEqual({ kind: "workspace-settings", workspaceId: workspace.id });
-    expect(test.frame.shellScreen.innerHTML).toContain("Workspace details");
+    expect(test.frame.shellScreen.innerHTML).toContain('id="workspace-page-heading"');
     expect(test.frame.shellScreen.innerHTML).toContain("Members");
     expect(test.frame.shellScreen.innerHTML).toContain("Workspace Invitations");
     expect(test.frame.shellScreen.innerHTML).toContain("Package Instances");
@@ -1147,13 +1147,13 @@ describe("Add and manage Personal Packages from the Workspace page", () => {
     status: { kind: "refused" as const, code: "artifact_changed" },
   };
 
-  it("puts an Add Personal Package button in the Packages section heading", async () => {
+  it("puts an Add Personal Package button at the end of the Package Instances group", async () => {
     const test = harness();
     await test.shell.updateWorkspace(model());
     test.shell.updatePackages(packages);
     await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
     const html = test.frame.shellScreen.innerHTML;
-    expect(html).toMatch(/<h2 id="package-instances-heading">Package Instances<\/h2>\s*<button type="button" class="package-add" data-package-install-action="open" aria-label="Add Personal Package"/);
+    expect(html).toMatch(/<h2 id="package-instances-heading">Package Instances<\/h2>[\s\S]*<div><button type="button" class="secondary package-add" data-package-install-action="open">Add Personal Package<\/button><\/div><\/div><\/section>/);
   });
 
   it("opens the add flow from +, previews, and installs only after Trust and install", async () => {

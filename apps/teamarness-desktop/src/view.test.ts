@@ -315,7 +315,9 @@ describe("Shell Workspace screens", () => {
     expect(invitations.replaceAll("Workspace Invitation", "")).not.toMatch(/\bInvitations?\b/);
 
     const settings = await rendered(model(), { kind: "workspace-settings", workspaceId: workspace.id });
-    expect(settings).toContain("Workspace details");
+    expect(settings).toMatch(/<h1 id="workspace-page-heading" class="package-page-title">[^<]+<\/h1><p class="package-page-subtitle">\d+ Members?\.<\/p>/);
+    expect(settings).not.toContain("Workspace details");
+    expect(settings).not.toContain("screen-section");
     expect(settings).toContain("Package Instances");
     expect(settings).toContain("Your name");
     expect(settings).not.toMatch(/leave Workspace|revoke|manager administration/i);

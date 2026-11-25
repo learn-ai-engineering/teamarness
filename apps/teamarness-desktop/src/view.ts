@@ -337,17 +337,18 @@ export function renderShell(
   const members = memberRows || (workspace.membershipLoaded
     ? '<li class="empty-state">No Members are listed.</li>'
     : '<li class="empty-state">Membership is loading.</li>');
-  return `${feedback}<section class="shell-screen"><header class="screen-heading"><p class="eyebrow">Workspace</p><h1>${escape(workspace.name)}</h1><p>${workspace.memberCount === 1 ? "1 Member" : `${workspace.memberCount} Members`}. Workspace details and your name are shown below.</p></header>
-    <section class="screen-section settings-panel" aria-labelledby="workspace-details-heading"><h2 id="workspace-details-heading">Workspace details</h2><dl><div><dt>Name</dt><dd>${escape(workspace.name)}</dd></div><div><dt>Members</dt><dd>${workspace.memberCount}</dd></div></dl></section>
-    <section class="screen-section"><h2>Your name</h2><form id="rename-person"><label for="rename-person-name">Name in this Workspace</label><input id="rename-person-name" required maxlength="256" autocomplete="name" value="${escape(workspace.ownPersonName)}"><button ${presentation.loading ? "disabled" : ""}>Save name</button></form></section>
-    <section class="screen-section"><h2>Add agent</h2><form id="add-agent"><label for="agent-name">Agent name</label><input id="agent-name" required maxlength="256" autocomplete="off"><button ${presentation.loading ? "disabled" : ""}>Add agent</button></form></section>
-    <section class="screen-section" aria-labelledby="members-heading"><div class="section-heading"><h2 id="members-heading">Members</h2>
-      <button type="button" id="refresh-membership" ${presentation.loading ? "disabled" : ""}>Refresh members</button></div><ol class="members">${members}</ol></section>
-    <section class="screen-section" aria-labelledby="invitations-heading"><h2 id="invitations-heading">Workspace Invitations</h2><p>Create a one-use Workspace Invitation.</p>
-    <button type="button" id="copy-invitation" ${presentation.loading ? "disabled" : ""}>Copy Workspace Invitation</button>
-    <p class="sensitive">Workspace Invitations are sensitive bearer admission material. Share them privately.</p></section>
-    <section class="screen-section settings-panel" aria-labelledby="package-instances-heading"><div class="section-heading"><h2 id="package-instances-heading">Package Instances</h2>
-      <button type="button" class="package-add" data-package-install-action="open" aria-label="Add Personal Package" title="Add Personal Package">+</button></div>${input.packageSettings ?? '<p class="empty-state">Package information is loading.</p>'}</section></section>`;
+  const disabled = presentation.loading ? " disabled" : "";
+  const memberCount = workspace.memberCount === 1 ? "1 Member." : `${workspace.memberCount} Members.`;
+  return `${feedback}<section class="shell-screen workspace-page" aria-labelledby="workspace-page-heading"><header class="package-page-header workspace-page-header"><p class="package-page-kind">Workspace</p><h1 id="workspace-page-heading" class="package-page-title">${escape(workspace.name)}</h1><p class="package-page-subtitle">${memberCount}</p></header>
+    ${settingsGroup("your-name", "Your name", "The name other Members see for you in this Workspace.", `<form id="rename-person"><label for="rename-person-name">Name in this Workspace</label><div class="inline-field"><input id="rename-person-name" required maxlength="256" autocomplete="name" value="${escape(workspace.ownPersonName)}"><button${disabled}>Save name</button></div></form>`)}
+    ${settingsGroup("members", "Members", "People and Agents in this Workspace. You are the Steward of each Agent you add.", `<ol class="members">${members}</ol><form id="add-agent"><label for="agent-name">Add an Agent</label><div class="inline-field"><input id="agent-name" required maxlength="256" autocomplete="off" placeholder="Agent name"><button${disabled}>Add agent</button></div></form><div><button type="button" id="refresh-membership" class="secondary"${disabled}>Refresh members</button></div>`)}
+    ${settingsGroup("invitations", "Workspace Invitations", "Each Workspace Invitation admits one Person, once.", `<div><button type="button" id="copy-invitation"${disabled}>Copy Workspace Invitation</button></div><p class="sensitive">Workspace Invitations are sensitive bearer admission material. Share them privately.</p>`)}
+    ${settingsGroup("package-instances", "Package Instances", "Packages in this Workspace. Hide one from navigation, or open it for details and controls.", `${input.packageSettings ?? '<p class="empty-state">Package information is loading.</p>'}<div><button type="button" class="secondary package-add" data-package-install-action="open">Add Personal Package</button></div>`)}</section>`;
+}
+
+/** One Workspace settings group, in the Package page's two-column group structure. */
+function settingsGroup(id: string, title: string, intro: string, body: string): string {
+  return `<section class="package-page-group" aria-labelledby="${id}-heading"><div class="package-page-group-intro"><h2 id="${id}-heading">${escape(title)}</h2><p>${escape(intro)}</p></div><div class="package-page-group-body">${body}</div></section>`;
 }
 
 function routeWorkspaceId(route: ShellRoute): string | null {
