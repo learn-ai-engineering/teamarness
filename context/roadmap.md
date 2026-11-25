@@ -79,7 +79,7 @@ Workstream `workspace-settings-ui` on branch `workspace-settings-ui`. Delivers f
 - **Notifications on Workspace settings and Package About pages never dismiss and are easy to miss** (`TEAM.SYS.SHELL-R08`). Shell-only: non-error notifications dismiss after 5 seconds, errors stay until closed with an X, styled after the External Gateway Package's configuration notifications. A notification carrying the only Restart or Retry control stays (DELTA-018 SF-304). The Package capability stays in **Shell notifications**.
 - **Rename and delete Workspaces** ([ADR 0048](.decisions/0048-local-workspace-rename-and-sole-creator-deletion.md), proposed; `TEAM.SYS.SHELL-R04`). Rename is Installation-local. Only the creator deletes, and only while no other Person is a Member; deletion erases the Workspace's Core data, Package Instances and Package Data Directories after the name is typed, and leaves mapped Documents folders on disk. Desktop only.
 
-Planned order: styling, settings-view sizing, notifications, rename, delete.
+Planned order: styling, settings-view sizing, notifications, rename, delete. All five are implemented on the branch with automated checks; manual verification on macOS is pending.
 
 **Outcome:** Workspace settings matches the Package pages, notifications are noticeable and clear themselves, and a test Workspace can be renamed and deleted.
 

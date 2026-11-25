@@ -17,6 +17,7 @@
     "allow-add-workspace-agent",
     "allow-remove-workspace-agent",
     "allow-rename-workspace",
+    "allow-delete-workspace",
     "allow-package-catalog-snapshot",
     "allow-package-subscribe-host-state",
     "allow-package-open-mount",

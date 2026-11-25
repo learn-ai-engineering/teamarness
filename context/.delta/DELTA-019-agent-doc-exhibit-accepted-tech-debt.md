@@ -34,3 +34,5 @@ Follow-up: Host Port maintenance on `main`.
 - On a Package page, the Configuration tab scrolls inside its frame, but the About tab scrolls the whole page. A Package's settings view is a sandboxed frame, so the Host cannot measure its content. To fix this, the frame runtime, which the Host owns, would report the content height over the frame bridge, and the Shell would size the frame to it. Don deferred this on 2026-11-01.
 
 Follow-up: the roadmap follow-up "sizing a Package's settings view to its content".
+
+Resolved in workstream `workspace-settings-ui` (2026-11-26), pending manual verification: private frame bridge protocol 5 reports the settings view's content height and the Shell sizes the frame to it; open modal dialogs are placed in the frame's visible region (`TEAM.SYS.SHELL-R02`).

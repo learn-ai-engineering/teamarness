@@ -93,6 +93,18 @@ pub(crate) struct RuntimeState {
     shutdown_complete: bool,
 }
 
+impl RuntimeState {
+    /// Drops every in-memory view of an erased Workspace. Dropping its watch senders and
+    /// membership subscribers ends the streams that wait on them.
+    pub(crate) fn forget_workspace(&mut self, workspace_id: WorkspaceId) {
+        self.memberships.remove(&workspace_id);
+        self.subscribers.remove(&workspace_id);
+        self.membership_epochs.remove(&workspace_id);
+        self.profile_generations.remove(&workspace_id);
+        self.name_replay_scans.remove(&workspace_id);
+    }
+}
+
 pub(crate) trait Clock: Send + Sync {
     fn now_unix_ms(&self) -> i64;
 }

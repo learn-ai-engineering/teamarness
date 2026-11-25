@@ -67,7 +67,10 @@ export type BridgeErrorCode =
   | "package_reconciliation"
   | "shutdown"
   | "not_steward"
-  | "principal_not_bound";
+  | "principal_not_bound"
+  | "not_workspace_creator"
+  | "workspace_has_members"
+  | "workspace_deletion_failed";
 
 /** A failure the Shell can show: a bridge code, or one raised by the webview itself. */
 export type ShellErrorCode = BridgeErrorCode | "clipboard_write";

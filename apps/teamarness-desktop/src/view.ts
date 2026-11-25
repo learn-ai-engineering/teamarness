@@ -164,6 +164,28 @@ export class ShellController {
     });
   }
 
+  /** Deletes the Workspace and all of its data on this Installation (ADR 0048). */
+  public async deleteWorkspace(workspaceId: string): Promise<void> {
+    await this.perform(async () => {
+      const name = this.model.workspaces.find(({ id }) => id === workspaceId)?.name ?? "the Workspace";
+      await this.bridge.deleteWorkspace(workspaceId);
+      this.watched.delete(workspaceId);
+      const retry = this.principalRetries.get(workspaceId);
+      if (retry !== undefined) clearTimeout(retry);
+      this.principalRetries.delete(workspaceId);
+      const workspaces = this.model.workspaces.filter(({ id }) => id !== workspaceId);
+      const memberships = Object.fromEntries(Object.entries(this.model.memberships).filter(([id]) => id !== workspaceId));
+      const principals = Object.fromEntries(Object.entries(this.model.principals).filter(([id]) => id !== workspaceId));
+      this.set({
+        workspaces,
+        memberships,
+        principals,
+        activeWorkspaceId: this.model.activeWorkspaceId === workspaceId ? workspaces[0]?.id ?? null : this.model.activeWorkspaceId,
+        notice: `Deleted ${name}`,
+      });
+    });
+  }
+
   /** Renames the Workspace on this Installation only; other Members keep their own name for it. */
   public async renameWorkspace(workspaceId: string, name: string): Promise<void> {
     await this.perform(async () => {
@@ -405,7 +427,16 @@ export function renderShell(
     ${settingsGroup("your-name", "Your name", "The name other Members see for you in this Workspace.", `<form id="rename-person"><label for="rename-person-name">Name in this Workspace</label><div class="inline-field"><input id="rename-person-name" required maxlength="256" autocomplete="name" value="${escape(workspace.ownPersonName)}"><button${disabled}>Save name</button></div></form>`)}
     ${settingsGroup("members", "Members", "People and Agents in this Workspace. You are the Steward of each Agent you add.", `<ol class="members">${members}</ol><form id="add-agent"><label for="agent-name">Add an Agent</label><div class="inline-field"><input id="agent-name" required maxlength="256" autocomplete="off" placeholder="Agent name"><button${disabled}>Add agent</button></div></form><div><button type="button" id="refresh-membership" class="secondary"${disabled}>Refresh members</button></div>`)}
     ${settingsGroup("invitations", "Workspace Invitations", "Each Workspace Invitation admits one Person, once.", `<div><button type="button" id="copy-invitation"${disabled}>Copy Workspace Invitation</button></div><p class="sensitive">Workspace Invitations are sensitive bearer admission material. Share them privately.</p>`)}
-    ${settingsGroup("package-instances", "Package Instances", "Packages in this Workspace. Hide one from navigation, or open it for details and controls.", `${input.packageSettings ?? '<p class="empty-state">Package information is loading.</p>'}<div><button type="button" class="secondary package-add" data-package-install-action="open">Add Personal Package</button></div>`)}</section>`;
+    ${settingsGroup("package-instances", "Package Instances", "Packages in this Workspace. Hide one from navigation, or open it for details and controls.", `${input.packageSettings ?? '<p class="empty-state">Package information is loading.</p>'}<div><button type="button" class="secondary package-add" data-package-install-action="open">Add Personal Package</button></div>`)}
+    ${workspace.canDelete ? renderDeleteWorkspace(workspace.name, presentation.loading) : ""}</section>`;
+}
+
+/**
+ * Deleting a Workspace takes typing its exact name: the confirm button stays disabled until the
+ * field matches, and the Shell checks it again on submit (ADR 0048).
+ */
+function renderDeleteWorkspace(name: string, loading: boolean): string {
+  return `<section class="package-page-group workspace-delete" aria-labelledby="delete-workspace-heading"><div class="package-page-group-intro"><h2 id="delete-workspace-heading">Delete Workspace</h2><p>You created this Workspace and no one else is a Member.</p></div><div class="package-page-group-body"><p>Deleting erases this Workspace and all of its data on this Installation, including its Agents and every Package's data. Files in folders mapped by Documents stay on disk. This cannot be undone.</p><form id="delete-workspace" data-workspace-name="${escape(name)}"><label for="delete-workspace-confirm">Type <strong>${escape(name)}</strong> to confirm</label><div class="inline-field"><input id="delete-workspace-confirm" autocomplete="off" spellcheck="false"><button type="submit" class="danger" disabled${loading ? ' aria-busy="true"' : ""}>Delete Workspace</button></div></form></div></section>`;
 }
 
 /** One Workspace settings group, in the Package page's two-column group structure. */

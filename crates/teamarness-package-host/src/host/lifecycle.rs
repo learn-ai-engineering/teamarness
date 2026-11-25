@@ -57,6 +57,8 @@ impl PackageHost {
         let mut report = Self::admit_sources(&config, &store).await?;
         let blocked = Self::reconcile_orphan_leases(&store, &mut report).await?;
         let workspaces = Self::list_core_workspaces(&core).await?;
+        // A deletion that stopped part way is finished or dropped before any Instance exists.
+        Self::settle_workspace_deletions(&config, &store, &workspaces).await?;
         let port_contracts: BTreeMap<
             PackageIdentity,
             Arc<teamarness_package_contract::port_contract::CompiledPortContracts>,

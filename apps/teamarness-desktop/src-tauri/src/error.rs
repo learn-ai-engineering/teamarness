@@ -30,6 +30,12 @@ pub enum BridgeErrorCode {
     Shutdown,
     NotSteward,
     PrincipalNotBound,
+    /// Only the Installation that created a Workspace may delete it (ADR 0048).
+    NotWorkspaceCreator,
+    /// A Workspace with another current Person cannot be deleted (ADR 0048).
+    WorkspaceHasMembers,
+    /// Package Instances could not be stopped, so nothing was deleted.
+    WorkspaceDeletionFailed,
 }
 
 impl BridgeError {
@@ -49,6 +55,14 @@ impl BridgeError {
     /// is shutting down becomes [`BridgeErrorCode::Shutdown`]; every other
     /// failure says that Package activation failed, and carries the Host's own
     /// retryability.
+    /// Reports a Package Host failure that stopped a Workspace deletion; nothing was deleted.
+    pub fn workspace_deletion(error: &PackageErrorEnvelope) -> Self {
+        match error.code {
+            PackageErrorCode::ShuttingDown => Self::shutdown(),
+            _ => Self::new(BridgeErrorCode::WorkspaceDeletionFailed, true),
+        }
+    }
+
     pub fn reconcile(error: &PackageErrorEnvelope) -> Self {
         match error.code {
             PackageErrorCode::ShuttingDown => Self::shutdown(),
@@ -99,6 +113,12 @@ impl From<WorkspaceError> for BridgeError {
             WorkspaceError::InvalidName => Self::invalid_input(),
             WorkspaceError::Conflict => Self::new(BridgeErrorCode::LocalConflict, false),
             WorkspaceError::UnknownWorkspace => Self::invalid_input(),
+            WorkspaceError::NotWorkspaceCreator => {
+                Self::new(BridgeErrorCode::NotWorkspaceCreator, false)
+            }
+            WorkspaceError::WorkspaceHasOtherMembers => {
+                Self::new(BridgeErrorCode::WorkspaceHasMembers, false)
+            }
             WorkspaceError::CorruptTrustAnchor => {
                 Self::new(BridgeErrorCode::InvalidBootstrap, false)
             }
@@ -185,6 +205,9 @@ mod tests {
             serde_json::to_value([
                 BridgeError::from(PersonNameError::NotOwnPerson),
                 BridgeError::new(BridgeErrorCode::PrincipalNotBound, false),
+                BridgeError::from(teamarness_core::WorkspaceError::NotWorkspaceCreator),
+                BridgeError::from(teamarness_core::WorkspaceError::WorkspaceHasOtherMembers),
+                BridgeError::new(BridgeErrorCode::WorkspaceDeletionFailed, true),
             ])
             .unwrap()
             .as_array()

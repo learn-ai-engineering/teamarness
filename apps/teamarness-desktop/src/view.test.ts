@@ -20,6 +20,7 @@ function fakeBridge(overrides: Partial<TeamarnessBridge> = {}): TeamarnessBridge
     createWorkspaceInvitation: async () => invitation,
     joinWorkspace: async () => state,
     renameWorkspace: async (workspaceId, name) => ({ ...workspace, id: workspaceId, name }),
+    deleteWorkspace: async () => undefined,
     currentMembership: async () => membership,
     renameWorkspacePrincipal: async () => undefined,
     addWorkspaceAgent: async () => undefined,
@@ -528,6 +529,37 @@ describe("Shell Workspace screens", () => {
     expect(html).toContain("Other Members keep their own name for it.");
   });
 
+  // Verifies: TEAM.SYS.SHELL-R04
+  it("offers deletion only to the sole creator and removes the Workspace after it", async () => {
+    const sole: Membership = { ...membership, members: membership.members.filter(({ identity }) => identity === fixture.installation.identity) };
+    const route = { kind: "workspace-settings", workspaceId: workspace.id } as const;
+    expect(await rendered(model(), route)).not.toContain('id="delete-workspace"');
+    expect(await rendered(model({ memberships: { [workspace.id]: sole }, workspaces: [{ ...workspace, createdBy: "b".repeat(64) }] }), route)).not.toContain('id="delete-workspace"');
+    const offered = await rendered(model({ memberships: { [workspace.id]: sole } }), route);
+    expect(offered).toContain('<form id="delete-workspace" data-workspace-name="Design team">');
+    expect(offered).toContain('<button type="submit" class="danger" disabled>Delete Workspace</button>');
+    expect(offered).toContain("Files in folders mapped by Documents stay on disk.");
+
+    const calls: string[] = [];
+    const controller = new ShellController(fakeBridge({
+      currentMembership: async () => sole,
+      deleteWorkspace: async (id) => { calls.push(id); },
+    }), () => undefined);
+    await controller.load();
+    await controller.deleteWorkspace(workspace.id);
+    expect(calls).toEqual([workspace.id]);
+    expect(controller.snapshot()).toMatchObject({ workspaces: [], activeWorkspaceId: null, notice: "Deleted Design team", error: null });
+    expect(controller.snapshot().memberships).toEqual({});
+
+    const refused = new ShellController(fakeBridge({
+      deleteWorkspace: async () => { throw { code: "workspace_has_members", retryable: false }; },
+    }), () => undefined);
+    await refused.load();
+    await refused.deleteWorkspace(workspace.id);
+    expect(refused.snapshot()).toMatchObject({ error: "workspace_has_members", workspaces: [workspace] });
+    expect(await rendered(refused.snapshot(), route)).toContain("This Workspace has other Members, so it cannot be deleted.");
+  });
+
   it("keeps membership refresh failures observable", async () => {
     const failure = fixture.errors.find(({ code }) => code === "timeout") as BridgeError;
     let shouldFail = false;
@@ -550,6 +582,7 @@ describe("shared bridge fixture", () => {
       "invalid_input", "authentication", "expired", "already_used", "readiness", "timeout",
       "overload", "invalid_bootstrap", "local_conflict", "admission_no_longer_current",
       "uncertain_storage_outcome", "shutdown", "not_steward", "principal_not_bound",
+      "not_workspace_creator", "workspace_has_members", "workspace_deletion_failed",
     ]);
     expect(fixture.workspace.id).toMatch(/^[0-9a-f]{32}$/);
     expect(fixture.membership.version).toMatch(/^[0-9a-f]{64}$/);

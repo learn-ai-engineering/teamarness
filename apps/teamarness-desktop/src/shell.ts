@@ -60,6 +60,7 @@ type WorkspaceActions = Readonly<{
   joinWorkspace(invitation: string, personName: string): Promise<void>;
   rename(workspaceId: string, name: string): Promise<void>;
   renameWorkspace(workspaceId: string, name: string): Promise<void>;
+  deleteWorkspace(workspaceId: string): Promise<void>;
   addAgent(workspaceId: string, name: string): Promise<void>;
   removeAgent(workspaceId: string, agentId: string): Promise<void>;
   renameAgent(workspaceId: string, agentId: string, name: string): Promise<void>;
@@ -604,6 +605,15 @@ export class Shell {
         event.preventDefault();
         const name = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#rename-workspace-name");
         if (name) void this.options.workspaceActions.renameWorkspace(workspaceId, name.value);
+      });
+      const deletion = this.shellFrame.shellScreen.querySelector<HTMLFormElement>("#delete-workspace");
+      const confirmation = deletion?.querySelector<HTMLInputElement>("#delete-workspace-confirm");
+      const confirm = deletion?.querySelector<HTMLButtonElement>("button");
+      const confirmed = (): boolean => confirmation?.value === deletion?.dataset.workspaceName;
+      confirmation?.addEventListener("input", () => { if (confirm) confirm.disabled = !confirmed(); });
+      deletion?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        if (confirmed()) void this.options.workspaceActions.deleteWorkspace(workspaceId);
       });
       this.shellFrame.shellScreen.querySelector<HTMLFormElement>("#rename-person")?.addEventListener("submit", (event) => {
         event.preventDefault();

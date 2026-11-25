@@ -8,12 +8,11 @@ BEFORE UPDATE OF workspace_id, creator_public_identity, authored_at_unix_ms,
     SELECT RAISE(ABORT, 'ready workspace trust anchors are immutable');
 END;
 
--- A Workspace being deleted on this Installation. The row is written in the transaction that
--- checks the sole-creator rule and removed in the transaction that erases the Workspace, so a
--- marker that survives a restart means the deletion must be finished, never undone.
+-- The Workspace being erased by the open transaction. Erasure writes the row, deletes every row
+-- of the Workspace, then deletes the marker before it commits, so no marker outlives its
+-- transaction. It has no foreign key: the Workspace row it names is deleted while it exists.
 CREATE TABLE IF NOT EXISTS workspace_deletions (
-    workspace_id BLOB PRIMARY KEY CHECK (length(workspace_id) = 16)
-                 REFERENCES workspaces(workspace_id),
+    workspace_id BLOB PRIMARY KEY CHECK (length(workspace_id) = 16),
     requested_at_unix_ms INTEGER NOT NULL
 ) STRICT;
 

@@ -53,6 +53,7 @@ pub use crate::errors::{
     MAX_PACKAGE_ERROR_DETAILS_BYTES, MAX_PACKAGE_ERROR_DETAILS_DEPTH, PackageErrorCode,
     PackageErrorEnvelope, PackageErrorStage, PackageOwnedError, RecoveryAction,
 };
+pub use crate::host::workspace_deletion::{WorkspaceDeletion, WorkspaceDeletionFailure};
 pub use crate::registrations::{
     inspect_package_directory, remove_registration, write_registration,
 };

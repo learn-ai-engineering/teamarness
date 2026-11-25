@@ -517,6 +517,10 @@ textarea:focus-visible {
 .workspace-page .members { margin: 0; }
 .workspace-page .member-row:first-child { padding-top: 0; border-top: 0; }
 .workspace-page .sensitive { margin: 0; font-size: 0.9rem; }
+.workspace-page .workspace-delete h2 { color: var(--teamarness-color-danger); }
+button.danger { color: var(--teamarness-color-danger); background: transparent; border: 1px solid var(--teamarness-color-danger); }
+button.danger:not(:disabled):hover { color: var(--teamarness-color-panel); background: var(--teamarness-color-danger); }
+button.danger:disabled { cursor: not-allowed; opacity: 0.5; }
 .workspace-page .package-add { display: inline-block; width: auto; height: auto; padding: 0.65rem 0.9rem; font-size: inherit; line-height: inherit; }
 
 /* The message area at the top of a screen keeps its height, so a message never moves the page. */

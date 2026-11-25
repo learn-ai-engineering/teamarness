@@ -47,10 +47,25 @@ async fn append_only_guards_reject_canonical_and_trust_anchor_changes() {
             .execute("DELETE FROM membership_operations", [])
             .is_err()
     );
+    // The local name may change (ADR 0048); every trust-anchor column stays immutable.
+    for column in [
+        "workspace_id",
+        "creator_public_identity",
+        "authored_at_unix_ms",
+        "genesis_operation_id",
+        "genesis_envelope",
+    ] {
+        assert!(
+            connection
+                .execute(&format!("UPDATE workspaces SET {column} = {column}"), [])
+                .is_err(),
+            "{column} must stay immutable"
+        );
+    }
     assert!(
         connection
             .execute("UPDATE workspaces SET name = 'Changed'", [])
-            .is_err()
+            .is_ok()
     );
     assert!(connection.execute("DELETE FROM workspaces", []).is_err());
 

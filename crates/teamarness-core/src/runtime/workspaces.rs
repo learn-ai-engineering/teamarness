@@ -59,6 +59,63 @@ impl CoreRuntime {
         result
     }
 
+    /// Whether this Installation may delete the Workspace now: it created it, and no current
+    /// Person other than its creator is a Member. The creator's own Agents do not count.
+    pub fn check_workspace_deletable(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<(), WorkspaceError> {
+        let mut state = self.lock_workspace_state()?;
+        self.current_deletability(&mut state, workspace_id)
+    }
+
+    /// Erases the Workspace and all of its data from this Installation (ADR 0048). The rule of
+    /// [`Self::check_workspace_deletable`] is checked again under the same lock as the erase, so
+    /// an admission that arrived after a precheck still refuses. Nothing is sent to other
+    /// Installations. Package Instances must already be stopped; the Package Host owns that.
+    pub fn delete_workspace(&self, workspace_id: WorkspaceId) -> Result<(), WorkspaceError> {
+        let mut state = self.lock_workspace_state()?;
+        self.current_deletability(&mut state, workspace_id)?;
+        let now_unix_ms = self.clock.now_unix_ms();
+        if let Err(error) =
+            crate::workspace_erase::erase(&mut state.connection, workspace_id, now_unix_ms)
+        {
+            if error == WorkspaceError::Storage(StorageError::UncertainOutcome) {
+                state.poisoned = true;
+            }
+            return Err(error);
+        }
+        state.forget_workspace(workspace_id);
+        state.sync_wake.notify_one();
+        Ok(())
+    }
+
+    fn current_deletability(
+        &self,
+        state: &mut RuntimeState,
+        workspace_id: WorkspaceId,
+    ) -> Result<(), WorkspaceError> {
+        self.maintain_and_publish(state, self.clock.now_unix_ms())
+            .map_err(fault!(WorkspaceError::Storage(StorageError::Database)))?;
+        let projection = state
+            .memberships
+            .get(&workspace_id)
+            .ok_or(WorkspaceError::UnknownWorkspace)?;
+        if projection.creator() != self.public_identity {
+            return Err(WorkspaceError::NotWorkspaceCreator);
+        }
+        let others =
+            crate::principals::registry(projection)
+                .into_iter()
+                .any(|(_, key, kind, _, _)| {
+                    kind == crate::PrincipalKind::Person && key != self.public_identity
+                });
+        if others {
+            return Err(WorkspaceError::WorkspaceHasOtherMembers);
+        }
+        Ok(())
+    }
+
     /// Lists workspaces known to this installation.
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceSummary>, WorkspaceError> {
         let state = self.lock_workspace_state()?;

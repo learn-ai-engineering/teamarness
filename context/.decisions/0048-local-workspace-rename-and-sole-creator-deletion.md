@@ -21,6 +21,12 @@ Deleting a Workspace with other Members would need a membership action, Content 
 5. **Deletion is deliberate and recoverable if interrupted.** The Shell requires the Person to type the exact Workspace name before deleting. Deletion cannot be undone. If the application stops part way, the next start finishes the deletion rather than leaving a partly deleted Workspace or orphaned Package Data Directories.
 6. **Desktop only.** Rename and delete are Shell controls. Core and Host expose the operations as library calls; the headless application does not offer them yet.
 
+## Implementation notes
+
+- Migration 0020 narrows `workspaces_no_update` to the trust-anchor columns and adds `workspace_deletions`. Each append-only `*_no_delete` trigger accepts a delete only while its own Workspace has a marker row. Core's erase writes the marker, deletes every row children-first, refuses to commit if any table with a `workspace_id` column still holds the Workspace, and removes the marker in the same transaction, so no marker outlives it.
+- Re-importing a stored Workspace no longer compares its name with the inviter's, so a join retry survives a rename on either side.
+- The Package Host owns the cross-store order. Under its tier and reconciliation locks it checks Core's rule, records a `pending_workspace_deletions` entry, disposes and removes every Instance of the Workspace, asks Core to erase it (rechecking the rule), then removes the Package Data Directories named by its mappings, without following links, and the Workspace's Host rows. A refusal or failed disposal drops the entry and recreates the Instances. `PackageHost::open` settles any entry before the first activation: it is dropped when Core still lists the Workspace and completed when Core does not, so both desktop and headless finish an interrupted deletion.
+
 ## Rejected alternatives
 
 - **Synchronized rename now:** needs the signed Workspace metadata model ADR 0005 deferred. Don chose Installation-local rename for this workstream; a later decision may replace it.

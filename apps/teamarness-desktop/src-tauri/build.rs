@@ -13,6 +13,7 @@ const COMMANDS: &[&str] = &[
     "add_workspace_agent",
     "remove_workspace_agent",
     "rename_workspace",
+    "delete_workspace",
     "package_catalog_snapshot",
     "package_subscribe_host_state",
     "package_open_mount",

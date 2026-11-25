@@ -193,6 +193,24 @@ class ThemeRailRegion extends Region {
   }
 }
 
+/** A Workspace settings screen whose delete form records its confirm state and submissions. */
+class DeleteRegion extends Region {
+  public readonly confirmation = new (class extends TestControl { public value = ""; type(value: string): void { this.value = value; this.click(); } })();
+  public readonly confirm = { disabled: true };
+  public readonly form = Object.assign(new TestControl(), {
+    dataset: { workspaceName: "Design team" } as Record<string, string>,
+    querySelector: (selector: string): unknown => selector === "#delete-workspace-confirm" ? this.confirmation : selector === "button" ? this.confirm : null,
+  });
+
+  public querySelector(selector: string): unknown {
+    return selector === "#delete-workspace" && this.innerHTML.includes('id="delete-workspace"') ? this.form : null;
+  }
+
+  public querySelectorAll(): readonly TestControl[] {
+    return [];
+  }
+}
+
 class RetryRegion extends Region {
   public readonly retry = new TestControl();
   public readonly refresh = new TestControl();
@@ -312,6 +330,7 @@ function harness(
       joinWorkspace: async () => undefined,
       rename: async () => undefined,
       renameWorkspace: async (id, name) => { calls.push(`rename-workspace:${id}:${name}`); },
+      deleteWorkspace: async (id) => { calls.push(`delete-workspace:${id}`); },
       addAgent: agentActions.addAgent ?? (async () => undefined),
       removeAgent: agentActions.removeAgent ?? (async () => undefined),
       renameAgent: agentActions.renameAgent ?? (async () => undefined),
@@ -676,6 +695,24 @@ describe("persistent Shell frame", () => {
     expect(test.calls).toContain("retry");
   });
 
+  // Verifies: TEAM.SYS.SHELL-R04
+  it("deletes a Workspace only after its exact name is typed", async () => {
+    const screen = new DeleteRegion();
+    const test = harness(screen as unknown as HTMLElement);
+    const sole = { ...membership, members: membership.members.filter(({ identity }) => identity === installation.identity) };
+    await test.shell.updateWorkspace({ ...model(), memberships: { [workspace.id]: sole } });
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+    expect(screen.innerHTML).toContain('id="delete-workspace"');
+    screen.form.click();
+    expect(test.calls).not.toContain(`delete-workspace:${workspace.id}`);
+    screen.confirmation.type("Design tea");
+    expect(screen.confirm.disabled).toBe(true);
+    screen.confirmation.type("Design team");
+    expect(screen.confirm.disabled).toBe(false);
+    screen.form.click();
+    expect(test.calls).toContain(`delete-workspace:${workspace.id}`);
+  });
+
   // Verifies: TEAM.SYS.SHELL-R08
   it("binds each Workspace notification's close control to its own dismissal", async () => {
     const screen = new RetryRegion();
@@ -971,6 +1008,7 @@ it.each(["create", "join"] as const)("reconciles a completed %s while rejected R
     createWorkspace: async () => pendingWorkspace,
     joinWorkspace: async () => pendingWorkspace,
     renameWorkspace: async (id, name) => ({ ...workspace, id, name }),
+    deleteWorkspace: async () => undefined,
     createWorkspaceInvitation: async () => fixture.invitation as Invitation,
     principalsSnapshot: async (workspaceId) => ({ workspaceId, cursor: "0", principals: [] }),
     subscribePrincipals: async () => undefined,
@@ -1009,6 +1047,7 @@ it.each(["create", "join"] as const)("reconciles a completed %s while rejected R
       joinWorkspace: (invitation, person) => controller.joinWorkspace(invitation, person),
       rename: (id, name) => controller.rename(id, name),
       renameWorkspace: (id, name) => controller.renameWorkspace(id, name),
+      deleteWorkspace: (id) => controller.deleteWorkspace(id),
       addAgent: (id, name) => controller.addAgent(id, name),
       removeAgent: (id, agent) => controller.removeAgent(id, agent),
       renameAgent: (id, agent, name) => controller.renameAgent(id, agent, name),
