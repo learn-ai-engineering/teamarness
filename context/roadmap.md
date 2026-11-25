@@ -134,6 +134,17 @@ Manual checks M1–M7 passed on 2026-11-01 with a real model. The first run foun
 
 **Follow-ups:** tracked in the Backlog: *Backlog Package › Ticket conflict detection across Installations* and *Backlog Package › DELTA-021: Backlog Package findings accepted as tech debt*.
 
+### Backlog polish (implemented; manual checks pending; not integrated)
+
+Started on 2026-11-26 on branch `backlog-polish`, workstream `backlog-polish`, for the five ready Tickets in the Backlog's *Backlog Package* epic. [ADR 0048](.decisions/0048-backlog-ticket-references-and-cancelled-status.md), accepted 2026-11-26, decides Ticket references and the Cancelled status.
+
+- Every Ticket has a reference: the shortest unique prefix of its ID, at least four characters, shown as `#a3f2` in its row and in the detail pane. `ticket.get` takes a `ref`; an ambiguous ref lists its candidates (`TEAM.SYS.BACKLOG-R11`).
+- Status gains `cancelled`. The status filter gains **Not done**, which is the default. Schema migration 0002 widens the status check, and the first activation re-evaluates records an older build quarantined as malformed (`R12`).
+- Port Contract 1.1 is an additive minor over the pinned 1.0, and a 1.0 consumer still passes `backlog_ports_proof`.
+- The left pane widens from its right edge (drag, arrow keys; double-click or Home resets) and remembers its width. One button expands or collapses every Epic. Selecting a Ticket no longer rebuilds the left pane, and a rebuild keeps its scroll position.
+
+Automated evidence: Backend unit tests, Backlog UI tests, and both Backlog system tests pass. The scroll fix and the drag resize need a manual check in the desktop app: the UI tests run in happy-dom, which has no layout. An Installation on an older build quarantines a record that sets `cancelled` until it updates; the release notes must say so.
+
 ### Better Doc Agent (complete, verified locally)
 
 Implemented on 2026-11-01 on branch `don-smith/better_doc_agent` in the Host and on `main` in the standalone Agent Package, workstream `better-doc-agent`. A Person asks a Workspace Agent for changes from inside a Document by @mentioning it in a Comment.
