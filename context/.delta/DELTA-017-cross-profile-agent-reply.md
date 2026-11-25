@@ -39,5 +39,6 @@ On `main`:
 
 ## Tracking
 
+- Teamarness Backlog: *Shell & Core › DELTA-017: external cross-profile Agent reply case fails*
 - `TEAM.SYS.PKG-R13`, ADR 0030, `context/roadmap.md` (Packagement and Agent-controlled Package Ports).
 - Workstream `packagement`: `implement/ports-2-integration-checkpoint.md` (Phase C) and Verify `verify/20261031T024307Z_validation-ports-2.md`, in the resolver-selected MyFlow store.

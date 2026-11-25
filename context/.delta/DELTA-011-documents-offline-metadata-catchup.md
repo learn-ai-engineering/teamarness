@@ -18,7 +18,7 @@ This is backlog work, not a current fix. Reproduce with Bob already joined: clos
 
 ## Tracking
 
+- Teamarness Backlog: *Documents › DELTA-011: Documents metadata catch-up after an existing Member restarts*
 - `TEAM-R10`, `TEAM.SYS.DOCS-R02`, `TEAM.SYS.DOCS-R03`
-- `context/roadmap.md`, Later (unscheduled)
 - `workspace-documents` workstream: `verify/20261024T012531Z_offline-collection-catchup-observation.md` and `verify/20261024T033051Z_existing-member-catchup-diagnosis.md`
 - No backend or UI change, commit, merge, or push is authorized by this delta.

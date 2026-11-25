@@ -34,3 +34,7 @@ Follow-up: Host Port maintenance on `main`.
 - On a Package page, the Configuration tab scrolls inside its frame, but the About tab scrolls the whole page. A Package's settings view is a sandboxed frame, so the Host cannot measure its content. To fix this, the frame runtime, which the Host owns, would report the content height over the frame bridge, and the Shell would size the frame to it. Don deferred this on 2026-11-01.
 
 Follow-up: the roadmap follow-up "sizing a Package's settings view to its content".
+
+## Tracking
+
+- Teamarness Backlog: *Agent › DELTA-019: Agent Doc Exhibit findings accepted as tech debt*
