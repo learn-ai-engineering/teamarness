@@ -70,6 +70,19 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
+### Workspace settings UI (started 2026-11-26)
+
+Workstream `workspace-settings-ui` on branch `workspace-settings-ui`. Delivers four Shell & Core Backlog Tickets:
+
+- **Align styling of Workspace settings with About/Configuration screens.** Workspace settings uses the same quieter page structure as a Package's About and Configuration tabs.
+- **Size a Package's settings view to its content so the Package page scrolls as one** (DELTA-019 group 4, `TEAM.SYS.SHELL-R02`). The Shell-owned frame runtime reports content height over the frame bridge and the Shell sizes the frame.
+- **Notifications on Workspace settings and Package About pages never dismiss and are easy to miss** (`TEAM.SYS.SHELL-R08`). Shell-only: non-error notifications dismiss after 5 seconds, errors stay until closed with an X, styled after the External Gateway Package's configuration notifications. A notification carrying the only Restart or Retry control stays (DELTA-018 SF-304). The Package capability stays in **Shell notifications**.
+- **Rename and delete Workspaces** ([ADR 0048](.decisions/0048-local-workspace-rename-and-sole-creator-deletion.md), proposed; `TEAM.SYS.SHELL-R04`). Rename is Installation-local. Only the creator deletes, and only while no other Person is a Member; deletion erases the Workspace's Core data, Package Instances and Package Data Directories after the name is typed, and leaves mapped Documents folders on disk. Desktop only.
+
+Planned order: styling, settings-view sizing, notifications, rename, delete.
+
+**Outcome:** Workspace settings matches the Package pages, notifications are noticeable and clear themselves, and a test Workspace can be renamed and deleted.
+
 ### Native headless application (implementation in progress)
 
 The `headless` workstream uses the integrated gateway Host baseline `2039693` and shared Core Runtime, Package Host and Package contracts (ADR 0047). Its first step delivers exclusive application ownership and desktop restart handoff, compiled native Backend targets, target-aware Package assembly with isolated resource roots, and fail-closed Linux process evidence. Phase 2 adds `apps/teamarness-headless`: offline help/version, explicit foreground `serve`, a JSON `status` client, same-UID private Unix transport, bounded connection/operation admission, and signal-driven drain followed by Host/Core cleanup. The binary and loopback test executable use the same library composition. Readiness includes Host diagnostics; it does not claim global synchronization. Phase-local Rust suites, strict checks and dependency/transport guards qualify local behavior on Mac; native Linux execution remains pending lane N. Phase 3 adds explicit identity, Workspace and Core Agent commands, safe invitation/consent input, and generic Personal Package inspection, consent, installation and lifecycle. Join distinguishes committed membership from later Host reconciliation failure. An independently named source-built test fixture qualifies native admission, generations and retained data without changing Team instances. Phase 4 adds immutable admitted schema discovery and digest-pinned, validated non-rendered requests. Per-Instance operator ownership survives observer loss through lease cleanup and reply without gating normal Ports or background work. The unknown fixture qualifies durable settings, bounded one-time output, errors, delayed effects, reload invalidation and its own Agent Binding. Phase 5 adds explicit native `build:app` selection, isolated headless distributions with complete Team resources, final-byte/native-header verification, relocated GUI-free artifact smoke, and a manually installed Linux user-service runbook. Selected desktop builds retain existing bundle and release paths. Phase 6 adds source-current loopback sync-only qualification with two headless CLI/socket endpoints and an ordinary desktop Core/Host backend across two Workspaces, offline/restart catch-up, late join, bidirectional domain content and independent Personal install/remove without Team generation changes. The canonical [verification runbook](../docs/headless/verification.md) and independent [Agent](../docs/headless/follow-ups/agent.md) and [gateway](../docs/headless/follow-ups/external-gateway.md) briefs ship with the application. Final native Linux lane N, production mesh/service/desktop human observations, and independent Verify remain required; generic fixture evidence is not actual Agent/gateway product qualification.
@@ -388,11 +401,11 @@ Incremental delivery on `feature/member-names`: Core-owned Workspace Person IDs 
 
 ### Shell notifications
 
-Replace the persistent status and error messages at the top of the selected-content pane with a Shell-owned notification mechanism that reserves or overlays space and dismisses non-error notifications automatically. Packages use the same mechanism through a generic capability, so notification presentation stays consistent.
+The Shell-only part for Shell-owned screens is delivered by **Workspace settings UI** (`TEAM.SYS.SHELL-R08`); the Package capability remains here (Backlog: "Shell-owned notification mechanism with a Package capability"). Replace the persistent status and error messages at the top of the selected-content pane with a Shell-owned notification mechanism that reserves or overlays space and dismisses non-error notifications automatically. Packages use the same mechanism through a generic capability, so notification presentation stays consistent.
 
-### Package visibility
+### Package visibility (complete)
 
-Let a person hide a Package from contextual navigation and show it again from Workspace settings, for example to hide the Tutorial and Reference Packages after first use.
+Delivered: Workspace settings shows a hide/show toggle per Package. Let a person hide a Package from contextual navigation and show it again from Workspace settings, for example to hide the Tutorial and Reference Packages after first use.
 
 ### Conversations UI overhaul (verified; remote delivery pending)
 
