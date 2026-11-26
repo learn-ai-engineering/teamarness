@@ -16,7 +16,7 @@ export interface TeamarnessBridge {
   joinWorkspace(invitation: string, personName: string): Promise<WorkspaceState>;
   /** Renames a Workspace on this Installation only (ADR 0049). */
   renameWorkspace(workspaceId: string, name: string): Promise<Workspace>;
-  /** Deletes a Workspace and its data on this Installation; only its sole creator may (ADR 0049). */
+  /** Deletes a Workspace and its data on this Installation; only its sole creator may (ADR 0050). */
   deleteWorkspace(workspaceId: string): Promise<void>;
   renameWorkspacePrincipal(workspaceId: string, principalId: string, name: string): Promise<void>;
   addWorkspaceAgent(workspaceId: string, name: string): Promise<void>;

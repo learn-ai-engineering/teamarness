@@ -1,4 +1,4 @@
--- ADR 0049: Installation-local Workspace rename and sole-creator Workspace deletion.
+-- ADR 0049: Installation-local Workspace rename. ADR 0050: sole-creator Workspace deletion.
 
 -- Only the local name may change; every trust-anchor column stays immutable.
 DROP TRIGGER IF EXISTS workspaces_no_update;

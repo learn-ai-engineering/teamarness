@@ -69,7 +69,7 @@ impl CoreRuntime {
         self.current_deletability(&mut state, workspace_id)
     }
 
-    /// Erases the Workspace and all of its data from this Installation (ADR 0049). The rule of
+    /// Erases the Workspace and all of its data from this Installation (ADR 0050). The rule of
     /// [`Self::check_workspace_deletable`] is checked again under the same lock as the erase, so
     /// an admission that arrived after a precheck still refuses. Nothing is sent to other
     /// Installations. Package Instances must already be stopped; the Package Host owns that.

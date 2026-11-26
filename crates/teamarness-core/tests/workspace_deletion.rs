@@ -1,4 +1,4 @@
-//! Sole-creator Workspace deletion (ADR 0049).
+//! Sole-creator Workspace deletion (ADR 0050).
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -1,4 +1,4 @@
-//! Workspace deletion through the Package Host (ADR 0049).
+//! Workspace deletion through the Package Host (ADR 0050).
 
 mod common;
 

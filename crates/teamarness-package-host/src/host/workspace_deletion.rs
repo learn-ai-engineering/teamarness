@@ -1,4 +1,4 @@
-//! Deleting a Workspace from this Installation (ADR 0049).
+//! Deleting a Workspace from this Installation (ADR 0050).
 //!
 //! One operation, under the Personal tier lock and the reconciliation lock so nothing creates an
 //! Instance meanwhile:
@@ -45,7 +45,7 @@ pub enum WorkspaceDeletionFailure {
 
 #[allow(clippy::result_large_err)]
 impl PackageHost {
-    /// Deletes a Workspace and all of its data on this Installation (ADR 0049).
+    /// Deletes a Workspace and all of its data on this Installation (ADR 0050).
     pub async fn delete_workspace(
         &self,
         workspace: &WorkspaceId,

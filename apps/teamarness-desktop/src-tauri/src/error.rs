@@ -30,9 +30,9 @@ pub enum BridgeErrorCode {
     Shutdown,
     NotSteward,
     PrincipalNotBound,
-    /// Only the Installation that created a Workspace may delete it (ADR 0049).
+    /// Only the Installation that created a Workspace may delete it (ADR 0050).
     NotWorkspaceCreator,
-    /// A Workspace with another current Person cannot be deleted (ADR 0049).
+    /// A Workspace with another current Person cannot be deleted (ADR 0050).
     WorkspaceHasMembers,
     /// Package Instances could not be stopped, so nothing was deleted.
     WorkspaceDeletionFailed,

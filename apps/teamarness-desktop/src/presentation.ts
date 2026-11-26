@@ -12,7 +12,7 @@ export type ShellPresentation = Readonly<{
     members: readonly MemberPresentation[];
     memberCount: number;
     membershipLoaded: boolean;
-    /** This Installation created the Workspace and is its only Person (ADR 0049). */
+    /** This Installation created the Workspace and is its only Person (ADR 0050). */
     canDelete: boolean;
   }> | null;
   loading: boolean;

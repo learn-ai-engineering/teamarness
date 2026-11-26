@@ -106,7 +106,7 @@ pub async fn rename_workspace(
         .await?
 }
 
-/// Deletes a Workspace and all of its data on this Installation (ADR 0049). Only its creator may,
+/// Deletes a Workspace and all of its data on this Installation (ADR 0050). Only its creator may,
 /// and only while no other Person is a Member; the Package Host stops its Package Instances first.
 #[tauri::command]
 pub async fn delete_workspace(

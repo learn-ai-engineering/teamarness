@@ -58,7 +58,8 @@ This index is the one place that lists every decision's status, its supersession
 | [0047](0047-native-applications-and-local-operator.md) | Shared native applications and local operator authority | accepted (2026-11-18) | 0036 (part: Shell-only registration authority) | – | In the ADR | Shared Core/Host, exclusive ownership and terminal handoff, native Package targets, private operator authority; staged implementation and native qualification remain explicit. |
 | [0048](0048-backlog-ticket-references-and-cancelled-status.md) | Backlog Tickets have derived short references and a Cancelled status | accepted (2026-11-26) | – | – | In the ADR | Refines 0039 (status value) and 0042 (re-evaluation pattern, for Backlog records); shortest-unique-prefix references, `ticket.get` by `ref`, Port Contract 1.1, Not done default filter |
 
-| [0049](0049-local-workspace-rename-and-sole-creator-deletion.md) | Installation-local Workspace rename and sole-creator Workspace deletion | proposed (2026-11-26) | 0005 (part: immutable local Workspace name) | – | In the ADR | Workstream `workspace-settings-ui`; answers `TEAM-DQ9` for deletion only; desktop only |
+| [0049](0049-installation-local-workspace-rename.md) | Installation-local Workspace rename | proposed (2026-11-26) | 0005 (part: immutable local Workspace name) | – | In the ADR | Workstream `workspace-settings-ui`; desktop only |
+| [0050](0050-sole-creator-workspace-deletion.md) | Sole-creator Workspace deletion | proposed (2026-11-26) | – | – | In the ADR | Workstream `workspace-settings-ui`; answers `TEAM-DQ9` for deletion only; desktop only |
 
 ### Parallel-branch numbering reconciliation
 
