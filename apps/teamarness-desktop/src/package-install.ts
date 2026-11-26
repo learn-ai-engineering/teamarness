@@ -211,9 +211,8 @@ export class PackageManagementController {
   }
 
   /**
-   * The message area at the top of the Workspace page's Packages section. It
-   * shows the last registration or Recover/Dispose result, named, and keeps
-   * its space when empty.
+   * The message at the top of the Workspace page's Packages group: the last
+   * registration or Recover/Dispose result, named, or nothing.
    */
   public renderMessage(snapshot: PackageHostSnapshot | null): string {
     const feedback = this.feedback.current();
@@ -222,7 +221,7 @@ export class PackageManagementController {
       : undefined;
     // A row that waits for a restart already says what a successful change did, and offers the restart.
     const pending = registration !== undefined && pendingRestartChange(registration) !== null;
-    if (!feedback || (pending && !feedback.failed)) return renderStatusMessageSlot(null, MESSAGE_DISMISS);
+    if (!feedback || (pending && !feedback.failed)) return "";
     const restart = feedback.restart && !pending
       ? '<button type="button" data-package-change-restart>Restart Teamarness</button>'
       : feedback.retry
@@ -561,9 +560,12 @@ const RISK_COPY: Readonly<Record<(typeof TRUSTED_NATIVE_CODE_RISKS)[number], str
   process: "Process: start other programs on this device.",
 };
 
+const CLOSE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+
 function renderInstallStep(step: PackageInstallStep, snapshot: PackageHostSnapshot | null): string {
-  const panel = (heading: string, body: string): string =>
-    `<section class="package-install" aria-labelledby="package-install-heading"><h3 id="package-install-heading" tabindex="-1" data-package-install-focus>${escape(heading)}</h3>${body}</section>`;
+  // The close control dismisses the flow from any step but one still working, and shows the + button again.
+  const panel = (heading: string, body: string, closable = true): string =>
+    `<section class="package-install" aria-labelledby="package-install-heading"><div class="package-install-heading"><h3 id="package-install-heading" tabindex="-1" data-package-install-focus>${escape(heading)}</h3>${closable ? `<button type="button" class="icon-button package-install-close" data-package-install-action="cancel" aria-label="Close Add Personal Package" title="Close">${CLOSE_ICON}</button>` : ""}</div>${body}</section>`;
   const button = (action: PackageInstallAction, label: string, secondary = false): string =>
     `<button type="button"${secondary ? ' class="secondary"' : ""} data-package-install-action="${action}">${escape(label)}</button>`;
   const actions = (...buttons: string[]): string => `<div class="package-instance-actions">${buttons.join("")}</div>`;
@@ -575,20 +577,20 @@ function renderInstallStep(step: PackageInstallStep, snapshot: PackageHostSnapsh
       const paste = step.pasting
         ? `<form id="package-install-path-form"><label for="package-install-path">Package folder path</label><input id="package-install-path" required autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="/Users/you/Packages/my-package"><button>Read folder</button></form>`
         : "";
-      return panel("Add Personal Package", `<p>Choose a built Package folder. Teamarness reads it first and shows what it contains. Nothing runs until you trust it.</p>${refusal}${actions(button("choose", "Choose folder"), step.pasting ? "" : button("paste", "Paste a path", true), button("cancel", "Cancel", true))}${paste}`);
+      return panel("Add Personal Package", `<p>Choose a built Package folder. Teamarness reads it first and shows what it contains. Nothing runs until you trust it.</p>${refusal}${actions(button("choose", "Choose folder"), step.pasting ? "" : button("paste", "Paste a path", true))}${paste}`);
     }
     case "working":
-      return panel("Add Personal Package", `<p role="status" aria-live="polite">${escape(step.message)}</p>`);
+      return panel("Add Personal Package", `<p role="status" aria-live="polite">${escape(step.message)}</p>`, false);
     case "preview":
-      return panel(`Preview: ${step.inspected.displayName}`, `${renderPreview(step.inspected, snapshot)}${actions(button("continue", "Continue"), button("back", "Choose another folder", true), button("cancel", "Cancel", true))}`);
+      return panel(`Preview: ${step.inspected.displayName}`, `${renderPreview(step.inspected, snapshot)}${actions(button("continue", "Continue"), button("back", "Choose another folder", true))}`);
     case "consent": {
       const risks = TRUSTED_NATIVE_CODE_RISKS.map((risk) => `<li>${escape(RISK_COPY[risk])}</li>`).join("");
       const label = step.inspected.kind === "overrides_team" ? "Trust and continue" : "Trust and install";
-      return panel(`Trust ${step.inspected.displayName}?`, `<p>${escape(step.inspected.displayName)} runs as native code on this device, with your permissions. Teamarness does not sandbox it. It can use:</p><ul class="package-risks">${risks}</ul><p>Install it only if you trust where it came from.</p>${actions(button("trust", label), button("cancel", "Cancel", true))}`);
+      return panel(`Trust ${step.inspected.displayName}?`, `<p>${escape(step.inspected.displayName)} runs as native code on this device, with your permissions. Teamarness does not sandbox it. It can use:</p><ul class="package-risks">${risks}</ul><p>Install it only if you trust where it came from.</p>${actions(button("trust", label))}`);
     }
     case "override": {
       const team = packageName(snapshot, step.inspected.identity);
-      return panel(`Replace ${team}?`, `<p>This is a second, separate confirmation. ${escape(step.inspected.displayName)} from this folder replaces the Team Package ${escape(team)} on this device, in all your Workspaces. The change applies after Teamarness restarts. Data is kept.</p><p>To return to the Team Package later, remove the override and restart.</p>${actions(button("override", `Replace ${team} after restart`), button("cancel", "Cancel", true))}`);
+      return panel(`Replace ${team}?`, `<p>This is a second, separate confirmation. ${escape(step.inspected.displayName)} from this folder replaces the Team Package ${escape(team)} on this device, in all your Workspaces. The change applies after Teamarness restarts. Data is kept.</p><p>To return to the Team Package later, remove the override and restart.</p>${actions(button("override", `Replace ${team} after restart`))}`);
     }
     case "installed":
       return panel(`${step.name} is installed`, `<p role="status">${escape(INSTALLED_COPY)}</p>${actions(button("done", "Done"))}`);

@@ -14,19 +14,21 @@ const person = (identity: string, name: string | null) => ({ principalId: identi
 const names = (principals: PrincipalsSnapshot["principals"]): PrincipalsSnapshot => ({ workspaceId, cursor: "1", principals });
 
 describe("Workspace Person presentation", () => {
-  it("keeps a stable fingerprint when names have not arrived and exposes full identities", async () => {
+  it("calls a Member unnamed until its name arrives, and never exposes an identity", async () => {
     const rows = await presentMembers(installation, membership);
-    expect(rows[0]!.name).toBe(`Member ${remote.slice(0, 12)}`);
-    expect(rows[0]!.detail).toContain(remote);
+    expect(rows[0]!.name).toBe("Unnamed Member");
+    expect(JSON.stringify(rows)).not.toContain(remote.slice(0, 12));
+    expect(JSON.stringify(rows)).not.toContain(local.slice(0, 12));
     expect(rows[1]!.name).not.toBe(installation.displayName);
   });
 
-  it("shows Unicode and duplicate names as text with distinguishing identities", async () => {
+  it("shows Unicode and duplicate names as text, marking duplicates without identities", async () => {
     const rows = await presentMembers(installation, membership, names([person(remote, "👩‍💻"), person(local, "👩‍💻")]));
     expect(rows.map(({ name }) => name)).toEqual(["👩‍💻", "👩‍💻"]);
-    expect(rows[0]!.detail).toContain("Duplicate name");
-    expect(rows[0]!.detail).toContain(remote);
-    expect(rows[1]!.detail).toContain(local);
+    expect(rows.map(({ duplicateName }) => duplicateName)).toEqual([true, true]);
+    expect(JSON.stringify(rows)).not.toContain(remote.slice(0, 12));
+    const distinct = await presentMembers(installation, membership, names([person(remote, "Ada"), person(local, "Grace")]));
+    expect(distinct.map(({ duplicateName }) => duplicateName)).toEqual([false, false]);
   });
 
   it("does not inherit names from a different Workspace", async () => {
@@ -34,7 +36,7 @@ describe("Workspace Person presentation", () => {
     const before = (await presentMembers(installation, membership))[0]!.name;
     expect((await presentMembers(installation, membership, other))[0]!.name).toBe(before);
     expect((await presentMembers(installation, membership, names([person(remote, null)])))[0]!.name).toBe(before);
-    expect(before).toBe(`Member ${remote.slice(0, 12)}`);
+    expect(before).toBe("Unnamed Member");
   });
 });
 
@@ -46,10 +48,11 @@ describe("Workspace Agent presentation", () => {
   const roster = { ...membership, members: [...membership.members, agent] };
   const profiles = names([person(remote, "Remote steward"), person(local, "Manager"), agentRow]);
 
-  it("shows kind, steward, full identity only in details, and Manager removal without rename", async () => {
+  it("shows kind and steward without identities, and Manager removal without rename", async () => {
     const rows = await presentMembers(installation, roster, profiles);
-    expect(rows[2]).toMatchObject({ name: "Helper <script>", indicator: "Agent · stewarded by Remote steward", role: "Member", canRemoveAgent: true, canRenameAgent: false, agentId });
-    expect(rows[2]!.detail).toContain(agentIdentity);
+    expect(rows[2]).toMatchObject({ name: "Helper <script>", indicator: "Agent · stewarded by Remote steward", role: "Member", canRemoveAgent: true, canRenameAgent: false, agentId, duplicateName: false });
+    // The Agent's Principal ID is kept for the remove and rename calls, never rendered; the key is not kept at all.
+    expect(JSON.stringify(rows)).not.toContain(agentIdentity.slice(0, 12));
     expect(rows[0]!.canRemoveAgent).toBe(false);
   });
 

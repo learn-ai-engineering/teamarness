@@ -22,9 +22,11 @@ const DIALOG_GUTTER_PX = 16;
 /**
  * Lets a settings view's document shrink to its content, so the Shell can size the frame to it.
  * Without this the frame document fills the frame, and a frame sized to its document could
- * grow but never shrink.
+ * grow but never shrink. The host's own height is overridden too: a Package that sizes its host
+ * to the viewport (`:host { height: 100vh }`, as the full-page views do) would otherwise report
+ * the frame's height as its content, and a frame first measured at 0 would stay at 0.
  */
-const CONTENT_SIZED_CSS = "html, body { height: auto; overflow: hidden; } #teamarness-package-host { min-height: 0; display: flow-root; }";
+const CONTENT_SIZED_CSS = "html, body { height: auto; overflow: hidden; } #teamarness-package-host { height: auto !important; min-height: 0 !important; max-height: none !important; display: flow-root; }";
 
 /**
  * Starts settings-view layout. The frame reports its content height whenever it changes. A frame

@@ -42,6 +42,7 @@ function model(change: Partial<ShellModel> = {}): ShellModel {
     error: null,
     notice: null,
     membershipRefreshUnavailable: null,
+    feedbackSection: null,
     ...change,
   };
 }
@@ -432,7 +433,43 @@ describe("Shell Workspace screens", () => {
     expect(html).toContain("Membership refreshed");
     expect(controller.snapshot().memberships[workspace.id]?.members).toEqual(membership.members);
     expect(html).not.toContain(membership.version);
-    for (const member of membership.members) expect(html).toContain(member.identity);
+    for (const member of membership.members) expect(html).not.toContain(member.identity.slice(0, 12));
+    expect(html).not.toContain("View identity");
+    // The result shows in the Members group that started it, not at the top of the page.
+    expect(controller.snapshot().feedbackSection).toBe("members");
+    const [beforeMembers, fromMembers] = html.split('id="members-heading"');
+    expect(beforeMembers).not.toContain("Membership refreshed");
+    expect(fromMembers!.split('id="invitations-heading"')[0]).toContain("Membership refreshed");
+  });
+
+  it("puts the + beside the Package Instances title, and hides it while the add flow is open", async () => {
+    const presentation = await buildShellPresentation(model(), workspace.id);
+    const route = { kind: "workspace-settings", workspaceId: workspace.id } as const;
+    const closed = renderShell(presentation, route, { packageSettings: "<p>packages</p>" });
+    expect(closed).toContain('<div class="section-heading"><h2 id="package-instances-heading">Package Instances</h2><button type="button" class="package-add" data-package-install-action="open" aria-label="Add Personal Package" title="Add Personal Package">+</button></div>');
+    const open = renderShell(presentation, route, { packageSettings: '<section class="package-install"></section><p>packages</p>', packageInstallOpen: true });
+    expect(open).not.toContain('data-package-install-action="open"');
+    expect(renderShell(presentation, route)).not.toContain('data-package-install-action="open"');
+  });
+
+  it("shows each action's result in its own group, and a load failure at the top", async () => {
+    const controller = new ShellController(fakeBridge({
+      renameWorkspace: async () => { throw { code: "invalid_input", retryable: false }; },
+    }), () => undefined);
+    await controller.load();
+    await controller.renameWorkspace(workspace.id, "Bad");
+    const html = await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id });
+    const groups = html.split('<section class="package-page-group"');
+    expect(groups[0]).not.toContain("status-message");
+    expect(groups[1]).toContain('id="workspace-name-heading"');
+    expect(groups[1]).toContain("The supplied value is invalid.");
+    // Retry reloads the Workspaces, which does not answer a group's refused action.
+    expect(html).not.toContain('id="retry"');
+    expect(groups.slice(2).join("")).not.toContain("The supplied value is invalid.");
+
+    const top = await rendered(model({ error: "timeout" }), { kind: "workspace-settings", workspaceId: workspace.id });
+    expect(top.split('<section class="package-page-group"')[0]).toContain("Workspace onboarding timed out.");
+    expect(top).toContain('id="retry"');
   });
 
   it("uses Workspace Invitation in every visible onboarding error", async () => {
@@ -635,7 +672,7 @@ describe("Workspace Agent settings", () => {
     expect(calls).toEqual([`add:${workspace.id}:Helper`, `remove:${workspace.id}:${agentId}`]);
   });
 
-  it("renders Manager removal but not rename for a remote steward, with identity only inside details", async () => {
+  it("renders Manager removal but not rename for a remote steward, and no identity", async () => {
     const source = model({
       memberships: { [workspace.id]: { ...membership, members: [...membership.members, agentMember] } },
       principals: { [workspace.id]: { ...fixture.principals, principals: [...fixture.principals.principals, agentProfile] } as PrincipalsSnapshot },
@@ -643,12 +680,14 @@ describe("Workspace Agent settings", () => {
     const html = await rendered(source, { kind: "workspace-settings", workspaceId: workspace.id });
     expect(html).toContain('id="add-agent"');
     expect(html).toContain('Agent · stewarded by Remote');
-    expect(html).toContain('data-remove-agent="2"');
+    expect(html).toContain('class="icon-button member-remove" data-remove-agent="2" aria-label="Remove agent Helper &lt;script&gt;"');
+    expect(html).not.toContain('data-edit-agent="2"');
     expect(html).not.toContain('data-rename-agent="2"');
     expect(html).toContain('Helper &lt;script&gt;');
     expect(html).not.toContain('<script>');
-    expect(html).toContain(`<summary>View identity</summary>Identity: ${agentKey}`);
-    expect(html.split('<summary>View identity</summary>')[0]).not.toContain(agentKey);
+    expect(html).not.toContain(agentKey.slice(0, 12));
+    expect(html).not.toContain("View identity");
+    expect(html).not.toContain(">Remove agent<");
     expect(html).not.toMatch(/revoke|manager administration/i);
   });
 
@@ -696,8 +735,15 @@ describe("Agent rename authorization feedback", () => {
       principals: { [workspace.id]: { ...fixture.principals, principals: [...fixture.principals.principals, agentProfile] } as PrincipalsSnapshot },
     });
     const html = await rendered(source, { kind: "workspace-settings", workspaceId: workspace.id });
-    expect(html).toContain('data-rename-agent="2"');
+    // The name itself is the rename control; there is no separate field or Save button until it is selected.
+    expect(html).toContain('class="member-name-edit" data-edit-agent="2" aria-label="Rename agent Helper"');
+    expect(html).not.toContain('data-rename-agent="2"');
+    expect(html).not.toContain("Save agent name");
     expect(html).toContain('data-remove-agent="2"');
+    const presentation = await buildShellPresentation(source, workspace.id);
+    const editing = renderShell(presentation, { kind: "workspace-settings", workspaceId: workspace.id }, { editingAgentId: agentId });
+    expect(editing).toContain('<form class="member-name-form" data-rename-agent="2"><input class="member-name-input" required maxlength="256" autocomplete="off" spellcheck="false" aria-label="Agent name" value="Helper"></form>');
+    expect(editing).not.toContain('data-edit-agent="2"');
 
     const controller = new ShellController(fakeBridge({
       renameWorkspacePrincipal: async () => { throw { code: "not_steward", retryable: false }; },

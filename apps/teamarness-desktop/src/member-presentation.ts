@@ -2,7 +2,8 @@ import type { Installation, Membership, PrincipalsSnapshot } from "./contracts";
 
 export type MemberPresentation = Readonly<{
   name: string;
-  detail: string;
+  /** Another Principal in the Workspace has the same name. Identities are never shown. */
+  duplicateName: boolean;
   role: "Manager" | "Member";
   indicator: string | null;
   canRemoveAgent: boolean;
@@ -23,13 +24,13 @@ export async function presentMembers(
   const self = membership.members.find(({ identity }) => identity === installation.identity);
   return membership.members.map((member) => {
     const principal = scoped.find(({ principalId }) => principalId === member.principalId);
-    const fingerprint = principal?.fingerprint ?? member.identity.slice(0, 12);
     const steward = scoped.find(({ principalId }) => principalId === member.stewardPrincipalId);
     return {
-      name: principal?.name ?? `${member.kind === "agent" ? "Agent" : "Member"} ${fingerprint}`,
-      detail: `${(counts.get(principal?.name ?? "") ?? 0) > 1 ? "Duplicate name · " : ""}Identity: ${member.identity}`,
+      // A name not yet received shows as unnamed; identities and fingerprints are never shown.
+      name: principal?.name ?? (member.kind === "agent" ? "Unnamed Agent" : "Unnamed Member"),
+      duplicateName: principal?.name != null && (counts.get(principal.name) ?? 0) > 1,
       role: member.role === "manager" ? "Manager" : "Member",
-      indicator: member.kind === "agent" ? `Agent · stewarded by ${steward?.name ?? (steward ? `Member ${steward.fingerprint}` : "unknown member")}` : null,
+      indicator: member.kind === "agent" ? `Agent · stewarded by ${steward?.name ?? "an unnamed Member"}` : null,
       canRemoveAgent: member.kind === "agent" && (self?.role === "manager" || (self?.kind === "person" && self.principalId === member.stewardPrincipalId)),
       canRenameAgent: member.kind === "agent" && self?.kind === "person" && self.principalId === member.stewardPrincipalId,
       agentId: member.kind === "agent" ? member.principalId : null,

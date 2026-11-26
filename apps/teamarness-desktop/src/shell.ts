@@ -94,6 +94,10 @@ export class Shell {
   private packageSnapshotFailed = false;
   /** The Person closed the snapshot failure notification; the next failure shows it again. */
   private packageSnapshotFailureDismissed = false;
+  /** The Agent whose name is edited in place on Workspace settings, by Principal ID. */
+  private editingAgentId: string | null = null;
+  /** Set while the selected screen's markup is replaced, so a field losing focus to removal is not a save. */
+  private replacingScreen = false;
   /** The last failed Recover or Dispose, for Retry and for a later successful refresh. */
   private packageLifecycleFeedback: PackageLifecycleFeedback | null = null;
   /** The message that result put in the Workspace page's message area. */
@@ -476,13 +480,52 @@ export class Shell {
         this.options.packageVisibility,
       )}${this.packageManagement.renderRegistrations(this.packageSnapshot)}`
       : undefined;
-    this.shellFrame.shellScreen.innerHTML = renderShell(
-      this.workspacePresentation,
-      this.selectedRoute,
-      { packageSettings },
-    );
+    // An Agent name being edited survives a render caused by something else, such as a roster update.
+    const editing = hasQueries(this.shellFrame.shellScreen)
+      ? this.shellFrame.shellScreen.querySelector<HTMLInputElement>(".member-name-input")
+      : null;
+    const draft = editing ? { value: editing.value, focused: editing.ownerDocument.activeElement === editing } : null;
+    const editingAgentId = this.editingAgentId !== null
+      && this.workspacePresentation.workspace?.members.some(({ agentId, canRenameAgent }) => canRenameAgent && agentId === this.editingAgentId)
+      ? this.editingAgentId
+      : null;
+    this.editingAgentId = editingAgentId;
+    this.replacingScreen = true;
+    try {
+      this.shellFrame.shellScreen.innerHTML = renderShell(
+        this.workspacePresentation,
+        this.selectedRoute,
+        { packageSettings, editingAgentId, packageInstallOpen: this.packageManagement.state().kind !== "closed" },
+      );
+    } finally {
+      this.replacingScreen = false;
+    }
     this.bindSelectedScreen();
+    if (draft && hasQueries(this.shellFrame.shellScreen)) {
+      const input = this.shellFrame.shellScreen.querySelector<HTMLInputElement>(".member-name-input");
+      if (input) {
+        input.value = draft.value;
+        if (draft.focused) input.focus();
+      }
+    }
     this.focusPackageInstallStep();
+  }
+
+  /** Starts or ends editing an Agent's name in place, and moves focus to the field or the name. */
+  private editAgentName(agentId: string | null): void {
+    const previous = this.editingAgentId;
+    this.editingAgentId = agentId;
+    this.renderSelectedScreen();
+    if (!hasQueries(this.shellFrame.shellScreen)) return;
+    const members = this.workspacePresentation?.workspace?.members ?? [];
+    if (agentId !== null) {
+      const input = this.shellFrame.shellScreen.querySelector<HTMLInputElement>(".member-name-input");
+      input?.focus();
+      input?.select();
+    } else if (previous !== null) {
+      const index = members.findIndex((member) => member.agentId === previous);
+      this.shellFrame.shellScreen.querySelector<HTMLElement>(`[data-edit-agent="${index}"]`)?.focus();
+    }
   }
 
   private focusPackageInstallStep(): void {
@@ -631,13 +674,37 @@ export class Shell {
           if (member?.canRemoveAgent && member.agentId) void this.options.workspaceActions.removeAgent(workspaceId, member.agentId);
         });
       });
+      this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-edit-agent]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const member = this.workspacePresentation?.workspace?.members[Number(button.dataset.editAgent)];
+          if (member?.canRenameAgent && member.agentId) this.editAgentName(member.agentId);
+        });
+      });
       this.shellFrame.shellScreen.querySelectorAll<HTMLFormElement>("[data-rename-agent]").forEach((form) => {
+        const member = this.workspacePresentation?.workspace?.members[Number(form.dataset.renameAgent)];
+        const name = form.querySelector<HTMLInputElement>("input");
+        if (!member?.canRenameAgent || !member.agentId || !name) return;
+        const agentId = member.agentId;
+        let settled = false;
+        // Enter or leaving the field saves a changed name; Escape, or an unchanged or empty name, cancels.
+        const finish = (save: boolean): void => {
+          if (settled) return;
+          settled = true;
+          const value = name.value.trim();
+          const changed = save && value !== "" && value !== member.name;
+          this.editAgentName(null);
+          if (changed) void this.options.workspaceActions.renameAgent(workspaceId, agentId, value);
+        };
         form.addEventListener("submit", (event) => {
           event.preventDefault();
-          const member = this.workspacePresentation?.workspace?.members[Number(form.dataset.renameAgent)];
-          const name = form.querySelector<HTMLInputElement>("input");
-          if (member?.canRenameAgent && member.agentId && name) void this.options.workspaceActions.renameAgent(workspaceId, member.agentId, name.value);
+          finish(true);
         });
+        name.addEventListener("keydown", (event) => {
+          if ((event as KeyboardEvent).key !== "Escape") return;
+          event.preventDefault();
+          finish(false);
+        });
+        name.addEventListener("blur", () => { if (!this.replacingScreen) finish(true); });
       });
       this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("#copy-invitation")?.addEventListener("click", () => {
         void this.options.workspaceActions.copyInvitation(workspaceId);

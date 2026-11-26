@@ -1,7 +1,7 @@
 import type { ShellErrorCode } from "./contracts";
 import { presentMembers, type MemberPresentation } from "./member-presentation";
 import type { PackageHostSnapshot } from "./package-contracts";
-import type { ShellModel } from "./view";
+import type { FeedbackSection, ShellModel } from "./view";
 
 export type ShellPresentation = Readonly<{
   workspaceChoices: readonly Readonly<{ name: string }>[];
@@ -18,6 +18,8 @@ export type ShellPresentation = Readonly<{
   loading: boolean;
   notice: string | null;
   membershipRefreshUnavailable: string | null;
+  /** Where `error` and `notice` show; null is the top of the screen. */
+  feedbackSection: FeedbackSection | null;
   error: Readonly<{ message: string; canRetry: boolean }> | null;
 }>;
 
@@ -67,7 +69,9 @@ export async function buildShellPresentation(
     loading: model.loading,
     notice: model.notice,
     membershipRefreshUnavailable: model.membershipRefreshUnavailable,
-    error: model.error ? { message: errorMessage(model.error), canRetry: true } : null,
+    feedbackSection: model.feedbackSection,
+    // Retry reloads the Workspaces, which answers a load failure; a group's own action is retried from its control.
+    error: model.error ? { message: errorMessage(model.error), canRetry: model.feedbackSection === null } : null,
   };
 }
 

@@ -190,6 +190,22 @@ describe("Add Personal Package flow", () => {
     expect(test.controller.renderPanel(snapshot())).toBe("");
   });
 
+  it("closes from the icon at the top of the flow, which replaces every Cancel button", async () => {
+    const test = harness();
+    await test.controller.installAction("open");
+    const open = test.controller.renderPanel(snapshot());
+    expect(open).toContain('class="icon-button package-install-close" data-package-install-action="cancel" aria-label="Close Add Personal Package"');
+    for (const action of ["choose", "continue"] as const) {
+      await test.controller.installAction(action);
+      const html = test.controller.renderPanel(snapshot());
+      expect(html).not.toContain(">Cancel<");
+      expect(html).toContain("package-install-close");
+    }
+    await test.controller.installAction("cancel");
+    expect(test.controller.state().kind).toBe("closed");
+    expect(test.controller.renderPanel(snapshot())).toBe("");
+  });
+
   it("never installs when the person cancels at consent", async () => {
     const test = harness();
     await test.controller.installAction("open");
@@ -528,10 +544,9 @@ describe("the Packages section message area", () => {
     status: { kind: "refused", code: "artifact_changed" },
   };
 
-  it("keeps its space when there is no message", () => {
+  it("renders nothing when there is no message", () => {
     const test = harness();
-    expect(test.controller.renderMessage(snapshot([refused])))
-      .toBe('<div class="status-message-slot"><div class="status-message" role="status" aria-live="polite"></div></div>');
+    expect(test.controller.renderMessage(snapshot([refused]))).toBe("");
   });
 
   it("hides a success after five seconds and renders again", async () => {

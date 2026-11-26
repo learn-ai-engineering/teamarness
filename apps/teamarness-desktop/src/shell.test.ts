@@ -85,6 +85,21 @@ class TestControl {
   }
 }
 
+/** A field with a listener per event type, for controls that handle several events. */
+class TestField {
+  public readonly dataset: Record<string, string> = {};
+  private readonly listeners = new Map<string, EventListener>();
+  public constructor(public value = "") {}
+
+  public addEventListener(type: string, listener: EventListener): void {
+    this.listeners.set(type, listener);
+  }
+
+  public fire(type: string, event: Partial<KeyboardEvent> = {}): void {
+    this.listeners.get(type)?.({ preventDefault: () => undefined, ...event } as unknown as Event);
+  }
+}
+
 /** A clock the test advances by hand, so message timing needs no waiting. */
 function manualTimers(): StatusMessageTimers & { advance(ms: number): void } {
   let now = 0;
@@ -118,9 +133,10 @@ class SettingsRegion extends Region {
   public readonly retrySnapshot = new TestControl();
   public readonly addAgent = new TestControl();
   public readonly removeAgent = new TestControl();
+  public readonly editAgent = new TestControl();
   public readonly renameAgent = new TestControl();
   public readonly agentName = { value: "Helper" };
-  public readonly renamedAgentName = { value: "Helper renamed" };
+  public readonly renamedAgentName = new TestField("Helper renamed");
 
   public querySelector(selector: string): TestControl | null {
     if (selector === "#add-agent") return this.addAgent;
@@ -135,6 +151,10 @@ class SettingsRegion extends Region {
     if (selector === "[data-remove-agent]") {
       this.removeAgent.dataset.removeAgent = "2";
       return this.innerHTML.includes('data-remove-agent="2"') ? [this.removeAgent] : [];
+    }
+    if (selector === "[data-edit-agent]") {
+      this.editAgent.dataset.editAgent = "2";
+      return this.innerHTML.includes('data-edit-agent="2"') ? [this.editAgent] : [];
     }
     if (selector === "[data-rename-agent]") {
       this.renameAgent.dataset.renameAgent = "2";
@@ -240,6 +260,7 @@ function model(activeWorkspaceId: string | null = workspace.id): ShellModel {
     error: null,
     notice: null,
     membershipRefreshUnavailable: null,
+    feedbackSection: null,
   };
 }
 
@@ -762,11 +783,8 @@ describe("persistent Shell frame", () => {
         "secret-diagnostic-recovery",
         "secret-diagnostic-id",
       ]) expect(html).not.toContain(forbidden);
-      if (route.kind === "workspace-settings") {
-        for (const { identity } of membership.members) {
-          expect(html).toContain(`<summary>View identity</summary>Identity: ${identity}`);
-        }
-      }
+      // Member identities are never shown (they add nothing a Person can use).
+      for (const { identity } of membership.members) expect(html).not.toContain(identity.slice(0, 12));
     }
   });
 });
@@ -789,12 +807,31 @@ describe("Workspace Agent Shell controls", () => {
     await test.shell.updateWorkspace({ ...model(), memberships: { [workspace.id]: { ...membership, members: [...membership.members, agent] } }, principals: { [workspace.id]: { ...fixture.principals, principals: [...fixture.principals.principals, principal] } as PrincipalsSnapshot } });
     screen.addAgent.click();
     screen.removeAgent.click();
+    // The name is edited in place: selecting it shows the field, and Enter saves.
+    expect(screen.innerHTML).not.toContain('data-rename-agent="2"');
+    screen.editAgent.click();
+    expect(screen.innerHTML).toContain('data-rename-agent="2"');
     screen.renameAgent.click();
+    expect(screen.innerHTML).not.toContain('data-rename-agent="2"');
     expect(calls).toEqual([
       `add:${workspace.id}:Helper`,
       `remove:${workspace.id}:${agentId}`,
       `rename:${workspace.id}:${agentId}:Helper renamed`,
     ]);
+
+    // Escape leaves the name as it was; leaving the field with a changed name saves it.
+    calls.length = 0;
+    screen.editAgent.click();
+    screen.renamedAgentName.fire("keydown", { key: "Escape" });
+    expect(screen.innerHTML).not.toContain('data-rename-agent="2"');
+    screen.editAgent.click();
+    screen.renamedAgentName.value = "Helper";
+    screen.renamedAgentName.fire("blur");
+    expect(calls).toEqual([]);
+    screen.editAgent.click();
+    screen.renamedAgentName.value = "Helper again";
+    screen.renamedAgentName.fire("blur");
+    expect(calls).toEqual([`rename:${workspace.id}:${agentId}:Helper again`]);
   });
 });
 
@@ -1209,13 +1246,14 @@ describe("Add and manage Personal Packages from the Workspace page", () => {
     status: { kind: "refused" as const, code: "artifact_changed" },
   };
 
-  it("puts an Add Personal Package button at the end of the Package Instances group", async () => {
+  it("puts the + beside the Package Instances title, and the flow above the Packages with a close icon in place of Cancel", async () => {
     const test = harness();
     await test.shell.updateWorkspace(model());
     test.shell.updatePackages(packages);
     await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
     const html = test.frame.shellScreen.innerHTML;
-    expect(html).toMatch(/<h2 id="package-instances-heading">Package Instances<\/h2>[\s\S]*<div><button type="button" class="secondary package-add" data-package-install-action="open">Add Personal Package<\/button><\/div><\/div><\/section>/);
+    expect(html).toContain('<h2 id="package-instances-heading">Package Instances</h2><button type="button" class="package-add" data-package-install-action="open"');
+    expect(html).not.toContain(">Add Personal Package</button>");
   });
 
   it("opens the add flow from +, previews, and installs only after Trust and install", async () => {
@@ -1616,21 +1654,28 @@ describe("Packages section messages on the Workspace page", () => {
     }],
   };
 
-  it("reserves the message area, shows a result at the top, and hides a success after five seconds", async () => {
+  it("shows a result at the top of the Packages group, and hides a success after five seconds", async () => {
     const screen = new ManagementRegion();
     const test = harness(screen as unknown as HTMLElement, { refresh: async () => refused });
     await test.shell.updateWorkspace(model());
     test.shell.updatePackages(refused);
     await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
-    const empty = '<div class="status-message-slot"><div class="status-message" role="status" aria-live="polite"></div></div>';
-    expect(screen.innerHTML).toContain(empty);
-    expect(screen.innerHTML.indexOf(empty)).toBeLessThan(screen.innerHTML.indexOf("package-instance-list"));
+    expect(screen.innerHTML).not.toContain("status-message");
 
     screen.control("registration:reload:0").click();
     await vi.waitFor(() => expect(screen.innerHTML).toContain("<p>com.example.broken: Reloaded.</p>"));
+    const packagesGroup = screen.innerHTML.slice(screen.innerHTML.indexOf('id="package-instances-heading"'));
+    expect(packagesGroup.indexOf("Reloaded.")).toBeGreaterThan(-1);
+    expect(packagesGroup.indexOf("Reloaded.")).toBeLessThan(packagesGroup.indexOf("package-instance-list"));
+    // The + beside the group title opens the flow, which then shows above the Packages and hides the +.
+    const plus = 'class="package-add" data-package-install-action="open" aria-label="Add Personal Package"';
+    const group = screen.innerHTML.slice(screen.innerHTML.lastIndexOf("<section", screen.innerHTML.indexOf('id="package-instances-heading"')));
+    expect(group.indexOf(plus)).toBeGreaterThan(-1);
+    expect(group.indexOf(plus)).toBeLessThan(group.indexOf("package-instance-list"));
+    expect(screen.innerHTML).not.toContain(">Add Personal Package</button>");
     test.timers.advance(STATUS_MESSAGE_HIDE_MS);
     expect(screen.innerHTML).not.toContain("Reloaded.");
-    expect(screen.innerHTML).toContain(empty);
+    expect(screen.innerHTML).not.toContain("status-message");
   });
 
   it("keeps an error until the person dismisses it", async () => {
