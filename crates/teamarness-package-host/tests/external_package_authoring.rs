@@ -17,9 +17,9 @@ use teamarness_package_host::{
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run through scripts/create-package.integration.test.mjs with built Package Directories"]
-async fn fresh_bundled_tutorial_then_generated_local_package_run_together() {
-    let tutorial_source = std::env::var("TEAMARNESS_BUNDLED_TUTORIAL_DIRECTORY")
-        .expect("integration driver must provide the bundled Tutorial Package Directory");
+async fn fresh_bundled_backlog_then_generated_local_package_run_together() {
+    let bundled_source = std::env::var("TEAMARNESS_BUNDLED_PACKAGE_DIRECTORY")
+        .expect("integration driver must provide the bundled Backlog Package Directory");
     let local_source = std::env::var("TEAMARNESS_GENERATED_PACKAGE_DIRECTORY")
         .expect("integration driver must provide the generated local Package Directory");
     let local_display_name = std::env::var("TEAMARNESS_GENERATED_PACKAGE_DISPLAY_NAME")
@@ -29,8 +29,8 @@ async fn fresh_bundled_tutorial_then_generated_local_package_run_together() {
     let private = root.path().join("private");
     let core_path = root.path().join("core");
     copy_directory(
-        Path::new(&tutorial_source),
-        &application.join("packages/dev.teamarness.tutorial"),
+        Path::new(&bundled_source),
+        &application.join("packages/dev.teamarness.backlog"),
     );
     fs::create_dir_all(private.join("packages")).unwrap();
     fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
@@ -39,7 +39,7 @@ async fn fresh_bundled_tutorial_then_generated_local_package_run_together() {
     fs::create_dir_all(&application).unwrap();
     fs::write(
         &index,
-        br#"{"schemaVersion":1,"packages":[{"directory":"packages/dev.teamarness.tutorial"}]}"#,
+        br#"{"schemaVersion":1,"packages":[{"directory":"packages/dev.teamarness.backlog"}]}"#,
     )
     .unwrap();
 
@@ -70,12 +70,12 @@ async fn fresh_bundled_tutorial_then_generated_local_package_run_together() {
         object(
             &request(
                 &host,
-                instance_key("dev.teamarness.tutorial", &workspace),
-                "tutorial.read"
+                instance_key("dev.teamarness.backlog", &workspace),
+                "backlog.draft.get"
             )
             .await
         )
-        .contains_key("algorithms")
+        .contains_key("state")
     );
     host.execute(PackageHostCommand::Shutdown(ShutdownHost))
         .await
@@ -102,12 +102,12 @@ async fn fresh_bundled_tutorial_then_generated_local_package_run_together() {
     let second = host.snapshot().await;
     assert!(second.diagnostics.is_empty(), "{:#?}", second.diagnostics);
     assert_eq!(second.packages.len(), 2);
-    let tutorial = second
+    let bundled = second
         .packages
         .iter()
-        .find(|package| package.identity.as_str() == "dev.teamarness.tutorial")
+        .find(|package| package.identity.as_str() == "dev.teamarness.backlog")
         .unwrap();
-    assert_eq!(tutorial.source, PackageSourceKind::Bundled);
+    assert_eq!(bundled.source, PackageSourceKind::Bundled);
     let local = second
         .packages
         .iter()
@@ -119,12 +119,12 @@ async fn fresh_bundled_tutorial_then_generated_local_package_run_together() {
         object(
             &request(
                 &host,
-                instance_key("dev.teamarness.tutorial", &workspace),
-                "tutorial.read"
+                instance_key("dev.teamarness.backlog", &workspace),
+                "backlog.draft.get"
             )
             .await
         )
-        .contains_key("algorithms")
+        .contains_key("state")
     );
     let local_response = request(
         &host,

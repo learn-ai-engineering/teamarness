@@ -18,7 +18,7 @@ This guide uses Apple silicon macOS, Rust 1.96 or newer, and Node.js 24 or newer
 
 ## Start with the finished experience
 
-Before you read manifests or write code, use the finished Tutorial Package. This gives the architecture something concrete to attach to.
+Before you read manifests or write code, use a finished bundled Package such as Backlog. This gives the architecture something concrete to attach to.
 
 From a fresh Teamarness checkout, install the locked dependencies and start a new development profile:
 
@@ -33,18 +33,18 @@ The first launch builds the application and its bundled Packages, so it may take
 In Teamarness:
 
 1. Create or select a Workspace.
-2. Open Tutorial.
-3. Try each pattern and a few palettes.
-4. Generate several pieces without changing the controls.
-5. Save several pieces and click between them.
+2. Open Backlog.
+3. Add an Epic and a few Tickets under it.
+4. Change a Ticket's status and priority, then try the filters.
+5. Click between the Tickets you created.
 
 You have now used all the parts of a Package that matter for this guide:
 
 - The Teamarness Shell renders the desktop, navigation, and a place for Package UI.
-- The Tutorial UI owns the controls and artwork you can see.
+- The Backlog UI owns the controls and lists you can see.
 - The Package Host starts the Backend and carries declared requests between the UI and Backend.
-- The Tutorial Backend owns the pattern rules and saved-art behavior.
-- The Package Data Directory holds Tutorial's records for this Installation and Workspace.
+- The Backlog Backend owns the Epic and Ticket rules and how they are stored.
+- The Package Data Directory holds the Package's own records for this Installation and Workspace.
 - The Teamarness Core Runtime owns the Installation, selected Workspace, and Package lifecycle.
 
 The arrows below name what crosses each relationship.
@@ -68,12 +68,12 @@ The main design boundary is between the Teamarness Core Runtime and each Package
 
 This is why Emojart will be a separate project. You are adding a Package to Teamarness, not adding emoji-art code to the Core Runtime or Shell.
 
-Quit Teamarness before continuing. You will return to the same `first-package` profile after Emojart is built. Do not edit `packages/tutorial/`. Tutorial is the finished example, while Emojart is the Package you own.
+Quit Teamarness before continuing. You will return to the same `first-package` profile after Emojart is built. Do not edit `packages/backlog-package/`. Backlog is a finished example, while Emojart is the Package you own.
 
 Keep these three paths separate:
 
-- Checked-in Tutorial source lives at `packages/tutorial/` in the Teamarness repository.
-- The application builder assembles bundled Tutorial as `dev.teamarness.tutorial` at `packages/dev.teamarness.tutorial/` in the application distribution. The Shell presents its Package Source as `Team`.
+- Checked-in Backlog source lives at `packages/backlog-package/` in the Teamarness repository.
+- The application builder assembles bundled Backlog as `dev.teamarness.backlog` at `packages/dev.teamarness.backlog/` in the application distribution. The Shell presents its Package Source as `Team`.
 - Learner-owned local Emojart lives in its own project outside the Teamarness repository. The Shell presents the registered Package Source as `Personal`.
 
 <a id="source-and-trust"></a>
@@ -82,7 +82,7 @@ Keep these three paths separate:
 
 ## How a local Package reaches Teamarness
 
-Tutorial arrived with the Teamarness application. Emojart will be a local Package, so it follows a different deployment path.
+Backlog arrived with the Teamarness application. Emojart will be a local Package, so it follows a different deployment path.
 
 Teamarness does not build a local Package as part of its own build. Each local Package lives in a separate project directory, can have its own Git repository, and produces its own Package Directory. An Installation-level registration file points Teamarness to that built directory. When you install the Package from the Shell, Teamarness validates the Package manifest and its declared files, writes the registration, and makes the Package available in the Shell.
 
@@ -336,9 +336,9 @@ npm run dev -- first-package
 
 Emojart starts at once, without a restart. The Shell writes the registration for this Installation into `.teamarness-dev/first-package/packages/registrations.v1.json`. [Local Package registration](local-package-registration.md) describes that file if you want to write it by hand.
 
-Confirm the Shell presents bundled Tutorial as `Team` and registered local Emojart as `Personal`; the [Source and trust](#source-and-trust) callout says what those aliases do and do not mean. If either is missing, record the badge observation as unresolved instead of marking it complete.
+Confirm the Shell presents bundled Backlog as `Team` and registered local Emojart as `Personal`; the [Source and trust](#source-and-trust) callout says what those aliases do and do not mean. If either is missing, record the badge observation as unresolved instead of marking it complete.
 
-In the Shell, confirm that Tutorial still opens and that Emojart now appears alongside it. Open Emojart and work through the feature:
+In the Shell, confirm that Backlog still opens and that Emojart now appears alongside it. Open Emojart and work through the feature:
 
 1. Try all four patterns and all four palettes.
 2. Generate repeatedly with one pair of controls and confirm the result changes.

@@ -91,7 +91,7 @@ A local Package with the Package Identity of a bundled Package replaces it only 
 
 1. Select **+** and choose the folder of the local build. The preview says that the Package replaces a Team Package.
 2. Read the native-code risks and select **Trust and continue**.
-3. Read the second confirmation and select the replace button. It names the Team Package, for example **Replace Tutorial after restart**.
+3. Read the second confirmation and select the replace button. It names the Team Package, for example **Replace Backlog after restart**.
 4. Select **Restart Teamarness**, or select **Later** to apply the override at the next start.
 
 Until the restart, **Needs attention on this device** lists the override with "Applies after restart" and a **Restart Teamarness** button. The Team Package keeps running, and its Package page still labels its source as "Team". To change your mind before the restart, select **Cancel override**, then confirm with **Cancel override** again. No restart is needed.
