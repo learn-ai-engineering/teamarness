@@ -24,6 +24,8 @@ const bundledPackages = (await readBundledPackages(repositoryRoot)).map(({ ident
 }));
 const version = await checkVersion();
 const dmg = join(repositoryRoot, "target/release/bundle/dmg", assetNames(`v${version}`)[0]);
+const backlogPackage = bundledPackages.find(({ identity }) => identity === "dev.teamarness.backlog");
+assert.ok(backlogPackage, "the Backlog Package is not bundled");
 const exhibitsPackage = bundledPackages.find(({ identity }) => identity === "dev.teamarness.exhibits");
 assert.ok(exhibitsPackage, "the Exhibits Package is not bundled");
 
@@ -189,15 +191,15 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
         delay 0.3
         click createButton
       `), "Workspace creation");
-      assert.equal(await registrationExists(dataDirectory), false, "fresh bundled Tutorial created a registration file");
+      assert.equal(await registrationExists(dataDirectory), false, "fresh bundled Packages created a registration file");
     }
 
     await waitForAccessible(accessibilityScript(childPid, `
       set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
       set teamPackages to my namedDescendant(activeWorkspaceNavigation, "Team Packages", "AXGroup")
-      set referencePackage to my namedDescendantStartingWith(teamPackages, "Reference Package", "AXButton")
-      return name of referencePackage
-    `), "bundled reference Package navigation");
+      set backlogNavigation to my namedDescendantStartingWith(teamPackages, "${backlogPackage.displayName}", "AXButton")
+      return name of backlogNavigation
+    `), "bundled Backlog navigation");
 
     // The Package Host eagerly activates every admitted Package that is not `on_demand`, so each
     // of those bundled Backends must launch. An `on_demand` Backend (Exhibits) starts when it is
@@ -217,42 +219,13 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
       return name of exhibitsNavigation
     `), "bundled Exhibits navigation");
 
-    await waitForAccessible(accessibilityScript(childPid, `
-      set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
-      set teamPackages to my namedDescendant(activeWorkspaceNavigation, "Team Packages", "AXGroup")
-      set tutorialPackage to my namedDescendantStartingWith(teamPackages, "Tutorial", "AXButton")
-      return name of tutorialPackage
-    `), "bundled Tutorial navigation");
-    diagnostics.activeStage = "bundled Tutorial selection";
+    diagnostics.activeStage = "bundled Backlog selection";
     await runAppleScript(accessibilityScript(childPid, `
       set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
       set teamPackages to my namedDescendant(activeWorkspaceNavigation, "Team Packages", "AXGroup")
-      set tutorialPackage to my namedDescendantStartingWith(teamPackages, "Tutorial", "AXButton")
-      click tutorialPackage
-    `), "bundled Tutorial selection");
-    await atStage("bundled Tutorial UI request response", () => waitFor(async () => {
-      const contents = spawnSync("osascript", ["-e", accessibilityScript(childPid, `
-        set selectedContent to my subroleDescendant(appUi, "AXLandmarkMain")
-        set packageInterface to my namedDescendant(selectedContent, "Package interface", "AXGroup")
-        return entire contents of packageInterface
-      `)], { encoding: "utf8" });
-      if (contents.status !== 0) {
-        diagnostics.lastAccessibilityFailure = appleScriptFailure(contents);
-        return undefined;
-      }
-      return contents.stdout.includes("Generate")
-        && contents.stdout.includes("Save")
-        && contents.stdout.includes("Waves")
-        && contents.stdout.includes("Garden");
-    }));
-
-    diagnostics.activeStage = "bundled reference Package selection";
-    await runAppleScript(accessibilityScript(childPid, `
-      set activeWorkspaceNavigation to my namedDescendant(appUi, "Active Workspace navigation", "AXGroup")
-      set teamPackages to my namedDescendant(activeWorkspaceNavigation, "Team Packages", "AXGroup")
-      set referencePackage to my namedDescendantStartingWith(teamPackages, "Reference Package", "AXButton")
-      click referencePackage
-    `), "bundled reference Package selection");
+      set backlogNavigation to my namedDescendantStartingWith(teamPackages, "${backlogPackage.displayName}", "AXButton")
+      click backlogNavigation
+    `), "bundled Backlog selection");
     await atStage("custom-scheme Package UI", () => waitFor(async () => {
       const contents = spawnSync("osascript", ["-e", accessibilityScript(childPid, `
         set selectedContent to my subroleDescendant(appUi, "AXLandmarkMain")
@@ -264,10 +237,9 @@ async function smokeLaunch(dataDirectory, createWorkspace) {
         return undefined;
       }
       const visible = contents.stdout;
-      return visible.includes("UI kit Ready")
-        && visible.includes("Signing round trip")
-        && visible.includes("Verified")
-        && visible.includes("Increment counter");
+      return visible.includes("Epics")
+        && visible.includes("All priorities")
+        && visible.includes("All statuses");
     }, "custom-scheme Package UI"));
 
     await quitDesktop({ childPid, desktop, diagnostics, atStage, backendPids });

@@ -3,10 +3,7 @@
 node_modules/
 /apps/teamarness-desktop/dist/
 /apps/teamarness-desktop/frame-dist/
-/packages/reference-package/ui/dist/
-/packages/tutorial/ui/dist/
 /packages/conversations-package/ui/dist/
-/packages/repo-aware/ui/dist/
 /packages/agent-package/ui/dist/
 /packages/documents-package/ui/dist/
 /packages/exhibits-package/ui/dist/

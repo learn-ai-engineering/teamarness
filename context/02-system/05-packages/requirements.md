@@ -42,6 +42,8 @@ Teamarness SHALL grant Package Trust during Package Admission. A Package Manifes
 
 ## TEAM.SYS.PKG-R08 — Reference Package
 
+> **Retired 2026-11-26.** The Reference Package was removed after Phase 3, and no other Package is a dedicated end-to-end fixture for this requirement. See [Removed Packages](../../removed-packages.md).
+
 Phase 3 SHALL include one trusted reference Package loaded from both an application-bundled Package Source and an explicitly registered installation-local Package Source. Both SHALL use the same Package-owned code and contracts. The reference Package SHALL exercise Package Manifest validation, Package Admission, capability negotiation, lifecycle transitions, its Package Data Directory, typed calls and events, inherited Workspace theming, and supported failure recovery end to end without introducing product-domain behavior.
 
 ## TEAM.SYS.PKG-R09 — Source and Registration

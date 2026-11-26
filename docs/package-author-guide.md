@@ -6,12 +6,12 @@ Teamarness supports `aarch64-apple-darwin`, and ships a Rust Backend SDK and a T
 
 ## Package Directory
 
-The directory root contains `teamarness.package.json`. The manifest points to one target Backend, one ESM UI entrypoint, optional UI assets, and one UI contract. The reference Package has this shape:
+The directory root contains `teamarness.package.json`. The manifest points to one target Backend, one ESM UI entrypoint, optional UI assets, and one UI contract. A Package Directory has this shape:
 
 ```text
 teamarness.package.json
 backend/
-  teamarness-reference-package-aarch64-apple-darwin
+  teamarness-example-package-aarch64-apple-darwin
 ui/
   index.js
   contract.json
@@ -369,7 +369,7 @@ A Package UI runs in a sandboxed frame with an opaque origin, so it reaches neit
 
 ## Bundled and local Package Source kinds
 
-`packages/tutorial/` is checked-in Tutorial source. The application builder turns it into the bundled `dev.teamarness.tutorial` Package Directory under `packages/dev.teamarness.tutorial/`. A generated learner project such as `dev.teamarness.emojart` remains installation-local: you install it from the Shell, which writes the owner-only registration file. Package Source values `bundled` and `local` remain canonical technical source data; the Shell presents them as `Team` and `Personal`. `Team` and `Personal` are UI aliases, not trust verdicts, and do not define registration scope or imply Workspace enablement, synchronization, sharing, networking, or collaboration.
+`packages/backlog-package/` is checked-in Backlog source. The application builder turns it into the bundled `dev.teamarness.backlog` Package Directory under `packages/dev.teamarness.backlog/`. A generated learner project such as `dev.teamarness.emojart` remains installation-local: you install it from the Shell, which writes the owner-only registration file. Package Source values `bundled` and `local` remain canonical technical source data; the Shell presents them as `Team` and `Personal`. `Team` and `Personal` are UI aliases, not trust verdicts, and do not define registration scope or imply Workspace enablement, synchronization, sharing, networking, or collaboration.
 
 ## Local development loop
 

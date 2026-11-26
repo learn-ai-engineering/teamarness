@@ -4,6 +4,8 @@ Prefix: `TEAM.SYS.REPO`
 
 Repository integration is delivered by the Repo-aware Package (`dev.teamarness.repo-aware`).
 
+> **Retired 2026-11-26.** The Repo-aware Package was removed from the repository, so these requirements are inactive. See [Removed Packages](../../removed-packages.md) to restore it.
+
 ## TEAM.SYS.REPO-R01 — Package-Owned Repository Integration
 
 Repository registration, Git inspection, and repository views SHALL be owned by a Package. The Core Runtime, Package Host, and Shell SHALL contain no repository-specific behavior. The Repo-aware Package SHALL require no Semantic Capability.
