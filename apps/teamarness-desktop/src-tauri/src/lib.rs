@@ -255,7 +255,7 @@ pub fn run() {
         commands::COMMAND_NAMES.len()
             + package_commands::COMMAND_NAMES.len()
             + update_commands::COMMAND_NAMES.len(),
-        37
+        39
     );
     let app = update::configure(tauri::Builder::default())
         .plugin(tauri_plugin_dialog::init())
