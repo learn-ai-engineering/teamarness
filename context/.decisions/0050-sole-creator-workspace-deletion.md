@@ -1,6 +1,6 @@
 # 0050 — Sole-creator Workspace deletion
 
-**Status:** proposed (2026-11-26)
+**Status:** accepted (2026-11-27)
 **Refines:** `TEAM-DQ9` (Package Instance lifecycle, for deletion only)
 
 ## Context

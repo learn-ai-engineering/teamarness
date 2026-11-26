@@ -1,6 +1,6 @@
 # 0049 — Installation-local Workspace rename
 
-**Status:** proposed (2026-11-26)
+**Status:** accepted (2026-11-27)
 **Supersedes in part:** ADR 0005 (Decision, "The name becomes immutable local metadata after import", as applied to the local Installation's own label)
 **Refines:** ADR 0005 (import-time Workspace name)
 

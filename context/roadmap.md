@@ -72,16 +72,16 @@ Completed on 2026-09-17. The Repo-aware Package (`packages/repo-aware`) register
 
 ## Current work
 
-### Workspace settings UI (started 2026-11-26)
+### Workspace settings UI (complete, verified on macOS)
 
 Workstream `workspace-settings-ui` on branch `workspace-settings-ui`. Delivers four Shell & Core Backlog Tickets:
 
 - **Align styling of Workspace settings with About/Configuration screens.** Workspace settings uses the same quieter page structure as a Package's About and Configuration tabs.
 - **Size a Package's settings view to its content so the Package page scrolls as one** (DELTA-019 group 4, `TEAM.SYS.SHELL-R02`). The Shell-owned frame runtime reports content height over the frame bridge and the Shell sizes the frame.
 - **Notifications on Workspace settings and Package About pages never dismiss and are easy to miss** (`TEAM.SYS.SHELL-R08`). Shell-only: non-error notifications dismiss after 5 seconds, errors stay until closed with an X, styled after the External Gateway Package's configuration notifications. A notification carrying the only Restart or Retry control stays (DELTA-018 SF-304). The Package capability is the Backlog Ticket *Shell & Core › Shell-owned notification mechanism with a Package capability*.
-- **Rename and delete Workspaces** ([ADR 0049](.decisions/0049-installation-local-workspace-rename.md) and [ADR 0050](.decisions/0050-sole-creator-workspace-deletion.md), proposed; `TEAM.SYS.SHELL-R04`). Rename is Installation-local. Only the creator deletes, and only while no other Person is a Member; deletion erases the Workspace's Core data, Package Instances and Package Data Directories after the name is typed, and leaves mapped Documents folders on disk. Desktop only.
+- **Rename and delete Workspaces** ([ADR 0049](.decisions/0049-installation-local-workspace-rename.md) and [ADR 0050](.decisions/0050-sole-creator-workspace-deletion.md), accepted; `TEAM.SYS.SHELL-R04`). Rename is Installation-local. Only the creator deletes, and only while no other Person is a Member; deletion erases the Workspace's Core data, Package Instances and Package Data Directories after the name is typed, and leaves mapped Documents folders on disk. Desktop only.
 
-Planned order: styling, settings-view sizing, notifications, rename, delete. All five are implemented on the branch with automated checks; manual verification on macOS is pending.
+Planned order: styling, settings-view sizing, notifications, rename, delete. All five are implemented. The full automated suite passes, and two manual review passes on macOS verified them on 2026-11-27. The Tickets are done; integration is PR #15.
 
 **Outcome:** Workspace settings matches the Package pages, notifications are noticeable and clear themselves, and a test Workspace can be renamed and deleted.
 
