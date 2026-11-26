@@ -11,7 +11,7 @@ import { createPackageProject, repositoryRoot } from "./create-package.mjs";
 
 const run = promisify(execFile);
 
-test("generated foundation validates, builds, rejects an invalid contract, and runs beside Tutorial", { timeout: 900_000 }, async () => {
+test("generated foundation validates, builds, rejects an invalid contract, and runs beside Backlog", { timeout: 900_000 }, async () => {
   const parent = await mkdtemp(join(tmpdir(), "teamarness-create-package-integration-"));
   const displayName = 'Emojart "$&" __REQUEST_NAMESPACE__ __PACKAGE_DISPLAY_NAME_RUST__ \\ Gallery';
   try {
@@ -68,12 +68,12 @@ test("generated foundation validates, builds, rejects an invalid contract, and r
       env: { ...process.env, CARGO_TARGET_DIR: join(parent, "custom target") },
     });
 
-    const tutorial = await resolveBundledPackage("dev.teamarness.tutorial");
-    const tutorialDirectory = await buildPackage({
-      sourceDirectory: tutorial.sourceDirectory,
-      cargoPackage: tutorial.cargoPackage,
-      expectedIdentity: tutorial.identity,
-      outputDirectory: join(parent, "bundled tutorial"),
+    const bundled = await resolveBundledPackage("dev.teamarness.backlog");
+    const bundledDirectory = await buildPackage({
+      sourceDirectory: bundled.sourceDirectory,
+      cargoPackage: bundled.cargoPackage,
+      expectedIdentity: bundled.identity,
+      outputDirectory: join(parent, "bundled backlog"),
     });
     await run(
       "cargo",
@@ -91,7 +91,7 @@ test("generated foundation validates, builds, rejects an invalid contract, and r
         cwd: repositoryRoot,
         env: {
           ...process.env,
-          TEAMARNESS_BUNDLED_TUTORIAL_DIRECTORY: tutorialDirectory,
+          TEAMARNESS_BUNDLED_PACKAGE_DIRECTORY: bundledDirectory,
           TEAMARNESS_GENERATED_PACKAGE_DIRECTORY: directory,
           TEAMARNESS_GENERATED_PACKAGE_DISPLAY_NAME: displayName,
         },
