@@ -408,6 +408,13 @@ def join(report, host, answers):
         workspace = body.get("workspace", {})
         report.item("changed", f"joined Workspace {workspace.get('name')} ({workspace.get('id')}); invitation file deleted")
         return
+    details = body.get("details") if isinstance(body, dict) else None
+    if isinstance(details, dict) and details.get("membershipCommitted"):
+        # The join committed but starting its Packages failed, so the Invitation is spent.
+        os.remove(path)
+        workspace = details.get("workspace", {})
+        raise Stop(f"joined Workspace {workspace.get('name')} ({workspace.get('id')}) and deleted the invitation file, "
+                   f"but its Packages did not start ({body.get('code')}); inspect with: {host.app} --data-dir {host.data} status and journalctl --user -u {UNIT_NAME} -b, then rerun setup")
     uncertain = not isinstance(body, dict) or body.get("outcomeUncertain", True)
     if uncertain:
         raise Stop(f"join outcome unknown — inspect with: {host.app} --data-dir {host.data} workspace list, then rerun setup")

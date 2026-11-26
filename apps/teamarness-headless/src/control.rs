@@ -278,7 +278,18 @@ impl<'a> ControlServer<'a> {
                     if completion.is_some_and(|result| result.is_err()) { failed = true; self._owner.record_terminal_failure(); }
                 }
                 accepted = listener.accept() => {
-                    let Ok((mut stream, _)) = accepted else { failed = true; break Instant::now(); };
+                    let mut stream = match accepted {
+                        Ok((stream, _)) => stream,
+                        Err(error) if transient_accept_failure(&error) => {
+                            // One peer's aborted connect, or a brief descriptor or memory
+                            // shortage, refuses only that connection. Pause so a shortage
+                            // does not spin, then keep serving.
+                            eprintln!("operator_accept_failed transient=true");
+                            tokio::time::sleep(ACCEPT_BACKOFF).await;
+                            continue;
+                        }
+                        Err(_) => { failed = true; break Instant::now(); }
+                    };
                     let Ok(connection) = connections.clone().try_acquire_owned() else {
                         // No task or queue is created for a refused connection.
                         drop(stream);
@@ -335,6 +346,26 @@ impl<'a> ControlServer<'a> {
             _server: self,
         }
     }
+}
+
+/// How long admission pauses after a transient accept failure.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Failures that refuse one connection without breaking the listener itself.
+fn transient_accept_failure(error: &std::io::Error) -> bool {
+    use nix::errno::Errno;
+    use std::io::ErrorKind;
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::OutOfMemory
+    ) || error.raw_os_error().is_some_and(|code| {
+        [Errno::EMFILE, Errno::ENFILE, Errno::ENOBUFS, Errno::ENOMEM]
+            .contains(&Errno::from_raw(code))
+    })
 }
 
 /// Only operator requests share this gate. Port traffic and Package background work do not.
@@ -467,4 +498,29 @@ async fn read_frame_observation(reader: &mut UnixStream) -> Result<Response, Con
         .await
         .map_err(|_| ControlError::new(ErrorCode::Unavailable))?;
     serde_json::from_slice(&bytes).map_err(|_| ControlError::new(ErrorCode::InvalidInput))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transient_accept_failure;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn only_per_connection_and_resource_failures_keep_the_listener() {
+        assert!(transient_accept_failure(&Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        assert!(transient_accept_failure(&Error::from_raw_os_error(
+            nix::errno::Errno::EMFILE as i32
+        )));
+        assert!(transient_accept_failure(&Error::from_raw_os_error(
+            nix::errno::Errno::ENFILE as i32
+        )));
+        assert!(!transient_accept_failure(&Error::from_raw_os_error(
+            nix::errno::Errno::EBADF as i32
+        )));
+        assert!(!transient_accept_failure(&Error::from_raw_os_error(
+            nix::errno::Errno::EINVAL as i32
+        )));
+    }
 }

@@ -33,6 +33,9 @@ if args[:2] == ["workspace", "join"]:
     if state.get("join") == "uncertain": done({"code": "host_failure", "outcomeUncertain": True}, 1)
     workspace = {"id": "cd" * 16, "name": "team"}
     state.setdefault("workspaces", []).append(workspace)
+    if state.get("join") == "unreconciled":
+        done({"code": "reconciliation_failed", "retryable": False, "outcomeUncertain": False,
+              "details": {"kind": "joined", "membershipCommitted": True, "workspace": workspace, "reconciliation": {}}}, 1)
     done({"membershipCommitted": True, "workspace": workspace})
 done({"code": "invalid_input"}, 2)
 `;
@@ -194,6 +197,23 @@ test("a truncated invitation stops before joining", async () => {
     const state = await f.readState();
     assert.deepEqual(state, {}, "nothing ran or changed before the Invitation was refused");
     await stat(invitation);
+  } finally { await f.cleanup(); }
+});
+
+test("a committed join whose Packages fail to start deletes the spent file and says so", async () => {
+  const f = await fixture({ join: "unreconciled" });
+  try {
+    const invitation = join(f.root, "invite.txt");
+    const payload = "02" + "0004" + "00".repeat(4) + "11".repeat(32) + "0002" + "6869";
+    await writeFile(invitation, `teamarness-workspace-v1.${payload}`, { mode: 0o600 });
+    await f.writeAnswers(`[join]\ninvitation_file = "${invitation}"\n`);
+    const first = f.run("--answers", f.answers);
+    assert.equal(first.code, 1);
+    assert.match(first.out, /stopped: joined Workspace team \(c+d+.*\) and deleted the invitation file, but its Packages did not start \(reconciliation_failed\)/);
+    await assert.rejects(stat(invitation));
+    const second = f.run("--answers", f.answers);
+    assert.match(second.out, /unchanged: join \(invitation file consumed/);
+    assert.equal((await f.readState()).calls.filter((call) => call[1] === "join").length, 1);
   } finally { await f.cleanup(); }
 });
 

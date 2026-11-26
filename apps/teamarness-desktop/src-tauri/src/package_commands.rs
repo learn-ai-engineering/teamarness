@@ -1250,7 +1250,7 @@ mod tests {
                 "presentation": {"displayName": "Desktop fixture"},
                 "protocol": {"major": 1, "minMinor": 0, "maxMinor": 0},
                 "backends": [{
-                    "target": "aarch64-apple-darwin",
+                    "target": teamarness_package_host::NATIVE_BACKEND_TARGET,
                     "path": "backend/package.mjs",
                     "size": backend.len(),
                     "sha256": digest(&backend)
