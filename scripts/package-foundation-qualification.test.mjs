@@ -30,12 +30,12 @@ test("Package authoring guidance follows the local Package development path", as
   const guide = await read("docs/build-your-first-package.md");
   const readme = await read("README.md");
   for (const phrase of [
-    "Checked-in Tutorial source",
-    "`packages/tutorial/`",
-    "`packages/dev.teamarness.tutorial/`",
-    "`dev.teamarness.tutorial`",
+    "Checked-in Backlog source",
+    "`packages/backlog-package/`",
+    "`packages/dev.teamarness.backlog/`",
+    "`dev.teamarness.backlog`",
     "Package Source values `bundled` and `local`",
-    "Shell presents bundled Tutorial as `Team` and registered local Emojart as `Personal`",
+    "Shell presents bundled Backlog as `Team` and registered local Emojart as `Personal`",
     "Team` and `Personal` are UI aliases, not trust verdicts",
     "registration scope, Workspace enablement, synchronization, sharing, networking, or collaboration",
     "Teamarness Core Runtime",
@@ -43,7 +43,7 @@ test("Package authoring guidance follows the local Package development path", as
     "Package UI",
     "Package Backend",
     "Package Data Directory",
-    "Save several pieces and click between them",
+    "Click between the Tickets you created",
     "The canonical recipe includes",
     "Changing only the seed must change the cells",
     "A changed seed field with identical cells does not pass",
@@ -138,8 +138,7 @@ test("Package styles preserve the strict host policy and avoid inline style APIs
 
   for (const path of [
     "packages/teamarness-package-ui-sdk/src/index.ts",
-    "packages/reference-package/ui/src/index.ts",
-    "packages/tutorial/ui/src/index.ts",
+    "packages/backlog-package/ui/src/index.ts",
     "apps/teamarness-desktop/src/package-frame/runtime.ts",
   ]) {
     const source = await read(path);
@@ -156,10 +155,7 @@ test("Package styles preserve the strict host policy and avoid inline style APIs
 });
 
 const PACKAGE_UI_DIRECTORIES = [
-  ["packages/reference-package/ui", "ReferenceContract"],
-  ["packages/tutorial/ui", "TutorialContract"],
   ["packages/conversations-package/ui", "ConversationsContract"],
-  ["packages/repo-aware/ui", "RepoAwareContract"],
 ];
 
 test("Package UIs use contract-typed requests and shared style adoption", async () => {
@@ -193,10 +189,7 @@ test("Package UIs use contract-typed requests and shared style adoption", async 
 });
 
 const BACKEND_DIRECTORIES = [
-  "packages/reference-package/backend",
-  "packages/tutorial/backend",
   "packages/conversations-package/backend",
-  "packages/repo-aware/backend",
   "templates/package-foundation/v1/backend",
 ];
 
@@ -258,7 +251,7 @@ test("packaged smoke waits for Package navigation and captures safe timeout diag
   const source = await read("scripts/smoke-packaged-app.mjs");
   const shellReadinessWait = source.indexOf('"desktop Shell readiness"');
   const workspaceCreation = source.indexOf('diagnostics.activeStage = "Workspace creation"');
-  const navigationWait = source.indexOf('"bundled reference Package navigation"');
+  const navigationWait = source.indexOf('"bundled Backlog navigation"');
   const backendWait = source.indexOf("`bundled Package Backend ${identity}`");
 
   assert.ok(shellReadinessWait >= 0, "packaged smoke must wait for desktop Shell readiness");
@@ -297,31 +290,16 @@ test("generated foundation and bundled Package policies remain independent", asy
   );
   assert.equal(packageJson.scripts[["setup", "tutorial"].join(":")], undefined);
   assert.ok(!packageJson.workspaces.includes(["packages", "emojart", "ui"].join("/")));
-  assert.ok((await readdir(new URL("packages/", root))).includes("tutorial"));
 
   const index = JSON.parse(await read("packages/application-packages.v1.json"));
   const bundled = await readBundledPackages();
   assert.deepEqual(bundled.map(({ identity }) => identity), [
-    "dev.teamarness.reference",
-    "dev.teamarness.tutorial",
     "dev.teamarness.conversations",
-    "dev.teamarness.repo-aware",
     "dev.teamarness.documents",
     "dev.teamarness.exhibits",
     "dev.teamarness.backlog",
   ]);
   assert.deepEqual(index, applicationIndexDocument(bundled));
-  const tutorial = JSON.parse(await read("packages/tutorial/ui-contract.json"));
-  assert.deepEqual(Object.keys(tutorial.requests).sort(), ["tutorial.generate", "tutorial.read", "tutorial.save"]);
-  assert.deepEqual(tutorial.subscriptions, {});
-  assert.deepEqual(tutorial["$defs"].algorithmId.enum, ["waves", "ripples", "spiral", "patchwork"]);
-  assert.deepEqual(tutorial["$defs"].paletteId.enum, ["garden", "ocean", "moon", "fruit"]);
-  assert.deepEqual(tutorial["$defs"].paletteChoice.oneOf, [
-    { const: { id: "garden", label: "Garden", values: ["🌱", "🌿", "🍀", "🌸", "🌻"] } },
-    { const: { id: "ocean", label: "Ocean", values: ["💧", "🐚", "🐠", "🐬", "🌊"] } },
-    { const: { id: "moon", label: "Moon", values: ["🌑", "🌒", "🌓", "🌔", "🌕"] } },
-    { const: { id: "fruit", label: "Fruit", values: ["🍓", "🍊", "🍋", "🍏", "🫐"] } },
-  ]);
 });
 
 test("delivery configuration includes all bundled Package Directories and source badges", async () => {
@@ -369,10 +347,7 @@ test("Package UIs run only in sandboxed frames and the Shell realm loads no Pack
   assert.equal(sdkManifest.dependencies?.["@tauri-apps/api"], undefined);
   const authorTrees = [
     "packages/teamarness-package-ui-sdk/src",
-    "packages/reference-package/ui/src",
-    "packages/tutorial/ui/src",
     "packages/conversations-package/ui/src",
-    "packages/repo-aware/ui/src",
     "templates/package-foundation/v1/ui/src",
     "apps/teamarness-desktop/src/package-frame",
   ];

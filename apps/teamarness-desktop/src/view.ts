@@ -172,7 +172,7 @@ export class ShellController {
     }, "join");
   }
 
-  /** Deletes the Workspace and all of its data on this Installation (ADR 0048). */
+  /** Deletes the Workspace and all of its data on this Installation (ADR 0049). */
   public async deleteWorkspace(workspaceId: string): Promise<void> {
     await this.perform(async () => {
       const name = this.model.workspaces.find(({ id }) => id === workspaceId)?.name ?? "the Workspace";
@@ -475,7 +475,7 @@ export function renderShell(
 
 /**
  * Deleting a Workspace takes typing its exact name: the confirm button stays disabled until the
- * field matches, and the Shell checks it again on submit (ADR 0048).
+ * field matches, and the Shell checks it again on submit (ADR 0049).
  */
 function renderDeleteWorkspace(name: string, loading: boolean, feedback: string): string {
   return `<section class="package-page-group workspace-delete" aria-labelledby="delete-workspace-heading"><div class="package-page-group-intro"><h2 id="delete-workspace-heading">Delete Workspace</h2><p>You created this Workspace and no one else is a Member.</p></div><div class="package-page-group-body">${feedback}<p>Deleting erases this Workspace and all of its data on this Installation, including its Agents and every Package's data. Files in folders mapped by Documents stay on disk. This cannot be undone.</p><form id="delete-workspace" data-workspace-name="${escape(name)}"><label for="delete-workspace-confirm">Type <strong>${escape(name)}</strong> to confirm</label><div class="inline-field"><input id="delete-workspace-confirm" autocomplete="off" spellcheck="false"><button type="submit" class="danger" disabled${loading ? ' aria-busy="true"' : ""}>Delete Workspace</button></div></form></div></section>`;

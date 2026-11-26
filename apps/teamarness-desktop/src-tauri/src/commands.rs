@@ -81,7 +81,7 @@ pub async fn list_workspaces(
         .await?
 }
 
-/// Renames a Workspace on this Installation only (ADR 0048). Running Package Instances see the
+/// Renames a Workspace on this Installation only (ADR 0049). Running Package Instances see the
 /// new name from their next start.
 #[tauri::command]
 pub async fn rename_workspace(
@@ -106,7 +106,7 @@ pub async fn rename_workspace(
         .await?
 }
 
-/// Deletes a Workspace and all of its data on this Installation (ADR 0048). Only its creator may,
+/// Deletes a Workspace and all of its data on this Installation (ADR 0049). Only its creator may,
 /// and only while no other Person is a Member; the Package Host stops its Package Instances first.
 #[tauri::command]
 pub async fn delete_workspace(

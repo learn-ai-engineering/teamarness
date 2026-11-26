@@ -47,7 +47,7 @@ async fn append_only_guards_reject_canonical_and_trust_anchor_changes() {
             .execute("DELETE FROM membership_operations", [])
             .is_err()
     );
-    // The local name may change (ADR 0048); every trust-anchor column stays immutable.
+    // The local name may change (ADR 0049); every trust-anchor column stays immutable.
     for column in [
         "workspace_id",
         "creator_public_identity",

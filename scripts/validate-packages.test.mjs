@@ -32,7 +32,7 @@ test("validates every bundled Package source and staged directory", async () => 
 test("reports the Package and rule for an invalid source", async () => {
   const root = await mkdtemp(join(tmpdir(), "teamarness-validate-"));
   temporaryRoots.push(root);
-  const sourceDirectory = "packages/tutorial";
+  const sourceDirectory = "packages/backlog-package";
   await cp(join(repositoryRoot, sourceDirectory), join(root, sourceDirectory), { recursive: true });
   const contractPath = join(root, sourceDirectory, "ui-contract.json");
   const contract = JSON.parse(await readFile(contractPath, "utf8"));
@@ -44,10 +44,10 @@ test("reports the Package and rule for an invalid source", async () => {
       validateBundledPackages({
         repositoryRoot,
         smoke: false,
-        packages: [{ identity: "dev.teamarness.tutorial", sourceDirectory: join(root, sourceDirectory) }],
+        packages: [{ identity: "dev.teamarness.backlog", sourceDirectory: join(root, sourceDirectory) }],
       }),
     (error) => {
-      assert.match(error.message, /dev\.teamarness\.tutorial/);
+      assert.match(error.message, /dev\.teamarness\.backlog/);
       assert.match(error.message, /ui_contract\.reference_not_local/);
       return true;
     },

@@ -36,3 +36,7 @@ Follow-up: Host Port maintenance on `main`.
 Follow-up: the roadmap follow-up "sizing a Package's settings view to its content".
 
 Resolved in workstream `workspace-settings-ui` (2026-11-26), pending manual verification: private frame bridge protocol 5 reports the settings view's content height and the Shell sizes the frame to it; open modal dialogs are placed in the frame's visible region (`TEAM.SYS.SHELL-R02`).
+
+## Tracking
+
+- Teamarness Backlog: *Agent › DELTA-019: Agent Doc Exhibit findings accepted as tech debt*

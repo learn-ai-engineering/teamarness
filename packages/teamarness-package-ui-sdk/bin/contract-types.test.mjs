@@ -231,20 +231,20 @@ test("generated types typecheck against the SDK client", async (t) => {
     await mkdir(source, { recursive: true });
     await run([
       "--contract",
-      join(repositoryRoot, "packages/tutorial/ui-contract.json"),
+      join(repositoryRoot, "packages/backlog-package/ui-contract.json"),
       "--out",
       join(source, "contract.generated.ts"),
       "--type-name",
-      "TutorialContract",
+      "BacklogContract",
     ]);
     await writeFile(
       join(source, "usage.ts"),
       `import { typedPackageClient, type PackageClient } from "@teamarness/package-ui-sdk";\n`
-        + `import type { TutorialContract } from "./contract.generated";\n\n`
+        + `import type { BacklogContract } from "./contract.generated";\n\n`
         + `export async function read(client: PackageClient): Promise<number> {\n`
-        + `  const typed = typedPackageClient<TutorialContract>(client);\n`
-        + `  const response = await typed.request("tutorial.read", {});\n`
-        + `  return response.artworks.length;\n`
+        + `  const typed = typedPackageClient<BacklogContract>(client);\n`
+        + `  const response = await typed.request("backlog.draft.get", {});\n`
+        + `  return response.state === null ? 0 : 1;\n`
         + `}\n`,
     );
     await writeFile(
@@ -274,9 +274,9 @@ test("generated types typecheck against the SDK client", async (t) => {
     await writeFile(
       join(source, "usage.ts"),
       `import { typedPackageClient, type PackageClient } from "@teamarness/package-ui-sdk";\n`
-        + `import type { TutorialContract } from "./contract.generated";\n\n`
+        + `import type { BacklogContract } from "./contract.generated";\n\n`
         + `export async function nope(client: PackageClient): Promise<unknown> {\n`
-        + `  return typedPackageClient<TutorialContract>(client).request("tutorial.nope", {});\n`
+        + `  return typedPackageClient<BacklogContract>(client).request("backlog.nope", {});\n`
         + `}\n`,
     );
     const failure = await run_("npx", compilerArguments, compilerOptions).then(
@@ -288,5 +288,5 @@ test("generated types typecheck against the SDK client", async (t) => {
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
-  t.diagnostic("typechecked the generated Tutorial contract types");
+  t.diagnostic("typechecked the generated Backlog contract types");
 });

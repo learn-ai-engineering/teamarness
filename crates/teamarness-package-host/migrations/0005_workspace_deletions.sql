@@ -1,4 +1,4 @@
--- ADR 0048: a Workspace whose deletion the Host has started. Written before Core erases the
+-- ADR 0049: a Workspace whose deletion the Host has started. Written before Core erases the
 -- Workspace and removed after its Package Data Directories are gone, so opening the Host finishes
 -- a deletion that stopped part way, or drops the entry when Core still has the Workspace.
 CREATE TABLE IF NOT EXISTS pending_workspace_deletions (

@@ -2,16 +2,7 @@
   "schemaVersion": 1,
   "packages": [
     {
-      "directory": "packages/dev.teamarness.reference"
-    },
-    {
-      "directory": "packages/dev.teamarness.tutorial"
-    },
-    {
       "directory": "packages/dev.teamarness.conversations"
-    },
-    {
-      "directory": "packages/dev.teamarness.repo-aware"
     },
     {
       "directory": "packages/dev.teamarness.documents"

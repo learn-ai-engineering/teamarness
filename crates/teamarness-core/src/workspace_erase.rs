@@ -1,4 +1,4 @@
-//! Erasing one Workspace from this Installation (ADR 0048).
+//! Erasing one Workspace from this Installation (ADR 0049).
 //!
 //! Erasure is a single transaction. It writes the Workspace's deletion marker, which is what
 //! lets the append-only triggers accept deletes for this Workspace and no other, deletes every

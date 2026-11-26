@@ -135,9 +135,9 @@ pub enum WorkspaceError {
     Conflict,
     /// No Workspace with this identity is stored on this Installation.
     UnknownWorkspace,
-    /// Only the Installation that created a Workspace may delete it (ADR 0048).
+    /// Only the Installation that created a Workspace may delete it (ADR 0049).
     NotWorkspaceCreator,
-    /// A Workspace with a current Person other than its creator cannot be deleted (ADR 0048).
+    /// A Workspace with a current Person other than its creator cannot be deleted (ADR 0049).
     WorkspaceHasOtherMembers,
     /// A ready workspace trust anchor or pending request is corrupt.
     CorruptTrustAnchor,

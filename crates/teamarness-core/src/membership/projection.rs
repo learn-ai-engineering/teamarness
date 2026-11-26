@@ -661,7 +661,7 @@ pub(crate) fn import_bootstrap_with_fault(
     let mut imported_member_change = false;
     let (imported_projection, writes_derived_state) =
         if let Some(existing) = local.get(&response.workspace_id) {
-            // The name is Installation-local metadata (ADR 0048), so it is not compared: a stored
+            // The name is Installation-local metadata (ADR 0049), so it is not compared: a stored
             // Workspace keeps its own name, whatever name the inviter now uses.
             let (creator, created_at, genesis_id, genesis_bytes): (Vec<u8>, i64, Vec<u8>, Vec<u8>) =
                 transaction
@@ -878,7 +878,7 @@ fn verify_creation_request(
         )
         .optional()
         .map_err(|_| crate::OnboardingError::LocalConflict)?;
-    // The creation request's name follows local renames (ADR 0048), so it is not compared.
+    // The creation request's name follows local renames (ADR 0049), so it is not compared.
     if !matches!(row, Some((creator, created_at, genesis_id, genesis, status))
         if creator == response.creator.as_bytes()
             && created_at == response.created_at_unix_ms

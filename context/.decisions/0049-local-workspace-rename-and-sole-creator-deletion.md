@@ -1,4 +1,4 @@
-# 0048 — Installation-local Workspace rename and sole-creator Workspace deletion
+# 0049 — Installation-local Workspace rename and sole-creator Workspace deletion
 
 **Status:** proposed (2026-11-26)
 **Supersedes in part:** ADR 0005 (Decision, "The name becomes immutable local metadata after import", as applied to the local Installation's own label)

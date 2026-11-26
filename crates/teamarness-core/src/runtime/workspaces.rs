@@ -42,7 +42,7 @@ impl CoreRuntime {
     }
 
     /// Renames a Workspace on this Installation only; other Members keep their own name for it
-    /// (ADR 0048). Names follow [`Self::create_workspace`]'s rules.
+    /// (ADR 0049). Names follow [`Self::create_workspace`]'s rules.
     pub fn rename_workspace(
         &self,
         workspace_id: WorkspaceId,
@@ -69,7 +69,7 @@ impl CoreRuntime {
         self.current_deletability(&mut state, workspace_id)
     }
 
-    /// Erases the Workspace and all of its data from this Installation (ADR 0048). The rule of
+    /// Erases the Workspace and all of its data from this Installation (ADR 0049). The rule of
     /// [`Self::check_workspace_deletable`] is checked again under the same lock as the erase, so
     /// an admission that arrived after a precheck still refuses. Nothing is sent to other
     /// Installations. Package Instances must already be stopped; the Package Host owns that.

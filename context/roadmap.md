@@ -2,11 +2,11 @@
 
 ## Status
 
-Active. This file records the expected sequence of major work and the reason for that order.
+Active. This file records the expected sequence of major work and the reason for that order. Remaining work — features, follow-ups, qualification gaps and accepted tech debt — is tracked as Tickets in the Teamarness Backlog (Default Workspace), not here. Pointers below name the Ticket as *Epic › Title*.
 
 ## Current baseline
 
-The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. Phase 7 (Documents Package) was integrated into `main` on 2026-10-24 for developer testing by explicit approval. Its overall Verify remains failed on two accepted internal-stage risks; the separate Documents layout workstream passed its scoped Verify. Integration is not a production release or a passing overall Verify. External Package authoring remains foundation-only while SDK publication policy is deferred (see Later). Documents rendered editing (ADRs 0031, 0032 and 0033) passed Verify and was integrated into `main` on 2026-10-25. Phase 5 is next for the core.
+The VRS intent tree and accepted architecture decisions are established. Phases 0 through 4 and Phase 6 are complete. Phase 7 (Documents Package) was integrated into `main` on 2026-10-24 for developer testing by explicit approval. Its overall Verify remains failed on two accepted internal-stage risks; the separate Documents layout workstream passed its scoped Verify. Integration is not a production release or a passing overall Verify. External Package authoring remains foundation-only while SDK publication policy is deferred (Backlog: *Shell & Core › Published, versioned Rust and TypeScript SDKs and a generated-project upgrade policy*). Documents rendered editing (ADRs 0031, 0032 and 0033) passed Verify and was integrated into `main` on 2026-10-25. Phase 5 is next for the core.
 
 ## Phases
 
@@ -54,6 +54,8 @@ Started on 2026-09-14. Core now owns the first generic Package-scoped Synchroniz
 
 Workspace leave, manager assignment and transfer, member removal controls, revocation-driven Content Key rotation (a new Content Key Generation per revocation), and epoch transitions visible to packages. Content Key rotation SHALL grant a newly admitted Member the earlier Content Key Generations of each Package scope, so they read the existing history (`TEAM.SYS.CONV-R12`). Phase 5 introduces multiple Workspace administrators — a small group (for example three or four Members) who can admit and revoke Members and perform other Workspace administration. Version 1's single Manager, the Workspace creator, is a scope limit, not the intended model (ADR 0013). Multi-device support lets one human identity have multiple Installation identities, with device-aware membership operations; ADR 0023 already models a Workspace Person as a key group, so this work attaches further Installation keys to that group. Workspace-specific names for one Installation per Person were delivered by the Member names workstream and generalized to Principal Names by the Workspace Principals workstream (see **Current work** and `TEAM-DQ8`); grouping multiple devices under one Person remains Phase 5 design work. Membership replication and synchronization peer authorization are delivered by ADR 0013; adding a membership action tag requires a new membership-sync protocol version, not a new envelope version. Package Instance lifecycle on leave and revocation (`TEAM-DQ9`) is decided in this phase: today the Package Host never disposes an Instance.
 
+**Tracked in the Backlog:** *Shell & Core › Phase 5 — Membership Management and Hardening*.
+
 **Outcome:** Workspace managers and members can complete the deferred membership workflows. A removed member cannot read or post future messages, a newly admitted member reads the existing history, and packages rotate keys after membership transitions.
 
 **Depends on:** Phase 4.
@@ -76,8 +78,8 @@ Workstream `workspace-settings-ui` on branch `workspace-settings-ui`. Delivers f
 
 - **Align styling of Workspace settings with About/Configuration screens.** Workspace settings uses the same quieter page structure as a Package's About and Configuration tabs.
 - **Size a Package's settings view to its content so the Package page scrolls as one** (DELTA-019 group 4, `TEAM.SYS.SHELL-R02`). The Shell-owned frame runtime reports content height over the frame bridge and the Shell sizes the frame.
-- **Notifications on Workspace settings and Package About pages never dismiss and are easy to miss** (`TEAM.SYS.SHELL-R08`). Shell-only: non-error notifications dismiss after 5 seconds, errors stay until closed with an X, styled after the External Gateway Package's configuration notifications. A notification carrying the only Restart or Retry control stays (DELTA-018 SF-304). The Package capability stays in **Shell notifications**.
-- **Rename and delete Workspaces** ([ADR 0048](.decisions/0048-local-workspace-rename-and-sole-creator-deletion.md), proposed; `TEAM.SYS.SHELL-R04`). Rename is Installation-local. Only the creator deletes, and only while no other Person is a Member; deletion erases the Workspace's Core data, Package Instances and Package Data Directories after the name is typed, and leaves mapped Documents folders on disk. Desktop only.
+- **Notifications on Workspace settings and Package About pages never dismiss and are easy to miss** (`TEAM.SYS.SHELL-R08`). Shell-only: non-error notifications dismiss after 5 seconds, errors stay until closed with an X, styled after the External Gateway Package's configuration notifications. A notification carrying the only Restart or Retry control stays (DELTA-018 SF-304). The Package capability is the Backlog Ticket *Shell & Core › Shell-owned notification mechanism with a Package capability*.
+- **Rename and delete Workspaces** ([ADR 0049](.decisions/0049-local-workspace-rename-and-sole-creator-deletion.md), proposed; `TEAM.SYS.SHELL-R04`). Rename is Installation-local. Only the creator deletes, and only while no other Person is a Member; deletion erases the Workspace's Core data, Package Instances and Package Data Directories after the name is typed, and leaves mapped Documents folders on disk. Desktop only.
 
 Planned order: styling, settings-view sizing, notifications, rename, delete. All five are implemented on the branch with automated checks; manual verification on macOS is pending.
 
@@ -85,14 +87,11 @@ Planned order: styling, settings-view sizing, notifications, rename, delete. All
 
 ### Native headless application (implementation in progress)
 
-The `headless` workstream uses the integrated gateway Host baseline `2039693` and shared Core Runtime, Package Host and Package contracts (ADR 0047). Its first step delivers exclusive application ownership and desktop restart handoff, compiled native Backend targets, target-aware Package assembly with isolated resource roots, and fail-closed Linux process evidence. Phase 2 adds `apps/teamarness-headless`: offline help/version, explicit foreground `serve`, a JSON `status` client, same-UID private Unix transport, bounded connection/operation admission, and signal-driven drain followed by Host/Core cleanup. The binary and loopback test executable use the same library composition. Readiness includes Host diagnostics; it does not claim global synchronization. Phase-local Rust suites, strict checks and dependency/transport guards qualify local behavior on Mac; native Linux execution remains pending lane N. Phase 3 adds explicit identity, Workspace and Core Agent commands, safe invitation/consent input, and generic Personal Package inspection, consent, installation and lifecycle. Join distinguishes committed membership from later Host reconciliation failure. An independently named source-built test fixture qualifies native admission, generations and retained data without changing Team instances. Phase 4 adds immutable admitted schema discovery and digest-pinned, validated non-rendered requests. Per-Instance operator ownership survives observer loss through lease cleanup and reply without gating normal Ports or background work. The unknown fixture qualifies durable settings, bounded one-time output, errors, delayed effects, reload invalidation and its own Agent Binding. Phase 5 adds explicit native `build:app` selection, isolated headless distributions with complete Team resources, final-byte/native-header verification, relocated GUI-free artifact smoke, and a manually installed Linux user-service runbook. Selected desktop builds retain existing bundle and release paths. Phase 6 adds source-current loopback sync-only qualification with two headless CLI/socket endpoints and an ordinary desktop Core/Host backend across two Workspaces, offline/restart catch-up, late join, bidirectional domain content and independent Personal install/remove without Team generation changes. The canonical [verification runbook](../docs/headless/verification.md) and independent [Agent](../docs/headless/follow-ups/agent.md) and [gateway](../docs/headless/follow-ups/external-gateway.md) briefs ship with the application. Final native Linux lane N, production mesh/service/desktop human observations, and independent Verify remain required; generic fixture evidence is not actual Agent/gateway product qualification.
+The `headless` workstream uses the integrated gateway Host baseline `2039693` and shared Core Runtime, Package Host and Package contracts (ADR 0047). Its first step delivers exclusive application ownership and desktop restart handoff, compiled native Backend targets, target-aware Package assembly with isolated resource roots, and fail-closed Linux process evidence. Phase 2 adds `apps/teamarness-headless`: offline help/version, explicit foreground `serve`, a JSON `status` client, same-UID private Unix transport, bounded connection/operation admission, and signal-driven drain followed by Host/Core cleanup. The binary and loopback test executable use the same library composition. Readiness includes Host diagnostics; it does not claim global synchronization. Phase-local Rust suites, strict checks and dependency/transport guards qualify local behavior on Mac; native Linux execution remains pending lane N. Phase 3 adds explicit identity, Workspace and Core Agent commands, safe invitation/consent input, and generic Personal Package inspection, consent, installation and lifecycle. Join distinguishes committed membership from later Host reconciliation failure. An independently named source-built test fixture qualifies native admission, generations and retained data without changing Team instances. Phase 4 adds immutable admitted schema discovery and digest-pinned, validated non-rendered requests. Per-Instance operator ownership survives observer loss through lease cleanup and reply without gating normal Ports or background work. The unknown fixture qualifies durable settings, bounded one-time output, errors, delayed effects, reload invalidation and its own Agent Binding. Phase 5 adds explicit native `build:app` selection, isolated headless distributions with complete Team resources, final-byte/native-header verification, relocated GUI-free artifact smoke, and a manually installed Linux user-service runbook. Selected desktop builds retain existing bundle and release paths. Phase 6 adds source-current loopback sync-only qualification with two headless CLI/socket endpoints and an ordinary desktop Core/Host backend across two Workspaces, offline/restart catch-up, late join, bidirectional domain content and independent Personal install/remove without Team generation changes. The canonical [verification runbook](../docs/headless/verification.md) and independent [Agent](../docs/headless/follow-ups/agent.md) and [gateway](../docs/headless/follow-ups/external-gateway.md) briefs ship with the application. Final native Linux lane N, production mesh/service/desktop human observations, and independent Verify remain required; generic fixture evidence is not actual Agent/gateway product qualification. Backlog: *Shell & Core › Headless: native Linux qualification and independent Verify*.
 
 The accepted native matrix is Apple Silicon desktop, Apple Silicon headless, and Ubuntu 26.04 x86_64 GNU/Linux headless. A selected build must build only that application/target. Agent and External Gateway production changes remain independent workstreams and are not synchronization dependencies. Native Linux automation and real service/logout/reboot observations remain pending their qualification lane; Mac tests do not establish them. Existing core roadmap Phase 5 ordering and desktop release tooling are unchanged.
 
-Headless compatibility intake ownership (independent Package work, not Host acceptance):
-
-- **Agent:** Agent Package maintainer (Don), workstream intake `agent-headless`. Pick up the [Agent brief](../docs/headless/follow-ups/agent.md) with the corrected Host commit and artifact ledger from the headless workstream. Record native artifact, model/configuration, and real Agent compatibility evidence there.
-- **External Gateway:** External Gateway maintainer (Don), workstream intake `external-gateway-headless`. Pick up the [gateway brief](../docs/headless/follow-ups/external-gateway.md) with the same pinned Host evidence. Record native home resolution, managed `tmx`, and real gateway compatibility evidence there. Neither intake is qualified by the generic Host fixture.
+Headless compatibility intake (independent Package work, not Host acceptance) is tracked in the Backlog: *Agent › Headless compatibility intake: Agent Package (agent-headless)* and *External Gateway › Headless compatibility intake: External Gateway (external-gateway-headless)*. The briefs remain in `docs/headless/follow-ups/`.
 
 ### External Gateway (full access verified locally; not integrated)
 
@@ -110,7 +109,7 @@ The follow-up `external-gateway-writes` delivers Person-selected ordinary querie
 
 Current evidence is `external-gateway-writes/verify/20261116T223500Z_validation.md`, its linked review and manual results, in the resolver-selected workstream store. `close/follow-ups.md` assigns the remaining checks and nonblocking documentation/test-maintenance work. Provider guides describe the Host error wrapper; gateway HTTP intentionally exposes Provider code, flags, and details directly under `error`. Clarifying that transport distinction is a documentation follow-up, not a change to the HTTP contract. CLI/onboarding distribution, full UI redesign, signed gateway-origin attribution, and stronger event/write guarantees remain separate. Keep the existing branches; no source push, merge, release, or normal-profile installation is authorized.
 
-The follow-up `external-gateway-onboarding` has completed implementation and is in Verify, with required native and detailed manual evidence still incomplete. Don accepted its native-picker direction, revised UI A, complete CLI interaction contract, and structural design on 2026-11-17. [ADR 0046](.decisions/0046-package-owned-managed-cli.md) selects one native Package artifact, a managed user-local `tmx` copy, private client credentials separate from verifier policy, and recoverable app-led setup. Every targeted CLI command requires an explicit Workspace; no project association or default is introduced. The design includes generic mount-bound navigation to the Package's Configuration tab and a Package-owned cancellable picker. G Phases 1–5 are committed: native CLI/streams, private client store, managed outputs, recoverable setup and Package-owned native picker. H Phase 6 implements generic own-Package Configuration navigation (mount contract 3/private bridge 4), with source-level lifecycle/isolation coverage. G Phase 7 canonical SDK refresh/revised A adoption is committed from clean H `46a9535` (all four trees canonical). H Phase 8 adds cumulative CLI/real-Host qualification with separately admitted, private-home fixture Backends and real CLI subprocesses; actual production artifacts remain separately hashed/offline-qualified. The [installed runbook](../docs/test-external-gateway-onboarding.md) uses the current account and one reused disposable app profile by default; a separate account is optional for clean-home or destructive checks. The final setup refinement separates CLI installation, Workspace credentials and optional skill installation, applies recognized CLI updates with one click, and places notices beside their controls. Don accepts the UI and reports successful Rotate → Disconnect → Reconnect, followed by an external-agent 32/32-Port smoke pass. Fresh qualification on H `96ff960` and G `7df368f` passes 322 Rust, 92 UI, 3 assembly tests and 17/17 real-Host cases; fresh complete three-lane source review retains no findings. Unreported detailed M1–M5 subchecks remain incomplete. The Phase-6 packaged isolation smoke is blocked by an existing same-name process AX targeting defect in the driver; it is not passing evidence and remains mandatory before final delivery. Automated checks do not substitute for those observations. [Remaining qualification and maintenance follow-ups](external-gateway-follow-ups.md) are tracked in `context/`, including deferred rate-limit feedback, an uncaptured guide failure, event counts, existing Refresh epic tickets, reliability observations and optional cleanup. No new fixes are requested from the smoke report. This work does not change core roadmap phase ordering or authorize integration, publication, or normal-profile installation.
+The follow-up `external-gateway-onboarding` has completed implementation and is in Verify, with required native and detailed manual evidence still incomplete. Don accepted its native-picker direction, revised UI A, complete CLI interaction contract, and structural design on 2026-11-17. [ADR 0046](.decisions/0046-package-owned-managed-cli.md) selects one native Package artifact, a managed user-local `tmx` copy, private client credentials separate from verifier policy, and recoverable app-led setup. Every targeted CLI command requires an explicit Workspace; no project association or default is introduced. The design includes generic mount-bound navigation to the Package's Configuration tab and a Package-owned cancellable picker. G Phases 1–5 are committed: native CLI/streams, private client store, managed outputs, recoverable setup and Package-owned native picker. H Phase 6 implements generic own-Package Configuration navigation (mount contract 3/private bridge 4), with source-level lifecycle/isolation coverage. G Phase 7 canonical SDK refresh/revised A adoption is committed from clean H `46a9535` (all four trees canonical). H Phase 8 adds cumulative CLI/real-Host qualification with separately admitted, private-home fixture Backends and real CLI subprocesses; actual production artifacts remain separately hashed/offline-qualified. The [installed runbook](../docs/test-external-gateway-onboarding.md) uses the current account and one reused disposable app profile by default; a separate account is optional for clean-home or destructive checks. The final setup refinement separates CLI installation, Workspace credentials and optional skill installation, applies recognized CLI updates with one click, and places notices beside their controls. Don accepts the UI and reports successful Rotate → Disconnect → Reconnect, followed by an external-agent 32/32-Port smoke pass. Fresh qualification on H `96ff960` and G `7df368f` passes 322 Rust, 92 UI, 3 assembly tests and 17/17 real-Host cases; fresh complete three-lane source review retains no findings. Unreported detailed M1–M5 subchecks remain incomplete. The Phase-6 packaged isolation smoke is blocked by an existing same-name process AX targeting defect in the driver; it is not passing evidence and remains mandatory before final delivery. Automated checks do not substitute for those observations. Remaining qualification and maintenance follow-ups are tracked in the Backlog's External Gateway epic (remaining qualification, rate limits, guide failure, error-shape docs, cleanup), with event counts under Backlog Package, and reliability observations, npm advisories and the architecture documentation update under Shell & Core. No new fixes are requested from the smoke report. This work does not change core roadmap phase ordering or authorize integration, publication, or normal-profile installation.
 
 ### Filesystem Docs (closed with accepted limitations)
 
@@ -146,7 +145,18 @@ Manual checks M1–M7 passed on 2026-11-01 with a real model. The first run foun
 
 **Outcome:** A Workspace plans its work as Epics and Tickets, and its Agents read and update Tickets beside the Members.
 
-**Follow-ups:** conflict detection across Installations (deferred by ADR 0039); the items in DELTA-021, including the untested Former member check, the snapshot limit of about 500 Tickets, and Port 1.0 text fixes before release.
+**Follow-ups:** tracked in the Backlog: *Backlog Package › Ticket conflict detection across Installations* and *Backlog Package › DELTA-021: Backlog Package findings accepted as tech debt*.
+
+### Backlog polish (implemented; manual checks pending; not integrated)
+
+Started on 2026-11-26 on branch `backlog-polish`, workstream `backlog-polish`, for the five ready Tickets in the Backlog's *Backlog Package* epic. [ADR 0048](.decisions/0048-backlog-ticket-references-and-cancelled-status.md), accepted 2026-11-26, decides Ticket references and the Cancelled status.
+
+- Every Ticket has a reference: the shortest unique prefix of its ID, at least four characters, shown as `#a3f2` in its row and in the detail pane. `ticket.get` takes a `ref`; an ambiguous ref lists its candidates (`TEAM.SYS.BACKLOG-R11`).
+- Status gains `cancelled`. The status filter gains **Not done**, which is the default. Schema migration 0002 widens the status check, and the first activation re-evaluates records an older build quarantined as malformed (`R12`).
+- Port Contract 1.1 is an additive minor over the pinned 1.0, and a 1.0 consumer still passes `backlog_ports_proof`.
+- The left pane widens from its right edge (drag, arrow keys; double-click or Home resets) and remembers its width. One button expands or collapses every Epic. Selecting a Ticket no longer rebuilds the left pane, and a rebuild keeps its scroll position.
+
+Automated evidence: Backend unit tests, Backlog UI tests, and both Backlog system tests pass. The scroll fix and the drag resize need a manual check in the desktop app: the UI tests run in happy-dom, which has no layout. An Installation on an older build quarantines a record that sets `cancelled` until it updates; the release notes must say so.
 
 ### Better Doc Agent (complete, verified locally)
 
@@ -161,7 +171,7 @@ Manual checks AC1–AC14 passed with a real model on 2026-11-01. Verify passed o
 
 **Outcome:** A Person @mentions an Agent in a Document Comment. The Agent revises the Document and replies in the thread, even while another Package is selected.
 
-**Follow-ups:** Agent-to-Agent mentions, with skill-guided loop limits; the items in DELTA-020.
+**Follow-ups:** tracked in the Backlog: *Agent › Agent-to-Agent mentions with skill-guided loop limits* and *Documents › Delta 020 v1.3*.
 
 ### Agent Doc Exhibit (complete, verified locally)
 
@@ -179,7 +189,7 @@ Integration evidence, 2026-10-31: three external cases in `tests/system/tests/ag
 
 **Outcome:** In chat, an Agent creates and revises a Document and publishes an Exhibit that the Steward opens by name, all attributed to the Agent.
 
-**Follow-ups:** a shared, human-curated Exhibit library catalog; larger Exhibits and an archive format; per-Agent turn bounds; staging the Agent harness for the Host's integration tests; and sizing a Package's settings view to its content so the Package page scrolls as one, as About does.
+**Follow-ups:** tracked in the Backlog: *Exhibits › Shared, human-curated Exhibit library catalog*; *Exhibits › Larger Exhibits and an archive format*; per-Agent turn bounds in *Agent › DELTA-019: Agent Doc Exhibit findings accepted as tech debt*; *Agent › Stage the Agent harness for the Host's integration tests*; and *Shell & Core › Size a Package's settings view to its content so the Package page scrolls as one*.
 
 ### Packagement (complete, verified locally)
 
@@ -209,7 +219,7 @@ All required implementation checks, the nine-case real Agent/Host integration ta
 
 Don approved local integration: reconcile main's documentation into alignment, land the Host first, then fast-forward standalone Agent main. No push or release is authorized. Registration replacement still takes effect on the next Host open. Packagement was then separate and had to preserve ports 2.0 when integrating, and to qualify restarting or reloading the Agent while commands remained unresolved. Its 2026-10-31 integration preserved ports 2.0 and qualified reloading the Agent with an unresolved command; see **Packagement** above. Per-Package Restart with an unresolved command is not separately tested ([DELTA-018](.delta/DELTA-018-packagement-accepted-tech-debt.md)). Existing full-Host retirement tests did not prove that case or that detached Provider work is quiescent.
 
-Follow-ups remain separate: Documents guidance/tools and Comments; Agent Chat versus the Host-owned Configuration view in Packagement; Exhibits file tooling; and the nonblocking published contract-identity grammar mismatch (`SM-003`, `contracts/package-capabilities/v1/package-ports-2.0.schema.json`). Historical Documents `StaleMount`, Core async-boundary stall and name-convergence timeout remain unexplained; passing checks do not establish their cause or repair.
+Follow-ups are tracked in the Backlog: *Agent › Agent Document tools and live-revise check (TEAM-DQ10)*; *Agent › Agent Chat versus the Host-owned Configuration view*; *Exhibits › Exhibits file tooling*; and *Shell & Core › Published contract-identity grammar mismatch (SM-003, package-ports 2.0 schema)*. Historical Documents `StaleMount`, Core async-boundary stall and name-convergence timeout remain unexplained; passing checks do not establish their cause or repair.
 
 ### Exhibits Package (slice 1 delivered; slice 2 planned)
 
@@ -221,7 +231,7 @@ Two generic seams carry the content, and neither names Exhibits. The Host capabi
 
 **Depends on:** Package interface, Agent Package (ADR 0030 actor).
 
-**Slice 2 (planned):** a Person takes an immutable Snapshot of a Draft to share it with the Workspace. Snapshots are manifest records on the immutable record log. Their files travel through a new Core-native blob capability family (`teamarness.synchronization.blobs`) as content-addressed, Content-Key-sealed blobs. Slice 2 also adds Snapshot history, continuing from any Snapshot, and local remove and restore. Teaching the standalone Agent Package to call the Exhibits Ports is a separate workstream in that Package's repository.
+**Slice 2 (planned):** a Person takes an immutable Snapshot of a Draft to share it with the Workspace. Snapshots are manifest records on the immutable record log. Their files travel through a new Core-native blob capability family (`teamarness.synchronization.blobs`) as content-addressed, Content-Key-sealed blobs. Slice 2 also adds Snapshot history, continuing from any Snapshot, and local remove and restore. Teaching the standalone Agent Package to call the Exhibits Ports is a separate workstream in that Package's repository. Tracked in the Backlog as *Exhibits › Add sharing*.
 
 ### Agent Package (complete, verified locally)
 
@@ -339,7 +349,7 @@ Implemented on branch `don-smith/rendered_doc_editing`, workstream `rendered-doc
 - the rendered editor, with per-person undo, split-then-refuse paste guards, copy as Markdown, and comment on selection;
 - Documents Port Contract 1.1 (`document.list`, `document.markdown`, `document.revise`, `documents.changed`), proven through the Host broker, where a Workspace Agent bound on the Installation revises a Document as itself (ADR 0033).
 
-The record format changed incompatibly, so development data directories that hold Documents must be reset. Automated checks pass, including the WebKit and Chromium frame scenarios (`npm run verify:documents-editor`). The long property run passed in Verify, and the developer checked live sync and an offline-then-online merge across two instances. The packaged-app isolation probe, IME input, and the two-second latency observation were not run before integration and remain open checks. Frame-policy findings are recorded in [DELTA-014](.delta/DELTA-014-package-ui-frame-form-and-select-behaviour.md). Edge cases that Verify confirmed and the developer accepted as tech debt are recorded in [DELTA-013](.delta/DELTA-013-documents-editor-accepted-tech-debt.md). Agent document tools, Agent mentions and Comment ports are tracked under **Agent participation in Package Ports**, and the remaining editor work is tracked under **Documents editor maintenance**, both in Planned follow-up workstreams.
+The record format changed incompatibly, so development data directories that hold Documents must be reset. Automated checks pass, including the WebKit and Chromium frame scenarios (`npm run verify:documents-editor`). The long property run passed in Verify, and the developer checked live sync and an offline-then-online merge across two instances. The packaged-app isolation probe, IME input, and the two-second latency observation were not run before integration and remain open checks. Frame-policy findings are recorded in [DELTA-014](.delta/DELTA-014-package-ui-frame-form-and-select-behaviour.md). Edge cases that Verify confirmed and the developer accepted as tech debt are recorded in [DELTA-013](.delta/DELTA-013-documents-editor-accepted-tech-debt.md). Agent document tools are tracked in the Backlog as *Agent › Agent Document tools and live-revise check (TEAM-DQ10)* (Agent mentions and Comment Ports were delivered by Documents 1.3), and the remaining editor work as *Documents › Documents editor maintenance*.
 
 **Outcome:** Members edit a Document in rendered form and converge, and another Package reads and revises it as Markdown against a base version.
 
@@ -353,30 +363,13 @@ The `auto-update` workstream delivered stable public `v0.1.0`, `v0.1.1` and `v0.
 
 PR/main now use lightweight Linux formatting, guards, lint, types and fast tests. Full native checks and artifact qualification run at release time before protected signing and publication. This avoids repeating heavyweight validation on PR and main; green main alone is not native release qualification.
 
-**Follow-ups, owner Don/maintainer:** closure accepts the controlled single-user outcome, not complete independent continuity/security qualification or a fresh whole-range formal Verify. Retain the [runbook's broader manual checks](../docs/releasing.md#manual-bootstrap-terminal-recovery-and-ab-qualification): backup/key restoration, exact Identity/argument/process-group continuity, complete persisted-content comparison and all-Backend health. The ordinary local bundle rebuild/smoke remains deferred. The Host deadline finding [DELTA-022](.delta/DELTA-022-host-deadline-qualification-failure.md) is not fixed; the later Documents `StaleMount` is also undiagnosed despite subsequent passing runs. Future Host/Documents reliability work must keep those findings separate. Detailed updater diagnostics and further CI speed work remain optional follow-up scopes, not hidden work in this closed delivery.
+**Follow-ups, owner Don/maintainer:** closure accepts the controlled single-user outcome, not complete independent continuity/security qualification or a fresh whole-range formal Verify. The runbook's broader manual checks, the deferred ordinary local bundle rebuild/smoke and the optional follow-ups are tracked in the Backlog: *Shell & Core › Stable releases: broader manual qualification and optional follow-ups*. The Host deadline finding [DELTA-022](.delta/DELTA-022-host-deadline-qualification-failure.md) is not fixed; the later Documents `StaleMount` is also undiagnosed despite subsequent passing runs. Future Host/Documents reliability work must keep those findings separate. Detailed updater diagnostics and further CI speed work remain optional, not hidden work in this closed delivery.
 
 Only this stable single-platform application update work moves out of Later. Tray/native menus, Developer ID/notarization, other targets, per-Package updates and one-hour adoption remain deferred. Local-first use does not require GitHub.
 
 ## Later (unscheduled)
 
-Intent with no delivery phase yet. Moving an item into a phase is a roadmap change.
-
-- Custom relay server configuration for teams (`TEAM-R11`, `TEAM.SYS.TRANS-R02`).
-- System tray and native menus (`TEAM.SYS.SHELL-R01`, ADR 0002).
-- One-hour update adoption (vision success criterion 6), Developer ID signing and notarization (`TEAM.DEL`); see **Stable application releases and updates** for the consent-driven tooling, not an adoption guarantee.
-- Linux desktop: qualify Tauri, native UI dependencies, bundle delivery and desktop lifecycle separately after the headless workstream. It is not an accepted build selection in that workstream.
-- Other CPU/libc targets, cross-compilation, launchd integration and public headless distribution/signing/update delivery.
-- Published, versioned Rust and TypeScript SDK artifacts and a generated-project upgrade policy (Phase 3 external authoring condition, ADR 0010).
-- Workspace-scoped Package registration and per-Workspace enablement (Package Registration Scope `workspace`). Today every admitted eager Package runs one Backend per Workspace (5 eager bundled Packages × 3 Workspaces = 15 processes); the on-demand Exhibits Package starts only on first use. Measure before scheduling.
-- Documents maintenance and wider qualification: Filesystem Docs is closed with owner-accepted limitations. Don/the next Documents maintainer owns DELTA-023 group 12's CR-301/302, three P2 improvements and deferred manual/platform checks. Prioritize from real use or wider-release needs rather than restarting the completed workstream automatically (ADRs 0041 and 0043).
-- View earlier Document versions and copy from them, built on the immutable record history. A change too large to undo in one record is not undoable (ADR 0032), and this is how a Member recovers from one.
-- Document log compaction via the reserved `document.snapshot` record kind (ADR 0027). It must keep Port Contract version tokens resolvable or refuse stale ones explicitly (ADR 0032).
-- Existing-Member Documents metadata catch-up after app restart ([DELTA-011](.delta/DELTA-011-documents-offline-metadata-catchup.md)): diagnose the observed Collection/Document delay before proposing a fix. A later edit coincided with visibility, but no full-app cause or reproduction is established.
-- A Conversations delivery qualification that meets `TEAM.SYS.CONV-R16`, including a 25-Member measurement (DELTA-008).
-- Platform key custody: store a key-encryption key in the macOS Keychain once signed builds exist (ADR 0017 triggers). The Agent Package's `api-key` file, protected only by file mode `0600` today, joins this item.
-- Agent Package: streaming replies and unprompted or scheduled posts. Generic tool use beyond declared Ports and runtime discovery are delivered by **Agent-controlled Package Ports**. Documents participation remains under **Documents Agent tools and Comments**.
-- Network denial for Exhibit content frames: a navigation handler and WebRTC denial beside the content policy's `connect-src` ([DELTA-015](.delta/DELTA-015-exhibit-content-network-access.md), ADR 0034).
-- Package platform authoring contracts: align the immutable-record-log 1.1 JSON request schema with the optional `principal` selector already supported by Host and SDK. See [DELTA-012](.delta/DELTA-012-record-log-principal-schema.md). This inherited mismatch is not resolved by the Agent integration.
+Unscheduled intent moved to the Teamarness Backlog on 2026-11-26 as `low`-priority, `not_ready` Tickets in the matching epic; each Ticket carries the text that was here. Moving one into a phase is a roadmap change.
 
 ## Not planned
 
@@ -385,13 +378,22 @@ Intent with no delivery phase yet. Moving an item into a phase is a roadmap chan
 
 ## Planned follow-up workstreams
 
-Identified on 2026-09-17 during Scope of the UI polish workstream. Each needs its own Scope.
+These follow-ups moved to the Teamarness Backlog on 2026-11-26; each Ticket carries the text that was here and still needs its own Scope.
 
-### External Gateway maintenance and remaining qualification
-
-The [repository-owned follow-up list](external-gateway-follow-ups.md) records owners, reported observations, uncertainty and next evidence for Gateway rate limits and wait guidance, the isolated Exhibits guide failure, Backlog event counts, architecture documentation drift, Documents Markdown escaping, reliability/dependency maintenance and optional cleanup. Don defers changes from the smoke report. The two reported Refresh epic tickets already exist and must not be duplicated.
-
-Required packaged native/frame-isolation and unreported detailed manual qualification remain distinct from that unscheduled maintenance. Final source review and automation pass, and Don accepts the functional/UI happy path; overall delivery approval remains pending. MyFlow reports are evidence, not the backlog.
+| Former section | Ticket (*Epic › Title*) |
+|---|---|
+| External Gateway maintenance and remaining qualification | *External Gateway › External Gateway onboarding: remaining qualification*, and the other External Gateway Tickets |
+| Shell notifications | *Shell & Core › Shell-owned notification mechanism with a Package capability* |
+| Package visibility | *Shell & Core › Package visibility: hide and show Packages from Workspace settings* |
+| Conversations UI overhaul (remote delivery) | *Conversations › Conversations UI overhaul: decide remote delivery* |
+| Conversations history maintenance | *Conversations › Conversations history maintenance*; *Conversations › Real Message time provenance* |
+| Data format versioning | *Shell & Core › Data format versioning ADR* |
+| WebAssembly Package class | *Shell & Core › WebAssembly Package class: re-evaluate ADR 0006* |
+| Package distribution and per-Instance restart | *Shell & Core › Package distribution, signing and per-Instance restart* |
+| Workspace Principal maintenance | *Shell & Core › Workspace Principal maintenance* |
+| Documents Agent tools and Comments | *Agent › Agent Document tools and live-revise check (TEAM-DQ10)* |
+| Documents editor maintenance | *Documents › Documents editor maintenance* |
+| Core test reliability | *Shell & Core › Core and Host test reliability: diagnose load-sensitive failures* |
 
 ### Member names
 
@@ -399,27 +401,11 @@ Incremental delivery on `feature/member-names`: Core-owned Workspace Person IDs 
 
 **Depends on:** membership synchronization delivered by the architecture review.
 
-### Shell notifications
-
-The Shell-only part for Shell-owned screens is delivered by **Workspace settings UI** (`TEAM.SYS.SHELL-R08`); the Package capability remains here (Backlog: "Shell-owned notification mechanism with a Package capability"). Replace the persistent status and error messages at the top of the selected-content pane with a Shell-owned notification mechanism that reserves or overlays space and dismisses non-error notifications automatically. Packages use the same mechanism through a generic capability, so notification presentation stays consistent.
-
-### Package visibility (complete)
-
-Delivered: Workspace settings shows a hide/show toggle per Package. Let a person hide a Package from contextual navigation and show it again from Workspace settings, for example to hide the Tutorial and Reference Packages after first use.
-
-### Conversations UI overhaul (verified; remote delivery pending)
-
-The Conversations Package UI redesign and history-continuity replacement are complete on the isolated `conversations-ui-overhaul` branch. The Package owns its projection journal, bounded change feed, independent history retries, and reading-position anchor. Automated checks and exact-range review pass. The developer accepted limited two-instance desktop coverage; long-history and other unavailable fixtures remain untested. The developer approved a local merge into `main`. Remote delivery needs a separate decision.
-
-### Conversations history maintenance (unscheduled)
-
-If prioritized, start a separate Scope for these nonblocking review findings: make the advancing-page mount fixture supply a valid open watermark (`SM-007`); avoid one redundant terminal delta request (`SF-006`); and restore the no-request assertion for malformed Channel slugs (`SM-008`). Retest the accepted but unavailable long-history, theme, resize, keyboard-error, and pending-access desktop cases when safe fixtures exist. If an issue appears, open a new workstream rather than rewriting the accepted manual result. Real Message time provenance also needs a separate Scope before dates or times can be shown; no timestamp was fabricated in this workstream.
-
 ### Package platform direction (recorded 2026-10-21)
 
 A design conversation on 2026-10-21 compared Teamarness with a thin-shell, package-host application model (WebAssembly components, typed ports, drop-in installation, per-package updates) and a biological membrane analogy. Reading the conversation against the context tree found that most of the "membrane" already exists at the Host seam: manifest-declared capability families negotiated per activation (ADR 0018), closed-schema UI contracts with requests and subscriptions, a Shell-owned UI contract (ADR 0015), and host-brokered calls. Two gaps remain: a Package cannot offer commands, queries, or events to another Package, and there is no Package signing, endorsement, or update distribution. Once Core owns Packages' seams, almost all later development is Package authoring, so these seams decide how far Package work can be parallelized.
 
-The agreed sequence is four workstreams. Each needs its own Scope.
+The agreed sequence is four workstreams. Package interface is recorded below; the other three are Backlog Tickets (see the table above).
 
 #### Package interface
 
@@ -427,79 +413,6 @@ Implementation in progress: the declaration, admission, scoped broker, and live 
 
 A Package declares the exact commands, queries, and events it provides or consumes. The Host resolves one Provider per contract at admission and routes grants in the caller's Workspace. On-demand activation is opt-in; Conversations remains eager for background synchronization. The real Conversations contract shipped a Person-only post, read-only page, and live coalescible invalidation; the Host derived a Person actor only. The Agent Package workstream (ADR 0030, see **Current work**) then added the Host-derived Agent actor, Conversations 1.1 with Agent-authored posts and `channel.list`, and the Agent runtime. An in-app diagnostics view needs a separate Observability Scope; bounded local observations do not provide one. The Package Process major, UI Host version, and existing capability families do not change.
 
-#### Data format versioning
-
-An ADR that governs the stored-record seam separately from the live Host seam that ADR 0018 governs. Synced records are signed by peers that cannot be asked to stop, so an old reader must tolerate additive fields and degrade visibly, never reject or fork. Today the Conversations and Documents canonical codecs are positional and reject trailing bytes, and the pinned Loro CRDT will make its encoding part of the Documents format. Scheduled early because there is no install base yet, which makes the rule cheapest now.
-
-#### WebAssembly Package class
-
-Re-evaluate ADR 0006's deferral. Its blocking reason, Package-owned Tokio and Iroh work, was removed by ADR 0007 when Core took ownership of transport and replication, and WASI 0.3 with component-model async has since shipped. The open question is Package-local state without native SQLite or `gix`. Agent Packages holding an Agent key with the user's ambient authority (ADR 0023) are the motivating case for a stronger execution boundary. Outcome: an ADR introducing a second Package class, or a dated re-deferral with explicit criteria.
-
-#### Package distribution and per-Instance restart
-
-Author signature over the Package artifact, a team endorsement of an exact digest and capability set recorded in the membership log, a Host-owned update feed per Package (The Update Framework's threat list as the checklist, Packages never fetch their own updates), a consolidated installed-Packages view with permission diffs, and restarting one Package Instance without restarting the application. Depends on the code-signing work under Later. The Packagement workstream (see **Current work**) delivers live install, reload, and per-Instance restart for Personal Packages only; Team Package changes still apply at the next start.
-
-### Workspace Principal maintenance (unscheduled)
-
-Start a separate Scope if sustained name-delivery or membership churn becomes an ordinary workload. Two bounded deferred-name replay schedules can starve an eligible name while churn continues; finite backlogs converge. That Scope should also decide whether to use or retire the unused deferred-reference target index. A smaller Core maintenance change can reuse one clock sample for local Agent removal. Clarify the ontology's Agent Identity keypair wording without changing key custody. Diagnose the intermittent `names_converge_without_package_instance_after_restart` test failure before changing a deadline or claiming that a passing retry fixed it. The `agent-invite` final Verify report owns the evidence; these are follow-ups, not unverified passes or blockers to the completed supported flow.
-
-### Documents Agent tools and Comments (follow-up)
-
-Identified on 2026-10-25 when rendered Document editing closed. Documents Port Contract 1.1 already lets a bound Workspace Agent list, read, observe and revise Documents (ADR 0033). The Agent Package now supports generic tools. Documents 1.2 adds `runtime.guide` and `document.create` (ADR 0038), so it is eligible for Agent discovery; see **Agent Doc Exhibit** under **Current work**. The generic guidance direction is delivered by [ADR 0035](.decisions/0035-agent-controlled-port-discovery.md) and the completed alignment workstream above. [TEAM-DQ10](open-questions.md) retains these Documents follow-ups:
-
-- Documents guidance and generic Agent tools can follow the ordinary `runtime.guide` convention; no Documents-specific Host adapter is planned.
-- Agent document tools in the standalone Agent Package, built on that guidance. A tool reads before every revise and revises against the version it read (R12).
-- Agent mentions and Comment Ports for Documents: delivered by Documents 1.3 (see **Better Doc Agent** under **Current work**).
-- A developer check once tools exist: an Agent revises a Document that a Member has open, and the change appears live.
-
-### Documents editor maintenance (unscheduled)
-
-Start a separate Scope if prioritized. These items were left open when rendered Document editing closed on 2026-10-25.
-
-- **Accepted tech debt:** [DELTA-013](.delta/DELTA-013-documents-editor-accepted-tech-debt.md) records the editor's size-estimate and undo-budget gaps, pasted link addresses, the concurrent-open session leak, and the retained test and naming items.
-- **Frame-policy divergences:** [DELTA-014](.delta/DELTA-014-package-ui-frame-form-and-select-behaviour.md) records the form-submit and `<select>` behaviour.
-- **Manual checks not yet run:**
-  - the packaged-app isolation probe (`npm run tauri build -- --bundles app,dmg`, then `npm run verify:packaged-app`);
-  - IME input in WKWebView;
-  - the two-second remote-edit latency observation (`TEAM.SYS.DOCS-R06`);
-  - the large-paste and delete-all undo checks.
-- **Robustness:**
-  - CPU and SQLite work run on async workers, and import costs grow with records × body size (`CR-006`).
-  - The hub-wide `identity_lookup_lock` is held across the Core append, which serialises local writes (`CR-007`).
-  - The growth budget counts only text (`CR-009`).
-  - A split paste continues after one piece is refused (`CR-103`).
-  - Exact measurement runs on keystrokes in large lists (`CR-104`).
-  - A revise merges before its cheap refusals while it holds the append lock (`CR-105`).
-  - A recovered poisoned gate can leave a body missing a committed record without a diagnostic (`CR-106`).
-  - A shared 256-slot session channel can cause a storm of snapshot reopens (`CR-204`).
-  - An Agent's refusal before the append is reported as outcome-uncertain rather than certain (`CR-501`). A refused Agent write also leaves no diagnostic.
-- **Contract and records:**
-  - `document.revise` can return undeclared `documents.document_too_large` and retryable `documents.edit_failed` (`SF-102`).
-  - `markdown-contract.md` omits the diff time budget (`SF-103`).
-  - The system proof never reaches the Provider's `actor_unauthorized` (`SF-205`).
-  - Conversations and Documents report Core's `principal_not_bound` in different shapes.
-- **Maintainability:**
-  - Cross-language bounds and the mark-expand configuration are hand-copied between TypeScript and Rust (`SM-003`, `SM-004`).
-  - The frame-scenario harness re-implements the Backend session protocol, uses fixed sleeps, and is not linted or type-checked (`SM-005`–`SM-007`).
-  - Loro parity is checked twice (`SM-008`).
-  - `skipLibCheck` is undocumented (`SM-009`).
-  - `backend.rs` holds the Editor Session seam without a module boundary (`SM-010`).
-  - `adopt_import` copies fields by hand (`SM-103`).
-  - There is duplication from corrective commits (`SM-105`).
-  - The Agent revise path is a boolean flag inside the shared write path (`SM-503`).
-- **Test gaps:**
-  - the undo growth refusal (`SM-106`);
-  - `Verifies:` citations in the TypeScript tests (`SM-206`);
-  - an uncertain Agent append failure, and an Agent revision relayed to an open Editor Session (`SM-504`).
-
-### Core test reliability (unscheduled)
-
-Three Core tests failed or hung under machine load during rendered Document editing Verify, and passed when run alone. That branch changed no Core files. Diagnose before changing them:
-
-- `runtime_tests::async_boundary::inbound_log_sync_receiver_calls_do_not_block_the_executor` hangs intermittently.
-- `runtime_tests::sync_authorization::names_converge_without_package_instance_after_restart` fails with "connection lost".
-- `sync_bounds::revocation_during_backoff_prevents_redial` fails once under load.
-
 ## Maintenance rule
 
-Update this roadmap when a phase starts, closes, changes order, or changes direction. Update subsystem requirements and specs when behavior or architecture intent changes. Record hard-to-reverse trade-off decisions in `context/.decisions/`, unresolved design questions in `context/open-questions.md`, and known implementation divergence in `context/.delta/`. Track actionable follow-ups in this roadmap or a linked repository-owned `context/` file. MyFlow artifacts retain evidence and history; they are not a source of remaining work.
+Update this roadmap when a phase starts, closes, changes order, or changes direction. Update subsystem requirements and specs when behavior or architecture intent changes. Record hard-to-reverse trade-off decisions in `context/.decisions/`, unresolved design questions in `context/open-questions.md`, and known implementation divergence in `context/.delta/`. Track remaining work — features, follow-ups, qualification gaps, and the work to resolve an open delta — as Tickets in the Teamarness Backlog, not in `context/` files or MyFlow artifacts. Link a delta or open question to its Ticket under Tracking. MyFlow artifacts retain evidence and history; they are not a source of remaining work.

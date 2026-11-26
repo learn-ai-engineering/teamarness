@@ -183,3 +183,7 @@ The cumulative technical review `verify/20261117T000228Z_slice-c-review-3.md` re
 **Broader qualification remains open:** real provider eviction, physical dual-alias storage, case-sensitive recovery execution, Linux and Windows watchers, separate-network latency, historical executables and distribution signing. App/DMG build success was ad-hoc linker signing, not Developer ID or notarization. Existing zero-files, hash-only move, uncertain-create, ambiguous-intent, race and repeat-archive limits remain.
 
 **Owner and destination:** Don or the next Documents maintainer, in a separately prioritized Documents maintenance/qualification scope. Revisit when actual use or a wider release justifies it; do not automatically restart the closed corrective loop. No further implementation is implied by recording these items.
+
+## Tracking
+
+- Teamarness Backlog: *Documents › Filesystem Docs maintenance and wider qualification (DELTA-023)*

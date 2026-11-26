@@ -271,7 +271,7 @@ async fn local_and_response_strict_prefixes_reconcile_without_replacement() {
     fs::remove_dir_all(later_directory).unwrap();
 }
 
-/// The Workspace name is Installation-local metadata (ADR 0048): a re-import that carries a
+/// The Workspace name is Installation-local metadata (ADR 0049): a re-import that carries a
 /// different inviter name is accepted and keeps the local name and membership.
 #[tokio::test]
 async fn reimport_with_a_different_name_keeps_local_state() {

@@ -88,7 +88,7 @@ A Member chooses a Unicode Workspace Person Name at create/join and may rename o
 
 **Status:** open.
 
-**Blocks:** Roadmap Phase 5 (Membership Management), which introduces Workspace leave and member removal.
+**Blocks:** Roadmap Phase 5 (Membership Management), which introduces Workspace leave and member removal. Tracked with Phase 5 in the Teamarness Backlog: *Shell & Core › Phase 5 — Membership Management and Hardening*.
 
 **Question:** When the local Installation leaves a Workspace or is revoked from it, does the Package Host suspend that Workspace's Package Instances, dispose them, or retain them and their Package Data Directories?
 
@@ -100,7 +100,7 @@ A Member chooses a Unicode Workspace Person Name at create/join and may rename o
 
 **Owner:** roadmap Phase 5.
 
-**Partial answer:** ADR 0048 (proposed) decides the deletion case only: when the sole creator deletes a Workspace, the Package Host disposes its Package Instances and removes their Package Data Directories. Leave and revocation remain open.
+**Partial answer:** ADR 0049 (proposed) decides the deletion case only: when the sole creator deletes a Workspace, the Package Host disposes its Package Instances and removes their Package Data Directories. Leave and revocation remain open.
 
 
 ## Stable release operations (delivered; broader qualification remains separate)
@@ -120,4 +120,4 @@ Don/maintainer retains key custody and the [runbook's broader qualification](../
 
 **Still open:** standalone Agent tools for Documents. Agent mentions and Comment Ports are delivered by Documents 1.3 (better-doc-agent, 2026-11-01). The read-before-revise and live-editor check remain separate follow-ups, not delivered here.
 
-**Owner:** agent-port-discovery for the generic interface; later Scope for Documents tools and Comments.
+**Owner:** agent-port-discovery for the generic interface; later Scope for Documents tools and Comments, tracked in the Teamarness Backlog: *Agent › Agent Document tools and live-revise check (TEAM-DQ10)*.

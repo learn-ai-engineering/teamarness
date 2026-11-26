@@ -165,6 +165,34 @@ impl Projection {
         self.tickets.iter()
     }
 
+    /// The Ticket IDs immediately before and after `id` in ID order, which decide its
+    /// reference (ADR 0048).
+    pub fn ticket_neighbours(&self, id: &str) -> (Option<&str>, Option<&str>) {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let previous = self
+            .tickets
+            .range::<str, _>((Unbounded, Excluded(id)))
+            .next_back()
+            .map(|(other, _)| other.as_str());
+        let next = self
+            .tickets
+            .range::<str, _>((Excluded(id), Unbounded))
+            .next()
+            .map(|(other, _)| other.as_str());
+        (previous, next)
+    }
+
+    /// Every Ticket ID that starts with `prefix`, in ID order.
+    pub fn tickets_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a String> {
+        self.tickets
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(id, _)| id)
+            .take_while(move |id| id.starts_with(prefix))
+    }
+
     pub fn texts(&self) -> &TextMap {
         &self.texts
     }

@@ -27,6 +27,7 @@ Bound and count mark attributes per run in the estimate, bound pasted link addre
 
 ## Tracking
 
+- Teamarness Backlog: *Documents › Documents editor maintenance*
 - `TEAM.SYS.DOCS-R09`, `TEAM.SYS.DOCS-R13`; ADR 0032
 - `packages/documents-package/ui/src/editor/{guard,undo}.ts`, `packages/documents-package/ui/src/controller.ts`
 - `rendered-document-editing` workstream: the fourth Verify report and its review artifact

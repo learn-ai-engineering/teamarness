@@ -73,7 +73,7 @@ async function mounted(backlog: FakeBacklog) {
     option.click();
   };
   const select = async (title: string) => {
-    [...root.querySelectorAll<HTMLButtonElement>(".ticket-title")].find((b) => b.textContent?.startsWith(title))!.click();
+    [...root.querySelectorAll<HTMLButtonElement>(".ticket-title")].find((b) => b.querySelector(".ticket-title-text")?.textContent?.startsWith(title))!.click();
     await settle();
   };
   const epicToggle = (title: string) => [...root.querySelectorAll<HTMLButtonElement>(".epic-button")]
@@ -267,7 +267,7 @@ describe("Save and Cancel clear the Ticket's draft only", () => {
 
 describe("remembered helpers", () => {
   const ticket: Ticket = {
-    ticketId: recordId(9), epicId: ALPHA, title: "T", body: "B", status: "ready", priority: "high", assignee: null,
+    ticketId: recordId(9), ref: recordId(9), epicId: ALPHA, title: "T", body: "B", status: "ready", priority: "high", assignee: null,
     archived: false, version: order(9), creator: "c", createdAt: 1, lastEditor: "c", lastAt: 1,
   };
 

@@ -29,3 +29,7 @@ Temporary instrumentation (since reverted) established these facts:
 3. Reproduce the post-join `markdown` failure with the request error captured.
 4. Check whether the negative `Nested.md` assertion exposes a placement-ordering bug in legacy flat mappings.
 5. Re-enable the test in the required checks once it passes repeatedly on a cold macOS build.
+
+## Tracking
+
+- Teamarness Backlog: *Documents › DELTA-024: flaky Documents folder sync qualification (test ignored)*

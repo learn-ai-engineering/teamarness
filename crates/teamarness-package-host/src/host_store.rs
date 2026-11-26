@@ -208,7 +208,7 @@ impl HostStore {
             .map_err(fault!(storage_failure()))
     }
 
-    /// Records that the Host has started deleting a Workspace (ADR 0048).
+    /// Records that the Host has started deleting a Workspace (ADR 0049).
     pub(crate) fn mark_workspace_deletion(
         &self,
         installation: &str,

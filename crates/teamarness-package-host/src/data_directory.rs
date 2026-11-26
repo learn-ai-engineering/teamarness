@@ -131,7 +131,7 @@ const fn unrepresentable() -> DataDirectoryFailure {
     }
 }
 
-/// Removes a deleted Workspace's Package Data Directories and then its Host rows (ADR 0048).
+/// Removes a deleted Workspace's Package Data Directories and then its Host rows (ADR 0049).
 ///
 /// Paths come from the stored mappings, not recomputed, and are validated like an allocation.
 /// Removal never follows a symbolic link, so a folder a Package linked to (such as a mapped

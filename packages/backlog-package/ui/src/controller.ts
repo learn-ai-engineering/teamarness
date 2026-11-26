@@ -5,7 +5,26 @@ import type {
 } from "./contract.generated";
 import { MAX_DRAFTS, draftOf, hasChanges, restoreEdit } from "./remembered";
 
-export type Filters = Readonly<{ priority: Priority | null; status: Status | null }>;
+/** A status filter: one status, every status not yet resolved, or `null` for all statuses. */
+export type StatusFilter = Status | "not_done";
+
+export type Filters = Readonly<{ priority: Priority | null; status: StatusFilter | null }>;
+
+/** The filters with nothing remembered: open work at every priority (ADR 0048). */
+export const DEFAULT_FILTERS: Filters = { priority: null, status: "not_done" };
+
+/** The statuses "Not done" keeps: work that is neither done nor cancelled. */
+export const NOT_DONE: ReadonlySet<Status> = new Set<Status>(["not_ready", "ready", "in_progress"]);
+
+/** Whether a Ticket's status passes the status filter. */
+export function matchesStatus(filter: StatusFilter | null, status: Status): boolean {
+  return filter === null || (filter === "not_done" ? NOT_DONE.has(status) : filter === status);
+}
+
+/** The narrowest the Epic rail is dragged to, in CSS pixels; also its default width. */
+export const MIN_NAV_WIDTH = 320;
+/** The widest remembered rail width (`navWidth.maximum`). */
+export const MAX_NAV_WIDTH = 4096;
 
 /** The Ticket fields a Person edits in the detail pane. */
 export type TicketFields = Readonly<{
@@ -90,6 +109,8 @@ export type ControllerState = Readonly<{
   filters: Filters;
   /** Epics whose Tickets are shown in the tree. */
   expandedEpicIds: ReadonlySet<string>;
+  /** The Epic rail's width in CSS pixels after a drag, or `null` for the default width. */
+  navWidth: number | null;
   /** The Ticket chosen in the tree; the detail pane shows it. */
   selectedTicketId: string | null;
   /** The selected Ticket in full, with any edit in progress. */
@@ -100,11 +121,11 @@ export type ControllerState = Readonly<{
 }>;
 
 export const PRIORITIES: readonly Priority[] = ["high", "medium", "low"];
-export const STATUSES: readonly Status[] = ["not_ready", "ready", "in_progress", "done"];
+export const STATUSES: readonly Status[] = ["not_ready", "ready", "in_progress", "done", "cancelled"];
 
 export const PRIORITY_LABEL: Readonly<Record<Priority, string>> = { high: "High", medium: "Medium", low: "Low" };
 export const STATUS_LABEL: Readonly<Record<Status, string>> = {
-  not_ready: "Not ready", ready: "Ready", in_progress: "In progress", done: "Done",
+  not_ready: "Not ready", ready: "Ready", in_progress: "In progress", done: "Done", cancelled: "Cancelled",
 };
 
 const EMPTY: Snapshot = { availability: "catching_up", warnings: [], epics: [], tickets: [] };
@@ -140,8 +161,9 @@ export class BacklogController {
     snapshot: EMPTY,
     loaded: false,
     showArchived: false,
-    filters: { priority: null, status: null },
+    filters: DEFAULT_FILTERS,
     expandedEpicIds: new Set(),
+    navWidth: null,
     selectedTicketId: null,
     detail: null,
     names: { available: false, cursor: "0", principals: [] },
@@ -186,6 +208,7 @@ export class BacklogController {
       showArchived: state.showArchived,
       filters: { priority: state.filters.priority, status: state.filters.status },
       expandedEpicIds: new Set(state.expandedEpicIds),
+      navWidth: state.navWidth ?? null,
     });
     this.selectTicket(state.selectedTicketId ?? null);
   }
@@ -196,7 +219,7 @@ export class BacklogController {
    * when they hold changes.
    */
   rememberedState(): { state: RememberedState; keep: string | null } {
-    const { detail, filters, showArchived, expandedEpicIds, selectedTicketId } = this._state;
+    const { detail, filters, showArchived, expandedEpicIds, navWidth, selectedTicketId } = this._state;
     const drafts: Record<string, Draft> = Object.fromEntries(this.drafts);
     const edit = detail?.edit ?? null;
     if (detail !== null && edit !== null) drafts[detail.ticketId] = draftOf(edit);
@@ -206,6 +229,7 @@ export class BacklogController {
       filters: { priority: filters.priority, status: filters.status },
       showArchived,
       expandedEpicIds: [...expandedEpicIds],
+      ...(navWidth === null ? {} : { navWidth }),
       drafts,
     };
     return { state, keep: selectedTicketId };
@@ -226,7 +250,7 @@ export class BacklogController {
     return sortTickets(this._state.snapshot.tickets.filter((ticket) => ticket.epicId === epicId
       && (showArchived || !ticket.archived)
       && (filters.priority === null || ticket.priority === filters.priority)
-      && (filters.status === null || ticket.status === filters.status)));
+      && matchesStatus(filters.status, ticket.status)));
   }
 
   get selectedTicket(): TicketSummary | null {
@@ -338,8 +362,26 @@ export class BacklogController {
     this.update({ filters: { ...this._state.filters, priority } });
   }
 
-  setStatusFilter(status: Status | null): void {
+  setStatusFilter(status: StatusFilter | null): void {
     this.update({ filters: { ...this._state.filters, status } });
+  }
+
+  /** Remembers the Epic rail's width; `null` returns it to the default. */
+  setNavWidth(width: number | null): void {
+    const navWidth = width === null ? null : Math.round(Math.min(MAX_NAV_WIDTH, Math.max(MIN_NAV_WIDTH, width)));
+    if (navWidth === this._state.navWidth) return;
+    this.update({ navWidth });
+  }
+
+  /** Whether every Epic in the tree is expanded, so the next expand/collapse all collapses. */
+  get allEpicsExpanded(): boolean {
+    const epics = this.visibleEpics;
+    return epics.length > 0 && epics.every((epic) => this._state.expandedEpicIds.has(epic.epicId));
+  }
+
+  /** Expands every Epic in the tree, or collapses them all when every one is already expanded. */
+  toggleAllEpics(): void {
+    this.update({ expandedEpicIds: this.allEpicsExpanded ? new Set() : new Set(this.visibleEpics.map((epic) => epic.epicId)) });
   }
 
   toggleEpic(epicId: string): void {
@@ -611,7 +653,8 @@ export class BacklogController {
     this._state = { ...before, ...changes };
     const after = this._state;
     if (before.showArchived !== after.showArchived || before.filters !== after.filters
-      || before.expandedEpicIds !== after.expandedEpicIds || before.selectedTicketId !== after.selectedTicketId
+      || before.expandedEpicIds !== after.expandedEpicIds || before.navWidth !== after.navWidth
+      || before.selectedTicketId !== after.selectedTicketId
       || before.detail?.edit !== after.detail?.edit) this.remember?.changed();
     this.announce();
   }

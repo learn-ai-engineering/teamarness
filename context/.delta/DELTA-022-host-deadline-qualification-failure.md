@@ -29,6 +29,7 @@ Don accepts carrying this unresolved reliability finding while planning updater 
 
 ## Tracking
 
+- Teamarness Backlog: *Shell & Core › DELTA-022: unresolved Host deadline test failure*
 - `context/roadmap.md`, stable application releases and updates.
 - MyFlow workstream `auto-update`: `verify/20261031_host-deadline-blocker.md`, `research/20261031T105055Z_host-root-equivalent.md`, and `research/20261031T105800Z_host-suite-result.md`.
 - The workstream's raw captures retain commands, exact dependency fingerprints, hashes, response fields, and timings without identity or record contents.

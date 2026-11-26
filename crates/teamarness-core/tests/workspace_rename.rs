@@ -1,4 +1,4 @@
-//! Installation-local Workspace rename (ADR 0048).
+//! Installation-local Workspace rename (ADR 0049).
 
 use std::fs;
 use std::path::PathBuf;

@@ -212,7 +212,7 @@ fn create_with_initial_name(
     Ok(summary(&request))
 }
 
-/// Renames a Workspace on this Installation only (ADR 0048).
+/// Renames a Workspace on this Installation only (ADR 0049).
 ///
 /// The name is unsigned local metadata, so nothing is sent to other Members. A Workspace this
 /// Installation created keeps its creation request in step, because readiness verification
