@@ -271,8 +271,10 @@ async fn local_and_response_strict_prefixes_reconcile_without_replacement() {
     fs::remove_dir_all(later_directory).unwrap();
 }
 
+/// The Workspace name is Installation-local metadata (ADR 0049): a re-import that carries a
+/// different inviter name is accepted and keeps the local name and membership.
 #[tokio::test]
-async fn immutable_name_conflict_rejects_without_replacing_local_state() {
+async fn reimport_with_a_different_name_keeps_local_state() {
     let (issuer_directory, joiner_directory, issuer, joiner, invitation, response) =
         response_fixture("name-conflict").await;
     let stored = joiner
@@ -280,12 +282,9 @@ async fn immutable_name_conflict_rejects_without_replacing_local_state() {
         .unwrap();
     let mut renamed = response;
     renamed.name = "Different Name".to_owned();
-    assert_eq!(
-        joiner
-            .import_response_for_test(&invitation, renamed, None)
-            .unwrap_err(),
-        OnboardingError::LocalConflict
-    );
+    joiner
+        .import_response_for_test(&invitation, renamed, None)
+        .unwrap();
     assert_eq!(joiner.list_workspaces().unwrap(), vec![stored.0]);
     assert_eq!(
         joiner.membership_snapshot(stored.1.workspace_id()).unwrap(),

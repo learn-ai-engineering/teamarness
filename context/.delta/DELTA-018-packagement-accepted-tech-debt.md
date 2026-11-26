@@ -19,7 +19,7 @@ Follow-up: Host Port maintenance on `main`.
 
 - **CR-201, SF-201, SM-106.** Override flow: a refused override shows "Source: Team"; cancelling a pending override navigates away; the pending-removal note repeats the success message.
 - **C5-001.** On a Package page, **Remove** followed by **Cancel** clears the Workspace page's Recover or Dispose message and its Retry.
-- **SF-304, SF-005, SM-005, SM-305, SM-202, SM-401, SM-508.** Messages and copy: a timed success can hide the only Restart control; a registration refused at startup shows no capabilities; Remove confirmation wording is duplicated; an unused Dismiss label; branch reachability; near-synonym message-clearing helpers; lifecycle action labels duplicated in `package-install.ts` and `shell.ts`.
+- **SF-304, SF-005, SM-005, SM-305, SM-202, SM-401, SM-508.** Messages and copy: a timed success can hide the only Restart control; a registration refused at startup shows no capabilities; Remove confirmation wording is duplicated; an unused Dismiss label; branch reachability; near-synonym message-clearing helpers; lifecycle action labels duplicated in `package-install.ts` and `shell.ts`. SF-304 is resolved in workstream `workspace-settings-ui` (2026-11-26): a success that carries the only Restart control stays until dismissed (`TEAM.SYS.SHELL-R08`).
 - **CR-003.** A failed replacement after retirement can leave the earlier Personal Package stopped. Reload or Remove recovers it. A transactional rollback is a redesign.
 
 Follow-up: an override UX slice, or the `package-builder` workstream.

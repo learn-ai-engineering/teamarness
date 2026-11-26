@@ -100,6 +100,8 @@ A Member chooses a Unicode Workspace Person Name at create/join and may rename o
 
 **Owner:** roadmap Phase 5.
 
+**Partial answer:** ADR 0050 (accepted) decides the deletion case only: when the sole creator deletes a Workspace, the Package Host disposes its Package Instances and removes their Package Data Directories. Leave and revocation remain open.
+
 
 ## Stable release operations (delivered; broader qualification remains separate)
 

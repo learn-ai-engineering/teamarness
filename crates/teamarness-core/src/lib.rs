@@ -41,6 +41,7 @@ mod storage;
 mod subscription;
 mod synchronization;
 mod workspace;
+mod workspace_erase;
 
 pub use error::{
     CoreError, IdentityError, InvitationError, MembershipError, OnboardingError, ShutdownError,

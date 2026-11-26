@@ -85,6 +85,21 @@ class TestControl {
   }
 }
 
+/** A field with a listener per event type, for controls that handle several events. */
+class TestField {
+  public readonly dataset: Record<string, string> = {};
+  private readonly listeners = new Map<string, EventListener>();
+  public constructor(public value = "") {}
+
+  public addEventListener(type: string, listener: EventListener): void {
+    this.listeners.set(type, listener);
+  }
+
+  public fire(type: string, event: Partial<KeyboardEvent> = {}): void {
+    this.listeners.get(type)?.({ preventDefault: () => undefined, ...event } as unknown as Event);
+  }
+}
+
 /** A clock the test advances by hand, so message timing needs no waiting. */
 function manualTimers(): StatusMessageTimers & { advance(ms: number): void } {
   let now = 0;
@@ -118,9 +133,10 @@ class SettingsRegion extends Region {
   public readonly retrySnapshot = new TestControl();
   public readonly addAgent = new TestControl();
   public readonly removeAgent = new TestControl();
+  public readonly editAgent = new TestControl();
   public readonly renameAgent = new TestControl();
   public readonly agentName = { value: "Helper" };
-  public readonly renamedAgentName = { value: "Helper renamed" };
+  public readonly renamedAgentName = new TestField("Helper renamed");
 
   public querySelector(selector: string): TestControl | null {
     if (selector === "#add-agent") return this.addAgent;
@@ -135,6 +151,10 @@ class SettingsRegion extends Region {
     if (selector === "[data-remove-agent]") {
       this.removeAgent.dataset.removeAgent = "2";
       return this.innerHTML.includes('data-remove-agent="2"') ? [this.removeAgent] : [];
+    }
+    if (selector === "[data-edit-agent]") {
+      this.editAgent.dataset.editAgent = "2";
+      return this.innerHTML.includes('data-edit-agent="2"') ? [this.editAgent] : [];
     }
     if (selector === "[data-rename-agent]") {
       this.renameAgent.dataset.renameAgent = "2";
@@ -193,12 +213,34 @@ class ThemeRailRegion extends Region {
   }
 }
 
+/** A Workspace settings screen whose delete form records its confirm state and submissions. */
+class DeleteRegion extends Region {
+  public readonly confirmation = new (class extends TestControl { public value = ""; type(value: string): void { this.value = value; this.click(); } })();
+  public readonly confirm = { disabled: true };
+  public readonly form = Object.assign(new TestControl(), {
+    dataset: { workspaceName: "Design team" } as Record<string, string>,
+    querySelector: (selector: string): unknown => selector === "#delete-workspace-confirm" ? this.confirmation : selector === "button" ? this.confirm : null,
+  });
+
+  public querySelector(selector: string): unknown {
+    return selector === "#delete-workspace" && this.innerHTML.includes('id="delete-workspace"') ? this.form : null;
+  }
+
+  public querySelectorAll(): readonly TestControl[] {
+    return [];
+  }
+}
+
 class RetryRegion extends Region {
   public readonly retry = new TestControl();
   public readonly refresh = new TestControl();
+  public readonly dismissError = new TestControl();
+  public readonly dismissRefresh = new TestControl();
 
   public querySelector(selector: string): TestControl | null {
     if (selector === "#retry-membership-refresh" && this.innerHTML.includes('id="retry-membership-refresh"')) return this.refresh;
+    if (selector === "[data-workspace-error-dismiss]" && this.innerHTML.includes("data-workspace-error-dismiss")) return this.dismissError;
+    if (selector === "[data-membership-refresh-dismiss]" && this.innerHTML.includes("data-membership-refresh-dismiss")) return this.dismissRefresh;
     return selector === "#retry" && this.innerHTML.includes('id="retry"') ? this.retry : null;
   }
 
@@ -218,6 +260,7 @@ function model(activeWorkspaceId: string | null = workspace.id): ShellModel {
     error: null,
     notice: null,
     membershipRefreshUnavailable: null,
+    feedbackSection: null,
   };
 }
 
@@ -307,12 +350,16 @@ function harness(
       createWorkspace: async () => undefined,
       joinWorkspace: async () => undefined,
       rename: async () => undefined,
+      renameWorkspace: async (id, name) => { calls.push(`rename-workspace:${id}:${name}`); },
+      deleteWorkspace: async (id) => { calls.push(`delete-workspace:${id}`); },
       addAgent: agentActions.addAgent ?? (async () => undefined),
       removeAgent: agentActions.removeAgent ?? (async () => undefined),
       renameAgent: agentActions.renameAgent ?? (async () => undefined),
       copyInvitation: async () => undefined,
       refreshMembership: async (id) => { calls.push(`refresh:${id}`); },
       retry: async () => { calls.push("retry"); },
+      dismissError: () => { calls.push("dismiss-error"); },
+      dismissMembershipRefreshWarning: () => { calls.push("dismiss-refresh-warning"); },
     },
     onRouteChange: (route) => { routes.push(route); },
     mountApplicationUpdates,
@@ -611,7 +658,7 @@ describe("persistent Shell frame", () => {
     nav.settings.click();
     await vi.waitFor(() => expect(nav.innerHTML).toMatch(/class="workspace-settings-link"[^>]*aria-current="page"/), { timeout: 5_000 });
     expect(test.shell.route()).toEqual({ kind: "workspace-settings", workspaceId: workspace.id });
-    expect(test.frame.shellScreen.innerHTML).toContain("Workspace details");
+    expect(test.frame.shellScreen.innerHTML).toContain('id="workspace-page-heading"');
     expect(test.frame.shellScreen.innerHTML).toContain("Members");
     expect(test.frame.shellScreen.innerHTML).toContain("Workspace Invitations");
     expect(test.frame.shellScreen.innerHTML).toContain("Package Instances");
@@ -669,6 +716,36 @@ describe("persistent Shell frame", () => {
     expect(test.calls).toContain("retry");
   });
 
+  // Verifies: TEAM.SYS.SHELL-R04
+  it("deletes a Workspace only after its exact name is typed", async () => {
+    const screen = new DeleteRegion();
+    const test = harness(screen as unknown as HTMLElement);
+    const sole = { ...membership, members: membership.members.filter(({ identity }) => identity === installation.identity) };
+    await test.shell.updateWorkspace({ ...model(), memberships: { [workspace.id]: sole } });
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+    expect(screen.innerHTML).toContain('id="delete-workspace"');
+    screen.form.click();
+    expect(test.calls).not.toContain(`delete-workspace:${workspace.id}`);
+    screen.confirmation.type("Design tea");
+    expect(screen.confirm.disabled).toBe(true);
+    screen.confirmation.type("Design team");
+    expect(screen.confirm.disabled).toBe(false);
+    screen.form.click();
+    expect(test.calls).toContain(`delete-workspace:${workspace.id}`);
+  });
+
+  // Verifies: TEAM.SYS.SHELL-R08
+  it("binds each Workspace notification's close control to its own dismissal", async () => {
+    const screen = new RetryRegion();
+    const test = harness(screen as unknown as HTMLElement);
+    await test.shell.updateWorkspace({ ...model(), error: "timeout", membershipRefreshUnavailable: workspace.id });
+    await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
+    screen.dismissError.click();
+    screen.dismissRefresh.click();
+    expect(test.calls).toEqual(expect.arrayContaining(["dismiss-error", "dismiss-refresh-warning"]));
+    expect(test.calls).not.toContain("retry");
+  });
+
   it("keeps protocol data out of normal text, attributes, and accessible labels on every Workspace screen", async () => {
     const test = harness();
     await test.shell.updateWorkspace(model());
@@ -706,11 +783,8 @@ describe("persistent Shell frame", () => {
         "secret-diagnostic-recovery",
         "secret-diagnostic-id",
       ]) expect(html).not.toContain(forbidden);
-      if (route.kind === "workspace-settings") {
-        for (const { identity } of membership.members) {
-          expect(html).toContain(`<summary>View identity</summary>Identity: ${identity}`);
-        }
-      }
+      // Member identities are never shown (they add nothing a Person can use).
+      for (const { identity } of membership.members) expect(html).not.toContain(identity.slice(0, 12));
     }
   });
 });
@@ -732,13 +806,34 @@ describe("Workspace Agent Shell controls", () => {
     });
     await test.shell.updateWorkspace({ ...model(), memberships: { [workspace.id]: { ...membership, members: [...membership.members, agent] } }, principals: { [workspace.id]: { ...fixture.principals, principals: [...fixture.principals.principals, principal] } as PrincipalsSnapshot } });
     screen.addAgent.click();
+    // The field keeps the name until the Agent is added, then clears.
+    await vi.waitFor(() => expect(screen.agentName.value).toBe(""));
     screen.removeAgent.click();
+    // The name is edited in place: selecting it shows the field, and Enter saves.
+    expect(screen.innerHTML).not.toContain('data-rename-agent="2"');
+    screen.editAgent.click();
+    expect(screen.innerHTML).toContain('data-rename-agent="2"');
     screen.renameAgent.click();
+    expect(screen.innerHTML).not.toContain('data-rename-agent="2"');
     expect(calls).toEqual([
       `add:${workspace.id}:Helper`,
       `remove:${workspace.id}:${agentId}`,
       `rename:${workspace.id}:${agentId}:Helper renamed`,
     ]);
+
+    // Escape leaves the name as it was; leaving the field with a changed name saves it.
+    calls.length = 0;
+    screen.editAgent.click();
+    screen.renamedAgentName.fire("keydown", { key: "Escape" });
+    expect(screen.innerHTML).not.toContain('data-rename-agent="2"');
+    screen.editAgent.click();
+    screen.renamedAgentName.value = "Helper";
+    screen.renamedAgentName.fire("blur");
+    expect(calls).toEqual([]);
+    screen.editAgent.click();
+    screen.renamedAgentName.value = "Helper again";
+    screen.renamedAgentName.fire("blur");
+    expect(calls).toEqual([`rename:${workspace.id}:${agentId}:Helper again`]);
   });
 });
 
@@ -951,6 +1046,8 @@ it.each(["create", "join"] as const)("reconciles a completed %s while rejected R
     currentMembership: async () => membership,
     createWorkspace: async () => pendingWorkspace,
     joinWorkspace: async () => pendingWorkspace,
+    renameWorkspace: async (id, name) => ({ ...workspace, id, name }),
+    deleteWorkspace: async () => undefined,
     createWorkspaceInvitation: async () => fixture.invitation as Invitation,
     principalsSnapshot: async (workspaceId) => ({ workspaceId, cursor: "0", principals: [] }),
     subscribePrincipals: async () => undefined,
@@ -988,12 +1085,16 @@ it.each(["create", "join"] as const)("reconciles a completed %s while rejected R
       createWorkspace: (name, person) => controller.createWorkspace(name, person),
       joinWorkspace: (invitation, person) => controller.joinWorkspace(invitation, person),
       rename: (id, name) => controller.rename(id, name),
+      renameWorkspace: (id, name) => controller.renameWorkspace(id, name),
+      deleteWorkspace: (id) => controller.deleteWorkspace(id),
       addAgent: (id, name) => controller.addAgent(id, name),
       removeAgent: (id, agent) => controller.removeAgent(id, agent),
       renameAgent: (id, agent, name) => controller.renameAgent(id, agent, name),
       copyInvitation: (id) => controller.copyInvitation(id),
       refreshMembership: (id) => controller.refreshMembership(id),
       retry: () => controller.load(),
+      dismissError: () => { controller.dismissError(); },
+      dismissMembershipRefreshWarning: () => { controller.dismissMembershipRefreshWarning(); },
     },
   });
   const ready: ApplicationUpdateSnapshot = {
@@ -1147,13 +1248,14 @@ describe("Add and manage Personal Packages from the Workspace page", () => {
     status: { kind: "refused" as const, code: "artifact_changed" },
   };
 
-  it("puts an Add Personal Package button in the Packages section heading", async () => {
+  it("puts the + beside the Package Instances title, and the flow above the Packages with a close icon in place of Cancel", async () => {
     const test = harness();
     await test.shell.updateWorkspace(model());
     test.shell.updatePackages(packages);
     await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
     const html = test.frame.shellScreen.innerHTML;
-    expect(html).toMatch(/<h2 id="package-instances-heading">Package Instances<\/h2>\s*<button type="button" class="package-add" data-package-install-action="open" aria-label="Add Personal Package"/);
+    expect(html).toContain('<h2 id="package-instances-heading">Package Instances</h2><button type="button" class="package-add" data-package-install-action="open"');
+    expect(html).not.toContain(">Add Personal Package</button>");
   });
 
   it("opens the add flow from +, previews, and installs only after Trust and install", async () => {
@@ -1554,21 +1656,28 @@ describe("Packages section messages on the Workspace page", () => {
     }],
   };
 
-  it("reserves the message area, shows a result at the top, and hides a success after five seconds", async () => {
+  it("shows a result at the top of the Packages group, and hides a success after five seconds", async () => {
     const screen = new ManagementRegion();
     const test = harness(screen as unknown as HTMLElement, { refresh: async () => refused });
     await test.shell.updateWorkspace(model());
     test.shell.updatePackages(refused);
     await test.shell.navigate({ kind: "workspace-settings", workspaceId: workspace.id });
-    const empty = '<div class="status-message-slot"><div class="status-message" role="status" aria-live="polite"></div></div>';
-    expect(screen.innerHTML).toContain(empty);
-    expect(screen.innerHTML.indexOf(empty)).toBeLessThan(screen.innerHTML.indexOf("package-instance-list"));
+    expect(screen.innerHTML).not.toContain("status-message");
 
     screen.control("registration:reload:0").click();
     await vi.waitFor(() => expect(screen.innerHTML).toContain("<p>com.example.broken: Reloaded.</p>"));
+    const packagesGroup = screen.innerHTML.slice(screen.innerHTML.indexOf('id="package-instances-heading"'));
+    expect(packagesGroup.indexOf("Reloaded.")).toBeGreaterThan(-1);
+    expect(packagesGroup.indexOf("Reloaded.")).toBeLessThan(packagesGroup.indexOf("package-instance-list"));
+    // The + beside the group title opens the flow, which then shows above the Packages and hides the +.
+    const plus = 'class="package-add" data-package-install-action="open" aria-label="Add Personal Package"';
+    const group = screen.innerHTML.slice(screen.innerHTML.lastIndexOf("<section", screen.innerHTML.indexOf('id="package-instances-heading"')));
+    expect(group.indexOf(plus)).toBeGreaterThan(-1);
+    expect(group.indexOf(plus)).toBeLessThan(group.indexOf("package-instance-list"));
+    expect(screen.innerHTML).not.toContain(">Add Personal Package</button>");
     test.timers.advance(STATUS_MESSAGE_HIDE_MS);
     expect(screen.innerHTML).not.toContain("Reloaded.");
-    expect(screen.innerHTML).toContain(empty);
+    expect(screen.innerHTML).not.toContain("status-message");
   });
 
   it("keeps an error until the person dismisses it", async () => {

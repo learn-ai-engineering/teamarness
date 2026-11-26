@@ -1,7 +1,7 @@
 import type { ShellErrorCode } from "./contracts";
 import { presentMembers, type MemberPresentation } from "./member-presentation";
 import type { PackageHostSnapshot } from "./package-contracts";
-import type { ShellModel } from "./view";
+import type { FeedbackSection, ShellModel } from "./view";
 
 export type ShellPresentation = Readonly<{
   workspaceChoices: readonly Readonly<{ name: string }>[];
@@ -12,10 +12,14 @@ export type ShellPresentation = Readonly<{
     members: readonly MemberPresentation[];
     memberCount: number;
     membershipLoaded: boolean;
+    /** This Installation created the Workspace and is its only Person (ADR 0050). */
+    canDelete: boolean;
   }> | null;
   loading: boolean;
   notice: string | null;
   membershipRefreshUnavailable: string | null;
+  /** Where `error` and `notice` show; null is the top of the screen. */
+  feedbackSection: FeedbackSection | null;
   error: Readonly<{ message: string; canRetry: boolean }> | null;
 }>;
 
@@ -58,11 +62,16 @@ export async function buildShellPresentation(
       members,
       memberCount: members.length,
       membershipLoaded: membership !== undefined && model.installation !== null,
+      canDelete: model.installation !== null && membership !== undefined
+        && workspace.createdBy === model.installation.identity
+        && membership.members.every(({ kind, identity }) => kind !== "person" || identity === model.installation?.identity),
     } : null,
     loading: model.loading,
     notice: model.notice,
     membershipRefreshUnavailable: model.membershipRefreshUnavailable,
-    error: model.error ? { message: errorMessage(model.error), canRetry: true } : null,
+    feedbackSection: model.feedbackSection,
+    // Retry reloads the Workspaces, which answers a load failure; a group's own action is retried from its control.
+    error: model.error ? { message: errorMessage(model.error), canRetry: model.feedbackSection === null } : null,
   };
 }
 
@@ -146,6 +155,9 @@ function errorMessage(code: ShellErrorCode): string {
     shutdown: "Teamarness is shutting down. Try again after reopening.",
     not_steward: "Only the steward can rename this Agent. Only the steward or Workspace Manager can remove it.",
     principal_not_bound: "This Package is not linked to the Agent.",
+    not_workspace_creator: "Only the Installation that created this Workspace can delete it.",
+    workspace_has_members: "This Workspace has other Members, so it cannot be deleted.",
+    workspace_deletion_failed: "The Workspace's Packages could not be stopped, so nothing was deleted. Try again.",
   };
   return messages[code];
 }

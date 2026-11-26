@@ -87,6 +87,12 @@ impl TierState {
     pub(crate) fn last_generation(&self, key: &PackageInstanceKey) -> u64 {
         self.generations.get(key).copied().unwrap_or(0)
     }
+
+    /// Remembers a disposed Instance's generation, so a later actor for `key` starts after it.
+    pub(crate) fn record_disposed(&mut self, key: &PackageInstanceKey, generation: u64) {
+        let last = self.generations.entry(key.clone()).or_insert(0);
+        *last = (*last).max(generation);
+    }
 }
 
 /// The Personal tier lock and the mutable per-identity Personal entries.
@@ -505,7 +511,7 @@ impl PackageHost {
     }
 
     /// Refuses a Personal operation that started while the Host was stopping.
-    async fn ensure_running(&self) -> Result<(), PackageErrorEnvelope> {
+    pub(crate) async fn ensure_running(&self) -> Result<(), PackageErrorEnvelope> {
         if self.inner.data.lock().await.state == PackageHostState::Running {
             Ok(())
         } else {

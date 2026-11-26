@@ -11,7 +11,8 @@ import {
   type PackageNavigationPresentation,
   type ShellPresentation,
 } from "./presentation";
-import type { StatusMessageTimers } from "./status-message";
+import { renderStatusMessage, type StatusMessageTimers } from "./status-message";
+import { captureDrafts, restoreDrafts } from "./form-drafts";
 import type { InstallationThemeController, ThemePreference } from "./theme";
 import { THEME_OPTIONS } from "./theme-icons";
 import { renderShell, type ShellModel } from "./view";
@@ -59,12 +60,16 @@ type WorkspaceActions = Readonly<{
   createWorkspace(name: string, personName: string): Promise<void>;
   joinWorkspace(invitation: string, personName: string): Promise<void>;
   rename(workspaceId: string, name: string): Promise<void>;
+  renameWorkspace(workspaceId: string, name: string): Promise<void>;
+  deleteWorkspace(workspaceId: string): Promise<void>;
   addAgent(workspaceId: string, name: string): Promise<void>;
   removeAgent(workspaceId: string, agentId: string): Promise<void>;
   renameAgent(workspaceId: string, agentId: string, name: string): Promise<void>;
   copyInvitation(workspaceId: string): Promise<void>;
   refreshMembership(workspaceId: string): Promise<void>;
   retry(): Promise<void>;
+  dismissError(): void;
+  dismissMembershipRefreshWarning(): void;
 }>;
 
 type ShellOptions = Readonly<{
@@ -88,6 +93,14 @@ export class Shell {
   private workspacePresentation: ShellPresentation | null = null;
   private packageSnapshot: PackageHostSnapshot | null = null;
   private packageSnapshotFailed = false;
+  /** The Person closed the snapshot failure notification; the next failure shows it again. */
+  private packageSnapshotFailureDismissed = false;
+  /** The Agent whose name is edited in place on Workspace settings, by Principal ID. */
+  private editingAgentId: string | null = null;
+  /** Set while the selected screen's markup is replaced, so a field losing focus to removal is not a save. */
+  private replacingScreen = false;
+  /** The route the selected screen was last rendered for, so drafts are kept only within one screen. */
+  private renderedRouteKey: string | null = null;
   /** The last failed Recover or Dispose, for Retry and for a later successful refresh. */
   private packageLifecycleFeedback: PackageLifecycleFeedback | null = null;
   /** The message that result put in the Workspace page's message area. */
@@ -198,7 +211,7 @@ export class Shell {
   }
 
   public updatePackageSnapshotFailure(): void {
-    this.packageSnapshotFailed = true;
+    { this.packageSnapshotFailed = true; this.packageSnapshotFailureDismissed = false; }
     this.renderPackageConsumers();
   }
 
@@ -413,7 +426,7 @@ export class Shell {
     this.shellFrame.contextualNavigation.innerHTML = `<header class="workspace-context"><div><p>Workspace</p><h1>${escape(activePresentation.name)}</h1></div>
       <button type="button" class="workspace-settings-link" data-screen="workspace-settings" aria-label="Workspace settings" title="Workspace settings"${settingsCurrent}>${SETTINGS_ICON}</button></header>
       <nav class="contextual-navigation__body" aria-label="Active Workspace">
-      ${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}
+      ${renderPackageSnapshotFailure(this.packageSnapshotFailed && !this.packageSnapshotFailureDismissed, this.packageSnapshot !== null)}
       <section class="package-group" aria-labelledby="team-packages-heading"><h2 id="team-packages-heading">Team Packages</h2><ul>${team || "<li>None available</li>"}</ul></section>
       <section class="package-group" aria-labelledby="private-packages-heading"><h2 id="private-packages-heading">Personal Packages</h2><ul>${privatePackages || "<li>None available</li>"}</ul></section></nav>`;
 
@@ -448,7 +461,7 @@ export class Shell {
     if (!this.workspacePresentation || this.selectedRoute.kind === "package-instance") return;
     if (this.selectedRoute.kind === "package-page") {
       this.shellFrame.shellScreen.innerHTML = renderShell(this.workspacePresentation, this.selectedRoute, {
-        packagePage: `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packagePage.render(this.packageSnapshot, this.selectedRoute.tab ?? "about")}${this.configurationUnavailable ? '<p role="alert">Configuration is unavailable. The Package must be active and declare a settings view. Try reopening it after refreshing.</p>' : ""}`,
+        packagePage: `${renderPackageSnapshotFailure(this.packageSnapshotFailed && !this.packageSnapshotFailureDismissed, this.packageSnapshot !== null)}${this.packagePage.render(this.packageSnapshot, this.selectedRoute.tab ?? "about")}${this.configurationUnavailable ? '<p role="alert">Configuration is unavailable. The Package must be active and declare a settings view. Try reopening it after refreshing.</p>' : ""}`,
       });
       this.bindSelectedScreen();
       const pageOpened = this.packagePage.takeFocusRequest();
@@ -464,19 +477,54 @@ export class Shell {
       return;
     }
     const packageSettings = this.selectedRoute.kind === "workspace-settings"
-      ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed, this.packageSnapshot !== null)}${this.packageManagement.renderMessage(this.packageSnapshot)}${this.packageManagement.renderPanel(this.packageSnapshot)}${renderPackageInstanceSettings(
+      ? `${renderPackageSnapshotFailure(this.packageSnapshotFailed && !this.packageSnapshotFailureDismissed, this.packageSnapshot !== null)}${this.packageManagement.renderMessage(this.packageSnapshot)}${this.packageManagement.renderPanel(this.packageSnapshot)}${renderPackageInstanceSettings(
         this.packagePresentation,
         this.packageActionTargets,
         this.options.packageVisibility,
       )}${this.packageManagement.renderRegistrations(this.packageSnapshot)}`
       : undefined;
-    this.shellFrame.shellScreen.innerHTML = renderShell(
-      this.workspacePresentation,
-      this.selectedRoute,
-      { packageSettings },
-    );
+    // What the Person is typing survives a render caused by something else, such as a notice
+    // hiding itself or a roster update, but never carries over to a different screen.
+    const routeKey = JSON.stringify(this.selectedRoute);
+    const drafts = this.renderedRouteKey === routeKey && hasQueries(this.shellFrame.shellScreen)
+      ? captureDrafts(this.shellFrame.shellScreen)
+      : [];
+    const editingAgentId = this.editingAgentId !== null
+      && this.workspacePresentation.workspace?.members.some(({ agentId, canRenameAgent }) => canRenameAgent && agentId === this.editingAgentId)
+      ? this.editingAgentId
+      : null;
+    this.editingAgentId = editingAgentId;
+    this.replacingScreen = true;
+    try {
+      this.shellFrame.shellScreen.innerHTML = renderShell(
+        this.workspacePresentation,
+        this.selectedRoute,
+        { packageSettings, editingAgentId, packageInstallOpen: this.packageManagement.state().kind !== "closed" },
+      );
+    } finally {
+      this.replacingScreen = false;
+    }
+    this.renderedRouteKey = routeKey;
     this.bindSelectedScreen();
+    if (hasQueries(this.shellFrame.shellScreen)) restoreDrafts(this.shellFrame.shellScreen, drafts);
     this.focusPackageInstallStep();
+  }
+
+  /** Starts or ends editing an Agent's name in place, and moves focus to the field or the name. */
+  private editAgentName(agentId: string | null): void {
+    const previous = this.editingAgentId;
+    this.editingAgentId = agentId;
+    this.renderSelectedScreen();
+    if (!hasQueries(this.shellFrame.shellScreen)) return;
+    const members = this.workspacePresentation?.workspace?.members ?? [];
+    if (agentId !== null) {
+      const input = this.shellFrame.shellScreen.querySelector<HTMLInputElement>(".member-name-input");
+      input?.focus();
+      input?.select();
+    } else if (previous !== null) {
+      const index = members.findIndex((member) => member.agentId === previous);
+      this.shellFrame.shellScreen.querySelector<HTMLElement>(`[data-edit-agent="${index}"]`)?.focus();
+    }
   }
 
   private focusPackageInstallStep(): void {
@@ -566,7 +614,7 @@ export class Shell {
       this.packageSnapshot = result.snapshot;
       this.packageSnapshotFailed = false;
     }
-    if (result.failure === "refresh" || result.failure === "operation-and-refresh") this.packageSnapshotFailed = true;
+    if (result.failure === "refresh" || result.failure === "operation-and-refresh") { this.packageSnapshotFailed = true; this.packageSnapshotFailureDismissed = false; }
     if (result.failure === "operation" || result.failure === "operation-and-refresh") {
       throw new Error("Package lifecycle operation failed");
     }
@@ -595,6 +643,20 @@ export class Shell {
     });
     const workspaceId = routeWorkspaceId(this.selectedRoute);
     if (workspaceId) {
+      this.shellFrame.shellScreen.querySelector<HTMLFormElement>("#rename-workspace")?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const name = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#rename-workspace-name");
+        if (name) void this.options.workspaceActions.renameWorkspace(workspaceId, name.value);
+      });
+      const deletion = this.shellFrame.shellScreen.querySelector<HTMLFormElement>("#delete-workspace");
+      const confirmation = deletion?.querySelector<HTMLInputElement>("#delete-workspace-confirm");
+      const confirm = deletion?.querySelector<HTMLButtonElement>("button");
+      const confirmed = (): boolean => confirmation?.value === deletion?.dataset.workspaceName;
+      confirmation?.addEventListener("input", () => { if (confirm) confirm.disabled = !confirmed(); });
+      deletion?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        if (confirmed()) void this.options.workspaceActions.deleteWorkspace(workspaceId);
+      });
       this.shellFrame.shellScreen.querySelector<HTMLFormElement>("#rename-person")?.addEventListener("submit", (event) => {
         event.preventDefault();
         const name = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#rename-person-name");
@@ -603,7 +665,13 @@ export class Shell {
       this.shellFrame.shellScreen.querySelector<HTMLFormElement>("#add-agent")?.addEventListener("submit", (event) => {
         event.preventDefault();
         const name = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#agent-name");
-        if (name) void this.options.workspaceActions.addAgent(workspaceId, name.value);
+        if (!name) return;
+        void this.options.workspaceActions.addAgent(workspaceId, name.value).then(() => {
+          // The field kept the name while the Agent was added; clear it once the add succeeded.
+          if (this.workspaceModel?.error !== null) return;
+          const added = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#agent-name");
+          if (added) added.value = "";
+        });
       });
       this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-remove-agent]").forEach((button) => {
         button.addEventListener("click", () => {
@@ -611,13 +679,37 @@ export class Shell {
           if (member?.canRemoveAgent && member.agentId) void this.options.workspaceActions.removeAgent(workspaceId, member.agentId);
         });
       });
+      this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-edit-agent]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const member = this.workspacePresentation?.workspace?.members[Number(button.dataset.editAgent)];
+          if (member?.canRenameAgent && member.agentId) this.editAgentName(member.agentId);
+        });
+      });
       this.shellFrame.shellScreen.querySelectorAll<HTMLFormElement>("[data-rename-agent]").forEach((form) => {
+        const member = this.workspacePresentation?.workspace?.members[Number(form.dataset.renameAgent)];
+        const name = form.querySelector<HTMLInputElement>("input");
+        if (!member?.canRenameAgent || !member.agentId || !name) return;
+        const agentId = member.agentId;
+        let settled = false;
+        // Enter or leaving the field saves a changed name; Escape, or an unchanged or empty name, cancels.
+        const finish = (save: boolean): void => {
+          if (settled) return;
+          settled = true;
+          const value = name.value.trim();
+          const changed = save && value !== "" && value !== member.name;
+          this.editAgentName(null);
+          if (changed) void this.options.workspaceActions.renameAgent(workspaceId, agentId, value);
+        };
         form.addEventListener("submit", (event) => {
           event.preventDefault();
-          const member = this.workspacePresentation?.workspace?.members[Number(form.dataset.renameAgent)];
-          const name = form.querySelector<HTMLInputElement>("input");
-          if (member?.canRenameAgent && member.agentId && name) void this.options.workspaceActions.renameAgent(workspaceId, member.agentId, name.value);
+          finish(true);
         });
+        name.addEventListener("keydown", (event) => {
+          if ((event as KeyboardEvent).key !== "Escape") return;
+          event.preventDefault();
+          finish(false);
+        });
+        name.addEventListener("blur", () => { if (!this.replacingScreen) finish(true); });
       });
       this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("#copy-invitation")?.addEventListener("click", () => {
         void this.options.workspaceActions.copyInvitation(workspaceId);
@@ -630,6 +722,12 @@ export class Shell {
     }
     this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("#retry")?.addEventListener("click", () => {
       void this.options.workspaceActions.retry();
+    });
+    this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("[data-workspace-error-dismiss]")?.addEventListener("click", () => {
+      this.options.workspaceActions.dismissError();
+    });
+    this.shellFrame.shellScreen.querySelector<HTMLButtonElement>("[data-membership-refresh-dismiss]")?.addEventListener("click", () => {
+      this.options.workspaceActions.dismissMembershipRefreshWarning();
     });
     this.bindPackageSnapshotRetry(this.shellFrame.shellScreen);
     this.bindPackageManagement();
@@ -684,6 +782,10 @@ export class Shell {
     region.querySelector<HTMLButtonElement>("[data-package-snapshot-retry]")?.addEventListener("click", () => {
       void this.retryPackageSnapshot();
     });
+    region.querySelector<HTMLButtonElement>("[data-package-snapshot-dismiss]")?.addEventListener("click", () => {
+      this.packageSnapshotFailureDismissed = true;
+      this.renderPackageConsumers();
+    });
   }
 
   private async retryPackageSnapshot(): Promise<void> {
@@ -711,7 +813,7 @@ export class Shell {
       this.packageSnapshotFailed = false;
     }
     if (result.failure === "refresh" || result.failure === "operation-and-refresh") {
-      this.packageSnapshotFailed = true;
+      { this.packageSnapshotFailed = true; this.packageSnapshotFailureDismissed = false; }
     }
     this.showPackageLifecycleFeedback({ action, instance, name, failure: result.failure });
     this.renderPackageConsumers();
@@ -882,7 +984,7 @@ function renderPackageSnapshotFailure(failed: boolean, hasSnapshot: boolean): st
   const message = hasSnapshot
     ? "Package information may be out of date. Showing the latest available Package information."
     : "Package information is unavailable.";
-  return `<div class="package-snapshot-failure" role="alert"><p>${message}</p><button type="button" data-package-snapshot-retry>Retry Package information</button></div>`;
+  return renderStatusMessage({ message, failed: true }, "data-package-snapshot-dismiss", '<button type="button" data-package-snapshot-retry>Retry Package information</button>');
 }
 
 // Only Package Instances that need recovery get lifecycle controls; healthy rows stay quiet.

@@ -11,7 +11,11 @@ import { createPackageProject, repositoryRoot } from "./create-package.mjs";
 
 const run = promisify(execFile);
 
-test("generated foundation validates, builds, rejects an invalid contract, and runs beside Backlog", { timeout: 900_000 }, async () => {
+// The generated foundation declares only an aarch64-apple-darwin Backend, so a Host elsewhere
+// refuses it as target_unsupported. Everything before the Host run is target-neutral.
+const foundationTarget = process.platform === "darwin" && process.arch === "arm64";
+
+test("generated foundation validates, builds, rejects an invalid contract, and runs beside Backlog", { timeout: 900_000 }, async (t) => {
   const parent = await mkdtemp(join(tmpdir(), "teamarness-create-package-integration-"));
   const displayName = 'Emojart "$&" __REQUEST_NAMESPACE__ __PACKAGE_DISPLAY_NAME_RUST__ \\ Gallery';
   try {
@@ -68,35 +72,39 @@ test("generated foundation validates, builds, rejects an invalid contract, and r
       env: { ...process.env, CARGO_TARGET_DIR: join(parent, "custom target") },
     });
 
-    const bundled = await resolveBundledPackage("dev.teamarness.backlog");
-    const bundledDirectory = await buildPackage({
-      sourceDirectory: bundled.sourceDirectory,
-      cargoPackage: bundled.cargoPackage,
-      expectedIdentity: bundled.identity,
-      outputDirectory: join(parent, "bundled backlog"),
-    });
-    await run(
-      "cargo",
-      [
-        "test",
-        "-p",
-        "teamarness-package-host",
-        "--test",
-        "external_package_authoring",
-        "--locked",
-        "--",
-        "--ignored",
-      ],
-      {
-        cwd: repositoryRoot,
-        env: {
-          ...process.env,
-          TEAMARNESS_BUNDLED_PACKAGE_DIRECTORY: bundledDirectory,
-          TEAMARNESS_GENERATED_PACKAGE_DIRECTORY: directory,
-          TEAMARNESS_GENERATED_PACKAGE_DISPLAY_NAME: displayName,
+    await t.test("runs beside Backlog in a Package Host", {
+      skip: !foundationTarget && "the generated foundation targets aarch64-apple-darwin only",
+    }, async () => {
+      const bundled = await resolveBundledPackage("dev.teamarness.backlog");
+      const bundledDirectory = await buildPackage({
+        sourceDirectory: bundled.sourceDirectory,
+        cargoPackage: bundled.cargoPackage,
+        expectedIdentity: bundled.identity,
+        outputDirectory: join(parent, "bundled backlog"),
+      });
+      await run(
+        "cargo",
+        [
+          "test",
+          "-p",
+          "teamarness-package-host",
+          "--test",
+          "external_package_authoring",
+          "--locked",
+          "--",
+          "--ignored",
+        ],
+        {
+          cwd: repositoryRoot,
+          env: {
+            ...process.env,
+            TEAMARNESS_BUNDLED_PACKAGE_DIRECTORY: bundledDirectory,
+            TEAMARNESS_GENERATED_PACKAGE_DIRECTORY: directory,
+            TEAMARNESS_GENERATED_PACKAGE_DISPLAY_NAME: displayName,
+          },
         },
-      },
-    );
+      );
+    });
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

@@ -792,12 +792,12 @@ pub fn write_qualification_provider(root: &Path) -> (String, String) {
         {"name":"sample.write","kind":"command","description":"Append a value once with the actual Host-authored actor.",
             "request":{"type":"object","required":["value"],"properties":{"value":{"$ref":"#/$defs/value"}},"additionalProperties":false},"response":{"type":"object"}}
     ]}]})).unwrap();
-    fs::write(root.join("backend/provider"), &binary).unwrap();
-    fs::set_permissions(
-        root.join("backend/provider"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
+    // A rewrite may replace a binary that is still running, which Linux refuses to write in
+    // place (ETXTBSY). Renaming a fresh file over it leaves the running process its own inode.
+    let staged = root.join("backend/provider.staged");
+    fs::write(&staged, &binary).unwrap();
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(&staged, root.join("backend/provider")).unwrap();
     fs::write(root.join("ui/index.js"), ui).unwrap();
     fs::write(root.join("ui-contract.json"), &ui_contract).unwrap();
     fs::write(root.join("ports.json"), &ports).unwrap();

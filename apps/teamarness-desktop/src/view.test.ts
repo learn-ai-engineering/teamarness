@@ -19,6 +19,8 @@ function fakeBridge(overrides: Partial<TeamarnessBridge> = {}): TeamarnessBridge
     createWorkspace: async () => state,
     createWorkspaceInvitation: async () => invitation,
     joinWorkspace: async () => state,
+    renameWorkspace: async (workspaceId, name) => ({ ...workspace, id: workspaceId, name }),
+    deleteWorkspace: async () => undefined,
     currentMembership: async () => membership,
     renameWorkspacePrincipal: async () => undefined,
     addWorkspaceAgent: async () => undefined,
@@ -40,6 +42,7 @@ function model(change: Partial<ShellModel> = {}): ShellModel {
     error: null,
     notice: null,
     membershipRefreshUnavailable: null,
+    feedbackSection: null,
     ...change,
   };
 }
@@ -315,7 +318,9 @@ describe("Shell Workspace screens", () => {
     expect(invitations.replaceAll("Workspace Invitation", "")).not.toMatch(/\bInvitations?\b/);
 
     const settings = await rendered(model(), { kind: "workspace-settings", workspaceId: workspace.id });
-    expect(settings).toContain("Workspace details");
+    expect(settings).toMatch(/<h1 id="workspace-page-heading" class="package-page-title">[^<]+<\/h1><p class="package-page-subtitle">\d+ Members?\.<\/p>/);
+    expect(settings).not.toContain("Workspace details");
+    expect(settings).not.toContain("screen-section");
     expect(settings).toContain("Package Instances");
     expect(settings).toContain("Your name");
     expect(settings).not.toMatch(/leave Workspace|revoke|manager administration/i);
@@ -428,7 +433,43 @@ describe("Shell Workspace screens", () => {
     expect(html).toContain("Membership refreshed");
     expect(controller.snapshot().memberships[workspace.id]?.members).toEqual(membership.members);
     expect(html).not.toContain(membership.version);
-    for (const member of membership.members) expect(html).toContain(member.identity);
+    for (const member of membership.members) expect(html).not.toContain(member.identity.slice(0, 12));
+    expect(html).not.toContain("View identity");
+    // The result shows in the Members group that started it, not at the top of the page.
+    expect(controller.snapshot().feedbackSection).toBe("members");
+    const [beforeMembers, fromMembers] = html.split('id="members-heading"');
+    expect(beforeMembers).not.toContain("Membership refreshed");
+    expect(fromMembers!.split('id="invitations-heading"')[0]).toContain("Membership refreshed");
+  });
+
+  it("puts the + beside the Package Instances title, and hides it while the add flow is open", async () => {
+    const presentation = await buildShellPresentation(model(), workspace.id);
+    const route = { kind: "workspace-settings", workspaceId: workspace.id } as const;
+    const closed = renderShell(presentation, route, { packageSettings: "<p>packages</p>" });
+    expect(closed).toContain('<div class="section-heading"><h2 id="package-instances-heading">Package Instances</h2><button type="button" class="package-add" data-package-install-action="open" aria-label="Add Personal Package" title="Add Personal Package">+</button></div>');
+    const open = renderShell(presentation, route, { packageSettings: '<section class="package-install"></section><p>packages</p>', packageInstallOpen: true });
+    expect(open).not.toContain('data-package-install-action="open"');
+    expect(renderShell(presentation, route)).not.toContain('data-package-install-action="open"');
+  });
+
+  it("shows each action's result in its own group, and a load failure at the top", async () => {
+    const controller = new ShellController(fakeBridge({
+      renameWorkspace: async () => { throw { code: "invalid_input", retryable: false }; },
+    }), () => undefined);
+    await controller.load();
+    await controller.renameWorkspace(workspace.id, "Bad");
+    const html = await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id });
+    const groups = html.split('<section class="package-page-group"');
+    expect(groups[0]).not.toContain("status-message");
+    expect(groups[1]).toContain('id="workspace-name-heading"');
+    expect(groups[1]).toContain("The supplied value is invalid.");
+    // Retry reloads the Workspaces, which does not answer a group's refused action.
+    expect(html).not.toContain('id="retry"');
+    expect(groups.slice(2).join("")).not.toContain("The supplied value is invalid.");
+
+    const top = await rendered(model({ error: "timeout" }), { kind: "workspace-settings", workspaceId: workspace.id });
+    expect(top.split('<section class="package-page-group"')[0]).toContain("Workspace onboarding timed out.");
+    expect(top).toContain('id="retry"');
   });
 
   it("uses Workspace Invitation in every visible onboarding error", async () => {
@@ -462,6 +503,100 @@ describe("Shell Workspace screens", () => {
     expect(html).not.toContain("timeout");
   });
 
+  // Verifies: TEAM.SYS.SHELL-R08
+  it("hides a Workspace notice after five seconds but keeps an error until it is closed", async () => {
+    const scheduled: Array<{ callback: () => void; ms: number; cleared: boolean }> = [];
+    const timers = {
+      setTimeout: (callback: () => void, ms: number) => { const entry = { callback, ms, cleared: false }; scheduled.push(entry); return entry; },
+      clearTimeout: (handle: unknown) => { (handle as { cleared: boolean }).cleared = true; },
+    };
+    const failure = fixture.errors.find(({ code }) => code === "timeout") as BridgeError;
+    let fail = false;
+    const controller = new ShellController(fakeBridge({
+      renameWorkspacePrincipal: async () => { if (fail) throw failure; },
+    }), () => undefined, undefined, timers);
+    await controller.load();
+    await controller.rename(workspace.id, "Don");
+    expect(controller.snapshot().notice).toBe("Name updated");
+    const live = scheduled.filter(({ cleared }) => !cleared);
+    expect(live.map(({ ms }) => ms)).toEqual([5_000]);
+    live[0]?.callback();
+    expect(controller.snapshot().notice).toBeNull();
+
+    fail = true;
+    await controller.rename(workspace.id, "Don");
+    expect(controller.snapshot().error).toBe("timeout");
+    expect(scheduled.filter(({ cleared }) => !cleared).every(({ callback }) => { callback(); return true; })).toBe(true);
+    expect(controller.snapshot().error).toBe("timeout");
+    const html = await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id });
+    expect(html).toContain('role="alert"');
+    expect(html).toContain("data-workspace-error-dismiss");
+    expect(html.indexOf("data-workspace-error-dismiss")).toBeGreaterThan(html.indexOf('id="workspace-page-heading"'));
+    controller.dismissError();
+    expect(controller.snapshot().error).toBeNull();
+  });
+
+  it("closes the roster refresh warning without retrying it", async () => {
+    let fail = false;
+    const controller = new ShellController(fakeBridge({
+      addWorkspaceAgent: async () => undefined,
+      currentMembership: async () => { if (fail) throw { code: "timeout", retryable: true }; return fixture.membership as Membership; },
+    }), () => undefined);
+    await controller.load();
+    fail = true;
+    await controller.addAgent(workspace.id, "Helper");
+    expect(await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id })).toContain("data-membership-refresh-dismiss");
+    controller.dismissMembershipRefreshWarning();
+    expect(controller.snapshot().membershipRefreshUnavailable).toBeNull();
+  });
+
+  // Verifies: TEAM.SYS.SHELL-R04
+  it("renames the Workspace on this Installation and shows the new name", async () => {
+    const calls: string[] = [];
+    const controller = new ShellController(fakeBridge({
+      renameWorkspace: async (workspaceId, name) => { calls.push(`${workspaceId}:${name}`); return { ...workspace, name }; },
+    }), () => undefined);
+    await controller.load();
+    await controller.renameWorkspace(workspace.id, "Scratch <space>");
+    expect(calls).toEqual([`${workspace.id}:Scratch <space>`]);
+    expect(controller.snapshot()).toMatchObject({ notice: "Workspace renamed", error: null });
+    const html = await rendered(controller.snapshot(), { kind: "workspace-settings", workspaceId: workspace.id });
+    expect(html).toContain('<h1 id="workspace-page-heading" class="package-page-title">Scratch &lt;space&gt;</h1>');
+    expect(html).toContain('id="rename-workspace-name" required maxlength="64" autocomplete="off" value="Scratch &lt;space&gt;"');
+    expect(html).toContain("Other Members keep their own name for it.");
+  });
+
+  // Verifies: TEAM.SYS.SHELL-R04
+  it("offers deletion only to the sole creator and removes the Workspace after it", async () => {
+    const sole: Membership = { ...membership, members: membership.members.filter(({ identity }) => identity === fixture.installation.identity) };
+    const route = { kind: "workspace-settings", workspaceId: workspace.id } as const;
+    expect(await rendered(model(), route)).not.toContain('id="delete-workspace"');
+    expect(await rendered(model({ memberships: { [workspace.id]: sole }, workspaces: [{ ...workspace, createdBy: "b".repeat(64) }] }), route)).not.toContain('id="delete-workspace"');
+    const offered = await rendered(model({ memberships: { [workspace.id]: sole } }), route);
+    expect(offered).toContain('<form id="delete-workspace" data-workspace-name="Design team">');
+    expect(offered).toContain('<button type="submit" class="danger" disabled>Delete Workspace</button>');
+    expect(offered).toContain("Files in folders mapped by Documents stay on disk.");
+
+    const calls: string[] = [];
+    const controller = new ShellController(fakeBridge({
+      currentMembership: async () => sole,
+      deleteWorkspace: async (id) => { calls.push(id); },
+    }), () => undefined);
+    await controller.load();
+    await controller.deleteWorkspace(workspace.id);
+    expect(calls).toEqual([workspace.id]);
+    expect(controller.snapshot()).toMatchObject({ workspaces: [], activeWorkspaceId: null, notice: "Deleted Design team", error: null });
+    expect(controller.snapshot().memberships).toEqual({});
+
+    const refused = new ShellController(fakeBridge({
+      deleteWorkspace: async () => { throw { code: "workspace_has_members", retryable: false }; },
+    }), () => undefined);
+    await refused.load();
+    await refused.deleteWorkspace(workspace.id);
+    expect(refused.snapshot()).toMatchObject({ error: "workspace_has_members", workspaces: [workspace] });
+    expect(await rendered(refused.snapshot(), route)).toContain("This Workspace has other Members, so it cannot be deleted.");
+  });
+
   it("keeps membership refresh failures observable", async () => {
     const failure = fixture.errors.find(({ code }) => code === "timeout") as BridgeError;
     let shouldFail = false;
@@ -484,6 +619,7 @@ describe("shared bridge fixture", () => {
       "invalid_input", "authentication", "expired", "already_used", "readiness", "timeout",
       "overload", "invalid_bootstrap", "local_conflict", "admission_no_longer_current",
       "uncertain_storage_outcome", "shutdown", "not_steward", "principal_not_bound",
+      "not_workspace_creator", "workspace_has_members", "workspace_deletion_failed",
     ]);
     expect(fixture.workspace.id).toMatch(/^[0-9a-f]{32}$/);
     expect(fixture.membership.version).toMatch(/^[0-9a-f]{64}$/);
@@ -536,7 +672,7 @@ describe("Workspace Agent settings", () => {
     expect(calls).toEqual([`add:${workspace.id}:Helper`, `remove:${workspace.id}:${agentId}`]);
   });
 
-  it("renders Manager removal but not rename for a remote steward, with identity only inside details", async () => {
+  it("renders Manager removal but not rename for a remote steward, and no identity", async () => {
     const source = model({
       memberships: { [workspace.id]: { ...membership, members: [...membership.members, agentMember] } },
       principals: { [workspace.id]: { ...fixture.principals, principals: [...fixture.principals.principals, agentProfile] } as PrincipalsSnapshot },
@@ -544,12 +680,14 @@ describe("Workspace Agent settings", () => {
     const html = await rendered(source, { kind: "workspace-settings", workspaceId: workspace.id });
     expect(html).toContain('id="add-agent"');
     expect(html).toContain('Agent · stewarded by Remote');
-    expect(html).toContain('data-remove-agent="2"');
+    expect(html).toContain('class="icon-button member-remove" data-remove-agent="2" aria-label="Remove agent Helper &lt;script&gt;"');
+    expect(html).not.toContain('data-edit-agent="2"');
     expect(html).not.toContain('data-rename-agent="2"');
     expect(html).toContain('Helper &lt;script&gt;');
     expect(html).not.toContain('<script>');
-    expect(html).toContain(`<summary>View identity</summary>Identity: ${agentKey}`);
-    expect(html.split('<summary>View identity</summary>')[0]).not.toContain(agentKey);
+    expect(html).not.toContain(agentKey.slice(0, 12));
+    expect(html).not.toContain("View identity");
+    expect(html).not.toContain(">Remove agent<");
     expect(html).not.toMatch(/revoke|manager administration/i);
   });
 
@@ -597,8 +735,15 @@ describe("Agent rename authorization feedback", () => {
       principals: { [workspace.id]: { ...fixture.principals, principals: [...fixture.principals.principals, agentProfile] } as PrincipalsSnapshot },
     });
     const html = await rendered(source, { kind: "workspace-settings", workspaceId: workspace.id });
-    expect(html).toContain('data-rename-agent="2"');
+    // The name itself is the rename control; there is no separate field or Save button until it is selected.
+    expect(html).toContain('class="member-name-edit" data-edit-agent="2" aria-label="Rename agent Helper"');
+    expect(html).not.toContain('data-rename-agent="2"');
+    expect(html).not.toContain("Save agent name");
     expect(html).toContain('data-remove-agent="2"');
+    const presentation = await buildShellPresentation(source, workspace.id);
+    const editing = renderShell(presentation, { kind: "workspace-settings", workspaceId: workspace.id }, { editingAgentId: agentId });
+    expect(editing).toContain('<form class="member-name-form" data-rename-agent="2"><input class="member-name-input" required maxlength="256" autocomplete="off" spellcheck="false" aria-label="Agent name" value="Helper"></form>');
+    expect(editing).not.toContain('data-edit-agent="2"');
 
     const controller = new ShellController(fakeBridge({
       renameWorkspacePrincipal: async () => { throw { code: "not_steward", retryable: false }; },

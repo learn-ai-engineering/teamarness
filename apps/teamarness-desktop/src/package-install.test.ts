@@ -190,6 +190,22 @@ describe("Add Personal Package flow", () => {
     expect(test.controller.renderPanel(snapshot())).toBe("");
   });
 
+  it("closes from the icon at the top of the flow, which replaces every Cancel button", async () => {
+    const test = harness();
+    await test.controller.installAction("open");
+    const open = test.controller.renderPanel(snapshot());
+    expect(open).toContain('class="icon-button package-install-close" data-package-install-action="cancel" aria-label="Close Add Personal Package"');
+    for (const action of ["choose", "continue"] as const) {
+      await test.controller.installAction(action);
+      const html = test.controller.renderPanel(snapshot());
+      expect(html).not.toContain(">Cancel<");
+      expect(html).toContain("package-install-close");
+    }
+    await test.controller.installAction("cancel");
+    expect(test.controller.state().kind).toBe("closed");
+    expect(test.controller.renderPanel(snapshot())).toBe("");
+  });
+
   it("never installs when the person cancels at consent", async () => {
     const test = harness();
     await test.controller.installAction("open");
@@ -528,10 +544,9 @@ describe("the Packages section message area", () => {
     status: { kind: "refused", code: "artifact_changed" },
   };
 
-  it("keeps its space when there is no message", () => {
+  it("renders nothing when there is no message", () => {
     const test = harness();
-    expect(test.controller.renderMessage(snapshot([refused])))
-      .toBe('<div class="status-message-slot"><div class="status-message" role="status" aria-live="polite"></div></div>');
+    expect(test.controller.renderMessage(snapshot([refused]))).toBe("");
   });
 
   it("hides a success after five seconds and renders again", async () => {
@@ -545,6 +560,19 @@ describe("the Packages section message area", () => {
     test.timers.advance(1);
     expect(test.controller.renderMessage(snapshot([refused]))).not.toContain("Reloaded.");
     expect(test.renders()).toBe(renders + 1);
+  });
+
+  // Verifies: TEAM.SYS.SHELL-R08
+  it("keeps a success that carries the only Restart control until it is dismissed (SF-304)", async () => {
+    const test = harness({ reload: async () => ({ revision: 6, restartRequired: true }) });
+    await test.controller.registrationAction("reload", refused.expectedIdentity, snapshot([refused]));
+    test.timers.advance(STATUS_MESSAGE_HIDE_MS * 10);
+    const message = test.controller.renderMessage(snapshot([refused]));
+    expect(message).toContain("data-package-change-restart");
+    expect(message).toContain('role="status"');
+    expect(message).toContain('data-package-message-dismiss aria-label="Dismiss message"');
+    test.controller.dismissMessage();
+    expect(test.controller.renderMessage(snapshot([refused]))).not.toContain("data-package-change-restart");
   });
 
   it("keeps an error until it is dismissed, or until the next action replaces it", async () => {

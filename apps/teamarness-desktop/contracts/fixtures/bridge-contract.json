@@ -94,6 +94,18 @@
     {
       "code": "principal_not_bound",
       "retryable": false
+    },
+    {
+      "code": "not_workspace_creator",
+      "retryable": false
+    },
+    {
+      "code": "workspace_has_members",
+      "retryable": false
+    },
+    {
+      "code": "workspace_deletion_failed",
+      "retryable": true
     }
   ],
   "principals": {

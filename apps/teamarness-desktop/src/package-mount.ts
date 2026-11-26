@@ -24,9 +24,15 @@ export type PackageFrameWindow = Readonly<{
   postMessage(message: unknown, targetOrigin: string, transfer: Transferable[]): void;
 }>;
 
+export type FrameVisibleRegion = Readonly<{ top: number; height: number }>;
+
 export type PackageFrameLease = Readonly<{
   readonly contentWindow: PackageFrameWindow | null;
   onLoad(listener: () => void): () => void;
+  /** Sizes the frame to a settings view's content height. */
+  setContentHeight?(height: number): void;
+  /** Reports which part of the frame is on screen until the returned stop is called. */
+  watchVisibleRegion?(listener: (region: FrameVisibleRegion) => void): () => void;
   remove(): void;
 }>;
 
@@ -68,6 +74,7 @@ export const browserFrameDom: PackageFrameDom = {
     iframe.addEventListener("load", onLoad);
     iframe.src = frame.src;
     target.replaceChildren(iframe);
+    const stops = new Set<() => void>();
     return Object.freeze({
       get contentWindow(): PackageFrameWindow | null {
         return iframe.contentWindow as PackageFrameWindow | null;
@@ -76,13 +83,60 @@ export const browserFrameDom: PackageFrameDom = {
         listeners.add(listener);
         return () => { listeners.delete(listener); };
       },
+      setContentHeight(height: number): void {
+        iframe.style.height = `${height}px`;
+        target.dataset.contentSized = "";
+      },
+      watchVisibleRegion(listener: (region: FrameVisibleRegion) => void): () => void {
+        const stop = watchFrameRegion(iframe, listener);
+        stops.add(stop);
+        return () => { if (stops.delete(stop)) stop(); };
+      },
       remove(): void {
         iframe.removeEventListener("load", onLoad);
+        for (const stop of stops) stop();
+        stops.clear();
+        delete target.dataset.contentSized;
         iframe.remove();
       },
     });
   },
 };
+
+/**
+ * Reports the part of `iframe` inside its scrolling pane, in the frame's own CSS pixels, on every
+ * pane scroll and resize. Coalesced to one report per animation frame.
+ */
+function watchFrameRegion(iframe: HTMLIFrameElement, listener: (region: FrameVisibleRegion) => void): () => void {
+  const pane = iframe.closest<HTMLElement>(".selected-content");
+  let scheduled = 0;
+  let last = "";
+  const measure = (): void => {
+    scheduled = 0;
+    const frame = iframe.getBoundingClientRect();
+    const view = pane?.getBoundingClientRect() ?? { top: 0, bottom: window.innerHeight };
+    const top = Math.max(0, Math.round(view.top - frame.top));
+    const height = Math.max(0, Math.round(Math.min(frame.bottom, view.bottom) - Math.max(frame.top, view.top)));
+    const key = `${top}:${height}`;
+    if (key === last) return;
+    last = key;
+    listener(Object.freeze({ top, height }));
+  };
+  const schedule = (): void => { if (scheduled === 0) scheduled = requestAnimationFrame(measure); };
+  const scroller: HTMLElement | Window = pane ?? window;
+  scroller.addEventListener("scroll", schedule, { passive: true });
+  window.addEventListener("resize", schedule);
+  const resize = new ResizeObserver(schedule);
+  resize.observe(iframe);
+  if (pane) resize.observe(pane);
+  schedule();
+  return () => {
+    if (scheduled !== 0) cancelAnimationFrame(scheduled);
+    scroller.removeEventListener("scroll", schedule);
+    window.removeEventListener("resize", schedule);
+    resize.disconnect();
+  };
+}
 
 const globalTimers: PackageMountTimers = Object.freeze({
   setTimeout: (callback: () => void, ms: number) => setTimeout(callback, ms),
@@ -148,6 +202,7 @@ export class PackageMountController {
     let frameLoaded = false;
     let connectTimer: unknown = null;
     let stopTheme: (() => void) | null = null;
+    let stopRegion: (() => void) | null = null;
     let faultReported = false;
     let hostClosed = false;
     let unmountRequested = false;
@@ -218,6 +273,7 @@ export class PackageMountController {
         onOpenSettings: async () => {
           if (origin.isCurrent()) await this.settingsNavigation?.open(origin);
         },
+        ...(loader.view === "settings" ? { onContentHeight: (height: number) => { frame.setContentHeight?.(height); } } : {}),
       });
       host = started;
       started.start();
@@ -241,6 +297,9 @@ export class PackageMountController {
           theme: this.theme.current(),
         });
         stopTheme = this.theme.subscribe((theme) => { started.sendTheme(theme); });
+        if (loader.view === "settings") {
+          stopRegion = frame.watchVisibleRegion?.((region) => { started.sendVisibleRegion(region); }) ?? null;
+        }
       }, () => undefined);
     });
     connectTimer = this.timers.setTimeout(() => {
@@ -274,7 +333,7 @@ export class PackageMountController {
         }
         if (!themeStopped) {
           themeStopped = true;
-          await capture(() => { stopTheme?.(); stopTheme = null; });
+          await capture(() => { stopTheme?.(); stopTheme = null; stopRegion?.(); stopRegion = null; });
         }
         if (!hostDisposed) {
           hostDisposed = true;
@@ -296,6 +355,7 @@ export class PackageMountController {
     this.interrupt = () => {
       clearConnectTimer();
       stopTheme?.(); stopTheme = null; themeStopped = true;
+      stopRegion?.(); stopRegion = null;
       stopWatchingLoad(); frame.remove(); frameRemoved = true;
       hostDisposed = true;
       void host?.dispose().catch(() => undefined);

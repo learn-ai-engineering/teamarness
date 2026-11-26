@@ -51,9 +51,10 @@ fn reject(patch: Value) -> ContractError {
 #[test]
 fn accepts_bundled_package_manifests() {
     let packages = repository_root().join("packages");
-    let mut seen = 0;
+    let mut seen = std::collections::BTreeSet::new();
     for entry in fs::read_dir(&packages).unwrap() {
-        let path = entry.unwrap().path().join("teamarness.package.json");
+        let directory = entry.unwrap().path();
+        let path = directory.join("teamarness.package.json");
         if !path.is_file() {
             continue;
         }
@@ -65,9 +66,23 @@ fn accepts_bundled_package_manifests() {
             "{}",
             path.display()
         );
-        seen += 1;
+        seen.insert(format!(
+            "packages/{}",
+            directory.file_name().unwrap().to_str().unwrap()
+        ));
     }
-    assert_eq!(seen, 7, "expected seven bundled Package manifests");
+    let index: Value =
+        serde_json::from_slice(&fs::read(packages.join("bundled-packages.json")).unwrap()).unwrap();
+    let bundled: std::collections::BTreeSet<String> = index["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|package| package["sourceDirectory"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        seen, bundled,
+        "every bundled Package has a manifest, and only those"
+    );
 }
 
 /// Documents declares the settings view that holds its folder mappings, so the Shell offers

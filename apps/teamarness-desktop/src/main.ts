@@ -49,12 +49,16 @@ const shell = new Shell(frame, {
     createWorkspace: async (name, personName) => { await controller.createWorkspace(name, personName); },
     joinWorkspace: async (invitation, personName) => { await controller.joinWorkspace(invitation, personName); },
     rename: async (workspaceId, name) => { await controller.rename(workspaceId, name); },
+    renameWorkspace: async (workspaceId, name) => { await controller.renameWorkspace(workspaceId, name); },
+    deleteWorkspace: async (workspaceId) => { await controller.deleteWorkspace(workspaceId); },
     addAgent: async (workspaceId, name) => { await controller.addAgent(workspaceId, name); },
     removeAgent: async (workspaceId, agentId) => { await controller.removeAgent(workspaceId, agentId); },
     renameAgent: async (workspaceId, agentId, name) => { await controller.renameAgent(workspaceId, agentId, name); },
     copyInvitation: async (workspaceId) => { await controller.copyInvitation(workspaceId); },
     refreshMembership: async (workspaceId) => { await controller.refreshMembership(workspaceId); },
     retry: async () => { await controller.load(); },
+    dismissError: () => { controller.dismissError(); },
+    dismissMembershipRefreshWarning: () => { controller.dismissMembershipRefreshWarning(); },
   },
 });
 

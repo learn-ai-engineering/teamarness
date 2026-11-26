@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tauri::{State, ipc::Channel};
 use teamarness_core::{PrincipalId, WorkspaceId, WorkspaceInvitation};
-use teamarness_package_host::{PackageHostCommand, ReconcileWorkspaces};
+use teamarness_package_host::{PackageHostCommand, ReconcileWorkspaces, WorkspaceDeletionFailure};
 
 use crate::DesktopState;
 use crate::dto::{
@@ -12,7 +12,7 @@ use crate::dto::{
 };
 use crate::error::BridgeError;
 
-pub const COMMAND_NAMES: [&str; 11] = [
+pub const COMMAND_NAMES: [&str; 13] = [
     "installation_details",
     "list_workspaces",
     "create_workspace",
@@ -24,6 +24,8 @@ pub const COMMAND_NAMES: [&str; 11] = [
     "rename_workspace_principal",
     "add_workspace_agent",
     "remove_workspace_agent",
+    "rename_workspace",
+    "delete_workspace",
 ];
 
 async fn blocking<T, F>(state: &DesktopState, operation: F) -> Result<T, BridgeError>
@@ -75,6 +77,62 @@ pub async fn list_workspaces(
                     .map_err(BridgeError::from)
             })
             .await
+        })
+        .await?
+}
+
+/// Renames a Workspace on this Installation only (ADR 0049). Running Package Instances see the
+/// new name from their next start.
+#[tauri::command]
+pub async fn rename_workspace(
+    workspace_id: String,
+    name: String,
+    state: State<'_, DesktopState>,
+) -> Result<WorkspaceDto, BridgeError> {
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let workspace =
+                WorkspaceId::from_str(&workspace_id).map_err(|_| BridgeError::invalid_input())?;
+            blocking(&state, move |runtime| {
+                runtime
+                    .rename_workspace(workspace, &name)
+                    .map(WorkspaceDto::from)
+                    .map_err(BridgeError::from)
+            })
+            .await
+        })
+        .await?
+}
+
+/// Deletes a Workspace and all of its data on this Installation (ADR 0050). Only its creator may,
+/// and only while no other Person is a Member; the Package Host stops its Package Instances first.
+#[tauri::command]
+pub async fn delete_workspace(
+    workspace_id: String,
+    state: State<'_, DesktopState>,
+) -> Result<(), BridgeError> {
+    let state = state.inner().clone();
+    let dispatch = state.clone();
+    dispatch
+        .dispatch(async move {
+            let workspace = teamarness_package_host::WorkspaceId::new(workspace_id)
+                .map_err(|_| BridgeError::invalid_input())?;
+            let deletion = state
+                .package_host()
+                .delete_workspace(&workspace)
+                .await
+                .map_err(|failure| match failure {
+                    WorkspaceDeletionFailure::Refused(refused) => BridgeError::from(refused),
+                    WorkspaceDeletionFailure::Host(error) => {
+                        BridgeError::workspace_deletion(&error)
+                    }
+                })?;
+            for instance in &deletion.removed {
+                state.remove_instance_tokens(instance).await;
+            }
+            Ok(())
         })
         .await?
 }
@@ -571,6 +629,8 @@ mod tests {
                 "rename_workspace_principal",
                 "add_workspace_agent",
                 "remove_workspace_agent",
+                "rename_workspace",
+                "delete_workspace",
             ]
         );
         let registry = COMMAND_NAMES.join(" ");

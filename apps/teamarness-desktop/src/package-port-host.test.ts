@@ -108,7 +108,7 @@ type Harness = {
 
 const open: Harness[] = [];
 
-function harness(mount = MOUNT, onOpenSettings?: () => Promise<void>): Harness {
+function harness(mount = MOUNT, onOpenSettings?: () => Promise<void>, onContentHeight?: (height: number) => void): Harness {
   const channel = new MessageChannel();
   const transport = recorder();
   const faults: PackageUiFaultSource[] = [];
@@ -121,6 +121,7 @@ function harness(mount = MOUNT, onOpenSettings?: () => Promise<void>): Harness {
     transport: transport.transport,
     onFault: (source) => faults.push(source),
     onOpenSettings,
+    ...(onContentHeight ? { onContentHeight } : {}),
   });
   channel.port2.onmessage = (event: MessageEvent) => { received.push(event.data as Record<string, unknown>); };
   channel.port2.start();
@@ -691,4 +692,20 @@ it("keeps exactly one pending settings intent even while navigation awaits avail
   release?.();
   await test.dispose();
   expect(test.faults).toEqual([]);
+});
+
+it("forwards settings content heights until unmount and posts visible regions", async () => {
+  const heights: number[] = [];
+  const test = harness(MOUNT, undefined, (height) => heights.push(height));
+  await test.greet();
+  test.fromFrame({ kind: "content_height", height: 640 });
+  await settle();
+  expect(heights).toEqual([640]);
+  test.host.sendVisibleRegion({ top: 32, height: 500 });
+  await settle();
+  expect(test.received.at(-1)).toEqual({ kind: "visible_region", top: 32, height: 500 });
+  test.fromFrame({ kind: "content_height", height: 1.5 });
+  await settle();
+  expect(test.faults).toEqual(["protocol"]);
+  expect(heights).toEqual([640]);
 });

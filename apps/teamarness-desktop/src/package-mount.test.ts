@@ -71,6 +71,7 @@ type FakeFrame = {
   readonly lease: PackageFrameLease;
   detachWindow(): void;
   load(): void;
+  showRegion(region: Readonly<{ top: number; height: number }>): void;
   port(): MessagePort;
 };
 
@@ -78,6 +79,7 @@ function fakeFrame(source: Readonly<{ src: string; title: string }>, calls: stri
   const posted: Array<Readonly<{ message: unknown; targetOrigin: string; transfer: unknown[] }>> = [];
   const listeners = new Set<() => void>();
   let windowAvailable = true;
+  const regionListeners = new Set<(region: Readonly<{ top: number; height: number }>) => void>();
   const lease: PackageFrameLease = Object.freeze({
     get contentWindow(): PackageFrameWindow | null {
       if (!windowAvailable) return null;
@@ -91,6 +93,12 @@ function fakeFrame(source: Readonly<{ src: string; title: string }>, calls: stri
       listeners.add(listener);
       return () => { listeners.delete(listener); };
     },
+    setContentHeight(height: number): void { calls.push(`height:${height}`); },
+    watchVisibleRegion(listener: (region: Readonly<{ top: number; height: number }>) => void): () => void {
+      calls.push("watch-region");
+      regionListeners.add(listener);
+      return () => { calls.push("stop-region"); regionListeners.delete(listener); };
+    },
     remove(): void { calls.push("remove-frame"); },
   });
   return {
@@ -98,6 +106,7 @@ function fakeFrame(source: Readonly<{ src: string; title: string }>, calls: stri
     posted,
     lease,
     detachWindow: () => { windowAvailable = false; },
+    showRegion: (region) => { for (const listener of [...regionListeners]) listener(region); },
     load: () => { for (const listener of [...listeners]) listener(); },
     port: () => {
       const transferred = posted[0]?.transfer[0];
@@ -345,6 +354,31 @@ describe("generic Package UI mount", () => {
     expect(settings.views).toEqual(["settings"]);
     expect(shown.frame.source.title).toBe("Fixture settings");
     expect(shown.scripted.received[0]).toEqual({ ...opened.scripted.received[0], view: "settings" });
+  });
+
+  it("sizes only a settings frame to its content and keeps it told of its visible region until unmount", async () => {
+    const settings = harness();
+    const shown = await mountThrough(settings, settings.controller(), undefined, "settings");
+    const mounted = await shown.mounted;
+    expect(settings.calls).toContain("watch-region");
+    shown.frame.showRegion({ top: 48, height: 520 });
+    shown.scripted.send({ kind: "content_height", height: 1800 });
+    await settle();
+    expect(shown.scripted.received).toContainEqual({ kind: "visible_region", top: 48, height: 520 });
+    expect(settings.calls).toContain("height:1800");
+    const unmounting = mounted.unmount();
+    await settle();
+    shown.scripted.send({ kind: "unmounted", ok: true });
+    await unmounting;
+    expect(settings.calls.indexOf("stop-region")).toBeLessThan(settings.calls.indexOf("remove-frame"));
+
+    const main = harness();
+    const opened = await mountThrough(main, main.controller());
+    await opened.mounted;
+    opened.scripted.send({ kind: "content_height", height: 900 });
+    await settle();
+    expect(main.calls).not.toContain("watch-region");
+    expect(main.calls).not.toContain("height:900");
   });
 
   it("mounts with the generic context, entrypoint and current theme values", async () => {

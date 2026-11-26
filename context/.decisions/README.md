@@ -58,6 +58,9 @@ This index is the one place that lists every decision's status, its supersession
 | [0047](0047-native-applications-and-local-operator.md) | Shared native applications and local operator authority | accepted (2026-11-18) | 0036 (part: Shell-only registration authority) | – | In the ADR | Shared Core/Host, exclusive ownership and terminal handoff, native Package targets, private operator authority; staged implementation and native qualification remain explicit. |
 | [0048](0048-backlog-ticket-references-and-cancelled-status.md) | Backlog Tickets have derived short references and a Cancelled status | accepted (2026-11-26) | – | – | In the ADR | Refines 0039 (status value) and 0042 (re-evaluation pattern, for Backlog records); shortest-unique-prefix references, `ticket.get` by `ref`, Port Contract 1.1, Not done default filter |
 
+| [0049](0049-installation-local-workspace-rename.md) | Installation-local Workspace rename | accepted (2026-11-27) | 0005 (part: immutable local Workspace name) | – | In the ADR | Workstream `workspace-settings-ui`; desktop only |
+| [0050](0050-sole-creator-workspace-deletion.md) | Sole-creator Workspace deletion | accepted (2026-11-27) | – | – | In the ADR | Workstream `workspace-settings-ui`; answers `TEAM-DQ9` for deletion only; desktop only |
+
 ### Parallel-branch numbering reconciliation
 
 At the 2026-10-24 Documents integration, the Workspace Principals and Package ports decisions already occupied 0023–0026 on `main`. The Documents branch had independently assigned 0023–0025. Its Documents, qualified replay, and import-failure decisions are indexed here as 0027–0029, respectively; older `workspace-documents` workstream artifacts retain their original branch-local numbers. The Documents author-presentation and Package-port wording was aligned with the already accepted 0023 and 0026 contracts.

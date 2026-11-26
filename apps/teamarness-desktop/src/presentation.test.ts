@@ -72,6 +72,7 @@ function model(change: Partial<ShellModel> = {}): ShellModel {
     error: null,
     notice: null,
     membershipRefreshUnavailable: null,
+    feedbackSection: null,
     ...change,
   };
 }
@@ -99,7 +100,7 @@ describe("display-safe Shell presentation", () => {
       membership.version,
       String(workspace.createdAtUnixMs),
     ]) expect(serialized).not.toContain(forbidden);
-    for (const { identity } of membership.members) expect(serialized).toContain(`Identity: ${identity}`);
+    for (const { identity } of membership.members) expect(serialized).not.toContain(identity.slice(0, 12));
   });
 
   it("represents loading, no-Workspace, and empty-membership states deliberately", async () => {

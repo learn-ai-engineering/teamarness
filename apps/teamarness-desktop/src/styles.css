@@ -14,8 +14,8 @@
   --teamarness-color-focus: #075db7;
   --teamarness-font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --teamarness-font-mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  --teamarness-radius-control: 6px;
-  --teamarness-radius-panel: 12px;
+  --teamarness-radius-control: 0;
+  --teamarness-radius-panel: 0;
 }
 
 :root[data-theme="dark"] {
@@ -30,8 +30,8 @@
   --teamarness-color-focus: #8fc7ff;
   --teamarness-font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --teamarness-font-mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  --teamarness-radius-control: 6px;
-  --teamarness-radius-panel: 12px;
+  --teamarness-radius-control: 0;
+  --teamarness-radius-panel: 0;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -47,8 +47,8 @@
     --teamarness-color-focus: #8fc7ff;
     --teamarness-font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --teamarness-font-mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-    --teamarness-radius-control: 6px;
-    --teamarness-radius-panel: 12px;
+    --teamarness-radius-control: 0;
+    --teamarness-radius-panel: 0;
   }
 }
 
@@ -105,7 +105,7 @@ button:disabled { cursor: wait; opacity: 0.6; }
   place-items: center;
   color: var(--teamarness-color-background);
   background: var(--teamarness-color-accent);
-  border-radius: 0.9rem;
+  border-radius: 0;
   font-size: 1.1rem;
   font-weight: 800;
 }
@@ -127,7 +127,7 @@ button:disabled { cursor: wait; opacity: 0.6; }
   color: var(--teamarness-color-text);
   background: transparent;
   border: 1px solid transparent;
-  border-radius: 0.8rem;
+  border-radius: 0;
   font-weight: 750;
 }
 .workspace-switcher button:hover,
@@ -227,6 +227,8 @@ button:disabled { cursor: wait; opacity: 0.6; }
   margin-inline: auto;
 }
 .package-ui-frame { display: block; width: 100%; height: 100%; border: 0; background: transparent; }
+/* A settings view sized to its content: the frame takes its reported height and the page scrolls as one. */
+#package-mount[data-placement="package-page"][data-content-sized] { flex: none; min-height: 0; padding-bottom: var(--shell-screen-padding); }
 #package-mount > .error { margin: clamp(1.25rem, 4vw, 3rem); }
 #package-mount > button { margin: 0 0 0 clamp(1.25rem, 4vw, 3rem); }
 .shell-screen { width: min(48rem, 100%); }
@@ -282,18 +284,13 @@ h1, h2, p { margin-top: 0; }
 .package-instance-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
 .package-instance-actions button { flex: 0 1 auto; }
 .package-instance-actions button:disabled { cursor: not-allowed; }
-.package-snapshot-failure,
+/* A notification in a Package row: the thin rule and its text, like every other notification. */
 .package-lifecycle-feedback {
-  padding: 0.75rem;
+  padding: 0.1rem 0 0.1rem 0.75rem;
   color: var(--teamarness-color-text);
-  background: var(--teamarness-color-background);
-  border: 1px solid var(--teamarness-color-danger);
-  border-radius: var(--teamarness-radius-control);
+  border-left: 2px solid var(--teamarness-color-danger);
 }
-.package-snapshot-failure p,
-.package-lifecycle-feedback p { margin-bottom: 0.65rem; }
-.package-snapshot-failure button,
-.package-lifecycle-feedback button { width: 100%; }
+.package-lifecycle-feedback p { margin-bottom: 0.5rem; }
 .package-add {
   display: grid;
   flex: none;
@@ -308,10 +305,11 @@ h1, h2, p { margin-top: 0; }
 .package-registrations { display: grid; gap: 0.75rem; margin-bottom: 1rem; }
 .package-install {
   padding: 1rem;
-  background: var(--teamarness-color-background);
+  background: var(--teamarness-color-panel);
   border: 1px solid var(--teamarness-color-border);
-  border-radius: var(--teamarness-radius-control);
 }
+.package-install-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; }
+.package-install-close { margin: -0.5rem -0.5rem 0 0; }
 .package-registrations { margin: 1.25rem 0 0; padding-top: 1rem; border-top: 1px solid var(--teamarness-color-border); }
 .package-install h3,
 .package-registrations h3 { margin: 0; font-size: 1rem; }
@@ -333,9 +331,6 @@ button.secondary {
   border: 1px solid var(--teamarness-color-border);
 }
 button.secondary:hover { background: var(--teamarness-color-panel); }
-.shell-status:empty,
-.shell-alert:empty { display: none; }
-.shell-alert:not(:empty) { margin-bottom: 1rem; padding: 1rem; background: var(--teamarness-color-panel); border: 1px solid var(--teamarness-color-danger); border-radius: var(--teamarness-radius-panel); }
 
 form { display: grid; gap: 0.75rem; }
 form > button { justify-self: start; }
@@ -372,12 +367,49 @@ textarea:focus-visible {
 .member-row strong,
 .member-row small { display: block; }
 .member-row small { margin-top: 0.2rem; color: var(--teamarness-color-text-muted); }
-.member-actions { display: grid; justify-items: end; gap: 0.4rem; }
-.member-actions form { display: grid; gap: 0.3rem; }
+.member-identity { min-width: 0; flex: 1; }
+.member-actions { display: flex; align-items: center; gap: 0.5rem; }
+/* An Agent name its Steward can rename: select it to edit in place. */
+.member-name-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  max-width: 100%;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px dashed transparent;
+  font-weight: inherit;
+  text-align: left;
+}
+.member-name-edit strong { overflow-wrap: anywhere; }
+.member-name-edit svg { flex: none; width: 0.9rem; height: 0.9rem; color: var(--teamarness-color-text-muted); opacity: 0; }
+.member-name-edit:hover,
+.member-name-edit:focus-visible { border-bottom-color: var(--teamarness-color-border); }
+.member-name-edit:hover svg,
+.member-name-edit:focus-visible svg { opacity: 1; }
+.member-name-form { display: block; }
+.member-name-input { width: min(100%, 20rem); padding: 0.2rem 0.4rem; font-weight: 700; }
+/* A control that is only an icon: no fill or frame until it is pointed at. */
+button.icon-button {
+  display: grid;
+  flex: none;
+  width: 2rem;
+  height: 2rem;
+  place-items: center;
+  padding: 0;
+  color: var(--teamarness-color-text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+}
+button.icon-button svg { width: 1.05rem; height: 1.05rem; }
+button.icon-button:hover { color: var(--teamarness-color-text); background: color-mix(in srgb, var(--teamarness-color-text) 8%, transparent); }
+button.member-remove:hover { color: var(--teamarness-color-danger); }
 .member-role { flex: none; color: var(--teamarness-color-text-muted); font-size: 0.85rem; font-weight: 700; }
 .empty-state { padding: 0.8rem 0; color: var(--teamarness-color-text-muted); }
 .error { color: var(--teamarness-color-danger); }
-.shell-status, .sensitive { color: var(--teamarness-color-accent); }
+.sensitive { color: var(--teamarness-color-accent); }
 .sensitive { margin: 0.8rem 0 0; font-weight: 700; }
 
 #application-update-notice:not(:empty) { flex: none; padding: 0.5rem 1rem; max-height: 30vh; overflow: auto; background: var(--teamarness-color-panel); border-bottom: 1px solid var(--teamarness-color-border); }
@@ -410,7 +442,7 @@ textarea:focus-visible {
 }
 .application-update-indicator:hover { background: var(--teamarness-color-panel); border-color: var(--teamarness-color-border); }
 .application-update-indicator svg { width: 1.3rem; height: 1.3rem; }
-.application-update-dot { position: absolute; top: 0.1rem; right: 0.1rem; width: 0.4rem; height: 0.4rem; border-radius: 50%; background: currentColor; }
+.application-update-dot { position: absolute; top: 0.1rem; right: 0.1rem; width: 0.4rem; height: 0.4rem; border-radius: 0; background: currentColor; }
 .application-update-indicator.is-busy svg { animation: application-update-spin 1.5s linear infinite; }
 @keyframes application-update-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .application-update-indicator.is-busy svg { animation: none; } }
@@ -456,7 +488,8 @@ textarea:focus-visible {
 }
 .package-instance-link:hover { color: var(--teamarness-color-accent); text-decoration-color: currentColor; }
 /* The Package page: a centred page with its header, underline tabs, and two-column groups. */
-.shell-screen.package-page { width: max(75%, min(100%, 40rem)); margin-inline: auto; }
+.shell-screen.package-page,
+.shell-screen.workspace-page { width: max(75%, min(100%, 40rem)); margin-inline: auto; }
 .package-page-header { display: block; }
 .package-page-kind {
   margin: 0 0 0.4rem;
@@ -507,20 +540,61 @@ textarea:focus-visible {
 .package-page-copyable input { flex: 1 1 12rem; min-width: 0; }
 .package-page-hint { margin: 0; color: var(--teamarness-color-text-muted); font-size: 0.9rem; }
 
-/* The message area at the top of a screen keeps its height, so a message never moves the page. */
-.status-message-slot { min-height: 3.25rem; margin: 0.75rem 0; }
+/* Workspace settings: the Package page structure, with a rule under the header in place of tabs. */
+.workspace-page-header { padding-bottom: 1.5rem; margin-bottom: 1.5rem; border-bottom: 1px solid var(--teamarness-color-border); }
+.workspace-page-header + .package-page-group,
+.workspace-page-header + .status-message-slot + .package-page-group { border-top: 0; padding-top: 0.5rem; }
+.workspace-page-header + .status-message-slot { margin: -0.5rem 0 1.5rem; }
+.workspace-page .inline-field { display: flex; gap: 0.5rem; align-items: center; }
+.workspace-page .inline-field input { flex: 1; min-width: 0; }
+.workspace-page .inline-field button { flex: none; }
+.workspace-page form { gap: 0.5rem; }
+.workspace-page label { font-weight: 600; }
+.workspace-page .members { margin: 0; }
+.workspace-page .member-row:first-child { padding-top: 0; border-top: 0; }
+.workspace-page .sensitive { margin: 0; font-size: 0.9rem; }
+.workspace-page .workspace-delete h2 { color: var(--teamarness-color-danger); }
+button.danger { color: var(--teamarness-color-danger); background: transparent; border: 1px solid var(--teamarness-color-danger); }
+button.danger:not(:disabled):hover { color: var(--teamarness-color-panel); background: var(--teamarness-color-danger); }
+button.danger:disabled { cursor: not-allowed; opacity: 0.5; }
+.workspace-page .package-page-group-intro .section-heading { align-items: flex-start; margin-bottom: 0.35rem; }
+.workspace-page .package-page-group-intro .section-heading h2 { margin: 0; }
+
+/* A notification is a thin rule beside its text, with no box around it (TEAM.SYS.SHELL-R08). */
+.status-message-slot { margin: 0; }
 .status-message:empty { display: none; }
+.status-message-slot > .status-message + .status-message { margin-top: 0.75rem; }
 .status-message {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 0.5rem 0.75rem;
-  min-height: 3.25rem;
-  padding: 0.5rem 0.75rem;
+  gap: 0.4rem 0.75rem;
+  padding: 0.15rem 0 0.15rem 0.75rem;
   color: var(--teamarness-color-text);
-  border-left: 3px solid var(--teamarness-color-accent);
+  border-left: 2px solid var(--teamarness-color-accent);
+  animation: status-message-in 160ms ease-out;
 }
-.status-message--error { border-left-color: var(--teamarness-color-danger); }
+.status-message--error { color: var(--teamarness-color-danger); border-left-color: var(--teamarness-color-danger); }
 .status-message p { flex: 1 1 16rem; margin: 0; overflow-wrap: anywhere; }
-.status-message--error p { color: var(--teamarness-color-danger); }
-.status-message button { flex: none; padding: 0.35rem 0.7rem; }
+.status-message button { flex: none; padding: 0.3rem 0.65rem; }
+.status-message button.status-message-dismiss {
+  display: grid;
+  width: 1.75rem;
+  height: 1.75rem;
+  place-items: center;
+  margin-left: auto;
+  padding: 0;
+  color: var(--teamarness-color-text-muted);
+  background: transparent;
+  border: 0;
+  font-size: 1.2rem;
+  line-height: 1;
+}
+.status-message button.status-message-dismiss:hover { color: var(--teamarness-color-text); }
+@keyframes status-message-in { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .status-message { animation: none; } }
+/* A screen's own message area (the Package page) keeps one line of space, so a message never moves the page. */
+.package-page .status-message-slot { min-height: 1.75rem; margin: 0.75rem 0; }
+/* The Package information failure also appears in the narrow navigation column. */
+.contextual-navigation .status-message { min-height: 0; }
+.contextual-navigation .status-message p { flex-basis: 100%; font-size: 0.85rem; }

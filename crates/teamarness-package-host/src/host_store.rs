@@ -117,6 +117,9 @@ impl HostStore {
                 "../migrations/0004_person_port_selections.sql"
             ))
             .map_err(fault!(storage_failure()))?;
+        connection
+            .execute_batch(include_str!("../migrations/0005_workspace_deletions.sql"))
+            .map_err(fault!(storage_failure()))?;
         Ok(Self { connection })
     }
 
@@ -203,6 +206,115 @@ impl HostStore {
             )
             .optional()
             .map_err(fault!(storage_failure()))
+    }
+
+    /// Records that the Host has started deleting a Workspace (ADR 0050).
+    pub(crate) fn mark_workspace_deletion(
+        &self,
+        installation: &str,
+        workspace: &str,
+    ) -> Result<(), HostStoreFailure> {
+        self.connection
+            .execute(
+                "INSERT INTO pending_workspace_deletions(installation_identity, workspace_id)
+                 VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                params![installation, workspace],
+            )
+            .map_err(fault!(storage_failure()))?;
+        Ok(())
+    }
+
+    /// Drops a deletion entry without touching any data: the Workspace was not deleted.
+    pub(crate) fn clear_workspace_deletion(
+        &self,
+        installation: &str,
+        workspace: &str,
+    ) -> Result<(), HostStoreFailure> {
+        self.connection
+            .execute(
+                "DELETE FROM pending_workspace_deletions
+                 WHERE installation_identity = ?1 AND workspace_id = ?2",
+                params![installation, workspace],
+            )
+            .map_err(fault!(storage_failure()))?;
+        Ok(())
+    }
+
+    pub(crate) fn pending_workspace_deletions(
+        &self,
+        installation: &str,
+    ) -> Result<Vec<String>, HostStoreFailure> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT workspace_id FROM pending_workspace_deletions
+                 WHERE installation_identity = ?1 ORDER BY workspace_id",
+            )
+            .map_err(fault!(storage_failure()))?;
+        let rows = statement
+            .query_map([installation], |row| row.get::<_, String>(0))
+            .map_err(fault!(storage_failure()))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(fault!(storage_failure()))
+    }
+
+    /// Whether any process lease of the Workspace is still recorded: a process may be live.
+    pub(crate) fn workspace_has_process_leases(
+        &self,
+        workspace: &str,
+    ) -> Result<bool, HostStoreFailure> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM process_leases WHERE workspace_id = ?1)",
+                [workspace],
+                |row| row.get(0),
+            )
+            .map_err(fault!(storage_failure()))
+    }
+
+    /// The stored relative paths of a Workspace's Package Data Directories.
+    pub(crate) fn workspace_data_directories(
+        &self,
+        installation: &str,
+        workspace: &str,
+    ) -> Result<Vec<String>, HostStoreFailure> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT relative_path FROM package_data_directories
+                 WHERE installation_identity = ?1 AND workspace_id = ?2 ORDER BY relative_path",
+            )
+            .map_err(fault!(storage_failure()))?;
+        let rows = statement
+            .query_map(params![installation, workspace], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(fault!(storage_failure()))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(fault!(storage_failure()))
+    }
+
+    /// Removes every Host row of a deleted Workspace, and its deletion entry last.
+    pub(crate) fn forget_workspace(
+        &self,
+        installation: &str,
+        workspace: &str,
+    ) -> Result<(), HostStoreFailure> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(fault!(storage_failure()))?;
+        for statement in [
+            "DELETE FROM package_data_directories WHERE installation_identity = ?1 AND workspace_id = ?2",
+            "DELETE FROM agent_port_selections WHERE installation_identity = ?1 AND workspace_id = ?2",
+            "DELETE FROM person_port_selections WHERE installation_identity = ?1 AND workspace_id = ?2",
+            "DELETE FROM pending_workspace_deletions WHERE installation_identity = ?1 AND workspace_id = ?2",
+        ] {
+            transaction
+                .execute(statement, params![installation, workspace])
+                .map_err(fault!(storage_failure()))?;
+        }
+        transaction.commit().map_err(fault!(storage_failure()))
     }
 
     pub(crate) fn record_data_directory(

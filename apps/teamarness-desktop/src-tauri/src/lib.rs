@@ -98,7 +98,7 @@ impl DesktopState {
             .retain(|_, lease| lease.mount != *mount);
     }
 
-    async fn remove_instance_tokens(&self, instance: &PackageInstanceKey) {
+    pub(crate) async fn remove_instance_tokens(&self, instance: &PackageInstanceKey) {
         self.protocol_mounts
             .lock()
             .await
@@ -255,7 +255,7 @@ pub fn run() {
         commands::COMMAND_NAMES.len()
             + package_commands::COMMAND_NAMES.len()
             + update_commands::COMMAND_NAMES.len(),
-        37
+        39
     );
     let app = update::configure(tauri::Builder::default())
         .plugin(tauri_plugin_dialog::init())
@@ -295,6 +295,8 @@ pub fn run() {
             commands::rename_workspace_principal,
             commands::add_workspace_agent,
             commands::remove_workspace_agent,
+            commands::rename_workspace,
+            commands::delete_workspace,
             package_commands::package_catalog_snapshot,
             package_commands::package_subscribe_host_state,
             package_commands::package_open_mount,
@@ -420,7 +422,7 @@ mod tests {
                     .as_str()
                     .is_some_and(|name| name.starts_with("allow-")))
                 .count(),
-            37
+            39
         );
     }
 

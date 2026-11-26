@@ -34,7 +34,7 @@ type OperationRow = (Vec<u8>, Vec<u8>, i64, i64, Vec<u8>);
 type WorkspaceRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 type WorkspaceAnchor = (WorkspaceId, PublicIdentity, MembershipOperationId, Vec<u8>);
 type FutureRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, Vec<u8>);
-type CreationRequestEvidence = (Vec<u8>, String, i64, Vec<u8>, Vec<u8>, String);
+type CreationRequestEvidence = (Vec<u8>, i64, Vec<u8>, Vec<u8>, String);
 
 pub(crate) type PrincipalAnchor = (
     MembershipOperationId,
@@ -661,31 +661,19 @@ pub(crate) fn import_bootstrap_with_fault(
     let mut imported_member_change = false;
     let (imported_projection, writes_derived_state) =
         if let Some(existing) = local.get(&response.workspace_id) {
-            let (name, creator, created_at, genesis_id, genesis_bytes): (
-                String,
-                Vec<u8>,
-                i64,
-                Vec<u8>,
-                Vec<u8>,
-            ) = transaction
-                .query_row(
-                    "SELECT name, creator_public_identity, authored_at_unix_ms,
-                        genesis_operation_id, genesis_envelope
-                 FROM workspaces WHERE workspace_id = ?1",
-                    [response.workspace_id.as_bytes().as_slice()],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )
-                .map_err(|_| crate::OnboardingError::LocalConflict)?;
-            if name != response.name
-                || creator != response.creator.as_bytes()
+            // The name is Installation-local metadata (ADR 0049), so it is not compared: a stored
+            // Workspace keeps its own name, whatever name the inviter now uses.
+            let (creator, created_at, genesis_id, genesis_bytes): (Vec<u8>, i64, Vec<u8>, Vec<u8>) =
+                transaction
+                    .query_row(
+                        "SELECT creator_public_identity, authored_at_unix_ms,
+                            genesis_operation_id, genesis_envelope
+                     FROM workspaces WHERE workspace_id = ?1",
+                        [response.workspace_id.as_bytes().as_slice()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .map_err(|_| crate::OnboardingError::LocalConflict)?;
+            if creator != response.creator.as_bytes()
                 || created_at != response.created_at_unix_ms
                 || genesis_id != response.genesis_id.as_bytes()
                 || genesis_bytes != response.genesis.canonical_bytes()
@@ -874,7 +862,7 @@ fn verify_creation_request(
 ) -> Result<(), crate::OnboardingError> {
     let row: Option<CreationRequestEvidence> = connection
         .query_row(
-            "SELECT creator_public_identity, name, authored_at_unix_ms,
+            "SELECT creator_public_identity, authored_at_unix_ms,
                     genesis_operation_id, genesis_envelope, status
              FROM workspace_creation_requests WHERE workspace_id = ?1",
             [response.workspace_id.as_bytes().as_slice()],
@@ -885,15 +873,14 @@ fn verify_creation_request(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
-                    row.get(5)?,
                 ))
             },
         )
         .optional()
         .map_err(|_| crate::OnboardingError::LocalConflict)?;
-    if !matches!(row, Some((creator, name, created_at, genesis_id, genesis, status))
+    // The creation request's name follows local renames (ADR 0049), so it is not compared.
+    if !matches!(row, Some((creator, created_at, genesis_id, genesis, status))
         if creator == response.creator.as_bytes()
-            && name == response.name
             && created_at == response.created_at_unix_ms
             && genesis_id == response.genesis_id.as_bytes()
             && genesis == response.genesis.canonical_bytes()

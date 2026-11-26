@@ -30,6 +30,12 @@ pub enum BridgeErrorCode {
     Shutdown,
     NotSteward,
     PrincipalNotBound,
+    /// Only the Installation that created a Workspace may delete it (ADR 0050).
+    NotWorkspaceCreator,
+    /// A Workspace with another current Person cannot be deleted (ADR 0050).
+    WorkspaceHasMembers,
+    /// Package Instances could not be stopped, so nothing was deleted.
+    WorkspaceDeletionFailed,
 }
 
 impl BridgeError {
@@ -43,6 +49,14 @@ impl BridgeError {
 
     pub const fn shutdown() -> Self {
         Self::new(BridgeErrorCode::Shutdown, true)
+    }
+
+    /// Reports a Package Host failure that stopped a Workspace deletion; nothing was deleted.
+    pub fn workspace_deletion(error: &PackageErrorEnvelope) -> Self {
+        match error.code {
+            PackageErrorCode::ShuttingDown => Self::shutdown(),
+            _ => Self::new(BridgeErrorCode::WorkspaceDeletionFailed, true),
+        }
     }
 
     /// Reports a Package reconciliation failure as what it is. Only a Host that
@@ -98,6 +112,13 @@ impl From<WorkspaceError> for BridgeError {
         match value {
             WorkspaceError::InvalidName => Self::invalid_input(),
             WorkspaceError::Conflict => Self::new(BridgeErrorCode::LocalConflict, false),
+            WorkspaceError::UnknownWorkspace => Self::invalid_input(),
+            WorkspaceError::NotWorkspaceCreator => {
+                Self::new(BridgeErrorCode::NotWorkspaceCreator, false)
+            }
+            WorkspaceError::WorkspaceHasOtherMembers => {
+                Self::new(BridgeErrorCode::WorkspaceHasMembers, false)
+            }
             WorkspaceError::CorruptTrustAnchor => {
                 Self::new(BridgeErrorCode::InvalidBootstrap, false)
             }
@@ -184,6 +205,9 @@ mod tests {
             serde_json::to_value([
                 BridgeError::from(PersonNameError::NotOwnPerson),
                 BridgeError::new(BridgeErrorCode::PrincipalNotBound, false),
+                BridgeError::from(teamarness_core::WorkspaceError::NotWorkspaceCreator),
+                BridgeError::from(teamarness_core::WorkspaceError::WorkspaceHasOtherMembers),
+                BridgeError::new(BridgeErrorCode::WorkspaceDeletionFailed, true),
             ])
             .unwrap()
             .as_array()
