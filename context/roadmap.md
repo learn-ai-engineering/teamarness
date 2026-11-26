@@ -134,7 +134,7 @@ Manual checks M1–M7 passed on 2026-11-01 with a real model. The first run foun
 
 **Follow-ups:** tracked in the Backlog: *Backlog Package › Ticket conflict detection across Installations* and *Backlog Package › DELTA-021: Backlog Package findings accepted as tech debt*.
 
-### Backlog polish (implemented; manual checks pending; not integrated)
+### Backlog polish (complete; scroll position check pending)
 
 Started on 2026-11-26 on branch `backlog-polish`, workstream `backlog-polish`, for the five ready Tickets in the Backlog's *Backlog Package* epic. [ADR 0048](.decisions/0048-backlog-ticket-references-and-cancelled-status.md), accepted 2026-11-26, decides Ticket references and the Cancelled status.
 
@@ -143,7 +143,9 @@ Started on 2026-11-26 on branch `backlog-polish`, workstream `backlog-polish`, f
 - Port Contract 1.1 is an additive minor over the pinned 1.0, and a 1.0 consumer still passes `backlog_ports_proof`.
 - The left pane widens from its right edge (drag, arrow keys; double-click or Home resets) and remembers its width. One button expands or collapses every Epic. Selecting a Ticket no longer rebuilds the left pane, and a rebuild keeps its scroll position.
 
-Automated evidence: Backend unit tests, Backlog UI tests, and both Backlog system tests pass. The scroll fix and the drag resize need a manual check in the desktop app: the UI tests run in happy-dom, which has no layout. An Installation on an older build quarantines a record that sets `cancelled` until it updates; the release notes must say so.
+Automated evidence: Backend unit tests, Backlog UI tests, and both Backlog system tests pass. On 2026-11-26 a manual check in the desktop app verified the Cancelled status, the **Not done** filter, panel resizing, Ticket references and Collapse/Expand All. Scroll position retention is not yet verified: it needs a Backlog larger than the one used in testing, and the UI tests run in happy-dom, which has no layout. An Installation on an older build quarantines a record that sets `cancelled` until it updates; the release notes must say so.
+
+Merged to `main` on 2026-11-26 in PR #14. The five Tickets are done.
 
 ### Better Doc Agent (complete, verified locally)
 
