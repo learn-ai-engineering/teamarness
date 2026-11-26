@@ -12,6 +12,7 @@ import {
   type ShellPresentation,
 } from "./presentation";
 import { renderStatusMessage, type StatusMessageTimers } from "./status-message";
+import { captureDrafts, restoreDrafts } from "./form-drafts";
 import type { InstallationThemeController, ThemePreference } from "./theme";
 import { THEME_OPTIONS } from "./theme-icons";
 import { renderShell, type ShellModel } from "./view";
@@ -98,6 +99,8 @@ export class Shell {
   private editingAgentId: string | null = null;
   /** Set while the selected screen's markup is replaced, so a field losing focus to removal is not a save. */
   private replacingScreen = false;
+  /** The route the selected screen was last rendered for, so drafts are kept only within one screen. */
+  private renderedRouteKey: string | null = null;
   /** The last failed Recover or Dispose, for Retry and for a later successful refresh. */
   private packageLifecycleFeedback: PackageLifecycleFeedback | null = null;
   /** The message that result put in the Workspace page's message area. */
@@ -480,11 +483,12 @@ export class Shell {
         this.options.packageVisibility,
       )}${this.packageManagement.renderRegistrations(this.packageSnapshot)}`
       : undefined;
-    // An Agent name being edited survives a render caused by something else, such as a roster update.
-    const editing = hasQueries(this.shellFrame.shellScreen)
-      ? this.shellFrame.shellScreen.querySelector<HTMLInputElement>(".member-name-input")
-      : null;
-    const draft = editing ? { value: editing.value, focused: editing.ownerDocument.activeElement === editing } : null;
+    // What the Person is typing survives a render caused by something else, such as a notice
+    // hiding itself or a roster update, but never carries over to a different screen.
+    const routeKey = JSON.stringify(this.selectedRoute);
+    const drafts = this.renderedRouteKey === routeKey && hasQueries(this.shellFrame.shellScreen)
+      ? captureDrafts(this.shellFrame.shellScreen)
+      : [];
     const editingAgentId = this.editingAgentId !== null
       && this.workspacePresentation.workspace?.members.some(({ agentId, canRenameAgent }) => canRenameAgent && agentId === this.editingAgentId)
       ? this.editingAgentId
@@ -500,14 +504,9 @@ export class Shell {
     } finally {
       this.replacingScreen = false;
     }
+    this.renderedRouteKey = routeKey;
     this.bindSelectedScreen();
-    if (draft && hasQueries(this.shellFrame.shellScreen)) {
-      const input = this.shellFrame.shellScreen.querySelector<HTMLInputElement>(".member-name-input");
-      if (input) {
-        input.value = draft.value;
-        if (draft.focused) input.focus();
-      }
-    }
+    if (hasQueries(this.shellFrame.shellScreen)) restoreDrafts(this.shellFrame.shellScreen, drafts);
     this.focusPackageInstallStep();
   }
 
@@ -666,7 +665,13 @@ export class Shell {
       this.shellFrame.shellScreen.querySelector<HTMLFormElement>("#add-agent")?.addEventListener("submit", (event) => {
         event.preventDefault();
         const name = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#agent-name");
-        if (name) void this.options.workspaceActions.addAgent(workspaceId, name.value);
+        if (!name) return;
+        void this.options.workspaceActions.addAgent(workspaceId, name.value).then(() => {
+          // The field kept the name while the Agent was added; clear it once the add succeeded.
+          if (this.workspaceModel?.error !== null) return;
+          const added = this.shellFrame.shellScreen.querySelector<HTMLInputElement>("#agent-name");
+          if (added) added.value = "";
+        });
       });
       this.shellFrame.shellScreen.querySelectorAll<HTMLButtonElement>("[data-remove-agent]").forEach((button) => {
         button.addEventListener("click", () => {

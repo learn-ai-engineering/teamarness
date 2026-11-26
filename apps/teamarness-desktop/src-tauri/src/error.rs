@@ -51,10 +51,6 @@ impl BridgeError {
         Self::new(BridgeErrorCode::Shutdown, true)
     }
 
-    /// Reports a Package reconciliation failure as what it is. Only a Host that
-    /// is shutting down becomes [`BridgeErrorCode::Shutdown`]; every other
-    /// failure says that Package activation failed, and carries the Host's own
-    /// retryability.
     /// Reports a Package Host failure that stopped a Workspace deletion; nothing was deleted.
     pub fn workspace_deletion(error: &PackageErrorEnvelope) -> Self {
         match error.code {
@@ -63,6 +59,10 @@ impl BridgeError {
         }
     }
 
+    /// Reports a Package reconciliation failure as what it is. Only a Host that
+    /// is shutting down becomes [`BridgeErrorCode::Shutdown`]; every other
+    /// failure says that Package activation failed, and carries the Host's own
+    /// retryability.
     pub fn reconcile(error: &PackageErrorEnvelope) -> Self {
         match error.code {
             PackageErrorCode::ShuttingDown => Self::shutdown(),

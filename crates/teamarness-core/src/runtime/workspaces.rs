@@ -104,12 +104,12 @@ impl CoreRuntime {
         if projection.creator() != self.public_identity {
             return Err(WorkspaceError::NotWorkspaceCreator);
         }
-        let others =
-            crate::principals::registry(projection)
-                .into_iter()
-                .any(|(_, key, kind, _, _)| {
-                    kind == crate::PrincipalKind::Person && key != self.public_identity
-                });
+        // Any current Installation key other than this one is another Person, whether or not it
+        // has a usable Person anchor; the creator's own Agent keys are not Installation keys.
+        let others = projection
+            .installation_members()
+            .into_iter()
+            .any(|key| key != self.public_identity);
         if others {
             return Err(WorkspaceError::WorkspaceHasOtherMembers);
         }

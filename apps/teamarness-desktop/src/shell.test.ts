@@ -806,6 +806,8 @@ describe("Workspace Agent Shell controls", () => {
     });
     await test.shell.updateWorkspace({ ...model(), memberships: { [workspace.id]: { ...membership, members: [...membership.members, agent] } }, principals: { [workspace.id]: { ...fixture.principals, principals: [...fixture.principals.principals, principal] } as PrincipalsSnapshot } });
     screen.addAgent.click();
+    // The field keeps the name until the Agent is added, then clears.
+    await vi.waitFor(() => expect(screen.agentName.value).toBe(""));
     screen.removeAgent.click();
     // The name is edited in place: selecting it shows the field, and Enter saves.
     expect(screen.innerHTML).not.toContain('data-rename-agent="2"');
