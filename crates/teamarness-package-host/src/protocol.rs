@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +20,13 @@ use crate::{
 type PendingRequests = Arc<Mutex<BTreeMap<String, oneshot::Sender<Result<Value, WireFailure>>>>>;
 type UiEventRoutes = Arc<Mutex<BTreeMap<String, Arc<UiEventRoute>>>>;
 type SharedState = Arc<Mutex<ContractState>>;
+/// Host requests withdrawn before the writer reached their frame.
+///
+/// Read and changed only while the classifier lock is held, so deciding to
+/// withdraw a request and the writer observing it are one step: either the
+/// writer has observed the request and it is retired as usual, or it has not
+/// and the writer drops the frame when it gets there. See [`ProcessClient::cancel`].
+type Withdrawn = Arc<std::sync::Mutex<BTreeSet<String>>>;
 
 /// One UI event route holds the credit window the contract grants the stream.
 const UI_EVENT_CAPACITY: usize = INITIAL_STREAM_CREDIT;
@@ -580,6 +587,7 @@ pub(crate) struct ProcessClient {
     writer: Writer,
     pending: PendingRequests,
     state: SharedState,
+    withdrawn: Withdrawn,
     ui_event_routes: UiEventRoutes,
     initialized: Arc<Mutex<Option<oneshot::Receiver<Frame>>>>,
     shutdown_ack: watch::Receiver<bool>,
@@ -996,6 +1004,7 @@ where
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let ui_event_routes = Arc::new(Mutex::new(BTreeMap::new()));
     let state = Arc::new(Mutex::new(ContractState::default()));
+    let withdrawn = Withdrawn::default();
     let (initialized_tx, initialized_rx) = oneshot::channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (pong_tx, pong_rx) = watch::channel(None);
@@ -1005,6 +1014,7 @@ where
         control_rx,
         data_rx,
         state.clone(),
+        withdrawn.clone(),
         failure_tx.clone(),
     ));
     tokio::spawn(reader_task(
@@ -1024,6 +1034,7 @@ where
         writer,
         pending,
         state,
+        withdrawn,
         ui_event_routes,
         initialized: Arc::new(Mutex::new(Some(initialized_rx))),
         shutdown_ack: shutdown_rx,
@@ -1038,6 +1049,7 @@ async fn writer_task<W>(
     mut control: mpsc::Receiver<QueuedFrame>,
     mut data: mpsc::Receiver<QueuedFrame>,
     state: Arc<Mutex<ContractState>>,
+    withdrawn: Withdrawn,
     failure: watch::Sender<Option<PackageErrorCode>>,
 ) where
     W: AsyncWrite + Unpin,
@@ -1057,11 +1069,30 @@ async fn writer_task<W>(
             // in contract and is written; the Package runs the same classifier
             // and ignores it. Only an out-of-contract frame fails the
             // generation the Host is serving.
-            state
-                .lock()
-                .await
-                .observe(Direction::HostToPackage, &queued.frame)
-                .map_err(protocol_code)?;
+            //
+            // A request withdrawn while it was still queued is the one frame
+            // not written: the Package never learns of it, so the Host owes it
+            // nothing, and no `cancel` for it is ever queued.
+            {
+                let mut state = state.lock().await;
+                if queued.frame.kind() == FrameKind::Request
+                    && queued
+                        .frame
+                        .field("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| {
+                            withdrawn
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(id)
+                        })
+                {
+                    return Ok(());
+                }
+                state
+                    .observe(Direction::HostToPackage, &queued.frame)
+                    .map_err(protocol_code)?;
+            }
             let bytes = encode_frame(&queued.frame).map_err(protocol_code)?;
             output
                 .write_all(&bytes)
@@ -1881,6 +1912,9 @@ impl ProcessClient {
         }
         if let Err(error) = self.writer.data(value).await {
             self.pending.lock().await.remove(&id);
+            // A cancel that withdrew it first has nothing left to withdraw.
+            let _state = self.state.lock().await;
+            self.withdrawn_ids().remove(&id);
             return Err(error);
         }
         if let Some(dispatched) = dispatched {
@@ -1907,6 +1941,13 @@ impl ProcessClient {
                 Err(error)
             }
             Err(_) => {
+                if self.withdraw_if_unwritten(&id).await {
+                    // The frame is still queued and now never will be written,
+                    // so the Package never saw the request: the timeout is
+                    // certain even for a state-changing one.
+                    self.pending.lock().await.remove(&id);
+                    return Err(WireFailure::new(PackageErrorCode::DeadlineExceeded));
+                }
                 if let Err(mut error) = self.send_cancel(&id).await {
                     // The command crossed the writer before cancellation failed. Retire
                     // its id and do not claim that the failed cancel undid its effect.
@@ -1949,6 +1990,23 @@ impl ProcessClient {
     /// fatal. A repeated cancel, or one for a request the answer already
     /// retired, is ignored by the same classifier when the writer observes it.
     pub(crate) async fn cancel(&self, target: &str) -> Result<(), WireFailure> {
+        // A request the writer has not reached yet is withdrawn instead: it
+        // never reaches the wire, so it needs neither a tombstone nor a
+        // `cancel`. Retiring it here would make the writer read the request,
+        // when it gets to it, as a `duplicate_id` of one already retired, and
+        // fail the generation (DELTA-024).
+        if self.withdraw_if_unwritten(target).await {
+            let removed = self.pending.lock().await.remove(target);
+            if let Some(sender) = removed {
+                let _ = sender.send(Err(WireFailure::new(PackageErrorCode::Cancelled)));
+            } else {
+                // Not a request in flight on this client, so nothing will ever
+                // consume the withdrawal.
+                let _state = self.state.lock().await;
+                self.withdrawn_ids().remove(target);
+            }
+            return Ok(());
+        }
         // Retire in the classifier before the adapter forgets the request. The
         // `cancel` frame is only queued here, and the writer may be blocked on
         // a slow pipe for as long as it takes to drain one; until it observes
@@ -1961,6 +2019,28 @@ impl ProcessClient {
             let _ = sender.send(Err(WireFailure::new(PackageErrorCode::Cancelled)));
         }
         self.send_cancel(target).await
+    }
+
+    /// Withdraws a request whose frame the writer has not observed yet.
+    ///
+    /// Returns `false`, changing nothing, once the writer has observed it: the
+    /// request is on the wire and is cancelled and retired as usual. The check
+    /// and the withdrawal happen under the classifier lock the writer holds
+    /// while it observes a frame, so the two cannot interleave.
+    async fn withdraw_if_unwritten(&self, id: &str) -> bool {
+        let state = self.state.lock().await;
+        if state.has_observed_request(id) {
+            return false;
+        }
+        self.withdrawn_ids().insert(id.to_owned());
+        true
+    }
+
+    /// The withdrawn set. Callers hold the classifier lock.
+    fn withdrawn_ids(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        self.withdrawn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     async fn send_cancel(&self, target: &str) -> Result<(), WireFailure> {

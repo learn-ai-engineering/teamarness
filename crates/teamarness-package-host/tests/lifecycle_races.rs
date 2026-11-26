@@ -441,6 +441,175 @@ async fn a_response_that_crossed_the_hosts_cancel_leaves_the_generation_alive() 
     held.abort();
 }
 
+/// Holds the Host's writer inside `write_all` on a request larger than the pipe.
+///
+/// Everything queued after it stays queued until the test drains the pipe, so
+/// a request sent now is accepted by the writer but not yet observed by it.
+async fn block_writer(client: &ProcessClient, package: &mut FakePackage, id: &str) {
+    let blocked = client.clone();
+    let id = id.to_owned();
+    let mut payload = std::collections::BTreeMap::new();
+    payload.insert(
+        "canonical".to_owned(),
+        PackageValue::String("A".repeat(256 * 1024)),
+    );
+    tokio::spawn(async move {
+        let _ = blocked
+            .request(
+                id,
+                "ui.read",
+                None,
+                PackageValue::Object(payload),
+                Duration::from_secs(30),
+                false,
+            )
+            .await;
+    });
+    package.read_one_chunk().await;
+}
+
+/// Drains the pipe past an answered probe and a later Host request.
+///
+/// The probe's answer travels the control lane and can overtake queued data
+/// frames, so the trailing request proves the writer has also passed every
+/// data frame queued before it. Returns every frame seen before that request.
+async fn drain_to_probe(
+    client: &ProcessClient,
+    package: &mut FakePackage,
+    probe: &str,
+) -> Vec<Frame> {
+    package
+        .send(json!({
+            "kind":"request", "id":probe, "operation":"capability.call",
+            "grant":"Z3JhbnQx", "deadlineUnixMs":"9007199254740998",
+            "payload":{"method":"get"}
+        }))
+        .await;
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = package.next_frame().await;
+            if matches!(frame.kind(), FrameKind::Response | FrameKind::Error)
+                && frame.field("id").and_then(Value::as_str) == Some(probe)
+            {
+                assert_eq!(frame.kind(), FrameKind::Response, "the probe was answered");
+                return;
+            }
+            seen.push(frame);
+        }
+    })
+    .await
+    .expect("the generation still answers after the withdrawn request");
+    let trailing = format!("h:after-{}", probe.trim_start_matches("p:"));
+    let after = client.clone();
+    let id = trailing.clone();
+    let request = tokio::spawn(async move {
+        after
+            .request(
+                id,
+                "ui.read",
+                None,
+                PackageValue::Object(Default::default()),
+                Duration::from_secs(30),
+                false,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = package.next_frame().await;
+            if frame.kind() == FrameKind::Request && names(&frame, &trailing) {
+                return;
+            }
+            seen.push(frame);
+        }
+    })
+    .await
+    .expect("the writer reaches a request queued after the withdrawn one");
+    request.abort();
+    seen
+}
+
+fn names(frame: &Frame, id: &str) -> bool {
+    frame.field("id").and_then(Value::as_str) == Some(id)
+        || frame.field("targetId").and_then(Value::as_str) == Some(id)
+}
+
+/// DELTA-024: a request cancelled while its frame is still queued is withdrawn.
+///
+/// `cancel` used to retire the ID in the classifier before the writer reached
+/// the request frame, so the writer then read the Host's own request as a
+/// `duplicate_id` and failed the generation. Mount teardown cancels every
+/// in-flight request, so this surfaced as `StaleMount` on a slow pipe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_cancelled_before_the_writer_reaches_it_is_withdrawn() {
+    let (client, mut package) = connect(Arc::new(ClosingStream), 1024);
+    block_writer(&client, &mut package, "h:big").await;
+
+    let (accepted, enqueued) = tokio::sync::oneshot::channel();
+    let queued = client.clone();
+    let request = tokio::spawn(async move {
+        queued
+            .request_observed(
+                "h:queued".to_owned(),
+                "ui.read",
+                PackageValue::Object(Default::default()),
+                Box::new(move || {
+                    let _ = accepted.send(());
+                }),
+            )
+            .await
+    });
+    enqueued
+        .await
+        .expect("the writer accepted the queued request");
+
+    client.cancel("h:queued").await.expect("cancel succeeds");
+    let failure = request.await.expect("join").expect_err("cancelled");
+    assert_eq!(failure.code, PackageErrorCode::Cancelled);
+    assert!(
+        !failure.outcome_uncertain,
+        "the request never reached the wire"
+    );
+
+    let seen = drain_to_probe(&client, &mut package, "p:probe-withdrawn").await;
+    assert!(seen.iter().any(|frame| names(frame, "h:big")));
+    assert!(
+        !seen.iter().any(|frame| names(frame, "h:queued")),
+        "neither the withdrawn request nor a cancel for it reaches the Package"
+    );
+    assert_eq!(client.failure(), None);
+}
+
+/// A request whose deadline passes while its frame is still queued is
+/// withdrawn too, and the timeout is certain because nothing was written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_that_times_out_before_the_writer_reaches_it_is_withdrawn() {
+    let (client, mut package) = connect(Arc::new(ClosingStream), 1024);
+    block_writer(&client, &mut package, "h:big").await;
+
+    let failure = client
+        .request(
+            "h:late".to_owned(),
+            "teamarness.port.command.v1",
+            None,
+            PackageValue::Object(Default::default()),
+            Duration::from_millis(50),
+            true,
+        )
+        .await
+        .expect_err("the deadline passes behind the blocked writer");
+    assert_eq!(failure.code, PackageErrorCode::DeadlineExceeded);
+    assert!(
+        !failure.outcome_uncertain,
+        "a command that never reached the wire cannot have committed"
+    );
+
+    let seen = drain_to_probe(&client, &mut package, "p:probe-late").await;
+    assert!(!seen.iter().any(|frame| names(frame, "h:late")));
+    assert_eq!(client.failure(), None);
+}
+
 /// CR-004: every in-flight capability call the contract permits is answered,
 /// behind a pipe the Package drains slowly and with contract-maximum payloads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

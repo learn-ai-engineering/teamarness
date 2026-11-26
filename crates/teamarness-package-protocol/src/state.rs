@@ -220,6 +220,18 @@ impl ContractState {
         self.abandoned.insert(id);
     }
 
+    /// Whether a `request` frame with this ID has been observed, in either
+    /// direction, and is still pending or tombstoned.
+    ///
+    /// A sender that queues frames before its writer observes them asks this
+    /// before retiring a request: one its writer has not reached yet is not on
+    /// the wire, so retiring it would make the writer read its own request as a
+    /// `duplicate_id`. The sender withdraws such a request instead.
+    #[must_use]
+    pub fn has_observed_request(&self, id: &str) -> bool {
+        self.pending.contains_key(id) || self.answered.contains(id) || self.abandoned.contains(id)
+    }
+
     /// Retires a stream this side has stopped serving.
     ///
     /// `event` and `credit` frames naming it are ignored from now on, because
