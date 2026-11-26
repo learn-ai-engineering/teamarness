@@ -24,5 +24,6 @@ Add a packaged-app probe that proves each denial. Close this delta when that pro
 
 ## Tracking
 
+- Teamarness Backlog: *Exhibits › DELTA-015: deny network access from Exhibit content frames*
 - ADR 0034, `TEAM.SYS.PKG-R17`, `context/roadmap.md` (Exhibits).
 - `exhibits-package` workstream: plan `plan/20261024T222308Z_exhibits-slice-1.md`, Explicit Exclusions.

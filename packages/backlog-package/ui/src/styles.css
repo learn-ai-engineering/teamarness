@@ -12,7 +12,7 @@ button, input, textarea { font: inherit; }
 .backlog-shell { display: flex; flex: 1; min-height: 0; min-width: 0; position: relative; }
 
 /* Left rail */
-.epic-rail { flex: none; width: min(320px, 40%); display: flex; flex-direction: column; min-height: 0; min-width: 0; border-right: 1px solid var(--teamarness-color-border); background: color-mix(in srgb, var(--teamarness-color-panel) 80%, var(--teamarness-color-background)); }
+.epic-rail { position: relative; flex: none; width: var(--epic-rail-width, min(320px, 40%)); min-width: min(320px, 40%); max-width: max(min(320px, 40%), calc(100% - 320px)); display: flex; flex-direction: column; min-height: 0; min-width: 0; border-right: 1px solid var(--teamarness-color-border); background: color-mix(in srgb, var(--teamarness-color-panel) 80%, var(--teamarness-color-background)); }
 .epic-rail-header { display: flex; align-items: center; gap: .25rem; flex: none; border-bottom: 1px solid var(--teamarness-color-border); padding: .55rem; }
 .epic-rail h2 { flex: 1; margin: 0 0 0 .3rem; color: var(--teamarness-color-text-muted); font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; }
 .backlog-icon { display: inline-grid; flex: none; place-items: center; width: 2rem; height: 2rem; border: 1px solid transparent; border-radius: var(--teamarness-radius-control, 6px); background: transparent; color: var(--teamarness-color-text-muted); cursor: pointer; padding: .3rem; }
@@ -22,6 +22,13 @@ button, input, textarea { font: inherit; }
 .control-tooltip { position: absolute; z-index: 8; top: 100%; right: 0; width: max-content; max-width: min(22rem, 80vw); padding: .3rem .5rem; border-radius: var(--teamarness-radius-control, 6px); background: var(--teamarness-color-text); color: var(--teamarness-color-background); font-size: .75rem; font-weight: 400; white-space: normal; overflow-wrap: anywhere; visibility: hidden; pointer-events: none; }
 .backlog-tooltip-control:hover .control-tooltip, .backlog-tooltip-control:focus-visible .control-tooltip { visibility: visible; }
 .backlog-page button:focus-visible, .backlog-page input:focus-visible, .backlog-page textarea:focus-visible { outline: 2px solid var(--teamarness-color-accent); outline-offset: -2px; }
+
+/* The rail's right edge: drag to widen it, arrow keys to step it, double-click or Home to reset. */
+.epic-rail-resizer { position: absolute; z-index: 4; top: 0; right: -4px; bottom: 0; width: 8px; cursor: col-resize; touch-action: none; }
+.epic-rail-resizer::after { content: ""; position: absolute; top: 0; bottom: 0; left: 3px; width: 2px; background: transparent; transition: background .12s; }
+.epic-rail-resizer:hover::after, .epic-rail-resizer.is-dragging::after, .epic-rail-resizer:focus-visible::after { background: var(--teamarness-color-accent); }
+.epic-rail-resizer:focus-visible { outline: none; }
+.backlog-icon:disabled { cursor: default; opacity: .5; }
 
 /* Filters */
 .backlog-filters { display: flex; flex: none; flex-wrap: wrap; gap: .4rem; padding: .5rem .55rem; border-bottom: 1px solid var(--teamarness-color-border); }
@@ -40,6 +47,7 @@ button, input, textarea { font: inherit; }
 .epic-button[aria-expanded="true"] svg { transform: rotate(90deg); }
 .epic-title, .ticket-title-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ticket-title { font-size: .92rem; }
+.ticket-ref { flex: none; color: var(--teamarness-color-text-muted); font-family: var(--teamarness-font-mono, ui-monospace, monospace); font-size: .75rem; }
 .ticket-meta { flex: none; color: var(--teamarness-color-text-muted); font-size: .75rem; }
 .ticket-meta.priority-high { color: var(--teamarness-color-danger, var(--teamarness-color-text)); }
 /* The selected Ticket: a copy of the Shell navigation's selected item (`.package-group button`). */
@@ -70,6 +78,8 @@ button, input, textarea { font: inherit; }
 .ticket-detail-placeholder { margin: 0; color: var(--teamarness-color-text-muted); }
 .ticket-detail-content { display: flex; flex-direction: column; gap: .8rem; max-width: 60rem; }
 .ticket-detail-header { display: flex; align-items: flex-start; gap: .6rem; }
+.ticket-title-group { display: flex; flex: 1; flex-direction: column; gap: .15rem; min-width: 0; }
+.ticket-detail-ref { align-self: flex-start; color: var(--teamarness-color-text-muted); font-family: var(--teamarness-font-mono, ui-monospace, monospace); font-size: .82rem; user-select: all; cursor: text; }
 .ticket-title-slot { flex: 1; min-width: 0; }
 .ticket-detail-title { margin: 0; font-size: 1.3rem; overflow-wrap: anywhere; }
 .ticket-title-input { width: 100%; font-size: 1.1rem; font-weight: 700; }
@@ -103,5 +113,6 @@ button, input, textarea { font: inherit; }
 @container (max-width: 640px) {
   .backlog-page .teamarness-page-header { padding: .5rem; }
   .backlog-shell { flex-direction: column; }
-  .epic-rail { width: 100%; max-height: 60%; border-right: 0; border-bottom: 1px solid var(--teamarness-color-border); }
+  .epic-rail-resizer { display: none; }
+  .epic-rail { width: 100%; min-width: 0; max-width: none; max-height: 60%; border-right: 0; border-bottom: 1px solid var(--teamarness-color-border); }
 }

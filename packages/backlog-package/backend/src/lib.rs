@@ -9,6 +9,7 @@
 
 mod backend;
 pub(crate) mod domain;
+pub(crate) mod refs;
 pub(crate) mod store;
 
 pub use backend::{BacklogActive, router};

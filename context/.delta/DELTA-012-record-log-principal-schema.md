@@ -14,6 +14,7 @@ Align the versioned request schema with the existing Host and SDK contract. Add 
 
 ## Tracking
 
+- Teamarness Backlog: *Shell & Core › DELTA-012: record-log 1.1 request schema omits the Principal selector*
 - `TEAM.SYS.PKG-R10`, ADR 0023, `context/roadmap.md` Later.
 - `agent-package` workstream: `verify/20261024T085236Z_fidelity.md` and `verify/20261024T092503Z_post-merge-review.md`.
 - Separate maintenance scope. No runtime change, SDK publication, merge, or push is authorized by this delta.

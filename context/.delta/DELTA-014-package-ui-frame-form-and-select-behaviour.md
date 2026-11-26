@@ -20,6 +20,7 @@ Replace the remaining `<select>` controls with button or listbox controls that c
 
 ## Tracking
 
+- Teamarness Backlog: *Shell & Core › DELTA-014: Package UI frame form-submit and <select> behaviour*
 - `TEAM.SYS.DOCS-R04`, `TEAM.SYS.DOCS-R13`; ADRs 0015 and 0031
 - `packages/documents-package/ui/frame-scenarios/` (`npm run verify:documents-editor`); `scripts/ui-isolation-probe/ui/index.js`
 - `rendered-document-editing` workstream: Phase 4 and Phase 6 findings in the plan's Context Checkpoint

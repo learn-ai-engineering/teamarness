@@ -34,6 +34,7 @@ There is no `cargo tree -d` ratchet. It would add a slow cargo invocation to `np
 
 ## Tracking
 
+- Teamarness Backlog: *Shell & Core › DELTA-009: duplicate Ed25519 stacks and SQLite drivers*
 - `crates/teamarness-core/src/synchronization/key_bridge.rs` and its tests
 - TEAM-DQ6 (the Tauri 2.11 pin)
 - The architecture-review workstream (see `roadmap.md` Current work), remediation plan phase 8 — structure and maintainability

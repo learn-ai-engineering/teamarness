@@ -12,9 +12,10 @@ The delivery targets are stated intent, not measured behaviour. A Workspace larg
 
 ## Resolution plan
 
-A performance qualification under `roadmap.md` Later (unscheduled) raises the test targets to the requirement and adds a 25-Member measurement. Close this delta when the qualification meets `TEAM.SYS.CONV-R16`.
+A performance qualification (tracked in the Teamarness Backlog; see Tracking) raises the test targets to the requirement and adds a 25-Member measurement. Close this delta when the qualification meets `TEAM.SYS.CONV-R16`.
 
 ## Tracking
 
+- Teamarness Backlog: *Conversations › DELTA-008: Conversations delivery qualification (CONV-R16, 25 Members)*
 - `TEAM.SYS.CONV-R16`
 - The architecture-review workstream (see `roadmap.md` Current work), remediation plan phase 2 — context integrity, authored the requirement text

@@ -53,3 +53,7 @@ Follow-up: the next Backlog workstream.
 - **SM-007.** Two UI comments say "Member" where they mean the Person using the UI. A test fixture comment refers to "Phase 2" of the workstream plan.
 
 Follow-up: the next Backlog workstream.
+
+## Tracking
+
+- Teamarness Backlog: *Backlog Package › DELTA-021: Backlog Package findings accepted as tech debt*

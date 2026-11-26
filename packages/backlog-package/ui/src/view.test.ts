@@ -71,17 +71,20 @@ async function mounted(backlog: FakeBacklog = createFakeBacklog(seed())) {
 
 describe("Backlog tree", () => {
   it("orders Epics alphabetically and Tickets by priority, status and creation", async () => {
-    const { q, epicTitles, ticketsIn } = await mounted();
+    const { q, epicTitles, ticketsIn, choose } = await mounted();
     expect(q("h1").textContent).toBe("Backlog");
     expect(q("[role=status]").textContent).toBe("Up to date");
     expect(epicTitles()).toEqual(["Alpha", "ALPHA", "beta"]);
+    expect(ticketsIn("Alpha")).toEqual(["High ready", "Medium in progress", "Low ready"]);
+    choose("Status filter", "All statuses");
     expect(ticketsIn("Alpha")).toEqual(["High ready", "High done", "Medium in progress", "Low ready"]);
     expect(ticketsIn("beta")).toEqual(["Beta medium"]);
     expect(q(".ticket-meta").textContent).toBe("High · Ready");
   });
 
   it("shows archived Epics and Tickets behind the eye toggle", async () => {
-    const { q, epicTitles, ticketsIn } = await mounted();
+    const { q, epicTitles, ticketsIn, choose } = await mounted();
+    choose("Status filter", "All statuses");
     const toggle = q<HTMLButtonElement>(".archived-toggle");
     expect(toggle.getAttribute("aria-label")).toBe("Show archived");
     expect(toggle.getAttribute("aria-pressed")).toBe("false");
@@ -126,13 +129,14 @@ describe("Backlog filters", () => {
   it("combine, keep every Epic visible and clear in one action each", async () => {
     const { root, labelled, epicTitles, ticketsIn, choose, q } = await mounted();
     expect(labelled("Clear priority filter").hidden).toBe(true);
-    expect(labelled("Clear status filter").hidden).toBe(true);
+    expect(labelled("Clear status filter").hidden).toBe(false);
     expect(labelled("Priority filter").textContent).toBe("All priorities");
+    expect(labelled("Status filter").textContent).toBe("Not done");
 
     choose("Priority filter", "High");
     expect(labelled("Priority filter").textContent).toBe("High");
     expect(epicTitles()).toEqual(["Alpha", "ALPHA", "beta"]);
-    expect(ticketsIn("Alpha")).toEqual(["High ready", "High done"]);
+    expect(ticketsIn("Alpha")).toEqual(["High ready"]);
     expect(ticketsIn("beta")).toEqual([]);
     expect(q('[aria-label="Tickets in beta"] .backlog-empty').textContent).toBe("No matching Tickets.");
 
@@ -148,6 +152,7 @@ describe("Backlog filters", () => {
 
     labelled("Clear status filter").click();
     expect(labelled("Status filter").textContent).toBe("All statuses");
+    expect(labelled("Clear status filter").hidden).toBe(true);
     expect(ticketsIn("Alpha")).toEqual(["High ready", "High done", "Medium in progress", "Low ready"]);
   });
 
@@ -169,7 +174,8 @@ describe("Backlog filters", () => {
       return labels;
     };
     expect(options("Priority filter")).toEqual(["All priorities", "High", "Medium", "Low"]);
-    expect(options("Status filter")).toEqual(["All statuses", "Not ready", "Ready", "In progress", "Done"]);
+    expect(options("Status filter"))
+      .toEqual(["Not done", "All statuses", "Not ready", "Ready", "In progress", "Done", "Cancelled"]);
   });
 });
 
@@ -295,11 +301,11 @@ describe("Backlog actions", () => {
     const { root, q } = await mounted();
     expect(q(".ticket-detail-placeholder").hidden).toBe(false);
     expect(q(".ticket-detail-content").hidden).toBe(true);
-    const title = [...root.querySelectorAll<HTMLButtonElement>(".ticket-title")].find((b) => b.textContent?.startsWith("High done"))!;
+    const title = [...root.querySelectorAll<HTMLButtonElement>(".ticket-title")].find((b) => b.querySelector(".ticket-title-text")?.textContent?.startsWith("Medium in progress"))!;
     title.click();
-    expect(q('.ticket-title[aria-current="true"]').textContent).toContain("High done");
+    expect(q('.ticket-title[aria-current="true"]').textContent).toContain("Medium in progress");
     expect(q(".ticket-detail-placeholder").hidden).toBe(true);
-    expect(q(".ticket-detail-title").textContent).toBe("High done");
+    expect(q(".ticket-detail-title").textContent).toBe("Medium in progress");
   });
 
   it("shows a refusal as an alert", async () => {
@@ -362,5 +368,77 @@ describe("Typing in inline forms", () => {
     const renameInput = q<HTMLInputElement>(".epic-rename input");
     expect(root.activeElement).toBe(renameInput);
     await typeThroughRemoteChange(root, backlog, renameInput, "bxyzeta");
+  });
+});
+
+describe("Backlog navigation polish", () => {
+  it("shows each Ticket's reference in its row and in the detail pane", async () => {
+    const { root, q, backlog } = await mounted();
+    const row = [...root.querySelectorAll<HTMLElement>(".ticket-row")]
+      .find((item) => item.querySelector(".ticket-title-text")?.textContent === "High ready")!;
+    const summary = backlog.snapshot().tickets.find((ticket) => ticket.ticketId === row.dataset.ticketId)!;
+    expect(row.querySelector(".ticket-ref")!.textContent).toBe(`#${summary.ref}`);
+    row.querySelector<HTMLButtonElement>(".ticket-title")!.click();
+    await tick();
+    expect(q(".ticket-detail-ref").textContent).toBe(`#${summary.ref}`);
+  });
+
+  it("selecting a Ticket keeps the tree, its scroll position and its rows in place", async () => {
+    const { root, q } = await mounted();
+    const list = q(".epic-list");
+    list.scrollTop = 120;
+    const rows = [...root.querySelectorAll(".ticket-row")];
+    const choose = (title: string) => [...root.querySelectorAll<HTMLButtonElement>(".ticket-title")]
+      .find((button) => button.querySelector(".ticket-title-text")?.textContent === title)!;
+    choose("Low ready").click();
+    await tick();
+    choose("High ready").click();
+    await tick();
+    expect([...root.querySelectorAll(".ticket-row")]).toEqual(rows);
+    expect(list.scrollTop).toBe(120);
+    expect(root.querySelectorAll('.ticket-title[aria-current="true"]')).toHaveLength(1);
+    expect(q('.ticket-title[aria-current="true"] .ticket-title-text').textContent).toBe("High ready");
+  });
+
+  it("keeps the scroll position when the tree is rebuilt", async () => {
+    const { q, backlog } = await mounted();
+    const list = q(".epic-list");
+    list.scrollTop = 80;
+    const ticket = [...backlog.tickets.values()].find((t) => t.title === "Low ready")!;
+    backlog.remoteChange(ticket.ticketId, { title: "Low ready, renamed" });
+    await tick();
+    expect(list.scrollTop).toBe(80);
+  });
+
+  it("expands every Epic, then collapses them all, from one toggle", async () => {
+    const { labelled, ticketsIn } = await mounted();
+    expect(labelled("Expand all Epics")).toBeNull();
+    labelled("Collapse all Epics").click();
+    expect(ticketsIn("Alpha")).toBeNull();
+    expect(ticketsIn("beta")).toBeNull();
+    labelled("Expand all Epics").click();
+    expect(ticketsIn("Alpha")).not.toBeNull();
+    expect(ticketsIn("beta")).not.toBeNull();
+    expect(labelled("Collapse all Epics")).not.toBeNull();
+  });
+
+  it("widens the Epic rail from its edge, never below the default, and remembers it", async () => {
+    const { q, backlog, unmount } = await mounted();
+    const rail = q(".epic-rail");
+    const edge = q('[role="separator"][aria-label="Resize Epics panel"]');
+    expect(rail.style.getPropertyValue("--epic-rail-width")).toBe("");
+    edge.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }));
+    expect(rail.style.getPropertyValue("--epic-rail-width")).toBe("320px");
+    edge.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true }));
+    expect(rail.style.getPropertyValue("--epic-rail-width")).toBe("");
+    // The width is stored in the controller, so it survives a Package switch.
+    edge.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    const widened = rail.style.getPropertyValue("--epic-rail-width");
+    expect(Number.parseInt(widened, 10)).toBeGreaterThanOrEqual(320);
+    await unmount();
+    teardown = [];
+    expect(backlog.remembered?.navWidth).toBe(Number.parseInt(widened, 10));
+    const again = await mounted(backlog);
+    expect(again.q(".epic-rail").style.getPropertyValue("--epic-rail-width")).toBe(widened);
   });
 });

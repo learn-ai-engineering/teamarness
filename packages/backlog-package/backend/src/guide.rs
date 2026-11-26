@@ -1,11 +1,11 @@
-//! Runtime advice for the Backlog Ports (1.0). Statuses, priorities, defaults and limits come
+//! Runtime advice for the Backlog Ports (1.1). Statuses, priorities, defaults and limits come
 //! from the constants that enforce them.
 
 use std::fmt::Write as _;
 
 use serde_json::{Value as JsonValue, json};
 
-use super::ports::{MAX_PAGE, PORT_PAYLOAD_BYTES};
+use super::ports::{MAX_CANDIDATES, MAX_PAGE, PORT_PAYLOAD_BYTES};
 use crate::domain::{DEFAULT_PRIORITY, DEFAULT_STATUS, MAX_BODY, MAX_TITLE, Priority, Status};
 
 /// What each status means, in listing order.
@@ -15,6 +15,7 @@ pub(super) fn status_meaning(status: Status) -> &'static str {
         Status::Ready => "specified, can be started",
         Status::InProgress => "someone is working on it",
         Status::Done => "finished",
+        Status::Cancelled => "closed, and will not be done",
     }
 }
 
@@ -40,6 +41,8 @@ pub(super) fn response() -> JsonValue {
 
 The Backlog holds Epics, each a titled group of Tickets. A Ticket is a unit of work with a title, a Markdown body, a status, a priority and an optional assignee. Every Ticket belongs to exactly one Epic. Epic and Ticket IDs are 64 lowercase hexadecimal characters: use an ID that ticket.list returned, never a guessed title.
 
+Every Ticket also has a short `ref`: the shortest prefix of its ID, at least {MIN_REF} characters, that no other Ticket shares. People write it with a leading `#`, for example `#a3f2`. A ref grows by a character when another Ticket arrives with the same prefix, so a ref written down earlier can later match several Tickets.
+
 ## Statuses
 
 {statuses}
@@ -50,9 +53,9 @@ The priorities, from most to least urgent, are {priorities}. New Tickets default
 ## What you can do
 
 - ticket.list returns Epics and Ticket summaries without bodies: Epics first, then Tickets, each in creation order, at most {MAX_PAGE} of each per page. A page can be shorter to fit the {payload_kib} KiB Port value bound. While nextCursor is present, pass it as cursor, with the same filters, for the next page. Filter with epicId, status or priority. Archived Epics, archived Tickets and the Tickets of archived Epics are omitted unless includeArchived is true. An unknown epicId is refused with backlog.not_found, and a cursor ticket.list did not return with backlog.invalid_cursor.
-- ticket.get takes ticketId and returns the whole Ticket: title, body, status, priority, assignee (a Principal ID or null), archived, version, creator, createdAt, lastEditor and lastAt. creator and lastEditor are signing keys; times are Unix milliseconds.
+- ticket.get takes exactly one of ticketId or ref and returns the whole Ticket: ref, title, body, status, priority, assignee (a Principal ID or null), archived, version, creator, createdAt, lastEditor and lastAt. creator and lastEditor are signing keys; times are Unix milliseconds. A ref is {MIN_REF} to 64 hexadecimal characters, with or without `#`, in any case. A ref that matches no Ticket is refused with backlog.not_found. One that matches several is refused with backlog.ambiguous_ref: its details list up to {MAX_CANDIDATES} `candidates` (ticketId, ref and title), and `more` is true when there are others. Never pick one yourself; show the candidates to the Person. Archived Tickets count. ticket.update and ticket.create take the full ticketId, never a ref.
 - ticket.create takes epicId, title and optional body, status and priority, and returns ticketId and version. The Epic must exist (backlog.not_found) and must not be archived (backlog.epic_archived).
-- ticket.update changes title, body, status or priority.
+- ticket.update changes title, body, status or priority. A Ticket closed without being done is `cancelled`, not `done`.
 - backlog.changed is an empty, live-only notice that may coalesce, with no initial event or replay. List or read again on receipt and after reconnecting.
 
 You cannot create, rename, archive or restore Epics, and you cannot assign, move, archive or restore Tickets. Ask a Person to do that in the Backlog.
@@ -72,6 +75,7 @@ A title has 1 to {MAX_TITLE} characters, with no control characters and no leadi
         default_status = DEFAULT_STATUS.as_str(),
         default_priority = DEFAULT_PRIORITY.as_str(),
         payload_kib = PORT_PAYLOAD_BYTES / 1024,
+        MIN_REF = crate::refs::MIN_REF,
     );
     json!({ "markdown": markdown })
 }

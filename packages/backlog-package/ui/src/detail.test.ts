@@ -57,7 +57,7 @@ async function opened(title: string, backlog: FakeBacklog = createFakeBacklog(se
   const labelled = <E extends Element = HTMLButtonElement>(label: string) => q<E>(`[aria-label="${label}"]`);
   const detail = () => q(".ticket-detail");
   const ticket = [...backlog.tickets.values()].find((candidate) => candidate.title === title)!;
-  [...root.querySelectorAll<HTMLButtonElement>(".ticket-title")].find((button) => button.textContent?.startsWith(title))!.click();
+  [...root.querySelectorAll<HTMLButtonElement>(".ticket-title")].find((button) => button.querySelector(".ticket-title-text")?.textContent?.startsWith(title))!.click();
   await settle();
   const options = (name: string) => {
     const popup = root.getElementById(labelled(name).getAttribute("aria-controls")!)!;

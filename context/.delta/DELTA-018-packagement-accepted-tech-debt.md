@@ -52,5 +52,6 @@ No ordinary install, reload, remove, restart or Agent reply flow is affected. Do
 
 ## Tracking
 
+- Teamarness Backlog: *Shell & Core › DELTA-018: Packagement findings accepted as tech debt*
 - ADR 0036, ADR 0037, `TEAM.SYS.PKG-R13`, `context/roadmap.md` (Packagement).
 - Workstream `packagement`, in the resolver-selected MyFlow store: `verify/20261031T030000Z_p2-dispositions-ports-2.md` (signed off), `verify/20261031T024307Z_review-ports-2.md`, `verify/20261031T040000Z_review-c5.md`, and `verify/20261030T230150Z_p2-triage.md`.

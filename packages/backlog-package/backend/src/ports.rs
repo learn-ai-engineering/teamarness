@@ -19,8 +19,10 @@ use teamarness_package_sdk::{BackendError, Context, EventSubscription, event_cha
 #[cfg(doc)]
 use super::append_as;
 use super::{
-    Author, BacklogActive, UNTITLED, error, not_found, parse_priority, parse_status, storage_failed,
+    Author, BacklogActive, ERROR_DETAILS_LIMIT, UNTITLED, error, invalid, not_found,
+    parse_priority, parse_status, storage_failed,
 };
+use crate::refs;
 
 pub(super) const CONTRACT: &str = "dev.teamarness.backlog";
 
@@ -173,6 +175,7 @@ pub(super) async fn list(
                 Position::Ticket(ticket.create_order.clone()),
                 json!({
                     "ticketId": ticket.id,
+                    "ref": ticket.reference,
                     "epicId": ticket.epic_id,
                     "title": ticket.title.as_deref().unwrap_or(UNTITLED),
                     "status": ticket.status.as_str(),
@@ -226,6 +229,83 @@ fn page_end(entries: &[(&Position, &JsonValue)]) -> usize {
         *count += 1;
     }
     entries.len()
+}
+
+// ---------------------------------------------------------------- ticket.get
+
+/// The most candidates a `backlog.ambiguous_ref` refusal lists.
+pub(crate) const MAX_CANDIDATES: usize = 16;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct GetRequest {
+    #[serde(default)]
+    ticket_id: Option<String>,
+    #[serde(default, rename = "ref")]
+    reference: Option<String>,
+}
+
+/// The Ticket ID a `ticket.get` names: its `ticketId`, or the one Ticket whose ID starts with
+/// its `ref` (ADR 0048). A reference that matches no Ticket is `backlog.not_found`; one that
+/// matches several is `backlog.ambiguous_ref`, listing them, and nothing is guessed.
+pub(super) async fn resolve(
+    context: &Context<BacklogActive>,
+    request: GetRequest,
+) -> Result<String, BackendError> {
+    let input = match (request.ticket_id, request.reference) {
+        (Some(ticket_id), None) => return Ok(ticket_id),
+        (None, Some(input)) => input,
+        _ => return Err(invalid("ref", "give exactly one of ticketId and ref")),
+    };
+    let prefix = refs::parse(&input).ok_or_else(|| invalid("ref", "invalid"))?;
+    let state = context.state().clone();
+    let lookup = prefix.clone();
+    let (matches, more) = context
+        .blocking(move |_| {
+            state
+                .store
+                .tickets_with_prefix(&lookup, MAX_CANDIDATES)
+                .map_err(storage_failed)
+        })
+        .await?;
+    match matches.as_slice() {
+        [] => Err(not_found(&input)),
+        [only] => Ok(only.clone()),
+        _ => {
+            let state = context.state().clone();
+            let candidates = context
+                .blocking(move |_| {
+                    let mut candidates = Vec::new();
+                    for id in &matches {
+                        if let Some(ticket) = state.store.ticket(id).map_err(storage_failed)? {
+                            candidates.push(json!({
+                                "ticketId": ticket.id,
+                                "ref": ticket.reference,
+                                "title": ticket.title.as_deref().unwrap_or(UNTITLED),
+                            }));
+                        }
+                    }
+                    Ok(candidates)
+                })
+                .await?;
+            Err(ambiguous_ref(&prefix, candidates, more))
+        }
+    }
+}
+
+/// `backlog.ambiguous_ref`, trimmed to the Host's error-details bound by dropping candidates
+/// from the end; `more` is then true.
+fn ambiguous_ref(prefix: &str, mut candidates: Vec<JsonValue>, mut more: bool) -> BackendError {
+    loop {
+        let details = json!({ "ref": prefix, "candidates": candidates, "more": more });
+        let fits =
+            serde_json::to_vec(&details).is_ok_and(|bytes| bytes.len() <= ERROR_DETAILS_LIMIT);
+        if fits || candidates.len() <= 2 {
+            return error("backlog.ambiguous_ref", false, details);
+        }
+        candidates.pop();
+        more = true;
+    }
 }
 
 // ---------------------------------------------------------------- backlog.changed
@@ -342,23 +422,69 @@ mod tests {
             .to_owned()
     }
 
-    // Verifies: TEAM.SYS.BACKLOG-R09 — the 1.0 contract is exactly the Ticket content Ports, the
-    // guide and the change event; no Epic, assign, move, archive or restore Port exists.
+    // Verifies: TEAM.SYS.BACKLOG-R09, TEAM.SYS.BACKLOG-R11 — 1.0 stays pinned, ports.json is
+    // the shipped 1.1, and 1.1 only adds `ref`, ticket.get by ref and `cancelled` (ADR 0048).
     #[test]
-    fn port_contract_1_0_is_pinned_and_offers_no_structural_ports() {
+    fn port_contract_1_1_is_pinned_additive_and_offers_no_structural_ports() {
+        use teamarness_package_contract::port_contract::check_additive_minor_documents;
         let fixture =
             compile_port_contracts(include_bytes!("../tests/fixtures/ports-1.0.json")).unwrap();
-        let current = contract();
         let pinned = fixture.project_metadata(CONTRACT, None).unwrap();
         assert_eq!(pinned.sha256, CONTRACT_1_0_SHA256);
+        let shipped =
+            compile_port_contracts(include_bytes!("../tests/fixtures/ports-1.1.json")).unwrap();
+        let current = contract();
         assert_eq!(
             current.project_metadata(CONTRACT, None).unwrap().bytes,
-            pinned.bytes,
-            "ports.json is the shipped 1.0 contract"
+            shipped.project_metadata(CONTRACT, None).unwrap().bytes,
+            "ports.json is the shipped 1.1 contract"
         );
+        // Remove exactly the declared 1.1 additions; every 1.0 shape must then be unchanged.
+        let mut normalized: JsonValue =
+            serde_json::from_slice(include_bytes!("../../ports.json")).unwrap();
+        let defs = normalized["$defs"].as_object_mut().unwrap();
+        assert_eq!(
+            defs.remove("ref").unwrap(),
+            json!({ "type": "string", "pattern": "^[0-9a-f]{4,64}$" })
+        );
+        assert!(defs.remove("refInput").is_some());
+        let statuses = defs["status"]["enum"].as_array_mut().unwrap();
+        assert_eq!(statuses.pop(), Some(json!("cancelled")));
+        for shape in ["ticketSummary", "ticket"] {
+            let shape = &mut defs[shape];
+            assert!(
+                shape["properties"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("ref")
+                    .is_some()
+            );
+            shape["required"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|field| field != "ref");
+        }
+        let get = normalized["contracts"][0]["ports"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|port| port["name"] == "ticket.get")
+            .unwrap();
+        let request = get["request"].as_object_mut().unwrap();
+        assert!(request.remove("oneOf").is_some());
+        assert!(
+            request["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("ref")
+                .is_some()
+        );
+        request.insert("required".into(), json!(["ticketId"]));
+        let normalized = compile_port_contracts(&serde_json::to_vec(&normalized).unwrap()).unwrap();
+        check_additive_minor_documents(&fixture, &normalized, CONTRACT).unwrap();
         let provided = &current.contracts[0];
         assert_eq!(provided.identity, CONTRACT);
-        assert_eq!((provided.major, provided.minor), (1, 0));
+        assert_eq!((provided.major, provided.minor), (1, 1));
         let ports: BTreeSet<(String, String)> = provided
             .ports
             .iter()
@@ -505,6 +631,9 @@ mod tests {
             "You cannot create, rename, archive or restore Epics".into(),
             "assign, move, archive or restore Tickets".into(),
             "- [ ]".into(),
+            format!("at least {} characters", crate::refs::MIN_REF),
+            format!("up to {MAX_CANDIDATES} `candidates`"),
+            "never a ref".into(),
         ];
         for status in Status::ALL {
             advice.push(format!(
@@ -523,6 +652,7 @@ mod tests {
             "backlog.invalid",
             "backlog.too_large",
             "backlog.invalid_cursor",
+            "backlog.ambiguous_ref",
             "backlog.actor_unauthorized",
             "backlog.unavailable",
             "outcomeUncertain",
@@ -531,6 +661,88 @@ mod tests {
         }
         for needle in advice {
             assert!(markdown.contains(&needle), "missing guidance: {needle}");
+        }
+        session.harness.shutdown().await.unwrap();
+    }
+
+    // Verifies: TEAM.SYS.BACKLOG-R11 — ticket.get finds a Ticket by its ref, with or without
+    // `#` and in any case, lists every candidate for an ambiguous ref, and guesses nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ticket_get_resolves_refs_and_refuses_ambiguity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = start(directory.path(), &Ledger::default()).await;
+        let epic_id = epic(&mut session, "Launch").await;
+        let (first, _) = ticket(&mut session, &epic_id, "Plan").await;
+        let only = agent_query(&mut session, "ticket.get", json!({ "ref": "#0000" })).await;
+        assert_eq!(only["ticketId"], json!(first));
+        assert_eq!(only["ref"], json!(&first[..4]));
+        let (second, _) = ticket(&mut session, &epic_id, "Ship").await;
+        let listed = agent_query(&mut session, "ticket.list", json!({})).await;
+        let refs: Vec<&str> = listed["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|ticket| ticket["ref"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            refs,
+            [first.as_str(), second.as_str()],
+            "refs lengthen to differ"
+        );
+        let exact = agent_query(
+            &mut session,
+            "ticket.get",
+            json!({ "ref": format!("#{}", second.to_uppercase()) }),
+        )
+        .await;
+        assert_eq!(exact["ticketId"], json!(second));
+        assert!(
+            contract()
+                .validate(CONTRACT, "ticket.get", "response", &exact)
+                .is_ok()
+        );
+        let ambiguous = port_as(
+            &mut session.harness,
+            "query",
+            "ticket.get",
+            agent_actor(),
+            json!({ "ref": "0000" }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(ambiguous.code(), "backlog.ambiguous_ref");
+        assert_eq!(
+            ambiguous.details(),
+            &json!({
+                "ref": "0000",
+                "more": false,
+                "candidates": [
+                    { "ticketId": first, "ref": first, "title": "Plan" },
+                    { "ticketId": second, "ref": second, "title": "Ship" },
+                ],
+            })
+        );
+        let missing = port_as(
+            &mut session.harness,
+            "query",
+            "ticket.get",
+            agent_actor(),
+            json!({ "ref": "ffff" }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code(), "backlog.not_found");
+        for refused in [
+            json!({}),
+            json!({ "ref": "abc" }),
+            json!({ "ticketId": first, "ref": "0000" }),
+        ] {
+            assert!(
+                contract()
+                    .validate(CONTRACT, "ticket.get", "request", &refused)
+                    .is_err(),
+                "{refused}"
+            );
         }
         session.harness.shutdown().await.unwrap();
     }

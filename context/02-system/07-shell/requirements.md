@@ -8,7 +8,7 @@ Phase 2 delivered the desktop window and Workspace onboarding between two Instal
 
 ## TEAM.SYS.SHELL-R01 — Tauri Desktop Host
 
-The system SHALL use Tauri v2 as the desktop shell. The shell SHALL manage the main window. System tray and native menus are unscheduled; see `roadmap.md` Later (unscheduled). Native application update policy is specified by `TEAM.SYS.SHELL-R07`. Application behavior SHALL live in the Rust runtime, not in the shell layer.
+The system SHALL use Tauri v2 as the desktop shell. The shell SHALL manage the main window. System tray and native menus are unscheduled; tracked in the Teamarness Backlog: *Shell & Core › System tray and native menus*. Native application update policy is specified by `TEAM.SYS.SHELL-R07`. Application behavior SHALL live in the Rust runtime, not in the shell layer.
 
 ## TEAM.SYS.SHELL-R02 — Package UI Frame Mounting
 

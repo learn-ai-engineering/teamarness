@@ -16,5 +16,6 @@ Roadmap Phase 5 Content Key Generations: a revocation starts a new generation, s
 
 ## Tracking
 
+- Teamarness Backlog: *Shell & Core › Phase 5 — Membership Management and Hardening*
 - Review finding CTX-01; ADR 0013
 - `TEAM.SYS.MEM-R05`, `TEAM.SYS.MEM-R06`, `TEAM.SYS.CONV-R11`, roadmap Phase 5
