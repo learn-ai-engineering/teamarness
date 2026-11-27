@@ -120,7 +120,8 @@ async fn unicode_validation_legacy_fallback_and_ownership() {
         runtime.set_own_person_name_for(workspace.id(), identity, "allowed"),
         Ok(())
     );
-    let stranger = open(&directory()).await;
+    let stranger_directory = directory();
+    let stranger = open(&stranger_directory).await;
     assert_eq!(
         runtime.set_own_person_name_for(workspace.id(), stranger.public_identity(), "forged"),
         Err(PersonNameError::NotOwnPerson)

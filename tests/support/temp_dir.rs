@@ -56,26 +56,52 @@ impl Drop for TempDir {
     }
 }
 
+/// Restores owner access to every reachable directory, continuing past
+/// failures so one bad entry cannot strand its siblings read-only. Every
+/// failure is reported; the first one is returned.
 #[cfg(unix)]
 fn restore_directory_access(path: &Path) -> io::Result<()> {
+    let mut first_error = None;
+    restore_directory_access_into(path, &mut first_error);
+    first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(unix)]
+fn restore_directory_access_into(path: &Path, first_error: &mut Option<io::Error>) {
     use std::os::unix::fs::PermissionsExt;
 
+    let mut record = |error: io::Error| {
+        eprintln!("cannot restore access to {}: {error}", path.display());
+        first_error.get_or_insert(error);
+    };
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => return record(error),
     };
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Ok(());
+        return;
     }
-    std::fs::set_permissions(
+    if let Err(error) = std::fs::set_permissions(
         path,
         std::fs::Permissions::from_mode(metadata.permissions().mode() | 0o700),
-    )?;
-    for entry in std::fs::read_dir(path)? {
-        restore_directory_access(&entry?.path())?;
+    ) {
+        record(error);
     }
-    Ok(())
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) => return record(error),
+    };
+    let mut children = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => children.push(entry.path()),
+            Err(error) => record(error),
+        }
+    }
+    for child in children {
+        restore_directory_access_into(&child, first_error);
+    }
 }
 
 #[cfg(not(unix))]
