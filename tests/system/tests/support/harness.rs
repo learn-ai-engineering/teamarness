@@ -1,3 +1,4 @@
+use super::tempfile;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

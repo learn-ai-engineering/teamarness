@@ -2,17 +2,14 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "../test-support/test_directory.rs"]
+mod test_directory;
+use test_directory::TestDirectory;
 
 use teamarness_core::{CoreError, CoreRuntime, CoreRuntimeConfig, StorageError};
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-fn directory() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "teamarness-owner-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
+fn directory() -> TestDirectory {
+    TestDirectory::new("application-owner")
 }
 fn config(path: &std::path::Path) -> CoreRuntimeConfig {
     CoreRuntimeConfig::new(path).with_exclusive_application_ownership()
@@ -80,7 +77,7 @@ async fn unsafe_lock_paths_are_refused_without_changing_their_targets() {
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o644
         );
-        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(&directory).unwrap();
         fs::remove_file(target).unwrap();
     }
 }
@@ -165,7 +162,10 @@ async fn application_death_releases_lock_while_exec_backend_survives() {
             "application_death_releases_lock_while_exec_backend_survives",
             "--nocapture",
         ])
-        .env("TEAMARNESS_OWNERSHIP_CHILD_DIRECTORY", &directory)
+        .env(
+            "TEAMARNESS_OWNERSHIP_CHILD_DIRECTORY",
+            directory.as_os_str(),
+        )
         .stdout(std::process::Stdio::null())
         .spawn()
         .unwrap();

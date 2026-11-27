@@ -302,8 +302,7 @@ fn headless_process_entry() {
     });
 }
 
-#[path = "../../../crates/teamarness-package-host/tests/common/mod.rs"]
-mod host_fixture;
+use support::host_fixture;
 
 fn stage_lifecycle_package(fixture: &support::Fixture) -> (std::path::PathBuf, std::path::PathBuf) {
     let package = fixture.config.application_root.join("fixture");

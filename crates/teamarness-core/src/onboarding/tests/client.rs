@@ -1,5 +1,5 @@
+use crate::test_directory::TestDirectory;
 use std::fs;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
@@ -9,14 +9,8 @@ use crate::{
     WorkspaceSummary,
 };
 
-static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
-fn directory(name: &str) -> std::path::PathBuf {
-    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "teamarness-client-{name}-{}-{sequence}",
-        std::process::id()
-    ))
+fn directory(name: &str) -> TestDirectory {
+    TestDirectory::new(name)
 }
 
 fn now_unix_ms() -> i64 {

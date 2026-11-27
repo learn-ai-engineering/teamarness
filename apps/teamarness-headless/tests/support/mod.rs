@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+#[path = "../../../../crates/teamarness-package-host/tests/common/mod.rs"]
+pub mod host_fixture;
+use host_fixture::tempfile;
 use std::path::PathBuf;
 use teamarness_core::CoreRuntime;
 use teamarness_headless::application::{Application, ApplicationConfig};

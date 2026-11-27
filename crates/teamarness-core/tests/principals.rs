@@ -1,15 +1,12 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "../test-support/test_directory.rs"]
+mod test_directory;
 use teamarness_core::{
     CoreRuntime, CoreRuntimeConfig, PersonNameError, PrincipalKind, SynchronizationError,
 };
+use test_directory::TestDirectory;
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-fn directory() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "principals-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
+fn directory() -> TestDirectory {
+    TestDirectory::new("principals")
 }
 async fn open(path: &std::path::Path) -> CoreRuntime {
     CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(path))

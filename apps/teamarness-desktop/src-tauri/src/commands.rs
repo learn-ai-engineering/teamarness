@@ -1,3 +1,6 @@
+#[cfg(test)]
+use crate::test_temp_dir as tempfile;
+
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -495,11 +498,8 @@ mod tests {
 
     #[tokio::test]
     async fn roster_remains_consistent_when_an_agent_is_removed_between_reads() {
-        let path = std::env::temp_dir().join(format!(
-            "shell-roster-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shell-roster");
         let runtime = teamarness_core::CoreRuntime::open_loopback_for_tests(
             teamarness_core::CoreRuntimeConfig::new(&path),
         )
@@ -531,11 +531,8 @@ mod tests {
 
     #[tokio::test]
     async fn agent_mutation_acknowledges_core_commit_without_a_roster_read() {
-        let path = std::env::temp_dir().join(format!(
-            "shell-agent-ack-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shell-agent-ack");
         let runtime = teamarness_core::CoreRuntime::open_loopback_for_tests(
             teamarness_core::CoreRuntimeConfig::new(&path),
         )

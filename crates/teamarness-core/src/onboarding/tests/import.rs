@@ -1,5 +1,5 @@
+use crate::test_directory::TestDirectory;
 use std::fs;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::Connection;
 
@@ -9,21 +9,15 @@ use crate::{
     CoreRuntime, CoreRuntimeConfig, MembershipVersion, OnboardingError, WorkspaceInvitation,
 };
 
-static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
-fn directory(name: &str) -> std::path::PathBuf {
-    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "teamarness-import-{name}-{}-{sequence}",
-        std::process::id()
-    ))
+fn directory(name: &str) -> TestDirectory {
+    TestDirectory::new(name)
 }
 
 async fn response_fixture(
     name: &str,
 ) -> (
-    std::path::PathBuf,
-    std::path::PathBuf,
+    TestDirectory,
+    TestDirectory,
     CoreRuntime,
     CoreRuntime,
     WorkspaceInvitation,

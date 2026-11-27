@@ -23,11 +23,7 @@ impl Clock for AddAgentRollbackClock {
 /// Verifies: TEAM.SYS.ID-R10, TEAM.SYS.MEM-R09
 #[tokio::test]
 async fn local_named_agent_add_survives_clock_rollback_without_parking_or_losing_custody() {
-    let directory = std::env::temp_dir().join(format!(
-        "teamarness-runtime-agent-clock-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&directory);
+    let directory = crate::test_directory::TestDirectory::new("agent-clock");
     let config = CoreRuntimeConfig::new(&directory);
     let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let now = Arc::new(AtomicI64::new(1_000_000));
@@ -90,16 +86,8 @@ async fn local_named_agent_add_survives_clock_rollback_without_parking_or_losing
 
 #[tokio::test]
 async fn uncertain_invitation_commit_poisons_runtime_until_authenticated_reopen() {
-    let issuer_directory = std::env::temp_dir().join(format!(
-        "teamarness-runtime-invitation-uncertain-{}",
-        std::process::id()
-    ));
-    let invitee_directory = std::env::temp_dir().join(format!(
-        "teamarness-runtime-invitation-claimant-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&issuer_directory);
-    let _ = fs::remove_dir_all(&invitee_directory);
+    let issuer_directory = crate::test_directory::TestDirectory::new("invitation-uncertain");
+    let invitee_directory = crate::test_directory::TestDirectory::new("invitation-claimant");
     let config = CoreRuntimeConfig::new(&issuer_directory);
     let issuer = CoreRuntime::open_loopback_for_tests(config.clone())
         .await
@@ -157,11 +145,7 @@ async fn uncertain_invitation_commit_poisons_runtime_until_authenticated_reopen(
 
 #[tokio::test]
 async fn canonical_path_admits_revokes_and_rejects_invalid_authority_without_advancing_state() {
-    let directory = std::env::temp_dir().join(format!(
-        "teamarness-runtime-membership-validation-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&directory);
+    let directory = crate::test_directory::TestDirectory::new("membership-validation");
     let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
         .await
         .unwrap();
@@ -314,11 +298,7 @@ fn topological_orders(prerequisites: &[Vec<usize>]) -> Vec<Vec<usize>> {
 
 #[tokio::test]
 async fn every_reachable_topological_order_converges_for_single_manager_branches() {
-    let baseline = std::env::temp_dir().join(format!(
-        "teamarness-runtime-convergence-baseline-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&baseline);
+    let baseline = crate::test_directory::TestDirectory::new("convergence-baseline");
     let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&baseline))
         .await
         .unwrap();
@@ -369,11 +349,7 @@ async fn every_reachable_topological_order_converges_for_single_manager_branches
     assert!(orders.len() > 1);
     let mut expected = None;
     for (index, order) in orders.into_iter().enumerate() {
-        let directory = std::env::temp_dir().join(format!(
-            "teamarness-runtime-convergence-{}-{index}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&directory);
+        let directory = crate::test_directory::TestDirectory::new(&format!("convergence-{index}"));
         fs::create_dir_all(&directory).unwrap();
         fs::copy(
             baseline.join(crate::storage::DATABASE_FILE_NAME),
@@ -426,11 +402,7 @@ async fn every_reachable_topological_order_converges_for_single_manager_branches
 
 #[tokio::test]
 async fn quarantine_retries_dependency_first_and_never_advances_twice() {
-    let directory = std::env::temp_dir().join(format!(
-        "teamarness-runtime-quarantine-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&directory);
+    let directory = crate::test_directory::TestDirectory::new("quarantine");
     let now = Arc::new(AtomicI64::new(1_000));
     let config = CoreRuntimeConfig::new(&directory);
     let runtime =

@@ -908,11 +908,7 @@ mod tests {
 
     #[test]
     fn interrupted_named_creation_recovers_original_person_and_name() {
-        let directory = std::env::temp_dir().join(format!(
-            "teamarness-named-creation-boundary-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&directory);
+        let directory = crate::test_directory::TestDirectory::new("named-creation-boundary");
         let runtime = crate::storage::open(&directory, 0).unwrap();
         let mut connection = runtime.connection;
         let creator = PublicIdentity::from_bytes(*runtime.secret_key.public().as_bytes()).unwrap();
@@ -961,11 +957,8 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let directory = std::env::temp_dir().join(format!(
-                "teamarness-creation-boundary-{}-{index}",
-                std::process::id()
-            ));
-            let _ = fs::remove_dir_all(&directory);
+            let directory =
+                crate::test_directory::TestDirectory::new(&format!("creation-boundary-{index}"));
             let runtime = crate::storage::open(&directory, 0).unwrap();
             let mut connection = runtime.connection;
             let secret_key = runtime.secret_key;
@@ -1100,9 +1093,7 @@ mod tests {
 
     #[test]
     fn future_authenticated_operation_is_durable_and_inert() {
-        let directory =
-            std::env::temp_dir().join(format!("teamarness-future-context-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
+        let directory = crate::test_directory::TestDirectory::new("future-context");
         let runtime = crate::storage::open(&directory, 0).unwrap();
         let mut connection = runtime.connection;
         let creator = runtime.secret_key;

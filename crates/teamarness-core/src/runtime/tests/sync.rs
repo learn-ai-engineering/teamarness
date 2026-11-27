@@ -2,11 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn production_log_sync_grants_scope_converges_and_survives_restart() {
-    let root = std::env::temp_dir().join(format!(
-        "teamarness-production-log-sync-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = crate::test_directory::TestDirectory::new("production-log-sync");
     let a_dir = root.join("a");
     let b_dir = root.join("b");
     let clock = || {
@@ -187,11 +183,7 @@ async fn production_log_sync_grants_scope_converges_and_survives_restart() {
 
 #[tokio::test]
 async fn current_peer_forwards_record_from_historical_member() {
-    let root = std::env::temp_dir().join(format!(
-        "teamarness-historical-record-forwarding-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = crate::test_directory::TestDirectory::new("historical-record-forwarding");
     let alice = CoreRuntime::open_with_clock_and_readiness(
         CoreRuntimeConfig::new(root.join("alice")),
         Box::new(SystemClock),
@@ -321,11 +313,7 @@ async fn current_peer_forwards_record_from_historical_member() {
 
 #[tokio::test]
 async fn invalid_remote_sequence_isolated_before_journal_commit() {
-    let root = std::env::temp_dir().join(format!(
-        "teamarness-invalid-remote-operation-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = crate::test_directory::TestDirectory::new("invalid-remote-operation");
     let a = CoreRuntime::open_with_clock_and_readiness(
         CoreRuntimeConfig::new(root.join("a")),
         Box::new(SystemClock),

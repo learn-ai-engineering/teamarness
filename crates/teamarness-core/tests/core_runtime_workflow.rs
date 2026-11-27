@@ -1,17 +1,12 @@
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "../test-support/test_directory.rs"]
+mod test_directory;
+use test_directory::TestDirectory;
 
 use teamarness_core::{CoreRuntime, CoreRuntimeConfig, MembershipEpoch, MembershipRole};
 
-static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
-fn private_data_directory() -> PathBuf {
-    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "teamarness-core-workflow-{}-{sequence}",
-        std::process::id()
-    ))
+fn private_data_directory() -> TestDirectory {
+    TestDirectory::new("core-workflow")
 }
 
 #[tokio::test]

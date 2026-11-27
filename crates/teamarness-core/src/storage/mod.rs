@@ -379,19 +379,12 @@ fn set_database_permissions(_path: &Path) -> Result<(), StorageError> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::test_directory::TestDirectory;
 
     use super::*;
 
-    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
-    fn test_directory(name: &str) -> PathBuf {
-        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "teamarness-storage-{name}-{}-{sequence}",
-            std::process::id()
-        ))
+    fn test_directory(name: &str) -> TestDirectory {
+        TestDirectory::new(name)
     }
 
     #[test]

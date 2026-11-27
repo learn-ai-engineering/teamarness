@@ -1,6 +1,7 @@
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "../test-support/test_directory.rs"]
+mod test_directory;
+use test_directory::TestDirectory;
 
 use rusqlite::Connection;
 use teamarness_core::{CoreRuntime, CoreRuntimeConfig, StorageError};
@@ -29,13 +30,8 @@ fn rewrite_control_bytes(connection: &Connection, edit: impl Fn(&mut Vec<u8>)) {
     }
 }
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-fn directory() -> PathBuf {
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "teamarness-immutable-recovery-{}-{n}",
-        std::process::id()
-    ))
+fn directory() -> TestDirectory {
+    TestDirectory::new("immutable-recovery")
 }
 
 // Verifies: TEAM.SYS.TRANS-R07

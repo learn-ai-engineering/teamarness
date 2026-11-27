@@ -1,5 +1,7 @@
 //! Native, source-current compositions. Only Core addressing is replaced by loopback.
 #![allow(dead_code)] // Each named target uses a different subset of these shared helpers.
+#[path = "../../../support/temp_dir.rs"]
+mod tempfile;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -29,7 +31,7 @@ pub const TEAM: [&str; 3] = [DOCUMENTS, BACKLOG, CONVERSATIONS];
 pub const DEADLINE: Duration = Duration::from_secs(60);
 
 pub fn fixture_root() -> tempfile::TempDir {
-    let root = tempfile::Builder::new()
+    let root = ::tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir()
         .unwrap();
@@ -54,7 +56,7 @@ pub fn fixture_root() -> tempfile::TempDir {
         std::env::temp_dir().display(),
         canonical.display()
     );
-    root
+    root.into()
 }
 
 pub fn digest(bytes: &[u8]) -> String {

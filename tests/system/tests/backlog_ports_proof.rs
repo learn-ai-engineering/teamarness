@@ -5,6 +5,7 @@
 #![cfg(unix)]
 #[allow(dead_code)] // Shared qualification helpers are used by different integration targets.
 mod support;
+use support::tempfile;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

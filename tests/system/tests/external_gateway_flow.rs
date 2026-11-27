@@ -5,6 +5,7 @@
 #![cfg(unix)]
 #[allow(dead_code)]
 mod support;
+use support::tempfile;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

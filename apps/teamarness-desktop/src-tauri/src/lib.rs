@@ -373,6 +373,10 @@ pub fn run() {
 }
 
 #[cfg(test)]
+#[path = "../../../../tests/support/temp_dir.rs"]
+mod test_temp_dir;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

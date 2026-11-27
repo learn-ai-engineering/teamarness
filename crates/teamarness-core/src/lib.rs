@@ -22,6 +22,10 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+#[path = "../test-support/test_directory.rs"]
+mod test_directory;
+
 mod blocking;
 mod diag;
 mod encoding;

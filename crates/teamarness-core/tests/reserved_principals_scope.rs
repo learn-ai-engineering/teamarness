@@ -5,14 +5,8 @@ const LEGACY_VALID_PACKAGE: &str = "internal.teamarness.principals";
 
 #[tokio::test]
 async fn public_record_operations_cannot_use_principals_scope() {
-    let root = std::env::temp_dir().join(format!(
-        "teamarness-reserved-scope-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("reserved-scope");
     let creator = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&root))
         .await
         .unwrap();

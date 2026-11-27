@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[path = "../../../../tests/support/temp_dir.rs"]
+pub(crate) mod tempfile;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -13,10 +16,10 @@ use teamarness_package_host::{
 use tempfile::TempDir;
 
 pub struct Fixture {
-    pub _root: TempDir,
     pub _private: PathBuf,
     pub core: Arc<CoreRuntime>,
     pub config: PackageHostConfig,
+    pub _root: TempDir,
 }
 
 impl Fixture {

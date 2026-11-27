@@ -24,7 +24,7 @@ impl Clock for FixedClock {
     }
 }
 
-async fn runtime(test: &str) -> (CoreRuntime, std::path::PathBuf) {
+async fn runtime(test: &str) -> (crate::test_directory::TestDirectory, CoreRuntime) {
     let root = cluster_root(test);
     let _ = std::fs::remove_dir_all(&root);
     let runtime = CoreRuntime::open_with_clock_and_readiness(
@@ -34,13 +34,13 @@ async fn runtime(test: &str) -> (CoreRuntime, std::path::PathBuf) {
     )
     .await
     .expect("the Installation opens");
-    (runtime, root)
+    (root, runtime)
 }
 
 /// Verifies: TEAM.SYS.TRANS-R06, TEAM.SYS.TRANS-R07
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_height_beyond_the_advance_window_is_rejected() {
-    let (runtime, root) = runtime("height-window").await;
+    let (root, runtime) = runtime("height-window").await;
     let workspace = runtime.create_workspace("Height window").unwrap();
     let id = workspace.id();
     let seed = runtime
@@ -86,7 +86,7 @@ async fn remote_height_beyond_the_advance_window_is_rejected() {
 /// Verifies: TEAM.SYS.TRANS-R07
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_append_after_a_maximum_window_height_does_not_saturate() {
-    let (runtime, root) = runtime("height-no-saturation").await;
+    let (root, runtime) = runtime("height-no-saturation").await;
     let workspace = runtime.create_workspace("Window edge").unwrap();
     let id = workspace.id();
     runtime
