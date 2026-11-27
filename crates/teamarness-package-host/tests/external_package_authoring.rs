@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+#[path = "../../../tests/support/temp_dir.rs"]
+mod tempfile;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

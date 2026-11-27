@@ -1,7 +1,7 @@
+use crate::test_directory::TestDirectory;
 use std::fs;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh_base::EndpointAddr;
@@ -12,14 +12,8 @@ use crate::{
     WorkspaceInvitation,
 };
 
-static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
-fn directory(name: &str) -> std::path::PathBuf {
-    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "teamarness-end-to-end-{name}-{}-{sequence}",
-        std::process::id()
-    ))
+fn directory(name: &str) -> TestDirectory {
+    TestDirectory::new(name)
 }
 
 fn now_unix_ms() -> i64 {
@@ -57,7 +51,7 @@ fn assert_same_membership(left: &MembershipSnapshot, right: &MembershipSnapshot)
     assert_eq!(left.members(), right.members());
 }
 
-async fn open(name: &str) -> (std::path::PathBuf, CoreRuntime) {
+async fn open(name: &str) -> (TestDirectory, CoreRuntime) {
     let path = directory(name);
     let runtime = CoreRuntime::open_for_onboarding_test(CoreRuntimeConfig::new(&path))
         .await

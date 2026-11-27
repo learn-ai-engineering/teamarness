@@ -1151,16 +1151,12 @@ mod tests {
         local: PublicIdentity,
         peer: PublicIdentity,
         workspace: WorkspaceId,
-        root: std::path::PathBuf,
+        root: crate::test_directory::TestDirectory,
     }
 
     impl Fixture {
         fn open(name: &str) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "teamarness-scheduler-{name}-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&root);
+            let root = crate::test_directory::TestDirectory::new(name);
             std::fs::create_dir_all(&root).expect("the test root is created");
             let stored = crate::storage::open(&root, 0).expect("a migrated database");
             let mut connection = stored.connection;
@@ -1288,7 +1284,7 @@ mod tests {
 
         fn finish(self) {
             drop(self.state);
-            let _ = std::fs::remove_dir_all(&self.root);
+            drop(self.root);
         }
     }
 

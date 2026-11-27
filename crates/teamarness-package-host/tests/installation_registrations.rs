@@ -10,6 +10,7 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
+use common::tempfile;
 use tempfile::TempDir;
 
 pub use teamarness_package_host::{

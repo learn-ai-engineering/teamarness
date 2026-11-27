@@ -1,5 +1,8 @@
 #![allow(clippy::result_large_err)]
 
+#[cfg(test)]
+use crate::test_temp_dir as tempfile;
+
 use std::path::PathBuf;
 use std::str::FromStr;
 

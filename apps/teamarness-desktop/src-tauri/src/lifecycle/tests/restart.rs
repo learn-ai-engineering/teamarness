@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_temp_dir as tempfile;
 
 /// Verifies: TEAM.SYS.SHELL-R01, TEAM.SYS.SHELL-R07
 #[test]

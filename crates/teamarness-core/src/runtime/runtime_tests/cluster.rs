@@ -4,30 +4,22 @@
 //! storage, and the system clock. Addresses are exchanged through the loopback
 //! address book, so a node can dial a peer it has never met.
 
+use crate::test_directory::TestDirectory;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::super::{CoreRuntime, CoreRuntimeConfig, PublicIdentity, SystemClock, WorkspaceId};
 use crate::RecordId;
 use crate::synchronization::limits::SessionLimits;
 
-static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
-
-/// A unique temporary root per test, so parallel tests never share a directory.
-pub(super) fn cluster_root(test: &str) -> PathBuf {
-    let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "teamarness-cluster-{test}-{}-{sequence}",
-        std::process::id()
-    ))
+/// A unique, owned temporary root per test.
+pub(super) fn cluster_root(test: &str) -> TestDirectory {
+    TestDirectory::new(test)
 }
 
 pub(super) const DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
 
 pub(super) struct SyncCluster {
-    root: PathBuf,
     names: Vec<&'static str>,
     nodes: Vec<Option<CoreRuntime>>,
     /// An Installation keeps its identity across a restart, so a test can name
@@ -35,6 +27,8 @@ pub(super) struct SyncCluster {
     identities: Vec<PublicIdentity>,
     /// A node keeps the bounds it was started with across a restart.
     limits: Vec<SessionLimits>,
+    // Drop the runtimes before removing their storage, including on panic.
+    root: TestDirectory,
 }
 
 impl SyncCluster {
@@ -52,7 +46,6 @@ impl SyncCluster {
         overrides: &[(&str, SessionLimits)],
     ) -> Self {
         let root = cluster_root(test);
-        let _ = std::fs::remove_dir_all(&root);
         let limits = names
             .iter()
             .map(|name| {
@@ -296,6 +289,5 @@ impl SyncCluster {
                 let _ = node.shutdown().await;
             }
         }
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }

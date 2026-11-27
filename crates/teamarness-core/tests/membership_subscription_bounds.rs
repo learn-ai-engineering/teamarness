@@ -4,14 +4,8 @@ use teamarness_core::{CoreRuntime, CoreRuntimeConfig, MembershipEpoch};
 
 #[tokio::test]
 async fn bounded_membership_subscription_releases_an_idle_receiver_after_timeout() {
-    let root = std::env::temp_dir().join(format!(
-        "teamarness-membership-bounds-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("membership-bounds");
     let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&root))
         .await
         .unwrap();

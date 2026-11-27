@@ -26,10 +26,8 @@ fn nested_cargo_pins_the_compiler_and_reports_json_stdout_despite_conflicting_am
         return;
     }
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let root = std::env::temp_dir().join(format!(
-        "teamarness-cargo-fixture-probe-{}",
-        std::process::id()
-    ));
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("cargo-fixture-probe");
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"fixture-compiler-proof\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n").unwrap();
     std::fs::write(

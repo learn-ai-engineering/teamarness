@@ -3,9 +3,7 @@ use super::*;
 #[tokio::test]
 async fn test_clock_is_injected_without_entering_the_public_configuration() {
     let calls = Arc::new(AtomicU64::new(0));
-    let directory =
-        std::env::temp_dir().join(format!("teamarness-runtime-clock-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&directory);
+    let directory = crate::test_directory::TestDirectory::new("runtime-clock");
 
     let runtime = CoreRuntime::open_with_clock(
         CoreRuntimeConfig::new(&directory),
@@ -24,11 +22,7 @@ async fn test_clock_is_injected_without_entering_the_public_configuration() {
 
 #[tokio::test]
 async fn dropping_a_membership_subscription_deregisters_its_listener() {
-    let directory = std::env::temp_dir().join(format!(
-        "teamarness-runtime-subscription-drop-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&directory);
+    let directory = crate::test_directory::TestDirectory::new("subscription-drop");
     let runtime = CoreRuntime::open_with_clock(
         CoreRuntimeConfig::new(&directory),
         Box::new(RecordingClock {
@@ -71,11 +65,7 @@ async fn dropping_a_membership_subscription_deregisters_its_listener() {
 
 #[tokio::test]
 async fn endpoint_identity_persists_and_invitation_lifetime_starts_after_readiness() {
-    let directory = std::env::temp_dir().join(format!(
-        "teamarness-runtime-transport-identity-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&directory);
+    let directory = crate::test_directory::TestDirectory::new("transport-identity");
     let now = Arc::new(AtomicI64::new(42_000));
     let config = CoreRuntimeConfig::new(&directory);
     let runtime =
@@ -112,11 +102,7 @@ async fn endpoint_identity_persists_and_invitation_lifetime_starts_after_readine
 
 #[tokio::test]
 async fn shutdown_waits_for_invitation_creation_after_readiness() {
-    let directory = std::env::temp_dir().join(format!(
-        "teamarness-runtime-invitation-shutdown-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&directory);
+    let directory = crate::test_directory::TestDirectory::new("invitation-shutdown");
     let runtime = Arc::new(
         CoreRuntime::open_with_clock(
             CoreRuntimeConfig::new(&directory),
@@ -155,11 +141,7 @@ async fn shutdown_waits_for_invitation_creation_after_readiness() {
 
 #[tokio::test]
 async fn readiness_failure_does_not_sign_or_start_an_invitation_lifetime() {
-    let directory = std::env::temp_dir().join(format!(
-        "teamarness-runtime-readiness-clock-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&directory);
+    let directory = crate::test_directory::TestDirectory::new("readiness-clock");
     let calls = Arc::new(AtomicU64::new(0));
     let runtime = CoreRuntime::open_with_clock_and_readiness(
         CoreRuntimeConfig::new(&directory),
@@ -187,11 +169,7 @@ async fn readiness_failure_does_not_sign_or_start_an_invitation_lifetime() {
 
 #[tokio::test]
 async fn stopping_transport_rejects_onboarding_but_preserves_local_commands() {
-    let directory = std::env::temp_dir().join(format!(
-        "teamarness-runtime-local-during-shutdown-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&directory);
+    let directory = crate::test_directory::TestDirectory::new("local-during-shutdown");
     let runtime = Arc::new(
         CoreRuntime::open_with_clock(
             CoreRuntimeConfig::new(&directory),

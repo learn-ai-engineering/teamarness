@@ -1,23 +1,17 @@
 //! Sole-creator Workspace deletion (ADR 0050).
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[path = "../test-support/test_directory.rs"]
+mod test_directory;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use test_directory::TestDirectory;
 
 use rusqlite::Connection;
 use teamarness_core::{CoreRuntime, CoreRuntimeConfig, WorkspaceError, WorkspaceId};
 
-static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
-fn private_data_directory(test_name: &str) -> PathBuf {
-    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
-        "teamarness-core-{test_name}-{}-{sequence}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&directory);
-    directory
+fn private_data_directory(test_name: &str) -> TestDirectory {
+    TestDirectory::new(test_name)
 }
 
 /// Rows of `workspace` left in any table with a `workspace_id` column, plus every row of the

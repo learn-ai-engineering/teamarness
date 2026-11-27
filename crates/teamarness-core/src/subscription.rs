@@ -329,7 +329,6 @@ mod tests {
 
     #[tokio::test]
     async fn durable_catch_up_replays_only_conflict_subjects() {
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         use crate::membership::test_authoring::{
@@ -339,12 +338,7 @@ mod tests {
             CoreRuntime, CoreRuntimeConfig, MembershipApplyOutcomeForTests, MembershipEpoch,
         };
 
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let directory = std::env::temp_dir().join(format!(
-            "teamarness-subscription-catch-up-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let directory = crate::test_directory::TestDirectory::new("subscription-catch-up");
         let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
             .await
             .unwrap();
@@ -449,7 +443,6 @@ mod tests {
 
     #[tokio::test]
     async fn durable_catch_up_includes_agents_of_conflicted_person() {
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         use crate::membership::test_authoring::{
@@ -457,12 +450,7 @@ mod tests {
         };
         use crate::{CoreRuntime, CoreRuntimeConfig, MembershipEpoch};
 
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let directory = std::env::temp_dir().join(format!(
-            "teamarness-subscription-dependent-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let directory = crate::test_directory::TestDirectory::new("subscription-dependent");
         let runtime = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(&directory))
             .await
             .unwrap();

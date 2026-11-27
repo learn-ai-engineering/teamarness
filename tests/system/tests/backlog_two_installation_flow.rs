@@ -9,6 +9,7 @@
 #![cfg(unix)]
 #[allow(dead_code)] // Shared qualification helpers are used by different integration targets.
 mod support;
+use support::tempfile;
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;

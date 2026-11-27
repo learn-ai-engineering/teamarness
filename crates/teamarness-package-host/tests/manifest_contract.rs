@@ -4,6 +4,8 @@ use std::fs;
 use std::os::unix::fs::symlink;
 
 use sha2::{Digest, Sha256};
+#[path = "../../../tests/support/temp_dir.rs"]
+mod tempfile;
 use tempfile::TempDir;
 
 pub use teamarness_package_host::{PackageErrorCode, PackageIdentity, PackageValue};

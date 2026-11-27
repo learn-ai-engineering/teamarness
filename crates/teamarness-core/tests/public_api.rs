@@ -1,14 +1,14 @@
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+#[path = "../test-support/test_directory.rs"]
+mod test_directory;
+use test_directory::TestDirectory;
 
 use serde::{Deserialize, Serialize};
 use teamarness_core::{CoreRuntime, CoreRuntimeConfig, PublicIdentity};
 
 #[path = "../../../tests/support/cargo_fixture.rs"]
 mod cargo_fixture;
-
-static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 // Cargo must prune unrelated workspace roots from a copied lock before --locked
 // checking the isolated consumer. Only the consumer itself may be newly resolved.
@@ -44,12 +44,8 @@ fn isolated_lock_refuses_dependency_version_or_checksum_drift() {
     }
 }
 
-fn temporary_directory() -> PathBuf {
-    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "teamarness-core-public-api-{}-{sequence}",
-        std::process::id()
-    ))
+fn temporary_directory() -> TestDirectory {
+    TestDirectory::new("public-api")
 }
 
 fn compile_fails(fixture: &Path, expected_marker: &str, shared_target: &Path) {

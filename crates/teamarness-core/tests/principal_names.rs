@@ -1,15 +1,12 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "../test-support/test_directory.rs"]
+mod test_directory;
 use teamarness_core::{
     CoreRuntime, CoreRuntimeConfig, OnboardingError, PersonNameError, WorkspaceId,
 };
+use test_directory::TestDirectory;
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-fn directory() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "principal-names-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
+fn directory() -> TestDirectory {
+    TestDirectory::new("principal-names")
 }
 fn durable_name(path: &std::path::Path, workspace: WorkspaceId) -> String {
     rusqlite::Connection::open(path.join("core.sqlite3"))
@@ -123,7 +120,8 @@ async fn unicode_validation_legacy_fallback_and_ownership() {
         runtime.set_own_person_name_for(workspace.id(), identity, "allowed"),
         Ok(())
     );
-    let stranger = open(&directory()).await;
+    let stranger_directory = directory();
+    let stranger = open(&stranger_directory).await;
     assert_eq!(
         runtime.set_own_person_name_for(workspace.id(), stranger.public_identity(), "forged"),
         Err(PersonNameError::NotOwnPerson)

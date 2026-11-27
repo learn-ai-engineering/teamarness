@@ -1579,6 +1579,8 @@ async fn failed_storage_never_claims_success_and_lost_completion_is_reread() {
     for access in ["agent", "person"] {
         let fixture = fixture_for_access(access).await;
         let workspace = fixture.core.list_workspaces().unwrap()[0].id();
+        // Read only by the test-hooks assertions below.
+        #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
         let agent = if access == "agent" {
             let agent = fixture.core.add_agent(workspace, "Storage Agent").unwrap();
             fixture

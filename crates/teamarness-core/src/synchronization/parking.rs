@@ -292,8 +292,7 @@ pub(crate) fn parked_count(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::test_directory::TestDirectory;
 
     use iroh_base::SecretKey;
     use p2panda_core::{Body, Hash, Header, SigningKey};
@@ -312,31 +311,24 @@ mod tests {
         ttl_ms: 1_000,
     };
 
-    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
     /// A real migrated SQLite database and real signed, sealed operations.
     /// Only the peer identities are synthetic.
     struct Fixture {
-        directory: PathBuf,
         connection: Connection,
         secret: SecretKey,
         workspace: WorkspaceId,
         key: ContentKey,
         next_sequence: u32,
         previous: Option<Hash>,
+        _directory: TestDirectory,
     }
 
     impl Fixture {
         fn new(name: &str) -> Self {
-            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-            let directory = std::env::temp_dir().join(format!(
-                "teamarness-parking-{name}-{}-{sequence}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&directory);
+            let directory = TestDirectory::new(name);
             let stored = crate::storage::open(&directory, 0).expect("a migrated test database");
             Self {
-                directory,
+                _directory: directory,
                 connection: stored.connection,
                 secret: stored.secret_key,
                 workspace: WorkspaceId::from_bytes([11; 16]),
@@ -445,12 +437,6 @@ mod tests {
             let author =
                 PublicIdentity::from_bytes(*self.secret.public().as_bytes()).expect("an author");
             parked_for_author(&self.connection, self.workspace, author).expect("parked operations")
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.directory);
         }
     }
 

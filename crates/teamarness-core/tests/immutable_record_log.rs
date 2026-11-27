@@ -1,16 +1,12 @@
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "../test-support/test_directory.rs"]
+mod test_directory;
+use test_directory::TestDirectory;
 
 use teamarness_core::{CoreRuntime, CoreRuntimeConfig, Cursor, OrderKey, RecordId};
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-fn directory() -> PathBuf {
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "teamarness-immutable-log-{}-{n}",
-        std::process::id()
-    ))
+fn directory() -> TestDirectory {
+    TestDirectory::new("immutable-log")
 }
 
 #[tokio::test]

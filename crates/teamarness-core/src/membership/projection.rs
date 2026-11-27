@@ -2527,11 +2527,7 @@ mod tests {
 
     #[test]
     fn a_non_manager_inviter_cannot_redeem_or_consume_a_nonce() {
-        let directory = std::env::temp_dir().join(format!(
-            "teamarness-invitation-non-manager-redeem-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&directory);
+        let directory = crate::test_directory::TestDirectory::new("non-manager-redeem");
         let stored = crate::storage::open(&directory, 0).unwrap();
         let mut connection = stored.connection;
         let manager = stored.secret_key;
@@ -2583,11 +2579,8 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let directory = std::env::temp_dir().join(format!(
-                "teamarness-invitation-fault-{}-{index}",
-                std::process::id()
-            ));
-            let _ = fs::remove_dir_all(&directory);
+            let directory =
+                crate::test_directory::TestDirectory::new(&format!("invitation-fault-{index}"));
             let stored = crate::storage::open(&directory, 0).unwrap();
             let mut connection = stored.connection;
             let manager = stored.secret_key;

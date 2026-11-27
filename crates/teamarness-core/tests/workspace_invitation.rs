@@ -132,11 +132,8 @@ async fn join_carries_the_group_create_and_a_retry_recovers_the_same_admission()
 
     use teamarness_core::{CoreRuntime, CoreRuntimeConfig, MembershipEpoch, MembershipRole};
 
-    let root = std::env::temp_dir().join(format!(
-        "teamarness-core-join-group-create-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("join-group-create");
     let issuer = CoreRuntime::open_loopback_for_tests(CoreRuntimeConfig::new(root.join("issuer")))
         .await
         .unwrap();

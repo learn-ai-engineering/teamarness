@@ -113,14 +113,8 @@ fn onboarding_errors_have_a_stable_retryability_contract() {
 // Verifies: TEAM.SYS.MEM-R05
 #[tokio::test]
 async fn durable_and_live_transitions_report_the_same_change_and_author() {
-    let root = std::env::temp_dir().join(format!(
-        "teamarness-transition-change-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("transition-change");
     let alice = open(root.join("alice")).await;
     let workspace = alice.create_workspace("Transition change").unwrap();
     let mut live = alice

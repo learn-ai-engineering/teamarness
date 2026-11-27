@@ -1,7 +1,7 @@
+use crate::test_directory::TestDirectory;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
@@ -9,14 +9,8 @@ use crate::{
 };
 use rusqlite::Connection;
 
-static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
-fn private_data_directory(test_name: &str) -> PathBuf {
-    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "teamarness-core-{test_name}-{}-{sequence}",
-        std::process::id()
-    ))
+fn private_data_directory(test_name: &str) -> TestDirectory {
+    TestDirectory::new(test_name)
 }
 
 fn now_unix_ms() -> i64 {

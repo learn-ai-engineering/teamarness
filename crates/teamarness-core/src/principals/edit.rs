@@ -572,11 +572,7 @@ mod tests {
         let workspace = projection.workspace_id();
         let edit = PrincipalNameEdit::sign(&key, workspace, person, 1, "Visible").unwrap();
         accept(&mut db, &projection, edit.canonical_bytes()).unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "person-edit-{}-{:?}.sqlite3",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let path = crate::test_directory::TestDirectory::new("person-edit.sqlite3");
         db.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])
             .unwrap();
         drop(db);
@@ -792,11 +788,7 @@ mod tests {
     fn concurrent_accepts_serialize_on_one_durable_winner() {
         let (db, projection, key, person) = fixture();
         let workspace = projection.workspace_id();
-        let path = std::env::temp_dir().join(format!(
-            "person-concurrent-{}-{:?}.sqlite3",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let path = crate::test_directory::TestDirectory::new("person-concurrent.sqlite3");
         db.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])
             .unwrap();
         drop(db);
@@ -847,11 +839,7 @@ mod tests {
         )
         .unwrap();
         // No append acknowledgement: do not complete, even if signing succeeded.
-        let path = std::env::temp_dir().join(format!(
-            "person-intent-{}-{:?}.sqlite3",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let path = crate::test_directory::TestDirectory::new("person-intent.sqlite3");
         db.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])
             .unwrap();
         drop(db);
